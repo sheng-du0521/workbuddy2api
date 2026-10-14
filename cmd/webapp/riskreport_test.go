@@ -112,7 +112,7 @@ func TestRestrictedViaProxyPath(t *testing.T) {
 	px.onAccountRestricted = a.handleRestrictedAccount
 
 	// 真实转发路径上报上游错误 → 应触发即时删除。
-	px.reportUpstreamError("r3", "m", 403, []byte(bodyRestricted11140), "")
+	px.reportUpstreamError("r3", "m", 403, []byte(bodyRestricted11140), "", nil)
 	if acc, _ := store.GetAccount("r3"); acc != nil {
 		t.Fatal("转发链上的账号级限制应即时删除")
 	}
@@ -129,7 +129,7 @@ func TestRestrictedFallsBackToDisable(t *testing.T) {
 	defer px.Close()
 	px.onAccountRestricted = nil
 
-	px.reportUpstreamError("r4", "m", 403, []byte(bodyRestricted11140), "")
+	px.reportUpstreamError("r4", "m", 403, []byte(bodyRestricted11140), "", nil)
 	st, ok := px.pool.Status("r4")
 	if !ok || !st.Disabled {
 		t.Fatalf("未注入回调时应落为停用，状态=%+v ok=%v", st, ok)

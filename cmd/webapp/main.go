@@ -206,6 +206,8 @@ func main() {
 		// 优先级：-key 参数 > 环境变量（脚本侧读）> admin.key 文件 > 新生成。
 		// 环境变量由启动脚本处理（见 start-webapp.bat），这里只管文件与生成。
 		keyPath := filepath.Join(filepath.Dir(*dbPath), "admin.key")
+		// R4：被拦样本文件与库 / 密钥同目录（-db 决定），避免依赖进程 CWD。
+		fpSampleFile = filepath.Join(filepath.Dir(*dbPath), "fingerprint_samples.jsonl")
 		if v, err := os.ReadFile(keyPath); err == nil {
 			if s := strings.TrimSpace(string(v)); s != "" {
 				*apiKey = s
@@ -1310,6 +1312,9 @@ func (a *app) routes() *http.ServeMux {
 	// 全池长期为空（上游看到的是一台「无设备凭证的客户端」）。
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/device-token", a.adminGuard(a.handleAccountDeviceToken))
 	mux.HandleFunc("GET /api/admin/device-tokens", a.adminGuard(a.handleDeviceTokenAudit))
+
+	// 指纹被拦样本回流（R4 / v0.26.1）：默认关闭，开启后落 system 原文前 300 字 + 工具清单。
+	mux.HandleFunc("GET /api/admin/fingerprint-samples", a.adminGuard(a.handleFingerprintSamples))
 	mux.HandleFunc("POST /api/admin/device-tokens/bulk", a.adminGuard(a.handleDeviceTokenBulk))
 
 	// ---- 出口代理池（v0.14.0 防封）----

@@ -1274,7 +1274,14 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			lastErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
 			retryAfter := resp.Header.Get("Retry-After")
-			kind := p.reportUpstreamError(au.UID, model, resp.StatusCode, body, retryAfter)
+			// 传 raw（客户端请求体原文）而不是 payload（改写后的 map）：raw 已是 []byte，
+			// 且 system 提示词在两者中一致（改写只动角色/档位）。
+			kind := p.reportUpstreamError(au.UID, model, resp.StatusCode, body, retryAfter, raw)
+			// R6（v0.26.1）：上游 5xx 说明**这一档整体不可用** → 把该成本层整层划掉，
+			// 下次选号自然落到下一档（默认关闭；见 picksink.go 的"为什么默认关闭"）。
+			if kind == upstream.ErrServer {
+				p.sinkCostTier(au.UID, model, tried)
+			}
 			// 记录分类，供最终状态码映射（见 upstreamFailureStatus）。
 			lastKind = kind
 			if retryAfter != "" {
@@ -1484,7 +1491,7 @@ func contextDone(r *http.Request) error {
 //     NoteError（熔断 30min 起、封顶 6h）。上游 5xx 多为全局故障，按熔断处理会
 //     把整池账号批量摘除——hub issue #271 实测「4 小时 196 次失败熔断 13 个号、
 //     池子几乎空掉」即此类尺度过激。本链路取更保守的降权口径。
-func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, retryAfter string) upstream.ErrKind {
+func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, retryAfter string, reqBody []byte) upstream.ErrKind {
 	// —— 账号级限制信号（v0.24.6）：先于按 code 的分流 ——
 	//
 	// 放在最前面是因为它的处置**强度最高且不可逆**（即时删除），而下面的
@@ -1592,6 +1599,9 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 			p.pool.NoteError(uid)
 		}
 	}
+	// R4（v0.26.1）：指纹被拦样本回流。挂在**唯一返回点**而不是每个 case 里 ——
+	// 分类已经算好，各 case 各写一遍必然漏一份。默认关闭时这里是零成本返回。
+	p.maybeSampleFingerprint(kind, uid, model, reqBody, body)
 	return kind
 }
 

@@ -1210,6 +1210,13 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		//   migrate       = 自动迁移到可用线路（旧行为）
 		// 见 egress_policy.go —— 为什么默认 strict 写在那里。
 		EgressOnLineDown *string `json:"egress_on_line_down"`
+		// FingerprintSamples 指纹被拦样本回流（R4，v0.26.1）：on / off，**默认 off**。
+		// 之所以默认关：它是本仓唯一会把请求内容（system 原文片段）写到磁盘的功能，
+		// 与"请求体不留存"的既有承诺冲突，必须由运维显式开启。见 fpsample.go 文件头。
+		FingerprintSamples *string `json:"fingerprint_samples"`
+		// PickSinkOn5xx 上游 5xx 时是否降档重试（R6，v0.26.1）：on / off，**默认 off**。
+		// 本仓的「档」是**成本层**，下沉 = 去用更贵的账号 → 默认不替站长做这个决定。
+		PickSinkOn5xx *string `json:"pick_sink_on_5xx"`
 		// 选号模式（v0.15.1）：weighted（缺省，三因子加权随机）|
 		// roundrobin（顺序游标轮转，负载均匀铺开，对齐参考实现）。
 		PickMode *string `json:"pick_mode"`
@@ -1438,6 +1445,28 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if v := strings.ToLower(strings.TrimSpace(*req.PickSinkOn5xx)); v != "" {
+			if v != "on" && v != "off" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "pick_sink_on_5xx 只能是 on 或 off"})
+				return
+			}
+			if err := a.store.SetKV(kvPickSinkOn5xx, v); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+		if v := strings.ToLower(strings.TrimSpace(*req.FingerprintSamples)); v != "" {
+			if v != "on" && v != "off" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "fingerprint_samples 只能是 on 或 off"})
+				return
+			}
+			if err := a.store.SetKV(kvFingerprintSamples, v); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
 	}
 	if req.EgressMaxPerProxy != nil {
 		v := *req.EgressMaxPerProxy
@@ -1629,6 +1658,18 @@ func (a *app) settingsView() map[string]any {
 	out["egress_jitter_ms"] = a.proxy.egressJitterMsNow()
 	// 线路失效处置策略（R1）：回显当前生效值，strict = 不静默换出口。
 	out["egress_on_line_down"] = a.egressOnLineDownMode()
+	// 样本回流开关（R4）：默认 off，回显让界面能说明"当前没在收集"。
+	smp, _ := a.store.GetKV(kvFingerprintSamples)
+	if !strings.EqualFold(strings.TrimSpace(smp), "on") {
+		smp = "off"
+	}
+	out["fingerprint_samples"] = smp
+	// 5xx 降档开关（R6）：默认 off。打开 = 允许用更贵的账号换可用性。
+	sink, _ := a.store.GetKV(kvPickSinkOn5xx)
+	if !strings.EqualFold(strings.TrimSpace(sink), "on") {
+		sink = "off"
+	}
+	out["pick_sink_on_5xx"] = sink
 	// 导入防关联 + 积分补新（v0.25.0）。换 IP 命令**原样回显**给管理员：
 	// 它是配置项不是密钥，回显才能核对填对没有（命令里可能带插座 token，
 	// 但能看到它的人本来就有管理密钥）。

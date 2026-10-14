@@ -38,7 +38,7 @@ func TestReportUpstreamErrorRequestLevelUnpunished(t *testing.T) {
 			_ = px.SyncAccounts()
 
 			for i := 0; i < 3; i++ {
-				px.reportUpstreamError("u1", "m", c.status, []byte(c.body), "")
+				px.reportUpstreamError("u1", "m", c.status, []byte(c.body), "", nil)
 			}
 
 			st, ok := px.pool.Status("u1")
@@ -65,7 +65,7 @@ func TestReportUpstreamErrorNotFoundShortCooldown(t *testing.T) {
 	defer store.Close()
 	_ = px.SyncAccounts()
 
-	px.reportUpstreamError("u1", "m", 404, []byte("Not Found"), "")
+	px.reportUpstreamError("u1", "m", 404, []byte("Not Found"), "", nil)
 
 	st, _ := px.pool.Status("u1")
 	if !st.Cooling {
@@ -86,7 +86,7 @@ func TestReportUpstreamErrorModelBlockedBackoff(t *testing.T) {
 	defer store.Close()
 	_ = px.SyncAccounts()
 
-	px.reportUpstreamError("u1", "m", 400, []byte(`{"code":11102,"msg":"service info not found"}`), "")
+	px.reportUpstreamError("u1", "m", 400, []byte(`{"code":11102,"msg":"service info not found"}`), "", nil)
 
 	st, _ := px.pool.Status("u1")
 	if st.Disabled {

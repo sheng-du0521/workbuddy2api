@@ -489,8 +489,20 @@
         </div>
         <div class="sub" style="margin:0 0 10px;">
           这里维护「可从哪些 IP 出去」。账号各自绑定一条线路，<b>同一号主的账号不应共用出口</b>。
-          <br>保存时会实测线路并回显<b>真实出口 IP</b>；连续 3 次探活失败的线路会自动停用，
-          并且<b>绑在它上面的账号会被自动迁到还活着的线路上</b>（无可用线路时退化为直连以保证可用）。
+          <br>保存时会实测线路并回显<b>真实出口 IP</b>；连续 3 次探活失败的线路会自动停用。
+          <br>停用后绑在它上面的账号怎么处置，由下方<b>失效处置策略</b>决定 ——
+          默认的<b>「不静默换出口」会把这些账号暂停服务</b>（留在原线路、<b>绝不回落直连</b>），
+          等你补线路或改绑定。
+        </div>
+
+        <div class="row" style="margin:0 0 14px;flex-wrap:wrap;gap:8px;align-items:center;">
+          <span class="muted" style="font-size:12px;">线路失效处置：</span>
+          <select id="egrOnLineDown" style="width:auto;">
+            <option value="strict">不静默换出口（默认）· 账号暂停服务，等人处理</option>
+            <option value="migrate">自动迁移到可用线路 · 不中断，但出口 IP 会变</option>
+          </select>
+          <button class="ghost" id="btnEgrOnLineDown">保存</button>
+          <span class="sub" id="egrOnLineDownHint" style="margin:0;"></span>
         </div>
 
         <!-- 候选批量探活导入（v0.24.6）。
@@ -580,6 +592,61 @@
             <button class="ghost" id="btnEgrClear" title="清空出口配置 = 回到「未指定」，由全局默认代理决定实际出口。">清空出口</button>
           </div>
           <div id="egrPlan" class="sub" style="margin:12px 0 0;"></div>
+        </div>
+      </div>
+
+      <!-- ========== 子区 ④：设备与选号诊断（v0.26.1） ========== -->
+      <div class="egr-sub" data-egr-sub="device" style="display:none;">
+        <div class="card">
+          <div class="section-head">
+            <h2>设备凭证（X-Device-Token）</h2>
+            <button class="ghost" id="btnDevTokRefresh">刷新</button>
+          </div>
+          <div class="sub" style="margin:0 0 12px;">
+            该头是上游 SDK 签发的设备凭证，也是本仓库<b>唯一有逆向证据</b>的风控头
+            （官方客户端恒带它）。全池都不带 = 一台「没有设备凭证的客户端」；
+            <b>全池共用一个</b> = 所有账号声称自己是<b>同一台设备</b> —— 后者更容易被一次性聚合出来。
+            本项目<b>不伪造</b>该值，只提供录入与共用检测。
+          </div>
+          <div id="devTokSummary" class="sub" style="margin:0 0 12px;"></div>
+          <details style="margin:0 0 12px;">
+            <summary class="muted" style="font-size:12px;cursor:pointer;">批量粘贴导入（每行：账号标识 凭证）</summary>
+            <div style="margin-top:8px;">
+              <textarea id="devTokText" rows="5" style="width:100%;font-family:ui-monospace,Consolas,monospace;"
+                placeholder="uid 或 uid 前 8 位 或 昵称，然后空白，然后凭证&#10;# 以 # 开头是注释&#10;例如：&#10;a1b2c3d4  eyJhbGciOi...（凭证原文不会回显）"></textarea>
+              <div class="row" style="margin-top:8px;gap:8px;align-items:center;">
+                <button id="btnDevTokImport">导入</button>
+                <span class="sub" id="devTokResult" style="margin:0;"></span>
+              </div>
+            </div>
+          </details>
+          <div id="devTokRows"></div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="section-head">
+            <h2>选号诊断</h2>
+            <button class="ghost" id="btnSelRefresh">刷新</button>
+          </div>
+          <div class="sub" style="margin:0 0 12px;">
+            <b>均衡度</b>看流量有没有堆在少数账号上（堆在一处 = 单号高频，本身就是风控信号）；
+            <b>候选队列</b>回答「为什么总选它 / 为什么跳过它」。两者都是<b>只读</b>，不产生任何出站请求。
+          </div>
+          <div id="selBalance"></div>
+          <div id="selCands" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="section-head">
+            <h2>指纹被拦样本</h2>
+            <span class="muted" style="font-size:12px;">默认关闭，开关在「设置 → 反代选号 · 防封」</span>
+          </div>
+          <div class="sub" style="margin:0 0 10px;">
+            上游按内容策略拦下请求时（11128 / 内容审核 / 11140），把 <b>system 提示词前 300 字 + 工具名</b>
+            留下来。用途是<b>扩指纹黑名单</b>：对照这些片段就能知道是哪句话触发了拦截，
+            不必再靠"从头抓包复现"。同一模式只留最新一条。
+          </div>
+          <div id="fpSamples"></div>
         </div>
       </div>
 
@@ -1160,6 +1227,27 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
             <label>请求抖动上限（毫秒）</label>
             <input type="number" id="setEgressJitter" min="0" max="5000" step="10">
             <div class="hint">让同一出口上的不同账号错开出发时刻，避免「同 IP 同毫秒齐发」。<b>0 = 关闭（默认）</b>；开启会按账号加最多该毫秒数的延迟。</div>
+          </div>
+          <div class="setting-card">
+            <label>上游 5xx 时降档重试（有成本）</label>
+            <select id="setPickSink" style="width:auto;">
+              <option value="off">关闭（默认）</option>
+              <option value="on">开启</option>
+            </select>
+            <div class="hint">上游 5xx 时把<b>当前成本层整层划掉</b>，本次请求下沉到下一档继续救。
+              ⚠️ 本项目的「档」是<b>成本层</b>（限免 / 无观测 / 已实测收费），<b>下沉 = 去用更贵的账号</b> ——
+              这是经营决定，所以默认关闭。</div>
+          </div>
+          <div class="setting-card">
+            <label>被拦样本回流（会落盘请求内容片段）</label>
+            <select id="setFpSamples" style="width:auto;">
+              <option value="off">关闭（默认）</option>
+              <option value="on">开启</option>
+            </select>
+            <div class="hint">上游按内容策略拦下请求时，把 <b>system 提示词前 300 字 + 工具名</b>落盘，
+              供你扩指纹黑名单（把对抗节奏从"发版"变成"运营"）。
+              ⚠️ 这是本项目中<b>唯一会把请求内容写到磁盘</b>的功能，因此默认关闭；
+              只落 system 片段，不落用户消息。</div>
           </div>
         </div>
         <div class="row" style="margin-top:14px;">
@@ -2168,6 +2256,13 @@ function accountCard(a) {
       t.title = '折合 ' + fmtPointsU(a.earned);
       chips.appendChild(t);
     }
+  }
+  // 运行态（v0.26.1，R9）：把「为什么不在池里」从一堆布尔位收敛成一眼可读的徽标。
+  // 最要紧的区分是**风控冷却**与**限流冷却** —— 前者等下去不会好，后者会自己恢复，
+  // 处置方向相反，此前都显示成"冷却中"。
+  if (typeof runStateChip === 'function') {
+    const rc = runStateChip(a);
+    if (rc) chips.appendChild(rc);
   }
   // 出站出口：区分「显式直连 / 指定代理 / 未指定 / 配置有误」四种状态（v0.14.1）。
   // 必须四态分明：把「显式直连」显示成代理、把「未指定」显示成直连，都会让管理员
@@ -3654,6 +3749,8 @@ async function loadSettings() {
     $('setEgressMaxPer').value = (d.egress_max_per_proxy === undefined ? '' : (d.egress_max_per_proxy || ''));
     $('setEgressJitter').value = d.egress_jitter_ms || 0;
     $('setEgress').value = d.egress_proxy_default || '';
+    $('setPickSink').value = d.pick_sink_on_5xx === 'on' ? 'on' : 'off';
+    $('setFpSamples').value = d.fingerprint_samples === 'on' ? 'on' : 'off';
     // 选号模式：回读实际生效值（后端归一化后返回），空/未知一律显示默认项。
     $('setPickMode').value = (d.pick_mode === 'roundrobin') ? 'roundrobin' : 'weighted';
     // 导入防关联 + 积分补新（v0.25.0）。
@@ -4378,6 +4475,8 @@ $('btnSaveProxy').onclick = async () => {
       egress_proxy_default: $('setEgress').value,
       egress_max_per_proxy: Number($('setEgressMaxPer').value) || 0,
       egress_jitter_ms: Number($('setEgressJitter').value) || 0,
+      pick_sink_on_5xx: $('setPickSink').value,
+      fingerprint_samples: $('setFpSamples').value,
     });
     toast('反代选号与防封设置已保存', 'ok');
     loadSettings();
@@ -5364,7 +5463,238 @@ let egrAccFilter = '__all__';
 let egrAccSummary = {};
 let egrAccDefault = '';
 
-const EGR_SUBS = [['pool', '出口代理'], ['accounts', '账号代理'], ['help', '去哪弄代理']];
+// ===========================================================================
+// 设备与选号诊断（v0.26.1）：设备凭证共用检测 + 选号均衡度 + 候选队列预览
+// ===========================================================================
+
+// RUN_STATE_META 运行态 → 配色 + 一眼标签。**枚举值由后端 runstate.go 给出**，
+// 这里只补展示（两端各写一份判定逻辑必然漂移，故判定只在后端）。
+// online 不显徽标：常态不需要占位置。
+const RUN_STATE_META = {
+  cooling: ['warn', '冷却'],
+  rate_limited: ['warn', '限流冷却'],
+  risk_cooling: ['err', '风控冷却'],
+  exhausted: ['warn', '额度耗尽'],
+  relogin: ['err', '需重登'],
+  egress_error: ['err', '出口异常'],
+  disabled: ['err', '已禁用'],
+  manual_disabled: ['', '手动停用'],
+};
+
+// RUN_STATE_TIP 每个非 online 态**该做什么**（运维看的是动作，不是状态名）。
+const RUN_STATE_TIP = {
+  cooling: '一般冷却，会自己恢复。等它到期即可。',
+  rate_limited: '上游限流（429 / 模型级 6004）。会按上游重置时间恢复；若同一号反复触发，考虑换出口。',
+  risk_cooling: '风控冷却（11140 / WAF / 指纹被拒）。**等下去不会好** —— 先查出口 IP 与请求形态。',
+  exhausted: '额度/积分耗尽，等到次日 04:00 或补充积分。',
+  relogin: '会话失效或试用未激活，**必须人工重新登录**。',
+  egress_error: '出口配置不可用，已被排除出选号（不会从本机 IP 裸奔）。去「代理 → 账号代理」修好。',
+  disabled: '系统判定不可用，可尝试「复活」。',
+  manual_disabled: '你自己停用的，启用即可回池。',
+};
+
+function runStateChip(a) {
+  const st = a && a.run_state;
+  if (!st || st === 'online') return null;
+  const meta = RUN_STATE_META[st];
+  if (!meta) return chipWithTitle(st, 'warn', '未知运行态：' + st);
+  return chipWithTitle(meta[1], meta[0], RUN_STATE_TIP[st] || ('运行态：' + st));
+}
+
+// ---- R1：线路失效处置策略 ----
+
+async function loadEgressPolicy() {
+  const sel = $('egrOnLineDown');
+  if (!sel) return;
+  try {
+    const d = await api('/api/admin/settings');
+    sel.value = d.egress_on_line_down || 'strict';
+    syncEgressPolicyHint();
+  } catch (e) { /* 拉不到就保持默认展示，不打扰 */ }
+}
+
+function syncEgressPolicyHint() {
+  const sel = $('egrOnLineDown'), hint = $('egrOnLineDownHint');
+  if (!sel || !hint) return;
+  hint.textContent = sel.value === 'migrate'
+    ? '自动迁移：线路挂了账号会被搬到别的线路继续服务 —— 出口 IP 会变，在上游眼里就是特征变化。'
+    : '不静默换出口：线路挂了账号暂停服务（绝不回落直连），等你补线路或改绑定。';
+}
+
+async function saveEgrOnLineDown() {
+  const sel = $('egrOnLineDown');
+  if (!sel) return;
+  try {
+    await post('/api/admin/settings', { egress_on_line_down: sel.value });
+    toast('已保存：' + (sel.value === 'migrate' ? '自动迁移' : '不静默换出口'));
+    syncEgressPolicyHint();
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+  }
+}
+
+// ---- R2 + R7 + R8：设备凭证与选号诊断 ----
+
+async function loadDeviceDiag() {
+  const box = $('devTokSummary');
+  if (box) box.textContent = '加载中…';
+  const [dt, bal, cand, fps] = await Promise.all([
+    api('/api/admin/device-tokens').catch((e) => ({ error: String(e.message || e) })),
+    api('/api/admin/selection-balance?hours=24').catch((e) => ({ error: String(e.message || e) })),
+    api('/api/admin/selection-candidates').catch((e) => ({ error: String(e.message || e) })),
+    api('/api/admin/fingerprint-samples').catch((e) => ({ error: String(e.message || e) })),
+  ]);
+  renderDeviceTok(dt);
+  renderSelBalance(bal);
+  renderSelCands(cand);
+  renderFpSamples(fps);
+}
+
+// renderFpSamples 被拦样本（R4）。关着的时候必须**明确说"当前没在收集"**，
+// 而不是显示"0 条"—— 后者会让人以为"没被拦过"，两件事完全不同。
+function renderFpSamples(d) {
+  const box = $('fpSamples');
+  if (!box) return;
+  if (!d || d.error) { box.textContent = '读取失败：' + ((d && d.error) || '未知错误'); return; }
+  if (!d.enabled) {
+    box.innerHTML = '<div class="sub">当前<b>未开启</b>收集 —— 一个字都没落盘。'
+      + '需要排查拦截原因时，去「设置 → 反代选号 · 防封」把它打开。</div>';
+    return;
+  }
+  const kinds = d.kinds || {};
+  const kindText = Object.keys(kinds).map((k) => k + ' ' + kinds[k]).join(' · ');
+  let html = '<div class="sub" style="margin:0 0 8px;">已收集 <b>' + d.count + '</b> 条去重样本'
+    + (kindText ? '（' + escapeHTML(kindText) + '）' : '')
+    + (d.full ? '　⚠️ <b>文件已达上限，暂停写入</b>，请先清理 ' + escapeHTML(d.file) : '') + '</div>';
+  const list = d.samples || [];
+  if (!list.length) { emptyBlock(box, '还没有样本（没被拦过，或拦住的是没有 system 的请求）。'); return; }
+  html += '<table class="egr-help-table"><thead><tr><th>时间</th><th>类型</th><th>模型</th><th>system 片段</th><th>工具</th></tr></thead><tbody>'
+    + list.slice().reverse().map((s) => '<tr><td class="mono">' + escapeHTML(fmtTime(s.at)) + '</td>'
+      + '<td><span class="tag warn">' + escapeHTML(s.kind) + '</span></td>'
+      + '<td class="mono">' + escapeHTML(s.model || '—') + '</td>'
+      + '<td style="font-size:12px;">' + escapeHTML((s.system || '').slice(0, 120)) + '</td>'
+      + '<td style="font-size:12px;">' + escapeHTML((s.tools || []).slice(0, 6).join(', ') || '—') + '</td></tr>').join('')
+    + '</tbody></table>';
+  box.innerHTML = html;
+}
+
+function renderDeviceTok(d) {
+  const sum = $('devTokSummary'), rows = $('devTokRows');
+  if (!sum || !rows) return;
+  if (!d || d.error) { sum.textContent = '读取失败：' + ((d && d.error) || '未知错误'); rows.innerHTML = ''; return; }
+  const bs = d.by_state || {};
+  const shared = d.shared || [];
+  const parts = [];
+  parts.push('<span class="tag ok">一号一凭证 ' + (bs.account || 0) + '</span>');
+  if (bs.global) parts.push('<span class="tag warn">靠全局兜底 ' + bs.global + '</span>');
+  if (bs.none) parts.push('<span class="tag">无凭证 ' + bs.none + '</span>');
+  parts.push('<span class="muted" style="font-size:12px;">共 ' + (d.total || 0) + ' 个账号</span>');
+  let html = parts.join(' ');
+  if (shared.length) {
+    // 共用分组是本页最该被看见的东西：一个凭证被多号共用 = 声称自己是同一台设备。
+    html += '<div style="margin-top:8px;color:#b42318;">⚠️ <b>共用检测命中 ' + shared.length + ' 组</b>：'
+      + shared.map((g) => (g.kind === 'global' ? '全局兜底' : '指纹 ' + escapeHTML(g.fp || '')) +
+          ' 被 <b>' + g.count + '</b> 个账号共用').join('；')
+      + '</div>';
+  }
+  if (d.advice) html += '<div style="margin-top:6px;opacity:.9;">' + escapeHTML(d.advice) + '</div>';
+  sum.innerHTML = html;
+
+  const list = d.rows || [];
+  if (!list.length) { emptyBlock(rows, '池内没有账号。'); return; }
+  const label = { account: ['ok', '一号一凭证'], global: ['warn', '靠全局兜底'], none: ['', '无凭证'] };
+  rows.innerHTML = '<table class="egr-help-table"><thead><tr><th>账号</th><th>凭证来源</th><th>指纹</th><th>长度</th></tr></thead><tbody>'
+    + list.map((r) => {
+      const m = label[r.state] || ['', r.state];
+      return '<tr><td>' + escapeHTML(r.nickname || maskUID(r.uid)) + '</td>'
+        + '<td><span class="tag ' + m[0] + '">' + m[1] + '</span></td>'
+        + '<td class="mono">' + (r.fp ? escapeHTML(r.fp) : '—') + '</td>'
+        + '<td class="mono">' + (r.token_len || '—') + '</td></tr>';
+    }).join('') + '</tbody></table>';
+}
+
+async function importDeviceTokens() {
+  const ta = $('devTokText'), res = $('devTokResult');
+  if (!ta || !res) return;
+  const text = (ta.value || '').trim();
+  if (!text) { res.textContent = '先粘贴内容。'; return; }
+  res.textContent = '导入中…';
+  try {
+    const d = await post('/api/admin/device-tokens/bulk', { text });
+    const bad = (d.results || []).filter((r) => !r.ok);
+    res.innerHTML = '成功 <b>' + d.applied + '</b> / ' + d.total + ' 行'
+      + (bad.length ? '，失败 ' + bad.length + ' 行：' + bad.slice(0, 3).map((r) => '第 ' + r.line + ' 行 ' + escapeHTML(r.error)).join('；') : '');
+    if (d.applied) { ta.value = ''; loadDeviceDiag(); }
+  } catch (e) {
+    res.textContent = '导入失败：' + e.message;
+  }
+}
+
+function renderSelBalance(d) {
+  const box = $('selBalance');
+  if (!box) return;
+  if (!d || d.error) { box.textContent = '读取失败：' + ((d && d.error) || '未知错误'); return; }
+  if (d.verdict === 'no-sample') { box.innerHTML = '<div class="sub">' + escapeHTML(d.advice || '窗口内没有样本。') + '</div>'; return; }
+  const kpis = [
+    ['窗口', d.window_hours + 'h'],
+    ['总请求', fmtNum(d.total_requests)],
+    ['覆盖账号', d.accounts_used + '/' + d.accounts_total + '（' + Math.round(d.coverage_pct || 0) + '%）'],
+    ['最高占比', (d.max_share_pct || 0).toFixed(1) + '%（理想 ' + (d.ideal_share_pct || 0).toFixed(1) + '%）'],
+    ['偏斜倍数', (d.skew_ratio || 0).toFixed(2) + '×'],
+  ];
+  const tone = d.warn ? 'err' : (d.verdict === 'ok' ? 'ok' : 'warn');
+  // KPI 用 **DOM 追加**而不是 innerHTML 拼接：statCard() 返回的是元素节点，
+  // 拼进字符串会变成 "[object HTMLDivElement]"（第一版就是这么错的，被用例抓住）。
+  box.innerHTML = '';
+  const kbox = el('div', 'kpis');
+  for (const k of kpis) kbox.appendChild(statCard(k[0], k[1]));
+  box.appendChild(kbox);
+  let html = '<div class="sub" style="margin:10px 0 0;"><span class="tag ' + tone + '">'
+    + escapeHTML(d.verdict) + '</span> ' + escapeHTML(d.advice || '') + '</div>';
+  const top = d.top || [];
+  if (top.length) {
+    html += '<table class="egr-help-table" style="margin-top:10px;"><thead><tr><th>账号</th><th>请求数</th><th>占比</th></tr></thead><tbody>'
+      + top.slice(0, 8).map((r) => '<tr><td class="mono">' + escapeHTML(maskUID(r.uid)) + '</td><td>'
+        + fmtNum(r.count) + '</td><td>' + (r.share_pct || 0).toFixed(1) + '%</td></tr>').join('')
+      + '</tbody></table>';
+  }
+  box.insertAdjacentHTML('beforeend', html);
+}
+
+function renderSelCands(d) {
+  const box = $('selCands');
+  if (!box) return;
+  if (!d || d.error) { box.textContent = '读取失败：' + ((d && d.error) || '未知错误'); return; }
+  const cands = d.candidates || [];
+  if (!cands.length) { emptyBlock(box, '池内没有账号。'); return; }
+  const inc = cands.filter((c) => c.included);
+  const out = cands.filter((c) => !c.included);
+  let html = '<div class="sub" style="margin:0 0 8px;">进候选 <b>' + inc.length + '</b> / 共 ' + d.total
+    + '；落选 <b>' + out.length + '</b> —— 落选原因按「不可自动恢复 → 可自动恢复」排序。</div>';
+  html += '<table class="egr-help-table"><thead><tr><th>账号</th><th>处境</th><th>权重 / 排名</th><th>原因</th></tr></thead><tbody>';
+  for (const c of inc.slice(0, 12)) {
+    html += '<tr><td>' + escapeHTML(maskUID(c.uid)) + '</td><td><span class="tag ok">进候选</span></td>'
+      + '<td class="mono">' + (c.weight || 0).toFixed(2) + ' / #' + (c.rank || '-') + (c.in_top5 ? '（Top5）' : '') + '</td>'
+      + '<td class="muted" style="font-size:12px;">' + (c.recent_pick ? '距上次选中很近（防撞号）' : '—') + '</td></tr>';
+  }
+  for (const c of out) {
+    html += '<tr><td>' + escapeHTML(maskUID(c.uid)) + '</td><td><span class="tag warn">落选</span></td>'
+      + '<td class="mono">—</td><td style="font-size:12px;">' + escapeHTML(c.skip_text || c.skip || '') + '</td></tr>';
+  }
+  html += '</tbody></table>';
+  box.innerHTML = html;
+}
+
+if ($('btnEgrOnLineDown')) {
+  $('btnEgrOnLineDown').onclick = saveEgrOnLineDown;
+  if ($('egrOnLineDown')) $('egrOnLineDown').onchange = syncEgressPolicyHint;
+}
+if ($('btnDevTokRefresh')) $('btnDevTokRefresh').onclick = () => loadDeviceDiag();
+if ($('btnDevTokImport')) $('btnDevTokImport').onclick = importDeviceTokens;
+if ($('btnSelRefresh')) $('btnSelRefresh').onclick = () => loadDeviceDiag();
+
+const EGR_SUBS = [['pool', '出口代理'], ['accounts', '账号代理'],
+  ['device', '设备与选号诊断'], ['help', '去哪弄代理']];
 
 // EGR_STATE_META 账号代理状态 → 展示元信息。
 // 后端同时返回 state_label，这里只补配色（两端各写一份中文会漂移，故不重复写文案）。
@@ -5406,10 +5736,12 @@ function showEgrSub(name) {
     segs.forEach((b, i) => b.classList.toggle('active', EGR_SUBS[i][0] === name));
   }
   if (name === 'accounts') renderEgrAccCards();
+  if (name === 'device') loadDeviceDiag();
   try { location.hash = 'egress'; } catch (e) { /* 忽略 */ }
 }
 
 async function loadEgress() {
+  loadEgressPolicy(); // R1：线路失效处置策略（独立拉，失败不影响主流程）
   try {
     // 三个接口并行：overview 负责风控视角（谁跟谁共用出口、谁在裸奔），
     // proxies 负责线路台账（名字/地区/探活历史），accounts 负责逐账号出口。

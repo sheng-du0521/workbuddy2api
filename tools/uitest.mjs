@@ -110,6 +110,10 @@ const FX = {
     egress_proxy_default: '', observed_models: 2, host_share_ratio: 0.6, referral_ratio: 0.1,
     withdraw_rate: 0.01, withdraw_min_points: 100,
     egress_max_per_proxy: 3, egress_jitter_ms: 0,
+    // v0.26.1（R1）：线路失效处置策略，strict = 不静默换出口。
+    egress_on_line_down: 'strict',
+    // v0.26.1（R4/R6）：两个默认关闭的开关。
+    fingerprint_samples: 'off', pick_sink_on_5xx: 'off',
   },
   // v0.14.0 出口代理（防封）：线路台账 + 风控视角聚合。
   '/api/admin/egress/proxies': {
@@ -119,6 +123,35 @@ const FX = {
       fail_streak: 0, created_at: now, updated_at: now,
     }],
     max_per_proxy: 3,
+  },
+  // v0.26.1：设备凭证审计（R2）+ 选号均衡度（R7）+ 候选队列预览（R8）。
+  '/api/admin/device-tokens': {
+    total: 3, by_state: { account: 1, global: 0, none: 2 }, distinct_fps: 1, shared: [],
+    rows: [
+      { uid: 'acc-aaaaaaaaaaaa', nickname: '甲号', state: 'account', fp: 'a1b2c3d4e5f60718', token_len: 128 },
+      { uid: 'acc-bbbbbbbbbbbb', nickname: '乙号', state: 'none' },
+      { uid: 'acc-cccccccccccc', nickname: '丙号', state: 'none' },
+    ],
+    verdict: 'partially-shared', advice: '存在共用同一凭证的账号分组，建议拆开（一设备一账号）。',
+  },
+  '/api/admin/fingerprint-samples': {
+    enabled: false, file: 'data/fingerprint_samples.jsonl', count: 0, full: false,
+    kinds: {}, samples: [],
+  },
+  '/api/admin/selection-balance': {
+    window_hours: 24, total_requests: 1050, accounts_used: 23, accounts_total: 27,
+    coverage_pct: 85.2, ideal_share_pct: 3.7, max_share_pct: 7.9, skew_ratio: 2.13,
+    median: 48, min: 2, top: [{ uid: 'acc-aaaaaaaaaaaa', count: 83, share_pct: 7.9 }],
+    warn: false, verdict: 'ok', advice: '分布健康：最高占比 7.9%，约 2.1 倍偏斜。',
+  },
+  '/api/admin/selection-candidates': {
+    model: '', realm: '', total: 3, included: 2,
+    candidates: [
+      { uid: 'acc-aaaaaaaaaaaa', included: true, weight: 12.5, rank: 1, in_top5: true, credits: 900 },
+      { uid: 'acc-bbbbbbbbbbbb', included: true, weight: 8.1, rank: 2, in_top5: true, credits: 400 },
+      { uid: 'acc-cccccccccccc', included: false, skip: 'cooling',
+        skip_text: '账号级冷却中（至 10:00:00）', credits: 0 },
+    ],
   },
   '/api/admin/egress/overview': {
     proxies: [{
@@ -844,8 +877,9 @@ function run(pageFile, meOverride, plan) {
         // v0.14.1：支持直连 —— 批量「设为直连 / 清空出口」两个按钮。
         ['#btnEgrDirect', 1], ['#btnEgrClear', 1],
         // 三个子区 + 子区导航，且线路池/账号代理/帮助三块都在同一文档里。
-        ['#egrTabs .seg', 3], ['[data-egr-sub="pool"]', 1],
-        ['[data-egr-sub="accounts"]', 1], ['[data-egr-sub="help"]', 1]],
+        ['#egrTabs .seg', 4], ['[data-egr-sub="pool"]', 1],
+        ['[data-egr-sub="accounts"]', 1], ['[data-egr-sub="device"]', 1],
+        ['[data-egr-sub="help"]', 1]],
       textIn: [['#egressAlert', '出口异常'], ['#egrCards', '香港 01'], ['#egrCards', '203.0.113.7'],
         ['#egrCards', '探活'], ['#egressAlert', '显式直连'],
         // 导航改名（旧名不能再出现）
@@ -860,7 +894,7 @@ function run(pageFile, meOverride, plan) {
       lacks: [['.nav-item[data-nav="egress"]', '出口代理']],
       // 默认停在「出口代理」子区：公共层先给线路池，账号层按需切。
       display: [['[data-egr-sub="pool"]', 'shown'], ['[data-egr-sub="accounts"]', 'none'],
-        ['[data-egr-sub="help"]', 'none']] },
+        ['[data-egr-sub="device"]', 'none'], ['[data-egr-sub="help"]', 'none']] },
     // 切到「账号代理」：KPI 6 块 + 5 张账号卡 + 筛选段控件，且 pool 子区被藏起。
     { click: ['#egrTabs .seg:nth-child(2)'],
       counts: [['egrAccKpis', 6], ['egrAccCards', 5]],
@@ -870,17 +904,44 @@ function run(pageFile, meOverride, plan) {
         ['#egrAccCards', '香港 01'], ['#egrAccCards', '本机 IP 直连'],
         ['#egrAccCards', '继承默认'], ['#egrAccCards', '配置值'], ['#egrAccCards', '实际出口']] },
     // 帮助子区可切换到达。
-    { click: ['#egrTabs .seg:nth-child(3)'],
+    { click: ['#egrTabs .seg:nth-child(4)'],
       has: [['[data-egr-sub="help"] .egr-help-table', 1], ['[data-egr-sub="help"] .egr-help-list', 4]],
       display: [['[data-egr-sub="help"]', 'shown'], ['[data-egr-sub="accounts"]', 'none']],
       textIn: [['[data-egr-sub="help"]', '方案 A：自建'], ['[data-egr-sub="help"]', '3proxy'],
         ['[data-egr-sub="help"]', '方案 B：买商业代理'], ['[data-egr-sub="help"]', '合规'],
         ['[data-egr-sub="help"]', '别一次全量切过去']] },
+    // v0.26.1：新增「设备与选号诊断」子区 —— 设备凭证共用检测 + 均衡度 + 候选队列。
+    { click: ['#egrTabs .seg:nth-child(3)'],
+      has: [['[data-egr-sub="device"]', 1], ['#devTokSummary', 1], ['#devTokRows', 1],
+        ['#devTokText', 1], ['#btnDevTokImport', 1], ['#selBalance', 1], ['#selCands', 1], ['#fpSamples', 1],
+        // 三张表：凭证逐号、均衡度 Top、候选队列
+        ['[data-egr-sub="device"] .egr-help-table', 3]],
+      display: [['[data-egr-sub="device"]', 'shown'], ['[data-egr-sub="pool"]', 'none']],
+      textIn: [['#devTokSummary', '一号一凭证 1'], ['#devTokSummary', '无凭证 2'],
+        ['#devTokSummary', '建议拆开'],
+        // 均衡度：三个关键数字 + 结论
+        ['#selBalance', '23/27'], ['#selBalance', '7.9%'], ['#selBalance', '2.13'],
+        // 候选队列：进候选者的权重排名 + 落选者的原因（本功能的全部意义就在这两列）
+        ['#selCands', '#1'], ['#selCands', 'Top5'], ['#selCands', '账号级冷却中'],
+        ['#selCands', '落选'],
+        // 样本开关关着时必须明说"未开启"：显示"0 条"会让人误以为"没被拦过"
+        ['#fpSamples', '未开启']],
+      // 凭证原文绝不出现（接口只回指纹与长度）
+      lacks: [['[data-egr-sub="device"]', 'AUTHTOKEN']] },
+    // R1：线路失效处置策略 = 面板可读可改（默认「不静默换出口」）
+    { nav: 'egress',
+      has: [['#egrOnLineDown', 1], ['#btnEgrOnLineDown', 1], ['#egrOnLineDown option', 2]],
+      textIn: [['#egrOnLineDown', '不静默换出口'], ['#egrOnLineDown', '自动迁移到可用线路']] },
     // 设置页新增出口池参数（上限 / 抖动）。
     { nav: 'settings', has: [['#setEgressMaxPer', 1], ['#setEgressJitter', 1], ['#setEgress', 1],
+        // v0.26.1：两个默认关闭的开关（R6 降档 / R4 样本回流）
+        ['#setPickSink', 1], ['#setFpSamples', 1],
+        ['#setPickSink option', 2], ['#setFpSamples option', 2],
         // v0.15.1：选号模式下拉（加权随机 / 顺序轮转）。
         ['#setPickMode', 1], ['#setPickMode option', 2]],
-      textIn: [['#setPickMode', '顺序轮转'], ['#setPickMode', '加权随机']] },
+      textIn: [['#setPickMode', '顺序轮转'], ['#setPickMode', '加权随机'],
+        ['#setPickSink', '关闭（默认）'], ['#setFpSamples', '关闭（默认）'],
+        ['#setFpSamples ~ .hint', '唯一会把请求内容写到磁盘']] },
     // v0.17.0：成长任务移出定时任务页（改为手动选号执行）—— taskGrid 回到 6 张，
     // 且不应再有 growth 的时段/开关/批次输入；提示框改为「手动选号」口径。
     // v0.17.1：新增独立「成长任务」侧边栏。
