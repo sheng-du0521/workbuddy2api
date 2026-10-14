@@ -140,6 +140,9 @@ func main() {
 	// 设备风控头（X-Device-Token）全局兜底 + 文件读取路径；空 = 不注入。
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	// v0.26.3：与主产品共用同一份来源优先级（每号 > 全局 > 文件 > 派生兜底 > 不注入）。
+	// 不加这一行会让同一个账号在两个产品上呈现不同的设备凭证，正是风控特征要避免的。
+	up.DeviceTokenFallback = cfg.Upstream.DeviceTokenFallback
 	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
 	up.ClientName = cfg.Upstream.ClientName
 	up.PassthroughIP = cfg.Upstream.PassthroughIP

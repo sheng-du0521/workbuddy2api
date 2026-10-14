@@ -11,7 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"time"
 	"workbuddy2api/internal/pool"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // ---------------------------------------------------------------------
@@ -160,7 +163,7 @@ func TestArchiveAbnormalOnUpstreamErrors(t *testing.T) {
 				t.Fatalf("初始应为反代组，得 %q", got)
 			}
 
-			px.reportUpstreamError("u1", "m", c.status, []byte(c.body), "", nil)
+			px.reportUpstreamError("u1", "m", c.status, []byte(c.body), time.Time{}, upstream.ResetNone, nil)
 
 			acc, err := store.GetAccount("u1")
 			if err != nil || acc == nil {
@@ -209,7 +212,7 @@ func TestArchiveAbnormalOn11140NeedsThreshold(t *testing.T) {
 
 	threshold := pool.AccountFaultThreshold()
 	for i := 1; i < threshold; i++ {
-		px.reportUpstreamError("u1", "m", 0, []byte(`{"code":11140}`), "", nil)
+		px.reportUpstreamError("u1", "m", 0, []byte(`{"code":11140}`), time.Time{}, upstream.ResetNone, nil)
 		acc, err := store.GetAccount("u1")
 		if err != nil || acc == nil {
 			t.Fatalf("GetAccount: %v %v", acc, err)
@@ -226,7 +229,7 @@ func TestArchiveAbnormalOn11140NeedsThreshold(t *testing.T) {
 		}
 	}
 
-	px.reportUpstreamError("u1", "m", 0, []byte(`{"code":11140}`), "", nil)
+	px.reportUpstreamError("u1", "m", 0, []byte(`{"code":11140}`), time.Time{}, upstream.ResetNone, nil)
 	acc, _ := store.GetAccount("u1")
 	if got := effectiveConsumeGroup(acc); got != cgAbnormal {
 		t.Fatalf("第 %d 次应归档到异常组，得 %q（note=%q）", threshold, got, acc.ConsumeGroupNote)
@@ -254,7 +257,7 @@ func TestArchiveAbnormalOn12153NeedsThreshold(t *testing.T) {
 	body := []byte(`{"code":12153}`)
 	// 前两次：只软冷却，**不归档**（保持反代组）。
 	for i := 0; i < 2; i++ {
-		px.reportUpstreamError("u1", "m", 0, body, "", nil)
+		px.reportUpstreamError("u1", "m", 0, body, time.Time{}, upstream.ResetNone, nil)
 		acc, _ := store.GetAccount("u1")
 		if got := effectiveConsumeGroup(acc); got == cgAbnormal {
 			t.Fatalf("第 %d 次不该归档（阈值 %d），note=%q", i+1, pool.SessionDeadThreshold(), acc.ConsumeGroupNote)
@@ -265,7 +268,7 @@ func TestArchiveAbnormalOn12153NeedsThreshold(t *testing.T) {
 		if st, _ := px.pool.Status("u1"); st.Disabled {
 			break
 		}
-		px.reportUpstreamError("u1", "m", 0, body, "", nil)
+		px.reportUpstreamError("u1", "m", 0, body, time.Time{}, upstream.ResetNone, nil)
 	}
 	acc, _ := store.GetAccount("u1")
 	if got := effectiveConsumeGroup(acc); got != cgAbnormal {
@@ -282,12 +285,12 @@ func TestArchiveAbnormalKeepsFirst(t *testing.T) {
 	defer store.Close()
 	_ = px.SyncAccounts()
 
-	px.reportUpstreamError("u1", "m", 402, []byte(`{}`), "", nil)
+	px.reportUpstreamError("u1", "m", 402, []byte(`{}`), time.Time{}, upstream.ResetNone, nil)
 	first, _ := store.GetAccount("u1")
 	// 第二枪必须挑一个**仍是一次即归档**且**原因文案不同**的错误：
 	// 14017（账号故障）满足这两点。12153 自 v0.24.7 起、11140 自 v0.24.3 起都不再
 	// 一次即归档（改累计阈值），故都不适合做本用例的第二枪。
-	px.reportUpstreamError("u1", "m", 0, []byte(`{"code":14017}`), "", nil)
+	px.reportUpstreamError("u1", "m", 0, []byte(`{"code":14017}`), time.Time{}, upstream.ResetNone, nil)
 	second, _ := store.GetAccount("u1")
 
 	if second.ConsumeGroupNote != first.ConsumeGroupNote {
@@ -307,7 +310,7 @@ func TestReconcileAbnormalRestores(t *testing.T) {
 	_ = px.SyncAccounts()
 
 	// cooling：真实走一次积分不足 → 带自动标记且处于「冷却到次日 4 点」。
-	px.reportUpstreamError("cooling", "m", 402, []byte(`{}`), "", nil)
+	px.reportUpstreamError("cooling", "m", 402, []byte(`{}`), time.Time{}, upstream.ResetNone, nil)
 	// auto：构造「已自动归档但池中已恢复」的状态。
 	if err := store.MarkAccountAbnormal("auto", cgProxy, autoTagPrefix+"积分不足（无法消耗积分）"); err != nil {
 		t.Fatalf("MarkAccountAbnormal: %v", err)

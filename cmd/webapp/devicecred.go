@@ -6,7 +6,9 @@ package main
 
 import (
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/upstream"
 )
@@ -47,6 +49,10 @@ import (
 const (
 	kvDeviceToken     = "device_token"
 	kvDeviceTokenFile = "device_token_file"
+	// kvDeviceTokenFallback 派生兜底开关（v0.26.3）：off（默认）/ derive。
+	kvDeviceTokenFallback = "device_token_fallback"
+	// kvDeviceTokenStaleDays 陈旧检测阈值（天，默认 30；0 = 关闭检测）。
+	kvDeviceTokenStaleDays = "device_token_stale_days"
 	// envDeviceToken / envDeviceTokenFile 部署级覆盖（优先级高于 kv）：
 	// 容器化部署里把凭证放环境变量比落库更常见（也不进备份文件）。
 	envDeviceToken     = "WB2API_DEVICE_TOKEN"
@@ -56,7 +62,7 @@ const (
 // globalDeviceToken 全局兜底设备凭证（env > kv）。返回空串表示未配置。
 //
 // 挂在 Store 上而不是 app 上：装配点是 NewProxy（那里只有 store），
-// 而视图侧要用的三态判断也不需要别的依赖 —— 少一层包装少一处漂移。
+// 而视图侧要用的来源判断（现为五态）也不需要别的依赖 —— 少一层包装少一处漂移。
 func (s *Store) globalDeviceToken() string {
 	if v := strings.TrimSpace(os.Getenv(envDeviceToken)); v != "" {
 		return v
@@ -105,23 +111,103 @@ func (s *Store) installDeviceToken(uc *upstream.Client) {
 	}
 	uc.DeviceToken = s.globalDeviceToken()
 	uc.DeviceTokenFile = s.deviceTokenFilePath()
+	uc.DeviceTokenFallback = s.deviceTokenFallbackOn()
 }
 
-// deviceTokenState 该账号出站时 X-Device-Token 的来源（三态）。
+// deviceTokenFallbackOn 派生兜底是否开启（kv device_token_fallback == "derive"）。
 //
-//	"account" —— 账号自带：一号一凭证，隔离性最好
-//	"global"  —— 靠全局兜底值/文件：**多号共用同一个设备凭证**，隔离性弱（但仍优于不带）
-//	"none"    —— 都没有：该头不会被注入，上游看到的是一台「无设备凭证的客户端」
+// 默认 **off**：派生值是合成凭证，不是上游 SDK 签发的真值。它能拿到的唯一好处是
+// "全池不再出现无凭证形态"，而代价是向上游送了一个上游从未签发过的值。
+// 这个取舍该由运维显式做，不该由程序默认替所有人做。
+func (s *Store) deviceTokenFallbackOn() bool {
+	if s == nil {
+		return false
+	}
+	v, _ := s.GetKV(kvDeviceTokenFallback)
+	return strings.EqualFold(strings.TrimSpace(v), "derive")
+}
+
+// deviceTokenStaleDays 陈旧判定阈值（天）。0 = 关闭检测。
 //
-// 为什么要做成显式三态而不是一个 bool：审计时的结论天差地别 ——
-// "全池都没带"（可聚类）与"全池共用一个"（也可聚类，但形态不同）需要的处置完全不同。
+// 默认 30 天：设备凭证由客户端 SDK 签发并在重装/升级时轮换，一个月的旧值
+// 大概率已经对不上当前客户端版本；而继续带一个"属于旧版本客户端"的凭证，
+// 本身就是客户端版本与凭证互相矛盾的信号。
+const defaultDeviceTokenStaleDays = 30
+
+func (s *Store) deviceTokenStaleDays() int {
+	if s == nil {
+		return defaultDeviceTokenStaleDays
+	}
+	v, _ := s.GetKV(kvDeviceTokenStaleDays)
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > 3650 {
+		return defaultDeviceTokenStaleDays
+	}
+	return n
+}
+
+// deviceTokenState 该账号出站时 X-Device-Token 的来源（五态，v0.26.3）。
+//
+//	"account" —— 账号自带真凭证，且未过期：一号一凭证，隔离性最好
+//	"stale"   —— 账号自带真凭证，但**超过 staleDays 没有更新**：仍在使用，
+//	             只是很可能已随客户端轮换而失效（见下"为什么只告警不替换"）
+//	"derived" —— 前三档全空 + 派生兜底开启：用的是按 uid 派生的合成值（各号互异）
+//	"global"  —— 靠全局兜底值/文件：**多号共用同一个设备凭证**，隔离性弱（仍优于不带）
+//	"none"    —— 都没有且派生兜底关闭：该头不会被注入，上游看到的是一台
+//	             「无设备凭证的客户端」——这是本文件最想消灭的形态
+//
+// 为什么要做成显式多态而不是一个 bool：审计结论天差地别 ——
+// "全池都没带"（可聚类）、"全池共用一个"（也可聚类，但形态不同）、
+// "各自一个合成值"（不可聚类，但值本身可能被判异常）需要的处置完全不同。
+//
+// ## 为什么陈旧（stale）只告警、不自动替换
+//
+// 陈旧 ≠ 失效，而两个方向的错判代价不对称：
+//
+//	把"陈旧但有效"当成"失效" → 丢掉一个真凭证，用合成值顶替（真值→合成值，
+//	                          确定性的降级）
+//	把"陈旧且失效"当成"有效" → 继续带一个对不上的凭证（可能被判异常，但也
+//	                          可能上游根本不校验它）
+//
+// 前者是**主动做错**，后者是**保持现状**。所以这里只把它显式标出来 + 给建议，
+// 由运维决定要不要重新采集（重新写入会刷新 DeviceTokenAt，状态自动回到 account）。
 func (a *app) deviceTokenState(acc *Account) string {
 	if acc != nil && strings.TrimSpace(acc.DeviceToken) != "" {
+		if a.deviceTokenStale(acc) {
+			return "stale"
+		}
 		return "account"
 	}
 	if a.store != nil && (a.store.globalDeviceToken() != "" ||
 		deviceTokenFileHasContent(a.store.deviceTokenFilePath())) {
 		return "global"
 	}
+	if a.store != nil && a.store.deviceTokenFallbackOn() {
+		return "derived"
+	}
 	return "none"
+}
+
+// deviceTokenStale 该账号自带凭证是否陈旧（超过阈值未更新）。
+//
+// DeviceTokenAt == 0 视为**不陈旧**（未知，不报警）：老库在加列之前写入的凭证
+// 没有时刻可算 —— 把它们一律标成陈旧会造成"升级后全池告警"，而告警一旦满屏就
+// 再也没人看了。宁可漏报历史遗留，也不制造一次假的全池告警。
+func (a *app) deviceTokenStale(acc *Account) bool {
+	if acc == nil || acc.DeviceTokenAt <= 0 {
+		return false
+	}
+	days := a.deviceTokenStaleDays()
+	if days <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(acc.DeviceTokenAt, 0)) > time.Duration(days)*24*time.Hour
+}
+
+// deviceTokenStaleDays 生效的陈旧阈值（store 未装配时取默认）。
+func (a *app) deviceTokenStaleDays() int {
+	if a.store == nil {
+		return defaultDeviceTokenStaleDays
+	}
+	return a.store.deviceTokenStaleDays()
 }

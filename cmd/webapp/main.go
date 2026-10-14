@@ -602,7 +602,7 @@ type accountView struct {
 	// DeviceTokenState 该账号出站时 X-Device-Token 的来源（v0.25.1）：
 	// "account"（账号自带，隔离性最好）/ "global"（全局兜底，多号共用同一凭证）/
 	// "none"（该头不会被注入 —— 上游看到的是一台「无设备凭证的客户端」）。
-	// 三态而非 bool：审计结论天差地别，处置也不同。见 devicecred.go。
+	// 多态而非 bool：审计结论天差地别，处置也不同（现为五态）。见 devicecred.go。
 	DeviceTokenState string `json:"device_token_state"`
 }
 
@@ -1315,6 +1315,9 @@ func (a *app) routes() *http.ServeMux {
 
 	// 指纹被拦样本回流（R4 / v0.26.1）：默认关闭，开启后落 system 原文前 300 字 + 工具清单。
 	mux.HandleFunc("GET /api/admin/fingerprint-samples", a.adminGuard(a.handleFingerprintSamples))
+
+	// 消耗失败台账（v0.26.3，见 failures.go）：统计 + 明细 + 错误码处置策略表。
+	mux.HandleFunc("GET /api/admin/consume-failures", a.adminGuard(a.handleConsumeFailures))
 	mux.HandleFunc("POST /api/admin/device-tokens/bulk", a.adminGuard(a.handleDeviceTokenBulk))
 
 	// ---- 出口代理池（v0.14.0 防封）----

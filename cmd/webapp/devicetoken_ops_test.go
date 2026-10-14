@@ -39,7 +39,8 @@ func postDevTok(t *testing.T, a *app, uid, token string) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
-// TestDeviceTokenAuditThreeStates 三态计数与结论文案（本功能的核心口径）。
+// TestDeviceTokenAuditThreeStates 计数与结论文案（本功能的核心口径；
+// v0.26.3 起 by_state 为五态，本用例只覆盖不涉及陈旧/派生的三档）。
 func TestDeviceTokenAuditThreeStates(t *testing.T) {
 	t.Setenv(envDeviceToken, "") // 排除环境变量干扰，避免测试机恰好设了该变量
 	store, px, a := newTestApp(t,

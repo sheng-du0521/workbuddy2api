@@ -1150,20 +1150,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     豁免（既有 issue #31 语义）。
 		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
 		//     （普通账号级限流不该因切模型绕过）。
-		if resetAt, ok := upstream.ParseRateReset(body); ok {
+		// v0.26.3：重置时间统一走 upstream.ResolveResetAtWith —— 与主产品
+		// （cmd/webapp）共用同一份优先级（body 文案 > body 字段 > 响应头）与
+		// 同一份边界策略（缺失/已过期一律回落有界退避，绝不"立刻恢复"）。
+		//
+		// 为什么必须共用：这份策略的每一处偏差都会变成"同一个上游错误在两个产品上
+		// 冷却时长不同"，而两个产品读写的是**同一个上游账号** —— 口径分叉等于
+		// 让账号的一半请求按一种纪律、另一半按另一种，风控特征也就跟着不一致。
+		//
+		// 本链路只能传「已解析的头时长」（Error.RetryAfter），拿不到原始 Header；
+		// 已知差异与理由见 ResolveResetAtWith 的注释（方向是更保守）。
+		var headerWait time.Duration
+		if uerr != nil && uerr.RetryAfter > 0 {
+			headerWait = uerr.RetryAfter
+		}
+		if resetAt, src := upstream.ResolveResetAtWith([]byte(body), headerWait, time.Now()); !resetAt.IsZero() {
+			suffix := ""
+			if src == upstream.ResetBodyJSON {
+				suffix = " [reset=body-json]"
+			} else if src == upstream.ResetHeader {
+				suffix = " [reset=header]"
+			}
 			if upstream.IsModelRateLimit(body) {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
+				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt,
+					model, "6004 model rate limit"+suffix)
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
-			return
-		}
-		// P1-2：body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加，
-		// 与重置墙钟同一对齐语义）。头优先于「有界退避」，但**低于** body 重置文案
-		// （上方已 return）——文案是上游更权威的口径（WAF 403 报告 §2.1：intl CLI
-		// 同序，Retry-After 也只在无重置文案时兜底）。
-		if uerr != nil && uerr.RetryAfter > 0 {
-			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit"+suffix)
 			return
 		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶

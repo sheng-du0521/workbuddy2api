@@ -33,6 +33,8 @@
 package main
 
 import (
+	"workbuddy2api/internal/upstream"
+
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -60,8 +62,17 @@ func deviceTokenFP(token string) string {
 // 单独成方法而不是复用某个通用 update：`accounts.device_token` 是**风控凭证**，
 // 写入口要显式、可审计，不能混在一堆可随意覆盖的字段里。
 func (s *Store) SetAccountDeviceToken(uid, token string) error {
-	_, err := s.db.Exec(`UPDATE accounts SET device_token = ?, updated_at = ? WHERE uid = ?`,
-		strings.TrimSpace(token), time.Now().Unix(), uid)
+	now := time.Now().Unix()
+	// device_token_at 只在**真的写入了凭证**时刷新；清除（空串）时归零，
+	// 表示"没有凭证"，从而不会被陈旧检测误判为"很久以前录的凭证"。
+	at := now
+	tok := strings.TrimSpace(token)
+	if tok == "" {
+		at = 0
+	}
+	_, err := s.db.Exec(
+		`UPDATE accounts SET device_token = ?, device_token_at = ?, updated_at = ? WHERE uid = ?`,
+		tok, at, now, uid)
 	return err
 }
 
@@ -69,9 +80,15 @@ func (s *Store) SetAccountDeviceToken(uid, token string) error {
 type deviceTokenRow struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname"`
-	State    string `json:"state"`        // account / global / none
-	FP       string `json:"fp,omitempty"` // 凭证指纹（仅 state=account 时非空）
-	TokenLen int    `json:"token_len"`    // 长度可用于判断"填了但明显不对"
+	// State 五态：account / stale / derived / global / none（见 devicecred.go）。
+	State string `json:"state"`
+	// FP 凭证指纹（account / stale 时非空；derived 时也给指纹 —— 它虽是合成值，
+	// 但"各号指纹互不相同"这一点必须能被验证，否则派生兜底等于没做隔离）。
+	FP string `json:"fp,omitempty"`
+	// TokenLen 长度可用于判断"填了但明显不对"。
+	TokenLen int `json:"token_len"`
+	// AgeDays 凭证距今天数（stale 时非零；account 时也给出，供运维判断"快到期了"）。
+	AgeDays int `json:"age_days,omitempty"`
 }
 
 // handleAccountDeviceToken POST /api/admin/accounts/{uid}/device-token
@@ -130,7 +147,8 @@ func (a *app) handleAccountDeviceToken(w http.ResponseWriter, r *http.Request) {
 
 // handleDeviceTokenAudit GET /api/admin/device-tokens
 //
-// 把「这台网关对外呈现成几台设备」做成一个可读结论：三态计数 + 共用分组 + 结论文案。
+// 把「这台网关对外呈现成几台设备」做成一个可读结论：五态计数 + 共用分组 + 结论文案。
+// （五态 = 真凭证 / 真凭证·陈旧 / 派生兜底 / 靠全局兜底 / 无凭证，见 devicecred.go）
 func (a *app) handleDeviceTokenAudit(w http.ResponseWriter, r *http.Request) {
 	accs, err := a.store.ListAccounts()
 	if err != nil {
@@ -138,16 +156,25 @@ func (a *app) handleDeviceTokenAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var rows []deviceTokenRow
-	byState := map[string]int{"account": 0, "global": 0, "none": 0}
+	byState := map[string]int{"account": 0, "stale": 0, "derived": 0, "global": 0, "none": 0}
 	groups := map[string][]string{} // fp → uids（含全局兜底那一组，用固定键）
 	for _, acc := range accs {
 		st := a.deviceTokenState(acc)
 		byState[st]++
 		row := deviceTokenRow{UID: acc.UID, Nickname: acc.Nickname, State: st}
 		switch st {
-		case "account":
+		case "account", "stale":
 			row.FP = deviceTokenFP(acc.DeviceToken)
 			row.TokenLen = len(strings.TrimSpace(acc.DeviceToken))
+			if acc.DeviceTokenAt > 0 {
+				row.AgeDays = int(time.Since(time.Unix(acc.DeviceTokenAt, 0)).Hours() / 24)
+			}
+			groups[row.FP] = append(groups[row.FP], acc.UID)
+		case "derived":
+			// 派生值也纳入指纹分组：它是"按 uid 派生"的，若实现出错（例如用途盐
+			// 写成了常量）会让全池派生出同一个值 —— 那正是本审计最该抓的形态。
+			row.FP = deviceTokenFP(upstream.AccountDeviceToken(acc.UID))
+			row.TokenLen = len(row.FP)
 			groups[row.FP] = append(groups[row.FP], acc.UID)
 		case "global":
 			// 全局兜底：所有落在这一态的账号**共用同一个凭证**，天然是一组。
@@ -187,11 +214,23 @@ func (a *app) handleDeviceTokenAudit(w http.ResponseWriter, r *http.Request) {
 	case byState["none"] == total:
 		verdict = "none"
 		advice = "全池都不带 X-Device-Token：上游看到的是一台「没有设备凭证的客户端」。" +
-			"这是一类稳定差异，建议至少给每号各录一份（桌面端抓包或从导出文件导入）。"
+			"这是一类稳定差异 —— 建议给每号各录一份真凭证；若暂时拿不到，" +
+			"可打开「派生兜底」（设置里 device_token_fallback=derive）先让每号有一个互异值，" +
+			"至少消掉「全池同一形态」这个特征。"
 	case byState["global"] > 0 && byState["account"] == 0:
 		verdict = "shared-global"
 		advice = "全池共用同一个全局兜底凭证：等于 **27 个账号声称自己是同一台设备**，" +
 			"比不带更容易被按该头聚合。处置：把全局兜底清掉，改为逐号录入。"
+	case byState["stale"] > 0:
+		verdict = "has-stale"
+		advice = "有 " + itoa(byState["stale"]) + " 个账号的凭证已超过 " + itoa(a.deviceTokenStaleDays()) +
+			" 天未更新。陈旧 ≠ 失效，所以**没有**自动替换（用合成值顶替真值是确定性的降级）；" +
+			"但如果这些号的请求开始被上游按客户端特征挡下，优先重新采集这几号的凭证。"
+	case byState["derived"] > 0 && byState["account"]+byState["stale"]+byState["global"] == 0:
+		verdict = "derived-only"
+		advice = "全池用的是**按 uid 派生的合成值**（不是上游签发的真凭证）：各号互异、" +
+			"不会被按单值聚类，但值本身上游从未签发过。这是「有总比没有好」的兜底；" +
+			"拿到真凭证后应逐号覆盖（覆盖后该号自动转为 account 态）。"
 	case len(shared) > 0:
 		verdict = "partially-shared"
 		advice = "存在共用同一凭证的账号分组，建议拆开（一设备一账号）。"
@@ -207,6 +246,10 @@ func (a *app) handleDeviceTokenAudit(w http.ResponseWriter, r *http.Request) {
 		"verdict":      verdict,
 		"advice":       advice,
 		"distinct_fps": len(groups),
+		// 回显生效中的两个开关：界面要能解释"为什么是这几档"，
+		// 否则运维看到 derived 态会以为程序擅自造了凭证。
+		"fallback_on": a.store.deviceTokenFallbackOn(),
+		"stale_days":  a.deviceTokenStaleDays(),
 	})
 }
 

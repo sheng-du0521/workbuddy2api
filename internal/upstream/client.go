@@ -494,6 +494,23 @@ const retryAfterSanity = 2 * time.Hour
 // 语义对齐 intl CLI（parseRetryAfterMs / parseRateLimitResetMs，报告 §2.1），
 // 上游族会发这些头是其存在依据。
 func ParseRetryAfter(h http.Header) (time.Duration, bool) {
+	return parseRetryAfterHeader(h, retryAfterSanity)
+}
+
+// parseRetryAfterHeader ParseRetryAfter 的带上限变体：上限由调用方给。
+//
+// 为什么要有这个变体（而不是让大家共用 2h）：候选头里 x-ratelimit-reset 的
+// 语义是**绝对时刻**，而 retryAfterSanity（2h）是按"再等多久"设计的。对
+// 绝对时刻型头，2h 上限会把「距现在 5 小时的真实重置」整条丢弃 —— 表现出来
+// 是冷却退化成 60 秒的本地退避，随后在窗口内反复撞墙。
+//
+// 因此：upstream.Error.RetryAfter（"再等多久"，需要 2h 上限做防呆）走
+// ParseRetryAfter；解析「重置墙钟」的 ResetResolveAt 走本函数并传更宽的上限
+// （见 resetat.go 的 resetHeaderSanity），截断统一交给 pool 的 softRateMax。
+func parseRetryAfterHeader(h http.Header, max time.Duration) (time.Duration, bool) {
+	if h == nil {
+		return 0, false
+	}
 	for _, name := range retryAfterHeaderCandidates {
 		v := strings.TrimSpace(h.Get(name))
 		if v == "" {
@@ -506,7 +523,7 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 		if !ok {
 			continue
 		}
-		if n <= 0 || n > retryAfterSanity {
+		if n <= 0 || (max > 0 && n > max) {
 			continue // 非正/异常大：丢弃（回落本地计算）
 		}
 		return n, true
@@ -813,8 +830,17 @@ type Client struct {
 
 	// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
 	// 读取频率限 5 分钟一次缓存（见 device_token.go），>1KB 或读失败则忽略。
-	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
+	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）
+	//           > DeviceTokenFallback（按 uid 派生）> 不注入。
 	DeviceTokenFile string
+
+	// DeviceTokenFallback 是否在**前三档全空**时启用「按 uid 稳定派生」的兜底值（v0.26.3）。
+	//
+	// 默认 false：派生值是**合成**凭证，不是上游 SDK 签发的真值。它的价值只在
+	// 补齐最后一档空位 —— 让"全池都不带该头"这个形态不再存在（那是最容易被
+	// 一次性聚类的形态）。是否启用由运维显式决定（设置项 device_token_fallback），
+	// 理由与边界见 internal/upstream/headers.go 的 resolveDeviceToken。
+	DeviceTokenFallback bool
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 	// 空（默认）= "WorkBuddy"：伪造官方桌面端指纹（X-IDE-* 四头 + X-Agent-Purpose，

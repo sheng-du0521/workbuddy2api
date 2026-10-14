@@ -16,15 +16,23 @@ import (
 // Account 一条持久化账号记录。字段与 internal/auth.Auth 对齐，
 // 但存储位置从 auths/*.json 换成 SQLite（Web 化必改项之一）。
 type Account struct {
-	UID           string
-	Nickname      string
-	Realm         string
-	EnterpriseID  string
-	Domain        string
-	AccessToken   string
-	RefreshToken  string
-	ExpiresAt     int64
-	DeviceToken   string
+	UID          string
+	Nickname     string
+	Realm        string
+	EnterpriseID string
+	Domain       string
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
+	DeviceToken  string
+	// DeviceTokenAt 设备凭证的**写入时刻**（unix 秒，v0.26.3）。
+	//
+	// 语义严格是"这个值是什么时候被写进来的"，不是"这行记录什么时候被改过"——
+	// 所以它与 UpdatedAt / OAuth 重同步解耦（见 UpsertAccount 的 ON CONFLICT 说明），
+	// 只有显式写入凭证的路径（SetAccountDeviceToken）才更新它。
+	// 用途：陈旧检测 —— 设备凭证会随客户端重装/升级轮换，一个两个月前抓的凭证
+	// 大概率已失效，继续带着它反而更像"伪造的旧客户端"。
+	DeviceTokenAt int64
 	Disabled      bool
 	CooldownUntil int64
 	FailCount     int
@@ -184,6 +192,7 @@ func (s *Store) migrate() error {
 			refresh_token  TEXT NOT NULL DEFAULT '',
 			expires_at     INTEGER NOT NULL DEFAULT 0,
 			device_token   TEXT NOT NULL DEFAULT '',
+			device_token_at INTEGER NOT NULL DEFAULT 0,
 			disabled       INTEGER NOT NULL DEFAULT 0,
 			cooldown_until INTEGER NOT NULL DEFAULT 0,
 			fail_count     INTEGER NOT NULL DEFAULT 0,
@@ -193,6 +202,10 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm)`,
 		// 风控上报台账（v0.24.6）：上游判定账号受限时落一条，见 riskreport.go。
 		migrationRiskReports,
+		// 消耗失败台账（v0.26.3）：四个阶段（预扣/上游/结算/扣费）的失败各落一条，
+		// 见 failures.go。与 risk_reports 的区别：risk_reports 记的是**账号级**
+		// 风控事件与处置动作，本表记的是**每一次消耗失败**及其错误码/上下文。
+		migrationConsumeFailures,
 		`CREATE TABLE IF NOT EXISTS kv (
 			k TEXT PRIMARY KEY,
 			v TEXT NOT NULL DEFAULT ''
@@ -207,6 +220,9 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sticky_expires ON sticky_binds(expires_at)`,
 	}
+	// 台账索引与建表分开追加：索引清单是切片，用展开而不是按下标逐个列 ——
+	// 按下标引用（consumeFailureIndexes[0]…）在有人重排切片时会静默错位。
+	stmts = append(stmts, consumeFailureIndexes...)
 	for _, st := range stmts {
 		if _, err := s.db.Exec(st); err != nil {
 			return fmt.Errorf("migrate: %w", err)
@@ -243,6 +259,11 @@ func (s *Store) migrate() error {
 		// 若混进 UpsertAccount，一次重新 OAuth 登录就会把它写空（同 v0.13.0 那类坑）。
 		`ALTER TABLE accounts ADD COLUMN credit_packs TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN credit_packs_at INTEGER NOT NULL DEFAULT 0`,
+		// v0.26.3：设备凭证的写入时刻（陈旧检测用，见 devicecred.go）。
+		// 为什么不复用 updated_at：账号的任何字段变动都会刷新 updated_at，
+		// 用它算"凭证多少天没更新"会得出**偏年轻**的结论（改个分组就重置了），
+		// 而陈旧检测的全部意义就是发现"这个凭证很久没换了"。
+		`ALTER TABLE accounts ADD COLUMN device_token_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate add column: %w", err)
@@ -253,7 +274,7 @@ func (s *Store) migrate() error {
 }
 
 const accountCols = `uid, nickname, realm, enterprise_id, domain, access_token,
-	refresh_token, expires_at, device_token, disabled, cooldown_until, fail_count,
+	refresh_token, expires_at, device_token, device_token_at, disabled, cooldown_until, fail_count,
 	account_group, egress_proxy, owner_user_id, host_group, pool_state, host_note,
 	earned_micro, task_cfg, consume_group, consume_group_prev, consume_group_note,
 	growth_done_at, created_at, updated_at`
@@ -264,6 +285,7 @@ func (s *Store) scanAccount(row interface{ Scan(dest ...any) error }) (*Account,
 	err := row.Scan(
 		&a.UID, &a.Nickname, &a.Realm, &a.EnterpriseID, &a.Domain,
 		&a.AccessToken, &a.RefreshToken, &a.ExpiresAt, &a.DeviceToken,
+		&a.DeviceTokenAt,
 		&disabled, &a.CooldownUntil, &a.FailCount, &a.Group, &a.EgressProxy,
 		&a.OwnerUserID, &a.HostGroup, &a.PoolState, &a.HostNote, &a.EarnedMicro, &a.TaskCfg,
 		&a.ConsumeGroup, &a.ConsumeGroupPrev, &a.ConsumeGroupNote,
@@ -321,7 +343,7 @@ func (s *Store) UpsertAccount(a *Account) error {
 	// earned_micro / consume_group*：这几项是号主、管理员与系统归档的业务状态，
 	// 重新 OAuth 登录或重同步绝不能把它们抹掉（否则一次刷新 token 就会把「已入池」打回
 	// 「未申请」、把收益清零、把已归档的异常账号悄悄放回消耗池）。
-	_, err := s.db.Exec(`INSERT INTO accounts (`+accountCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO accounts (`+accountCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(uid) DO UPDATE SET
 			nickname=excluded.nickname,
 			realm=excluded.realm,
@@ -331,12 +353,19 @@ func (s *Store) UpsertAccount(a *Account) error {
 			refresh_token=excluded.refresh_token,
 			expires_at=excluded.expires_at,
 			device_token=excluded.device_token,
+			-- device_token_at 刻意**不**跟随重同步刷新：它的语义是"这个凭证是什么时候换的"，
+			-- 用 excluded 会让每次 OAuth 刷新都把它洗成"现在"，陈旧检测将永远显示新鲜
+			-- （正是需要它报警的那种情况反而消失）。只有显式写入凭证才更新它。
+			device_token_at=CASE WHEN excluded.device_token <> accounts.device_token
+			                     AND excluded.device_token <> ''
+			                THEN excluded.device_token_at ELSE accounts.device_token_at END,
 			disabled=excluded.disabled,
 			cooldown_until=excluded.cooldown_until,
 			fail_count=excluded.fail_count,
 			updated_at=excluded.updated_at`,
 		a.UID, a.Nickname, a.Realm, a.EnterpriseID, a.Domain,
 		s.encField(a.AccessToken), s.encField(a.RefreshToken), a.ExpiresAt, s.encField(a.DeviceToken),
+		a.DeviceTokenAt,
 		boolToInt(a.Disabled), a.CooldownUntil, a.FailCount, a.Group, a.EgressProxy,
 		a.OwnerUserID, a.HostGroup, a.PoolState, a.HostNote, a.EarnedMicro, a.TaskCfg,
 		a.ConsumeGroup, a.ConsumeGroupPrev, a.ConsumeGroupNote,

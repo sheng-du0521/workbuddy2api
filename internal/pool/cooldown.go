@@ -79,48 +79,88 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	}
 }
 
-// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
-// 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
+// CooldownSoftForModel 6004 模型级限额的**模型级**软冷却入口（issue #31）：
+// 把该模型的冷却截止对齐到上游重置墙钟（不做指数堆加、不做账号级污染）。
 //
-//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
-//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
-//   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
-//     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
-//     冷却越堆越厚）。不记录模型（不豁免）。
+// ## 两条分支
 //
-// 与旧实现的差异：有上游重置时间时绝对不做指数堆加（旧实现 softStreak 计数含
-// 死逻辑，纯属库房麻痹）；无重置时间时，「冷却中兜底探测再 429」不再 softStreak++
-// 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
+//   - resetAt 非零（解析到权威恢复时刻，见 upstream.ResolveResetAt）→
+//     modelCooldowns[model] = {Until: min(resetAt, now+soft_rate_max), ResetAt: resetAt}。
+//     **不写 until**（账号级）—— 6004 只挡这一个模型，切别的模型立即可用，
+//     这正是本入口存在的意义。
+//   - resetAt 零值（上游没给时间信息 / 给的时间已过期）→ 模型级**有界退避**：
+//     base 起按该模型在本账号上的连续被判次数翻倍、封顶 soft_rate_max。
+//     同样**不写 until**。
+//
+// ## 为什么零值分支必须走模型级（v0.26.3 修正，此前是账号级）
+//
+// 旧实现的零值分支写 `e.until = now.Add(d)` 并清空 modelCooldowns —— 那是
+// **账号级**冷却。而本函数的调用者只有一个语义：6004（模型级限额，见
+// cmd/webapp 与本仓旧网关的 applyErrorPolicy）。于是产生一个自相矛盾的行为：
+//
+//	上游带 Retry-After 头  → 只挡该模型，"切模型即可用"成立；
+//	上游只把时间写在 body 里 → **整个账号被挡**，所有模型一起不可用。
+//
+// 后果不是"多等一会儿"而是**白扣一个健康号**：6004 的模型级限额通常是小时级
+// 窗口，账号明明可以在其它模型上正常服务，却因为一次没有响应头的 6004 被整池
+// 排除。零值分支改走模型级后，两种形态的行为一致（区别只是退避时长来自本地
+// 估算而非上游明示）。这也让 v0.26.3 的「body 文案/字段解析」成为**锦上添花**
+// 而不是唯一依赖 —— 解析失败时不再有量级差异。
+//
+// ## 并发（同一账号同模型被并发请求同时撞 6004）
+//
+// 本函数持 p.mu，但"并发"在这里的真正风险不是数据竞争（锁已经保证），
+// 而是**语义竞争**：多个响应乱序到达，若逐个覆盖，一条较早发出的、重置时间
+// 更近的响应会把已经写入的更长冷却**改短**，于是号在实际窗口内被反复放出来
+// 撞墙。因此：
+//
+//   - 非零分支取 max(已有 Until, 本次 Until)，**只延长不缩短**；保留与更长
+//     那一条对应的 ResetAt / Reason（台账显示的必须是当前真正生效的那条冷却
+//     的来由，而不是最后到达的那个）。
+//   - 零值分支若已有未到期的模型级冷却，则**不推进次数、不延长**（兜底探测
+//     不再堆叠 —— 与 CooldownSoftRate 同一纪律）。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
+	if uid == "" {
+		return
+	}
+	if model == "" {
+		// 没有模型名就无法做模型级隔离。此时**退化为账号级软冷却**而不是"不冷却"：
+		// 「不知道该挡哪个模型」的正确处置是挡得更宽（宁可多挡一个号），
+		// 而不是完全不管 —— 后者会让该账号立刻被再次选中、立刻再撞一次同样的错。
+		p.CooldownSoftRate(uid, base, resetAt, reason)
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		now := time.Now()
-		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
-			if e.modelCooldowns == nil {
-				e.modelCooldowns = map[string]modelCooldown{}
-			}
-			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
-				ResetAt: resetAt,
-				Reason:  reason,
-			}
-		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
-			if e.coolKind != CoolSoft || !now.Before(e.until) {
-				d := p.softDurationLocked(base, e.softStreak+1)
-				e.softStreak++
-				e.until = now.Add(d)
-			}
-			e.coolKind = CoolSoft
-			e.reason = reason
-			e.modelCooldowns = nil
-		}
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	now := time.Now()
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	prev := e.modelCooldowns[model]
+	if !resetAt.IsZero() {
+		until := p.cappedSoftUntilLocked(now, resetAt)
+		if !prev.Until.IsZero() && prev.Until.After(until) {
+			// 已有更晚的冷却：保留（并发乱序不得把冷却改短）。
+			return
+		}
+		// Hits 归零：本条冷却的时长来自上游权威时刻，与本地退避次数无关。
+		e.modelCooldowns[model] = modelCooldown{Until: until, ResetAt: resetAt, Reason: reason}
+	} else if !prev.Until.IsZero() && now.Before(prev.Until) {
+		// 已在模型级冷却中：不推进计数、不延长，只把 reason 刷新为最新一次
+		// （运维看到的原因应是"最近一次为什么"，而时长保持不变）。
+		prev.Reason = reason
+		e.modelCooldowns[model] = prev
+	} else {
+		// 无时间信息且不在冷却中：模型级有界退避（base 起，按连续次数翻倍、封顶）。
+		d := p.softDurationLocked(base, prev.Hits+1)
+		hits := prev.Hits + 1
+		e.modelCooldowns[model] = modelCooldown{Until: now.Add(d), Reason: reason, Hits: hits}
+	}
+	p.dirty.Store(true)
 }
 
 // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口（handler.applyErrorPolicy

@@ -1,8 +1,8 @@
 {
-  "version": "0.26.0",
+  "version": "0.26.3",
   "min_supported": "0.24.0",
-  "notes": "v0.26.0：新增版本更新提醒（只提醒，不自动更新）；新增「禁止商用倒卖」声明。",
-  "released_at": 1791964976,
+  "notes": "v0.26.3：6004 模型级限流对齐上游重置时刻（三级解析 + 模型级冷却语义修正）；新增消耗失败台账与错误码处置策略注册表；设备凭证支持按 uid 派生兜底与陈旧检测。",
+  "released_at": 1792013190,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {

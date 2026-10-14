@@ -1217,6 +1217,12 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		// PickSinkOn5xx 上游 5xx 时是否降档重试（R6，v0.26.1）：on / off，**默认 off**。
 		// 本仓的「档」是**成本层**，下沉 = 去用更贵的账号 → 默认不替站长做这个决定。
 		PickSinkOn5xx *string `json:"pick_sink_on_5xx"`
+		// DeviceTokenFallback 设备凭证派生兜底（v0.26.3）：off（默认）/ derive。
+		// derive = 前三档（账号 / 全局 / 文件）全空时，按 uid 稳定派生一个互异值。
+		// 见 devicecred.go 与 upstream/headers.go 的 resolveDeviceToken。
+		DeviceTokenFallback *string `json:"device_token_fallback"`
+		// DeviceTokenStaleDays 设备凭证陈旧阈值（天，0=关闭检测，默认 30）。
+		DeviceTokenStaleDays *int `json:"device_token_stale_days"`
 		// 选号模式（v0.15.1）：weighted（缺省，三因子加权随机）|
 		// roundrobin（顺序游标轮转，负载均匀铺开，对齐参考实现）。
 		PickMode *string `json:"pick_mode"`
@@ -1441,6 +1447,33 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := a.store.SetKV(kvEgressOnLineDown, m); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+		if v := strings.ToLower(strings.TrimSpace(*req.DeviceTokenFallback)); v != "" {
+			if v != "off" && v != "derive" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "device_token_fallback 只能是 off 或 derive"})
+				return
+			}
+			if err := a.store.SetKV(kvDeviceTokenFallback, v); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			// 改开关要立刻生效：出站取值装配在 upstream.Client 上，不是每次请求现读 kv。
+			if a.proxy != nil && a.proxy.uc != nil {
+				a.proxy.uc.DeviceTokenFallback = v == "derive"
+			}
+		}
+		if v := req.DeviceTokenStaleDays; v != nil {
+			n := *v
+			if n < 0 || n > 3650 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "device_token_stale_days 需在 0..3650 之间（0 = 关闭检测）"})
+				return
+			}
+			if err := a.store.SetKV(kvDeviceTokenStaleDays, strconv.Itoa(n)); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
@@ -1670,6 +1703,13 @@ func (a *app) settingsView() map[string]any {
 		sink = "off"
 	}
 	out["pick_sink_on_5xx"] = sink
+	// 设备凭证的两项设置（v0.26.3）：回显让界面能说明当前处于哪一档。
+	dtFb, _ := a.store.GetKV(kvDeviceTokenFallback)
+	if !strings.EqualFold(strings.TrimSpace(dtFb), "derive") {
+		dtFb = "off"
+	}
+	out["device_token_fallback"] = dtFb
+	out["device_token_stale_days"] = a.deviceTokenStaleDays()
 	// 导入防关联 + 积分补新（v0.25.0）。换 IP 命令**原样回显**给管理员：
 	// 它是配置项不是密钥，回显才能核对填对没有（命令里可能带插座 token，
 	// 但能看到它的人本来就有管理密钥）。

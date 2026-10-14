@@ -79,6 +79,7 @@
     "cli_version": "",
     "device_token": "",
     "device_token_file": "",
+    "device_token_fallback": false,
     "client_name": "WorkBuddy",
     "passthrough_ip": false
   },

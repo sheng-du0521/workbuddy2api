@@ -1139,10 +1139,22 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 					At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
 					Err: "余额不足（预扣被拒）", ElapsedMS: time.Since(start).Milliseconds(),
 				})
+				// 消耗失败台账（failures.go）：预扣阶段被拒是**用户侧**失败，
+				// 与上游无关 —— 记下来是为了让"用户看到余额不足的次数"可查，
+				// 而不是让学生在 error_msg 里翻。
+				p.store.recordConsumeFailure(ConsumeFailure{
+					Stage: FailStageReserve, Status: http.StatusPaymentRequired,
+					Model: model, UserID: u.ID, KeyID: keyID,
+					Source: "reserve", Detail: "预扣被拒：余额不足（需 " + formatPoints(reserve) + " 点）",
+				})
 				return
 			case rerr != nil:
 				// 预扣失败（存储抖动等）不阻断：退化为事后结算，不误杀用户请求。
 				log.Printf("reserve failed, fallback to post-paid: %v", rerr)
+				p.store.recordConsumeFailure(ConsumeFailure{
+					Stage: FailStageReserve, Model: model, UserID: u.ID, KeyID: keyID,
+					Source: "reserve", Detail: "预扣失败，退化为事后结算：" + rerr.Error(),
+				})
 			default:
 				resv = rv
 			}
@@ -1274,9 +1286,21 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			lastErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
 			retryAfter := resp.Header.Get("Retry-After")
+			// 上游明示的恢复时刻：三级来源解析（body 文案 > body 字段 > 响应头），
+			// 见 internal/upstream/resetat.go。解析放在调用点而不是策略函数内部，
+			// 是为了让「解析」与「据此罚谁」分开 —— 策略函数只需要一个时刻。
+			resetAt, resetSrc := upstream.ResolveResetAt(resp.Header, body, time.Now())
 			// 传 raw（客户端请求体原文）而不是 payload（改写后的 map）：raw 已是 []byte，
 			// 且 system 提示词在两者中一致（改写只动角色/档位）。
-			kind := p.reportUpstreamError(au.UID, model, resp.StatusCode, body, retryAfter, raw)
+			kind := p.reportUpstreamError(au.UID, model, resp.StatusCode, body, resetAt, resetSrc, raw)
+			// 下游可用的等待提示：上游常常只把恢复时刻写在 body 里而不发 Retry-After 头，
+			// 此时把解析出来的剩余秒数合成一个转发给客户端 —— 否则兼容客户端会立刻重试，
+			// 把一次限流放大成一串连击（对上游是更明显的异常特征）。
+			if retryAfter == "" && !resetAt.IsZero() {
+				if sec := int(time.Until(resetAt).Seconds() + 0.999); sec > 0 {
+					lastRetryAfter = itoa(sec)
+				}
+			}
 			// R6（v0.26.1）：上游 5xx 说明**这一档整体不可用** → 把该成本层整层划掉，
 			// 下次选号自然落到下一档（默认关闭；见 picksink.go 的"为什么默认关闭"）。
 			if kind == upstream.ErrServer {
@@ -1479,6 +1503,11 @@ func contextDone(r *http.Request) error {
 
 // reportUpstreamError 按上游错误分类上报冷却/熔断，语义对齐 cmd/server 的 applyErrorPolicy。
 //
+// 参数 resetAt / resetSrc 来自 upstream.ResolveResetAt（上游明示的恢复时刻与来源）；
+// 零值表示"上游没给可用时间信息"，此时各分支回落到**有界退避**（本地估算）。
+// 把解析结果作为入参而不是在函数内部再解析一次：同一个响应只解析一次，
+// 且"解析"与"处置强度"两件事的边界清晰（改解析不影响罚谁）。
+//
 // v0.18.x 修复（误熔断）：旧实现的 default 分支无条件 NoteError（喂熔断器）——
 // 于是**请求级错误**（内容拦截 400 / 11101 请求体畸形 / 11102 模型不存在 /
 // 11115 上下文超长 / 上游 404）也记在账号头上，连 3 次即熔断一个健康账号
@@ -1491,7 +1520,33 @@ func contextDone(r *http.Request) error {
 //     NoteError（熔断 30min 起、封顶 6h）。上游 5xx 多为全局故障，按熔断处理会
 //     把整池账号批量摘除——hub issue #271 实测「4 小时 196 次失败熔断 13 个号、
 //     池子几乎空掉」即此类尺度过激。本链路取更保守的降权口径。
-func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, retryAfter string, reqBody []byte) upstream.ErrKind {
+func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, resetAt time.Time, resetSrc upstream.ResetSource, reqBody []byte) upstream.ErrKind {
+	display := upstream.UpstreamDisplayMsg(string(body))
+	code := parseUpstreamCode(body)
+	// kind 供本函数内部分流、台账记录、以及调用方（WAF IP 级 fail-fast 判定）共用，
+	// 只分类一次。
+	kind := upstream.Classify(status, string(body))
+
+	// 消耗失败台账（failures.go）：**每一次**上游拒绝都落一条，且**放在所有处置
+	// 分支之前** —— 下面的"账号受限"分支会提前 return，把它放在分类之后、
+	// 处置之前的唯一目的就是让"无论走哪条分支，记录都在"。
+	//
+	// 为什么把请求**形状**（消息条数 / 是否流式 / 工具数）也算进上下文：
+	// 排障时最先要回答的是"失败的请求长什么样"，这些不涉及内容的统计量足以
+	// 把「长上下文超限」与「普通请求被拦」分开，且不落任何提示词原文。
+	p.store.recordConsumeFailure(ConsumeFailure{
+		Stage:       FailStageUpstream,
+		Code:        code,
+		Kind:        kind.String(),
+		Status:      status,
+		Model:       model,
+		UID:         uid,
+		Source:      "proxy",
+		ResetSource: string(resetSrc),
+		Detail: fmt.Sprintf("上游 %d：%s｜请求形状 %s", status,
+			firstLine(display), requestShape(reqBody)),
+	})
+
 	// —— 账号级限制信号（v0.24.6）：先于按 code 的分流 ——
 	//
 	// 放在最前面是因为它的处置**强度最高且不可逆**（即时删除），而下面的
@@ -1500,27 +1555,25 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 	//
 	// 走回调而不是在这里直接删：删除要动 DB + 池 + 健康快照三处（deleteAccountsHard），
 	// 那是 app 层的职责；Proxy 只负责识别与转达，避免把两层的边界打穿。
-	if display := upstream.UpstreamDisplayMsg(string(body)); upstream.IsAccountRestricted(display) {
+	if upstream.IsAccountRestricted(display) {
 		if p.onAccountRestricted != nil {
 			p.onAccountRestricted(uid, "proxy", display)
 		} else {
 			// 未注入回调（单元测试 / 极简装配）：退化为停用，绝不静默放过。
 			p.pool.RetireAccount(uid, upstream.ErrAccountFault, upstream.AccountRestrictedHint())
 		}
-		return upstream.Classify(status, string(body))
-	}
-
-	code := parseUpstreamCode(body)
-	// kind 供本函数内部分流与调用方（WAF IP 级 fail-fast 判定）共用，只分类一次。
-	kind := upstream.Classify(status, string(body))
-	var resetAt time.Time
-	if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
-		resetAt = time.Now().Add(time.Duration(sec) * time.Second)
+		return kind
 	}
 	switch {
 	case code == 6004:
 		// 模型级限额：只冷却该模型，账号对其他模型仍可用。
-		p.pool.CooldownSoftForModel(uid, softCooldown, resetAt, model, "6004 model rate limit")
+		//
+		// 冷却时长来源（v0.26.3）：
+		//   resetAt 非零 → 对齐上游明示的恢复墙钟（封顶 soft_rate_max，见 pool 侧）；
+		//   resetAt 零值 → 模型级有界退避（soft_rate 基数起、按连续次数翻倍）。
+		// 两者都**只挡该模型**；reason 里带上来源，排障时能一眼看出这个时长
+		// 是上游给的还是本地估的（这两种情况的处置方向完全不同）。
+		p.pool.CooldownSoftForModel(uid, softCooldown, resetAt, model, "6004 model rate limit"+resetSrcSuffix(resetSrc))
 	case code == 11128 && (status == http.StatusBadRequest || status == http.StatusForbidden):
 		// 渠道 / 客户端指纹级拒绝（v0.24.8）：**这次请求**被上游按渠道策略挡下，
 		// 不是账号自身的问题 → 零动作（不冷却 / 不熔断 / 不计数），但**仍然轮转**：
@@ -1574,9 +1627,9 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 		p.pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 		p.archiveAbnormal(uid, "积分不足（无法消耗积分）", true)
 	case status == 429:
-		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "429 rate limit")
+		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "429 rate limit"+resetSrcSuffix(resetSrc))
 	case status == 403:
-		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "waf 403 block")
+		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "waf 403 block"+resetSrcSuffix(resetSrc))
 	case status == 401:
 		p.pool.NoteSessionDead(uid)
 	case status >= 500:
@@ -2148,12 +2201,25 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 			if _, err := p.store.SettleReservation(resv.ID, chargedMicro); err != nil {
 				errMsg = strings.TrimSpace(errMsg + " [settle_failed:" + err.Error() + "]")
 				settled = false // 交给调用方 defer 释放，避免预扣悬空
+				// 结算失败是**账目类**失败：响应已经发出，钱的方向对用户有利，
+				// 但必须留痕，否则"账对不上"时无从追查（v0.26.2 那笔孤儿预扣
+				// 就是靠 usage_logs 的 error_msg 才定位到的；结构化之后不必再翻文本）。
+				p.store.recordConsumeFailure(ConsumeFailure{
+					Stage: FailStageSettle, Model: model, UID: upstreamUID, UserID: u.ID,
+					KeyID: keyID, Attempt: attempts, Source: "settle",
+					Detail: "预扣结算失败：" + err.Error(),
+				})
 			}
 		case chargedMicro > 0:
 			// 无预扣（池内还没有单价数据）→ 退化为事后结算。
 			if _, err := p.store.ChargeUser(u.ID, chargedMicro); err != nil {
 				// 扣费失败不阻断响应（响应已发出），但要留痕。
 				errMsg = strings.TrimSpace(errMsg + " [charge_failed:" + err.Error() + "]")
+				p.store.recordConsumeFailure(ConsumeFailure{
+					Stage: FailStageCharge, Model: model, UID: upstreamUID, UserID: u.ID,
+					KeyID: keyID, Attempt: attempts, Source: "charge",
+					Detail: "事后扣费失败：" + err.Error(),
+				})
 			}
 		}
 	}

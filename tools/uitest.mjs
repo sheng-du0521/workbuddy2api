@@ -114,6 +114,8 @@ const FX = {
     egress_on_line_down: 'strict',
     // v0.26.1（R4/R6）：两个默认关闭的开关。
     fingerprint_samples: 'off', pick_sink_on_5xx: 'off',
+    // v0.26.3：设备凭证的派生兜底与陈旧阈值。
+    device_token_fallback: 'off', device_token_stale_days: 30,
   },
   // v0.14.0 出口代理（防封）：线路台账 + 风控视角聚合。
   '/api/admin/egress/proxies': {
@@ -126,17 +128,55 @@ const FX = {
   },
   // v0.26.1：设备凭证审计（R2）+ 选号均衡度（R7）+ 候选队列预览（R8）。
   '/api/admin/device-tokens': {
-    total: 3, by_state: { account: 1, global: 0, none: 2 }, distinct_fps: 1, shared: [],
+    total: 4, by_state: { account: 1, stale: 1, derived: 1, global: 0, none: 1 },
+    distinct_fps: 3, shared: [], fallback_on: true, stale_days: 30,
     rows: [
-      { uid: 'acc-aaaaaaaaaaaa', nickname: '甲号', state: 'account', fp: 'a1b2c3d4e5f60718', token_len: 128 },
-      { uid: 'acc-bbbbbbbbbbbb', nickname: '乙号', state: 'none' },
-      { uid: 'acc-cccccccccccc', nickname: '丙号', state: 'none' },
+      { uid: 'acc-aaaaaaaaaaaa', nickname: '甲号', state: 'account', fp: 'a1b2c3d4e5f60718', token_len: 128, age_days: 3 },
+      { uid: 'acc-bbbbbbbbbbbb', nickname: '乙号', state: 'stale', fp: 'bbbb111122223333', token_len: 96, age_days: 45 },
+      { uid: 'acc-cccccccccccc', nickname: '丙号', state: 'derived', fp: 'dddd444455556666', token_len: 32 },
+      { uid: 'acc-dddddddddddd', nickname: '丁号', state: 'none' },
     ],
-    verdict: 'partially-shared', advice: '存在共用同一凭证的账号分组，建议拆开（一设备一账号）。',
+    verdict: 'has-stale', advice: '有 1 个账号的凭证已超过 30 天未更新。',
   },
   '/api/admin/fingerprint-samples': {
     enabled: false, file: 'data/fingerprint_samples.jsonl', count: 0, full: false,
     kinds: {}, samples: [],
+  },
+  // v0.26.3：消耗失败台账（统计 + 明细 + 处置策略表）。
+  '/api/admin/consume-failures': {
+    window_hours: 24, since: 0, limit: 100, retention: 5000, total: 12,
+    rows: [
+      { id: 3, at: 1791972000, stage: 'upstream', code: 6004, code_key: '6004', kind: 'soft_rate',
+        scope: 'model', policy: '6004', auto_recover: true, status: 429, model: 'hy3-x',
+        uid: 'acc-aaaaaaaaaaaa', source: 'proxy', reset_source: 'body-text',
+        detail: '上游 429：模型用量超限｜请求形状 messages=3 stream' },
+      { id: 2, at: 1791971000, stage: 'settle', code_key: 'consume:settle', scope: 'account',
+        auto_recover: true, source: 'settle', detail: '预扣结算失败：not found' },
+      { id: 1, at: 1791970000, stage: 'reserve', code_key: 'consume:reserve', scope: 'request',
+        auto_recover: true, user_id: 1, source: 'reserve', detail: '预扣被拒：余额不足（需 12 点）' },
+    ],
+    stats: [
+      { code_key: '6004', stage: 'upstream', count: 9, last_at: 1791972000, auto_recover: true,
+        scope: 'model', handling: '只冷却该 (账号, 模型)：对齐上游重置墙钟，无时间信息则有界退避' },
+      { code_key: 'consume:reserve', stage: 'reserve', count: 2, last_at: 1791970000,
+        auto_recover: true, scope: 'request', handling: '拒绝请求（402），不扣费、不罚账号' },
+      { code_key: 'consume:settle', stage: 'settle', count: 1, last_at: 1791971000,
+        auto_recover: true, scope: 'account', handling: '留痕并释放预扣（不静默吞掉），该笔实际未扣费' },
+      // 未声明处置的码：必须照样出现在统计里并显式标出「未声明处置」——
+      // 上游随时会冒出新码，静默丢掉等于让台账在最需要它的时候失明。
+      { code_key: '99999', stage: 'upstream', count: 1, last_at: 1791970500 },
+    ],
+    policies: [
+      { key: '6004', code: 6004, name: '模型级用量超限', stage: 'upstream', scope: 'model',
+        handling: '只冷却该 (账号, 模型)', auto_recover: true, note: '绝不写账号级冷却' },
+      { key: '11140', code: 11140, name: '请求非法', stage: 'upstream', scope: 'account',
+        handling: '专用 2h 软冷却 + 连续计数', auto_recover: true },
+      { key: 'consume:settle', name: '预扣结算失败', stage: 'settle', scope: 'account',
+        handling: '留痕并释放预扣', auto_recover: true },
+      // 需人工介入的一档（界面上必须与"会自动恢复"区分开）
+      { key: '12153', code: 12153, name: '会话失效（需重新登录）', stage: 'upstream',
+        scope: 'account', handling: '连续计数，满阈值后停用并归档', auto_recover: false },
+    ],
   },
   '/api/admin/selection-balance': {
     window_hours: 24, total_requests: 1050, accounts_used: 23, accounts_total: 27,
@@ -910,6 +950,22 @@ function run(pageFile, meOverride, plan) {
       textIn: [['[data-egr-sub="help"]', '方案 A：自建'], ['[data-egr-sub="help"]', '3proxy'],
         ['[data-egr-sub="help"]', '方案 B：买商业代理'], ['[data-egr-sub="help"]', '合规'],
         ['[data-egr-sub="help"]', '别一次全量切过去']] },
+    // v0.26.3：消耗失败台账（统计 + 明细 + 处置策略表三块）。
+    { nav: 'report',
+      has: [['#cfHours', 1], ['#cfCode', 1], ['#cfStage', 1], ['#btnCfRefresh', 1],
+        ['#cfStats', 1], ['#cfRows', 1], ['#cfPolicies', 1],
+        // 统计表 + 明细表 + 策略表 = 3 张
+        ['.pane[data-pane="report"] .egr-help-table', 3]],
+      textIn: [
+        ['#cfStats', '失败总数'], ['#cfStats', '9'], ['#cfStats', '只挡该 (账号, 模型)'],
+        // 未声明处置的码必须显式标出来 —— 否则运维会以为是"没问题"
+        ['#cfStats', '未声明处置'],
+        // 四个阶段必须分开标签（预扣是用户侧、上游是账号侧，处置完全不同）
+        ['#cfStage', '预扣'], ['#cfStage', '上游'], ['#cfStage', '结算'], ['#cfStage', '扣费'],
+        // 明细里要能看到错误码与重置来源（后者区分"上游说的"与"本地估的"）
+        ['#cfRows', '6004'], ['#cfRows', 'body-text'], ['#cfRows', '预扣被拒'],
+        // 策略表整体回显（含未命中的码，便于区分"没出现"与"没声明"）
+        ['#cfPolicies', '11140'], ['#cfPolicies', '需人工']] },
     // v0.26.1：新增「设备与选号诊断」子区 —— 设备凭证共用检测 + 均衡度 + 候选队列。
     { click: ['#egrTabs .seg:nth-child(3)'],
       has: [['[data-egr-sub="device"]', 1], ['#devTokSummary', 1], ['#devTokRows', 1],
@@ -917,8 +973,11 @@ function run(pageFile, meOverride, plan) {
         // 三张表：凭证逐号、均衡度 Top、候选队列
         ['[data-egr-sub="device"] .egr-help-table', 3]],
       display: [['[data-egr-sub="device"]', 'shown'], ['[data-egr-sub="pool"]', 'none']],
-      textIn: [['#devTokSummary', '一号一凭证 1'], ['#devTokSummary', '无凭证 2'],
-        ['#devTokSummary', '建议拆开'],
+      textIn: [['#devTokSummary', '真凭证 1'], ['#devTokSummary', '无凭证 1'],
+        // v0.26.3：五态必须分别可见（stale 与 derived 的处置方向相反，
+        // 合成一个"有凭证 N 个"会把它们混掉）。
+        ['#devTokSummary', '真凭证·陈旧 1'], ['#devTokSummary', '派生兜底 1'],
+        ['#devTokSummary', '派生兜底 已开'], ['#devTokSummary', '陈旧阈值 30 天'],
         // 均衡度：三个关键数字 + 结论
         ['#selBalance', '23/27'], ['#selBalance', '7.9%'], ['#selBalance', '2.13'],
         // 候选队列：进候选者的权重排名 + 落选者的原因（本功能的全部意义就在这两列）
@@ -937,11 +996,15 @@ function run(pageFile, meOverride, plan) {
         // v0.26.1：两个默认关闭的开关（R6 降档 / R4 样本回流）
         ['#setPickSink', 1], ['#setFpSamples', 1],
         ['#setPickSink option', 2], ['#setFpSamples option', 2],
+        // v0.26.3：设备凭证的派生兜底与陈旧阈值
+        ['#setDevTokFallback', 1], ['#setDevTokStaleDays', 1],
+        ['#setDevTokFallback option', 2],
         // v0.15.1：选号模式下拉（加权随机 / 顺序轮转）。
         ['#setPickMode', 1], ['#setPickMode option', 2]],
       textIn: [['#setPickMode', '顺序轮转'], ['#setPickMode', '加权随机'],
         ['#setPickSink', '关闭（默认）'], ['#setFpSamples', '关闭（默认）'],
-        ['#setFpSamples ~ .hint', '唯一会把请求内容写到磁盘']] },
+        ['#setFpSamples ~ .hint', '唯一会把请求内容写到磁盘'],
+        ['#setDevTokFallback ~ .hint', '上游 SDK 签发的真凭证']] },
     // v0.17.0：成长任务移出定时任务页（改为手动选号执行）—— taskGrid 回到 6 张，
     // 且不应再有 growth 的时段/开关/批次输入；提示框改为「手动选号」口径。
     // v0.17.1：新增独立「成长任务」侧边栏。

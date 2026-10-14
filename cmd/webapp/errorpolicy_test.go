@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"time"
+
 	"workbuddy2api/internal/upstream"
 )
 
@@ -38,7 +40,7 @@ func TestReportUpstreamErrorRequestLevelUnpunished(t *testing.T) {
 			_ = px.SyncAccounts()
 
 			for i := 0; i < 3; i++ {
-				px.reportUpstreamError("u1", "m", c.status, []byte(c.body), "", nil)
+				px.reportUpstreamError("u1", "m", c.status, []byte(c.body), time.Time{}, upstream.ResetNone, nil)
 			}
 
 			st, ok := px.pool.Status("u1")
@@ -65,7 +67,7 @@ func TestReportUpstreamErrorNotFoundShortCooldown(t *testing.T) {
 	defer store.Close()
 	_ = px.SyncAccounts()
 
-	px.reportUpstreamError("u1", "m", 404, []byte("Not Found"), "", nil)
+	px.reportUpstreamError("u1", "m", 404, []byte("Not Found"), time.Time{}, upstream.ResetNone, nil)
 
 	st, _ := px.pool.Status("u1")
 	if !st.Cooling {
@@ -86,7 +88,7 @@ func TestReportUpstreamErrorModelBlockedBackoff(t *testing.T) {
 	defer store.Close()
 	_ = px.SyncAccounts()
 
-	px.reportUpstreamError("u1", "m", 400, []byte(`{"code":11102,"msg":"service info not found"}`), "", nil)
+	px.reportUpstreamError("u1", "m", 400, []byte(`{"code":11102,"msg":"service info not found"}`), time.Time{}, upstream.ResetNone, nil)
 
 	st, _ := px.pool.Status("u1")
 	if st.Disabled {

@@ -517,8 +517,17 @@ type modelCooldown struct {
 	ResetAt time.Time
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string
-	// Hits 11102 负缓存的累计命中次数（驱动指数退避）。运行态不落盘（同 modelCost 口径：
-	// 重启后从 6h 基数重新学习）；6004 条目 Hits 恒 0。持久化来回不会写入该字段。
+	// Hits 该 (账号, 模型) 键被**连续挡下**的次数，驱动指数退避。两种来源共用：
+	//
+	//	11102 负缓存命中（BlockModelBackoff，base=6h / 封顶 24h）
+	//	6004 但上游没给重置时间（CooldownSoftForModel 零值分支，base=soft_rate 基数）
+	//
+	// 合用一个计数是刻意的：键相同、含义相同（"这个模型在这个号上又被挡了一次"），
+	// 而两个来源永不同时写同一键（一次错误只会走一条分支）。分两个字段只会让
+	// "到底该看哪个"变成一个新的困惑源。
+	//
+	// 运行态不落盘（同 modelCost 口径：重启后从基数重新学习）；带上游重置时间的
+	// 6004 条目 Hits 恒 0。持久化来回不会写入该字段。
 	Hits int
 }
 

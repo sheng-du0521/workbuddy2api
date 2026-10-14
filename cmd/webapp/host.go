@@ -75,7 +75,8 @@ type hostAccountView struct {
 	// CreditCachedRemain 缓存明细的可用合计（v0.25.0，排除已过期包）——
 	// 卡片大数字用它，保证与明细行自洽。CreditPacksAt > 0 才有效。
 	CreditCachedRemain int64 `json:"credit_cached_remain"`
-	// DeviceTokenState 见 accountView 同名字段（v0.25.1）：account / global / none。
+	// DeviceTokenState 见 accountView 同名字段（v0.25.1 起；v0.26.3 扩为五态）：
+	// account / stale / derived / global / none。
 	DeviceTokenState string `json:"device_token_state"`
 }
 

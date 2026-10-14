@@ -103,10 +103,29 @@ func (c *Client) billingUA() string {
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
-// 优先级：auth.Auth.DeviceToken（每号）> Client.DeviceToken（config 全局）> 文件兜底。
+//
+// 优先级（v0.26.3 在末尾追加了派生兜底）：
+//
+//	① auth.Auth.DeviceToken（每号，真值）
+//	② Client.DeviceToken（config 全局）
+//	③ DeviceTokenFile（宿主落盘的桌面端凭证）
+//	④ **派生兜底** DeviceTokenFallbackEnabled 为真时，按 uid 稳定派生（每号互异）
+//	⑤ 都没有 → 空串（不注入该头）
+//
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
-// 为什么不放进 CommonHeaders：鉴权/刷新类头（refresh / FetchModels）给设备 token
-// 无意义且可能被上游风控误判为异常客户端；只在 chat/billing 业务请求注入。
+//
+// ## 为什么兜底排在最后而不是排在②③之前
+//
+// ②③ 是**真凭证**（上游 SDK 签发），派生值是合成的。虽然派生值在"一号一值"
+// 上优于"全池共用一个真值"（后者让所有账号声称自己是同一台设备），但把合成值
+// 插到用户显式配置的真值**之前**会静默忽略用户的配置 —— 那类意外比它想解决的
+// 问题更难查。所以派生只补最后一档空位：**现在"全池没有凭证"这档不再存在**。
+//
+// ## 为什么兜底值必须按 uid 派生而不是全局常量
+//
+// 一个全局常量等于给整池账号发同一张设备身份证 —— 上游一眼就能把 27 个号聚成
+// "同一台设备在轮着用"，比"完全不带"更容易被一次性处理。派生值保证异号互异，
+// 且跨重启恒定（见 deriveAccountStableID 的幂等三性）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
@@ -115,9 +134,27 @@ func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 		return c.DeviceToken
 	}
 	if c != nil && c.DeviceTokenFile != "" {
-		return readDeviceTokenFile(c.DeviceTokenFile)
+		if tok := readDeviceTokenFile(c.DeviceTokenFile); tok != "" {
+			return tok
+		}
+	}
+	if c != nil && c.DeviceTokenFallback && a != nil {
+		return AccountDeviceToken(a.UID)
 	}
 	return ""
+}
+
+// AccountDeviceToken 按 uid 稳定派生的设备凭证兜底值（32 hex）。
+//
+// 复用 deriveAccountStableID 的既有口径与用途盐隔离：新增用途 "device-token"
+// 与 "machine" / "session" 互不碰撞（已有测试断言用途隔离），因此该值不会与
+// X-Machine-ID / X-Session-ID 撞车 —— 那三个头若取同值，本身就是"同一套模板
+// 批量生成"的迹象。
+//
+// 空 uid 返回空串（不参与派生）：否则所有空 uid 账号会得到同一个看似正常的
+// 哈希，"多账号隔离"实际失效却毫无痕迹（同 deriveAccountStableID 的既定纪律）。
+func AccountDeviceToken(uid string) string {
+	return deriveAccountStableID(uid, "device-token")
 }
 
 // injectDeviceToken 在 req 注入 X-Device-Token 头（仅当取到非空 token）。

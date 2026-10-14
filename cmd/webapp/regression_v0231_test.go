@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"workbuddy2api/internal/pool"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // ===========================================================================
@@ -193,7 +195,7 @@ func TestFix3_PermissionFaultNeedsManual(t *testing.T) {
 	defer px.Close()
 
 	// 走真实的错误处置路径（而非手工调 archiveAbnormal），确保测的是生产代码。
-	px.reportUpstreamError("p1", "some-model", 400, []byte(`{"code":14017}`), "", nil)
+	px.reportUpstreamError("p1", "some-model", 400, []byte(`{"code":14017}`), time.Time{}, upstream.ResetNone, nil)
 
 	acc, _ := store.GetAccount("p1")
 	if acc.ConsumeGroup != cgAbnormal {
@@ -224,7 +226,7 @@ func TestFix3_CreditFaultStillAutoRecovers(t *testing.T) {
 	defer px.Close()
 
 	// 14020（余额不足）走真实处置路径。
-	px.reportUpstreamError("c1", "m", 400, []byte(`{"code":14020}`), "", nil)
+	px.reportUpstreamError("c1", "m", 400, []byte(`{"code":14020}`), time.Time{}, upstream.ResetNone, nil)
 	acc, _ := store.GetAccount("c1")
 	if effectiveConsumeGroup(acc) != cgAbnormal {
 		t.Fatalf("余额耗尽应归档异常组，得 %q", consumeGroupLabel(effectiveConsumeGroup(acc)))

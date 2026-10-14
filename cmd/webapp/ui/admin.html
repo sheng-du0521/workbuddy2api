@@ -1058,6 +1058,37 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
         </div>
         <div id="reportDailyTable"></div>
       </div>
+
+      <!-- ==================== 消耗失败台账（v0.26.3） ==================== -->
+      <div class="card">
+        <div class="section-head">
+          <h2>消耗失败台账</h2>
+          <div class="row">
+            <label>近</label>
+            <input type="number" id="cfHours" value="24" min="1" max="720" style="min-width:80px;">
+            <label>小时</label>
+            <input type="text" id="cfCode" placeholder="按错误码（如 6004）" style="min-width:150px;">
+            <select id="cfStage" style="width:auto;">
+              <option value="">全部阶段</option>
+              <option value="reserve">预扣</option>
+              <option value="upstream">上游</option>
+              <option value="settle">结算</option>
+              <option value="charge">扣费</option>
+            </select>
+            <button id="btnCfRefresh">查询</button>
+          </div>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          请求的「消耗」在四个阶段都会失败：<b>预扣</b>（余额不足）/ <b>上游</b>（被拒，带错误码）/
+          <b>结算</b>（预扣对不上）/ <b>扣费</b>（响应已发出后的扣款失败）。此前这些只留下一行
+          <code>error_msg</code> 自由文本，<b>问不出「最近为什么在失败」</b>；这里把它们结构化落表，可按码 / 阶段 / 窗口查。
+          <br>右侧「处置策略」是<b>声明式注册表</b>——每个错误码「罚谁、怎么恢复、要不要人工」都写在那里，
+          与代码里的处置分支由测试强制一一对应（声明了没实现会直接测试失败）。
+        </div>
+        <div id="cfStats"></div>
+        <div id="cfRows" style="margin-top:14px;"></div>
+        <div id="cfPolicies" style="margin-top:14px;"></div>
+      </div>
     </section>
 
     <!-- ==================== 公告（v0.17.8） ==================== -->
@@ -1237,6 +1268,23 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
             <div class="hint">上游 5xx 时把<b>当前成本层整层划掉</b>，本次请求下沉到下一档继续救。
               ⚠️ 本项目的「档」是<b>成本层</b>（限免 / 无观测 / 已实测收费），<b>下沉 = 去用更贵的账号</b> ——
               这是经营决定，所以默认关闭。</div>
+          </div>
+          <div class="setting-card">
+            <label>设备凭证派生兜底</label>
+            <select id="setDevTokFallback" style="width:auto;">
+              <option value="off">关闭（默认）</option>
+              <option value="derive">开启（按 uid 派生，各号互异）</option>
+            </select>
+            <div class="hint">前三档（账号自带 / 全局值 / 落盘文件）<b>全空</b>时才启用：
+              按 uid 稳定派生一个互异值，让「全池都不带该头」这个最容易被一次性聚类的形态消失。
+              ⚠️ 派生值是<b>合成</b>的，不是上游 SDK 签发的真凭证 —— 拿到真值后应逐号覆盖（覆盖即自动转为真凭证态）。</div>
+          </div>
+          <div class="setting-card">
+            <label>设备凭证陈旧阈值（天）</label>
+            <input type="number" id="setDevTokStaleDays" min="0" max="3650" step="1">
+            <div class="hint">超过该天数未更新的凭证在审计里标为「陈旧」。<b>0 = 关闭检测</b>，默认 30。
+              陈旧<b>不等于</b>失效，所以只告警不自动替换（用合成值顶替真值是确定性的降级）。
+              未记录写入时刻的历史凭证视为未知、不告警（避免升级后全池刷屏）。</div>
           </div>
           <div class="setting-card">
             <label>被拦样本回流（会落盘请求内容片段）</label>
@@ -3750,6 +3798,8 @@ async function loadSettings() {
     $('setEgressJitter').value = d.egress_jitter_ms || 0;
     $('setEgress').value = d.egress_proxy_default || '';
     $('setPickSink').value = d.pick_sink_on_5xx === 'on' ? 'on' : 'off';
+    $('setDevTokFallback').value = d.device_token_fallback === 'derive' ? 'derive' : 'off';
+    $('setDevTokStaleDays').value = String(d.device_token_stale_days ?? 30);
     $('setFpSamples').value = d.fingerprint_samples === 'on' ? 'on' : 'off';
     // 选号模式：回读实际生效值（后端归一化后返回），空/未知一律显示默认项。
     $('setPickMode').value = (d.pick_mode === 'roundrobin') ? 'roundrobin' : 'weighted';
@@ -4476,6 +4526,8 @@ $('btnSaveProxy').onclick = async () => {
       egress_max_per_proxy: Number($('setEgressMaxPer').value) || 0,
       egress_jitter_ms: Number($('setEgressJitter').value) || 0,
       pick_sink_on_5xx: $('setPickSink').value,
+      device_token_fallback: $('setDevTokFallback').value,
+      device_token_stale_days: Number($('setDevTokStaleDays').value) || 0,
       fingerprint_samples: $('setFpSamples').value,
     });
     toast('反代选号与防封设置已保存', 'ok');
@@ -4751,6 +4803,7 @@ async function loadUserRanking(days) {
 }
 
 async function loadReport() {
+  loadConsumeFailures(); // 消耗失败台账（独立拉，失败不影响主报表）
   const days = Number($('reportDays').value) || 14;
   try {
     const d = await api(`/api/admin/usage?days=${days}`);
@@ -5464,6 +5517,143 @@ let egrAccSummary = {};
 let egrAccDefault = '';
 
 // ===========================================================================
+// 消耗失败台账（v0.26.3，见 cmd/webapp/failures.go）
+// ===========================================================================
+
+// CF_STAGE_META 阶段 → 一眼可读的标签。
+// 四个阶段的失败**处置完全不同**（预扣是用户侧、上游是账号侧、结算是账目侧），
+// 所以不允许合并成一个"失败数"。
+const CF_STAGE_META = {
+  reserve: ['warn', '预扣'],
+  upstream: ['err', '上游'],
+  settle: ['warn', '结算'],
+  charge: ['warn', '扣费'],
+};
+
+async function loadConsumeFailures() {
+  const box = $('cfStats');
+  if (box) box.textContent = '加载中…';
+  const q = new URLSearchParams({
+    hours: String(Number($('cfHours')?.value) || 24),
+    limit: '100',
+  });
+  const code = ($('cfCode')?.value || '').trim();
+  const stage = ($('cfStage')?.value || '').trim();
+  if (code) q.set('code', code);
+  if (stage) q.set('stage', stage);
+  let d;
+  try {
+    d = await api('/api/admin/consume-failures?' + q.toString());
+  } catch (e) {
+    if (box) box.textContent = '读取失败：' + e.message;
+    return;
+  }
+  renderCfStats(d);
+  renderCfRows(d);
+  renderCfPolicies(d);
+}
+
+function renderCfStats(d) {
+  const box = $('cfStats');
+  if (!box) return;
+  const stats = d.stats || [];
+  const total = stats.reduce((n, s) => n + (s.count || 0), 0);
+  const kpis = [
+    ['窗口', (d.window_hours || 0) + 'h'],
+    ['失败总数', fmtNum(total)],
+    ['涉及错误码', String(stats.length)],
+    ['台账容量', fmtNum(d.total || 0) + ' / ' + fmtNum(d.retention || 0)],
+  ];
+  box.innerHTML = '';
+  const kbox = el('div', 'kpis');
+  for (const k of kpis) kbox.appendChild(statCard(k[0], k[1]));
+  box.appendChild(kbox);
+
+  if (!stats.length) {
+    box.insertAdjacentHTML('beforeend',
+      '<div class="sub" style="margin-top:10px;">窗口内没有失败记录。' +
+      '（注意：台账上限 ' + fmtNum(d.retention || 0) + ' 行，超出会丢最旧 —— ' +
+      '错误风暴时段更早的记录可能已被挤掉。）</div>');
+    return;
+  }
+  // 统计表**同时**显示处置：运维在这一页要回答的是"为什么失败、我该做什么"，
+  // 只给次数而不给处置说明等于把答案留在代码里。
+  let html = '<table class="egr-help-table" style="margin-top:10px;"><thead><tr>' +
+    '<th>错误码</th><th>阶段</th><th>次数</th><th>罚谁</th><th>会自动恢复</th><th>处置</th><th>最近</th>' +
+    '</tr></thead><tbody>';
+  for (const s of stats) {
+    const sm = CF_STAGE_META[s.stage] || ['', s.stage];
+    const scope = CF_SCOPE_TEXT[s.scope] || (s.scope ? s.scope : '<span class="muted">未声明处置</span>');
+    html += '<tr><td class="mono">' + escapeHTML(s.code_key || '(无码)') + '</td>' +
+      '<td><span class="tag ' + sm[0] + '">' + sm[1] + '</span></td>' +
+      '<td>' + fmtNum(s.count) + '</td>' +
+      '<td style="font-size:12px;">' + scope + '</td>' +
+      '<td>' + (s.scope ? (s.auto_recover ? '<span class="tag ok">会</span>' : '<span class="tag err">需人工</span>') : '—') + '</td>' +
+      '<td style="font-size:12px;">' + escapeHTML(s.handling || '—') + '</td>' +
+      '<td class="mono">' + escapeHTML(fmtTime(s.last_at)) + '</td></tr>';
+  }
+  box.insertAdjacentHTML('beforeend', html + '</tbody></table>');
+}
+
+// CF_SCOPE_TEXT 处置范围 → 人话。放在前端是因为它是**展示口径**
+// （后端给的是 request/model/account/global 这类机器可读值）。
+const CF_SCOPE_TEXT = {
+  request: '这次请求（不罚账号）',
+  model: '只挡该 (账号, 模型)',
+  account: '整个账号',
+  global: '上游全局（与单账号无关）',
+};
+
+function renderCfRows(d) {
+  const box = $('cfRows');
+  if (!box) return;
+  const rows = d.rows || [];
+  if (!rows.length) { emptyBlock(box, '窗口内没有明细。'); return; }
+  let html = '<div class="sub" style="margin:0 0 8px;">明细（最新 100 条，倒序）</div>' +
+    '<table class="egr-help-table"><thead><tr>' +
+    '<th>时间</th><th>阶段</th><th>码</th><th>状态</th><th>账号</th><th>模型</th>' +
+    '<th>重置来源</th><th>摘要</th></tr></thead><tbody>';
+  for (const r of rows) {
+    const sm = CF_STAGE_META[r.stage] || ['', r.stage];
+    html += '<tr><td class="mono">' + escapeHTML(fmtTime(r.at)) + '</td>' +
+      '<td><span class="tag ' + sm[0] + '">' + sm[1] + '</span></td>' +
+      '<td class="mono">' + escapeHTML(r.code ? String(r.code) : (r.code_key || '—')) + '</td>' +
+      '<td class="mono">' + (r.status || '—') + '</td>' +
+      '<td class="mono">' + (r.uid ? escapeHTML(maskUID(r.uid)) : '—') + '</td>' +
+      '<td class="mono">' + escapeHTML(r.model || '—') + '</td>' +
+      // 重置来源只在限流类有意义：它区分"上游明说的时长"与"我们本地估的"，
+      // 后者才说明解析可能失效，是排障要看的重点。
+      '<td style="font-size:12px;">' + escapeHTML(r.reset_source || '—') + '</td>' +
+      '<td style="font-size:12px;">' + escapeHTML(r.detail || '') + '</td></tr>';
+  }
+  box.innerHTML = html + '</tbody></table>';
+}
+
+function renderCfPolicies(d) {
+  const box = $('cfPolicies');
+  if (!box) return;
+  const pols = d.policies || [];
+  if (!pols.length) { box.innerHTML = ''; return; }
+  let html = '<div class="sub" style="margin:0 0 8px;">错误码处置策略表（声明式注册表，' +
+    pols.length + ' 条）—— 界面上的每一行都对应代码里一个真实分支，' +
+    '由测试强制（只声明不实现会直接测试失败）。</div>' +
+    '<table class="egr-help-table"><thead><tr>' +
+    '<th>码</th><th>含义</th><th>罚谁</th><th>会自动恢复</th><th>处置</th><th>备注</th>' +
+    '</tr></thead><tbody>';
+  for (const p of pols) {
+    html += '<tr><td class="mono">' + escapeHTML(p.key) + '</td>' +
+      '<td style="font-size:12px;">' + escapeHTML(p.name || '') + '</td>' +
+      '<td style="font-size:12px;">' + (CF_SCOPE_TEXT[p.scope] || p.scope || '—') + '</td>' +
+      '<td>' + (p.auto_recover ? '<span class="tag ok">会</span>' : '<span class="tag err">需人工</span>') + '</td>' +
+      '<td style="font-size:12px;">' + escapeHTML(p.handling || '') + '</td>' +
+      '<td style="font-size:12px;" class="muted">' + escapeHTML(p.note || '') + '</td></tr>';
+  }
+  box.innerHTML = html + '</tbody></table>';
+}
+
+$('btnCfRefresh') && ($('btnCfRefresh').onclick = loadConsumeFailures);
+
+// ===========================================================================
 // 设备与选号诊断（v0.26.1）：设备凭证共用检测 + 选号均衡度 + 候选队列预览
 // ===========================================================================
 
@@ -5585,10 +5775,16 @@ function renderDeviceTok(d) {
   const bs = d.by_state || {};
   const shared = d.shared || [];
   const parts = [];
-  parts.push('<span class="tag ok">一号一凭证 ' + (bs.account || 0) + '</span>');
+  // 五态（v0.26.3）：account / stale / derived / global / none。
+  // 每一态的处置方向都不同，所以必须分开展示 —— 合成一个"有凭证 N 个"会
+  // 把 stale（真值但可能失效）与 derived（合成值）混在一起，而这两者正好相反。
+  parts.push('<span class="tag ok">真凭证 ' + (bs.account || 0) + '</span>');
+  if (bs.stale) parts.push('<span class="tag warn" title="凭证超过阈值未更新，很可能已随客户端轮换失效；陈旧≠失效，故未自动替换">真凭证·陈旧 ' + bs.stale + '</span>');
+  if (bs.derived) parts.push('<span class="tag" title="按 uid 派生的合成值：各号互异，但不是上游签发的真凭证">派生兜底 ' + bs.derived + '</span>');
   if (bs.global) parts.push('<span class="tag warn">靠全局兜底 ' + bs.global + '</span>');
-  if (bs.none) parts.push('<span class="tag">无凭证 ' + bs.none + '</span>');
-  parts.push('<span class="muted" style="font-size:12px;">共 ' + (d.total || 0) + ' 个账号</span>');
+  if (bs.none) parts.push('<span class="tag err">无凭证 ' + bs.none + '</span>');
+  parts.push('<span class="muted" style="font-size:12px;">共 ' + (d.total || 0) + ' 个账号' +
+    '（派生兜底 ' + (d.fallback_on ? '已开' : '关闭') + ' · 陈旧阈值 ' + (d.stale_days || 0) + ' 天）</span>');
   let html = parts.join(' ');
   if (shared.length) {
     // 共用分组是本页最该被看见的东西：一个凭证被多号共用 = 声称自己是同一台设备。
@@ -5602,14 +5798,18 @@ function renderDeviceTok(d) {
 
   const list = d.rows || [];
   if (!list.length) { emptyBlock(rows, '池内没有账号。'); return; }
-  const label = { account: ['ok', '一号一凭证'], global: ['warn', '靠全局兜底'], none: ['', '无凭证'] };
-  rows.innerHTML = '<table class="egr-help-table"><thead><tr><th>账号</th><th>凭证来源</th><th>指纹</th><th>长度</th></tr></thead><tbody>'
+  const label = {
+    account: ['ok', '真凭证'], stale: ['warn', '真凭证·陈旧'], derived: ['', '派生兜底'],
+    global: ['warn', '靠全局兜底'], none: ['err', '无凭证'],
+  };
+  rows.innerHTML = '<table class="egr-help-table"><thead><tr><th>账号</th><th>凭证来源</th><th>指纹</th><th>长度</th><th>距今</th></tr></thead><tbody>'
     + list.map((r) => {
       const m = label[r.state] || ['', r.state];
       return '<tr><td>' + escapeHTML(r.nickname || maskUID(r.uid)) + '</td>'
         + '<td><span class="tag ' + m[0] + '">' + m[1] + '</span></td>'
         + '<td class="mono">' + (r.fp ? escapeHTML(r.fp) : '—') + '</td>'
-        + '<td class="mono">' + (r.token_len || '—') + '</td></tr>';
+        + '<td class="mono">' + (r.token_len || '—') + '</td>'
+        + '<td class="mono">' + (r.age_days ? r.age_days + ' 天' : '—') + '</td></tr>';
     }).join('') + '</tbody></table>';
 }
 

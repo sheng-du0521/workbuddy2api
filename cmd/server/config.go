@@ -143,6 +143,10 @@ type Config struct {
 		// 容器内无桌面端 Turing SDK，这是把外部生成的 token 注入的入口；空 = 不注入。
 		// 每号覆盖优先级：auths 文件 device_token > 本全局值 > DeviceTokenFile（文件兜底）。
 		DeviceToken string `json:"device_token"`
+		// DeviceTokenFallback 前三档（每号 / 全局值 / 文件）全空时，是否按 uid 稳定
+		// 派生一个兜底值（v0.26.3，与 cmd/webapp 的 device_token_fallback 同一语义）。
+		// 默认 false：派生值是合成凭证，只用来消掉"全池都不带该头"这一形态。
+		DeviceTokenFallback bool `json:"device_token_fallback"`
 		// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
 		// 读取频率限 5 分钟一次缓存，>1KB 或读失败则忽略（优雅降级不注入）。
 		DeviceTokenFile string `json:"device_token_file"`

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/upstream"
 )
@@ -20,7 +21,7 @@ import (
 // 而"从来没注入"是个**静默失败**：没有任何报错，只有审计才看得出来。
 // ===========================================================================
 
-// TestDeviceTokenStateThreeStates 三态必须分明。
+// TestDeviceTokenStateThreeStates 三态必须分明（v0.26.3 起在派生兜底关闭时即此三态）。
 //
 // 为什么不是 bool：审计结论天差地别 —— 「全池都没带」（可聚类）与
 // 「全池共用一个」（也可聚类，形态不同）需要的处置完全不同。
@@ -201,5 +202,218 @@ func TestDeviceTokenWiredIntoAuthAuth(t *testing.T) {
 	}
 	if au.DeviceToken != "dt-9" {
 		t.Fatalf("device_token 未传到 auth.Auth，得 %q", au.DeviceToken)
+	}
+}
+
+// ===========================================================================
+// v0.26.3 派生兜底 + 陈旧检测（五态）
+//
+// 三态扩成五态的原因：审计结论比"有没有带"更细 ——
+//   derived = 各号一个合成值（不可按单值聚类，但值本身非上游签发）
+//   stale   = 真值但很可能已随客户端轮换失效（真值 vs 现在值，取舍不同）
+// 这两种都不是"none"，也不该被并进 "account" 里悄悄混过去。
+// ===========================================================================
+
+// TestDeviceTokenDerivedStateFallbackOffIsNone 兜底开关**默认关闭** ——
+// 三个空档全空时仍是 none（既有行为零变化）。
+func TestDeviceTokenDerivedStateFallbackOffIsNone(t *testing.T) {
+	store, px, a := newTestApp(t)
+	defer store.Close()
+	defer px.Close()
+	t.Setenv(envDeviceToken, "")
+	t.Setenv(envDeviceTokenFile, "")
+
+	if store.deviceTokenFallbackOn() {
+		t.Fatal("派生兜底默认必须是关闭的（合成值不该默认发给上游）")
+	}
+	if got := a.deviceTokenState(&Account{UID: "x"}); got != "none" {
+		t.Fatalf("默认应为 none，得 %q", got)
+	}
+}
+
+// TestDeviceTokenDerivedStateWhenEnabled 开关打开且有 uid → derived。
+func TestDeviceTokenDerivedStateWhenEnabled(t *testing.T) {
+	store, px, a := newTestApp(t)
+	defer store.Close()
+	defer px.Close()
+	t.Setenv(envDeviceToken, "")
+	t.Setenv(envDeviceTokenFile, "")
+
+	if err := store.SetKV(kvDeviceTokenFallback, "derive"); err != nil {
+		t.Fatal(err)
+	}
+	if !store.deviceTokenFallbackOn() {
+		t.Fatal("开关未生效")
+	}
+	if got := a.deviceTokenState(&Account{UID: "x"}); got != "derived" {
+		t.Fatalf("应为 derived，得 %q", got)
+	}
+	// 真值仍然优先于派生值：账号 / 全局 / 文件任一存在就不落到 derived。
+	if got := a.deviceTokenState(&Account{UID: "x", DeviceToken: "real"}); got != "account" {
+		t.Fatalf("账号真值应优先，得 %q", got)
+	}
+	if err := store.SetKV(kvDeviceToken, "g"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.deviceTokenState(&Account{UID: "x"}); got != "global" {
+		t.Fatalf("全局真值应优先于派生，得 %q", got)
+	}
+}
+
+// TestInstallDeviceTokenWiresFallback 开关必须真装到出站客户端上。
+//
+// 只改 kv 不装配 = 界面显示 derived、实际出站仍不带头 —— 又一个静默失败。
+func TestInstallDeviceTokenWiresFallback(t *testing.T) {
+	store, _, _ := newTestApp(t)
+	defer store.Close()
+
+	uc := upstream.New()
+	if err := store.SetKV(kvDeviceTokenFallback, "derive"); err != nil {
+		t.Fatal(err)
+	}
+	store.installDeviceToken(uc)
+	if !uc.DeviceTokenFallback {
+		t.Fatal("派生兜底开关未装配到 upstream.Client")
+	}
+	if err := store.SetKV(kvDeviceTokenFallback, "off"); err != nil {
+		t.Fatal(err)
+	}
+	store.installDeviceToken(uc)
+	if uc.DeviceTokenFallback {
+		t.Fatal("关闭后仍残留开启状态")
+	}
+}
+
+// TestDeviceTokenStaleDetection 陈旧阈值：超过阈值才算陈旧，且未刷新时刻视为未知（不报警）。
+func TestDeviceTokenStaleDetection(t *testing.T) {
+	store, px, a := newTestApp(t)
+	defer store.Close()
+	defer px.Close()
+	t.Setenv(envDeviceToken, "")
+	t.Setenv(envDeviceTokenFile, "")
+
+	now := time.Now().Unix()
+	cases := []struct {
+		name string
+		at   int64
+		want bool
+	}{
+		{"刚写入", now, false},
+		{"29 天前（阈值内）", now - 29*86400, false},
+		{"31 天前（超阈值）", now - 31*86400, true},
+		{"时刻未知（未记录）", 0, false}, // 老库遗留：不报警（避免升级后全池告警）
+	}
+	for _, c := range cases {
+		if got := a.deviceTokenStale(&Account{UID: "x", DeviceToken: "t", DeviceTokenAt: c.at}); got != c.want {
+			t.Errorf("%s：stale=%v want %v", c.name, got, c.want)
+		}
+	}
+	// 阈值为 0 = 关闭检测。
+	if err := store.SetKV(kvDeviceTokenStaleDays, "0"); err != nil {
+		t.Fatal(err)
+	}
+	if a.deviceTokenStale(&Account{UID: "x", DeviceToken: "t", DeviceTokenAt: now - 400*86400}) {
+		t.Error("阈值为 0 时应关闭检测")
+	}
+}
+
+// TestDeviceTokenStaleDaysDefaultAndBounds 阈值的默认值与越界回落。
+func TestDeviceTokenStaleDaysDefaultAndBounds(t *testing.T) {
+	store, _, a := newTestApp(t)
+	defer store.Close()
+
+	if got := a.deviceTokenStaleDays(); got != defaultDeviceTokenStaleDays {
+		t.Errorf("默认阈值 = %d, want %d", got, defaultDeviceTokenStaleDays)
+	}
+	for _, tc := range []struct {
+		set  string
+		want int
+	}{
+		{"7", 7},
+		{"abc", defaultDeviceTokenStaleDays}, // 非法 → 默认
+		{"-1", defaultDeviceTokenStaleDays},  // 负数 → 默认
+		{"99999", defaultDeviceTokenStaleDays},
+		{"0", 0}, // 0 是合法值（关闭检测）
+	} {
+		if err := store.SetKV(kvDeviceTokenStaleDays, tc.set); err != nil {
+			t.Fatal(err)
+		}
+		if got := a.deviceTokenStaleDays(); got != tc.want {
+			t.Errorf("阈值 %q → %d, want %d", tc.set, got, tc.want)
+		}
+	}
+}
+
+// TestSetDeviceTokenRecordsTimestamp 写入凭证必须刷新时刻；清除必须归零。
+//
+// 归零这一半同样重要：清除后若仍留着旧时刻，"没有凭证"会被算成"很久前录的凭证"，
+// 于是该账号在审计里显示成 stale 而不是 none —— 状态互相矛盾。
+func TestSetDeviceTokenRecordsTimestamp(t *testing.T) {
+	store, px, _ := newTestApp(t, &Account{UID: "u1", AccessToken: "at"})
+	defer store.Close()
+	defer px.Close()
+
+	before := time.Now().Unix()
+	if err := store.SetAccountDeviceToken("u1", "  tok-1  "); err != nil {
+		t.Fatal(err)
+	}
+	acc, err := store.GetAccount("u1")
+	if err != nil || acc == nil {
+		t.Fatalf("GetAccount: %v %v", acc, err)
+	}
+	if acc.DeviceToken != "tok-1" {
+		t.Errorf("应 trim 后写入，得 %q", acc.DeviceToken)
+	}
+	if acc.DeviceTokenAt < before || acc.DeviceTokenAt > time.Now().Unix() {
+		t.Errorf("写入时刻 = %d, want ≈%d", acc.DeviceTokenAt, before)
+	}
+
+	if err := store.SetAccountDeviceToken("u1", ""); err != nil {
+		t.Fatal(err)
+	}
+	acc2, _ := store.GetAccount("u1")
+	if acc2.DeviceTokenAt != 0 {
+		t.Errorf("清除后时刻应归零，得 %d", acc2.DeviceTokenAt)
+	}
+}
+
+// TestUpsertAccountKeepsDeviceTokenAt OAuth 重同步不得把凭证时刻洗成"现在"。
+//
+// 用 excluded.device_token_at 会让每次刷新 token 都重置该时刻，
+// 于是"多久没换凭证"这个指标**永远显示新鲜** —— 正是需要它报警的场景反而消失。
+func TestUpsertAccountKeepsDeviceTokenAt(t *testing.T) {
+	store, px, _ := newTestApp(t, &Account{UID: "u1", AccessToken: "at"})
+	defer store.Close()
+	defer px.Close()
+
+	old := time.Now().Add(-100 * 24 * time.Hour).Unix()
+	if err := store.SetAccountDeviceToken("u1", "tok-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE accounts SET device_token_at = ? WHERE uid = 'u1'`, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟 OAuth 重同步：token 相同、但走一次 UpsertAccount。
+	acc, _ := store.GetAccount("u1")
+	acc.AccessToken = "at2"
+	if err := store.UpsertAccount(acc); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := store.GetAccount("u1")
+	if after.DeviceTokenAt != old {
+		t.Errorf("重同步把凭证时刻洗成了 %d，want 保持 %d", after.DeviceTokenAt, old)
+	}
+
+	// 但如果**凭证本身变了**（重新采集），时刻应更新为传入值。
+	acc2, _ := store.GetAccount("u1")
+	acc2.DeviceToken = "tok-new"
+	acc2.DeviceTokenAt = time.Now().Unix()
+	if err := store.UpsertAccount(acc2); err != nil {
+		t.Fatal(err)
+	}
+	after2, _ := store.GetAccount("u1")
+	if after2.DeviceTokenAt == old {
+		t.Error("凭证变化时时刻应随之更新")
 	}
 }
