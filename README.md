@@ -1,10 +1,10 @@
 > [!WARNING]
+>
 > ### 禁止商用倒卖
 >
 > **禁止将本项目的源代码（含其衍生版本、修改版本，以及任何实质性相同的副本）用于商业转售、倒卖或付费分发。**
 >
-> 具体包括但不限于：出售本项目源码或"源码授权"；以"付费进群 / 付费教程 / 加盟费 / 代理费 /
-> 技术支持费"等任何名义把源码作为对价交付；把本项目打包后以"源码版"为卖点单独收费；
+> 具体包括但不限于：出售本项目源码或"源码授权"；以"付费进群 / 付费教程 / 加盟费 / 代理费 / 技术支持费"等任何名义把源码作为对价交付；把本项目打包后以"源码版"为卖点单独收费；
 > 以及声称已获作者授权进行上述活动。
 >
 > **允许**：个人学习、研究、测试；自行部署使用（含为你自己或所在组织提供服务）；
@@ -18,36 +18,34 @@
 > 若需要让"禁止商用"具备完全的法律强制力，只能更换许可证（如 PolyForm Noncommercial），
 > 且只能对**新发布的版本**生效。完整说明见 [NOTICE](NOTICE)。
 
-> [!NOTE]
-> **延续仓库**：原上游 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 已于 2026-09-24 从 GitHub 消失（删除或转私有）。本仓库是其完整历史的延续副本（含上游最后的公开提交 `9a26ae7`），按原项目的 **MIT License** 继续维护，原始版权声明见 [LICENSE](LICENSE)。
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy2API" width="120">
-</p>
-
 <h1 align="center">WorkBuddy2API</h1>
 
 <p align="center">
-  <b>把 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关</b><br>
+  
+  <b>把 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关</b>  
+
+  
   OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 积分补充
+  
 </p>
 
 <p align="center">
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.26.0-00ADD8?logo=go&logoColor=white&style=flat-square">
+  
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26.0-00ADD8?logo=go\&logoColor=white\&style=flat-square">
+  
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
-  <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker&logoColor=white&style=flat-square">
+  
+  <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker\&logoColor=white\&style=flat-square">
+  
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
-  <a href="https://t.me/sliverkiss_blog"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-%E9%A2%91%E9%81%93-blue?logo=telegram&logoColor=white&style=flat-square"></a>
+  
 </p>
 
 ---
 
 ## 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeBuddy``` 账号包装为统一的 `/v1/chat/completions` 服务。
-
-### 交流群组
-- [@checkinHome](https://t.me/checkinHome)
+WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 `CodeBuddy` 账号包装为统一的 `/v1/chat/completions` 服务。
 
 ### 本项目做什么
 
@@ -59,10 +57,10 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 本仓库同时维护两个入口，它们**互相独立、端口不同、配置方式不同**：
 
-| 入口 | 可执行 | 默认端口 | 说明 |
-|---|---|---|---|
+| 入口                 | 可执行                         | 默认端口     | 说明                                                                                                       |
+| ------------------ | --------------------------- | -------- | -------------------------------------------------------------------------------------------------------- |
 | **Web 应用中转站**（主产品） | `cmd/webapp` → `webapp.exe` | **8780** | 单进程 = 网站 + 用户控制台 + **内置管理后台** + OpenAI 兼容网关。账号/计费/兑换/提现/代挂都在 SQLite 里，全部界面化。启动脚本 `dist/start-webapp.bat` |
-| 网关核心（精简版） | `cmd/server` → `wb2api.exe` | 7863 | 只有 OpenAI 兼容网关 + 账号池，**无 Web 界面**；配置文件 `config.json` + 环境变量 `WB2A_*` |
+| 网关核心（精简版）          | `cmd/server` → `wb2api.exe` | 7863     | 只有 OpenAI 兼容网关 + 账号池，**无 Web 界面**；配置文件 `config.json` + 环境变量 `WB2A_*`                                     |
 
 > **关于「不内嵌 Web 管理面板」**：那条描述只适用于**网关核心 `cmd/server`**。
 > **Web 应用中转站 `cmd/webapp` 就是内置管理后台的**（admin.html / dashboard.html 由 exe 内嵌提供，
@@ -71,16 +69,18 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 ### 本项目不做什么
 
-- **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责。
+- **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 `CodeBuddy` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责。
 - **网关核心（cmd/server）不内嵌 Web 管理面板** — 该入口保持精简；需要界面的用主产品 `cmd/webapp`。
+    
   （想用第三方面板也可部署社区项目，均独立维护、与网关解耦：
+    
   [workbuddy2api-gui](https://github.com/287775856/workbuddy2api-gui)、
+    
   [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)）
 
-> ⚠️ 合规须知：本项目是**非官方**网关，使用 ```CodeBuddy``` 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
+> ⚠️ 合规须知：本项目是**非官方**网关，使用 `CodeBuddy` 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
-📖 文档：Web 中转站见 [`dist/Web应用使用说明.md`](dist/Web应用使用说明.md)；本项目历史调研与事件报告见 [`docs/`](docs/)。
-（原上游 Wiki 链接已失效 —— 上游仓库 2026-09-24 消失，见文首说明。）
+📖 文档：本项目历史调研与事件报告见 [`docs/`](docs/)；Web 中转站使用说明见 [`dist/Web应用使用说明.md`](dist/Web应用使用说明.md)。
 
 ## 核心能力
 
@@ -127,6 +127,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - **会话粘性** — 同一对话固定走同一账号（多轮上下文不跳号、上游 prompt cache 不碎）。粘性键按此优先级取：**conversation 维度四键**（`metadata.conversation_id` / `metadata.conversationId` / `conversation_id` / `conversationId` 任一）→ **`prompt_cache_key`**（pi-ai 系客户端把会话 ID 放在这个 OpenAI 前缀缓存字段里）→ **首条 user 消息文本的 sha256 兜底**（OpenAI 兼容协议无会话 ID 字段，dsh / Codex 等客户端四键全缺，此前粘性恒不命中、逐请求换号；现由首条 user 消息派生会话级稳定键——会话内历史追加不影响该键，开新会话自然换键）。`user_id` **不是**粘性键——它会把一个用户的所有并行对话钉到同一个号上（粒度远粗于上游对话级缓存边界），发 `user_id` 的客户端回落加权轮换（**该回落同样适用于首条 user 消息兜底**：请求体带 `metadata.user_id` 或顶层 `user_id` 时不派生兜底键）。绑定 30 分钟滚动续期，空闲即过期释放
 - **负载分布** — 粘性与分层都未限定时，三因子加权随机（`credits ×10 + 快过期积分 ×8 + 闲置补偿`）把流量摊开：高余额号多扛、快过期积分的号先用、闲置号补位；防惊群跳过 100ms 内刚选中的号。权重是**概率倾斜**而非硬排序（Top-5 短名单 + 名单内抽签），不会让单一账号垄断流量
 
+
 ### 定时积分任务
 
 - **签到**（09 / 21 点）— 每日签到 + 余额查询，余额恢复自动解冻冷却账号
@@ -139,18 +140,27 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 六类任务独立排程、独立开关（`schedule.*_enabled`），互不影响。
 
 管理后台「实时概览」页有**号池仪表盘**（v0.17.2 新增，v0.17.3 迁至本页并**实时化**）：
+  
 账号总数 / 可用 / 积分合计 / 平均积分 / 出口异常 / 累计服务 / **指纹隔离**，
+  
 外加健康度与消耗分组环形图、积分 Top、Token 到期分布、出站出口、自动任务覆盖、号池消耗 Top。
+  
 聚合由服务端完成（`GET /api/admin/pool-dashboard`）并与实时态势**同频轮询**（默认 3 秒）——
+  
 走服务端是因为轮询频率高（客户端算需每次推整个账号列表），且指纹健康度必须与出站请求同源计算。
+  
 **不向上游发任何请求**（故「积分」为号池内存的最近已知值，非实时余额）。
 
 执行台账卡片上「任务性质」（`自动排程 · 9/21 点`）与「本轮触发」（`本轮 · 定时/人工`）是两个独立维度 ——
+  
 自动任务被人工点过「立即执行」后，最近一轮显示「本轮 · 人工」，它依然是自动排程的。
 
 **防风控加固**（v0.17.3，来源见 `docs/风控策略调研.md`）：设备指纹派生统一为
+  
 `md5("<purpose>:<uid>")`（此前 Go 用 sha256、Python 用 md5，**同一账号经两条通道对上游呈现两个设备标识**）；
+  
 空 uid / 派生碰撞计入仪表盘「指纹异常」显性告警（原本完全静默）；批内多任务错峰 60~150s
+  
 （同一时点多类任务遍历同一批账号）；六类任务补齐「手动 vs 定时」运行互斥（撞车即让路，避免双倍打上游）。
 
 **成长任务不走排程**（v0.17.0）：它发的是真实写请求（上报 / accept / claim），且每个号要按四类客户端指纹分别构造事件链，风险与成本都高于上面六类；「哪些号该跑」也是运营判断而非时间判断。因此改为**选号手动执行** —— 管理后台与用户控制台都有独立的「成长任务」页（v0.17.1）：勾选账号后点「跑成长任务」（跑单个则点账号卡上的成长任务标签），后台逐个串行、账号之间随机等待 30~120 秒，已完成的由服务端幂等跳过。同一页可查看**完成进度**：进度条按「本功能可自动完成的 16 项」算，明细列出全部任务且未完成排前；查进度是只读请求、串行 + 账号间亚秒级错开、结果缓存 5 分钟、单次上限 20 个账号。入口：`POST /api/admin/growth/run`、`POST /api/admin/growth/progress`、`GET /api/admin/growth/overview`（用户侧同名 `/api/host/growth/*`，只认本人代挂账号）。
@@ -160,91 +170,143 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 **代理页拆为「出口代理 / 账号代理」+ 修掉过时说明**（v0.17.9）：
 
 - 侧边栏「出口代理」改名「**代理**」，页内分三块：**出口代理**（线路池：有哪些 IP）/ **账号代理**
+    
   （逐账号：这个号实际从哪出）/ **去哪弄代理**（选购指南）。
 - 新增 `GET /api/admin/egress/accounts`：逐账号给出**配置值**与**实际出口**（两列分开，因为
+    
   「未指定」可能继承全局默认）、五态（指定线路 / 继承默认 / 显式直连 / 未指定直连 / 配置异常）
+    
   与计数汇总；**排序刻意把「配置异常」放最前**（坏代理会让账号被排除出选号，最该先处理）。
+    
   每行可单独**改 / 直连 / 清空**，设置时服务端实测并回显真实出口 IP。
 - **修掉过时说明**：页面上还写着「账号池卡片上的『代理』按钮可设置」——那两个按钮 v0.15.0 就撤了；
+    
   另有「留空表示有意直连」与同页三态口径自相矛盾。已一并改正，并同步设置页与账号卡的交叉引用。
-- 界面内新增**「去哪弄代理」**：与使用说明同口径，重点是那条最容易买错的硬约束 ——
+- 界面内新&#x589E;**「去哪弄代理」**：与使用说明同口径，重点是那条最容易买错的硬约束 ——
+    
   上游是国内域名、账号是国内号，**不要买海外住宅代理 / 不要拿境外 VPS 当出口**；
+    
   并给出渠道对照表、自建与商业两条路线、随包 `tools/proxyscan` 验证方法、7 条踩坑（含合规）。
 
 **密钥脱敏 / 深色模式 / 改密码 / 公告 / 消耗排行 / 仪表盘修复**（v0.17.8）：
 
 - **API 密钥默认脱敏**：`GET /api/keys` 不再返回明文（只回 `masked` + `revealable`），
+    
   完整值走显式 `GET /api/keys/{id}/reveal`（本人限定、单把、不写日志）。掩码保留 `sk-wb-` 前缀与末 4 位，
+    
   中间固定 8 个 `•`（长度不随真实密钥变化）。测试对话页改为「下拉存 id、发送时才取明文」。
 - **深色模式**：两侧侧边栏底部「深色 / 浅色」按钮，`<html data-theme>` 驱动 CSS 变量，**即时生效**；
+    
   偏好落 `localStorage`（刷新 / 重新登录保持）；未手选时跟随系统 `prefers-color-scheme`；
+    
   四个页面 `<head>` 有首屏防闪内联脚本。
 - **修改密码**：`POST /api/auth/password`。规则：8–128 位、至少两类字符、不得与用户名/原密码相同；
+    
   原密码错一律 401（防探测）；成功后**注销其它会话、保留当前**。
 - **站内公告**：`announcements` 表 + 管理端增删改查/启停 + 用户侧只读。
+    
   概览页**顶部**的「公告」卡片**始终**展示启用中的（置顶优先，≤20 条；**无公告时整块隐藏**）；
+    
   进入控制台弹窗**只弹未读**的
+    
   （已读 id 记 `localStorage`）。约束：标题 ≤60 / 正文 ≤1000 / 总量 ≤100，超限 400 不静默截断。
 - **用户消耗排行**：按**消耗点数降序**（→ 请求数 → id）排序，**不含管理密钥通道**（`user_id=0`）。
+    
   管理端报表页（完整用户名，≤50 名）/ 用户控制台概览（**他人脱敏** + 自己的名次，≤10 名，15 秒轮询）。
+    
   不按 token 排 —— token 与费用非线性，会得出误导性榜单。
 - **号池仪表盘修复**：① 导入新号后「积分合计」不更新 —— 池内 credits 是内存快照，新号在首次签到前恒为 0；
+    
   现改为**导入后立即异步拉取**这批新号的余额（账号间错开数百毫秒），并新增手动「刷新余额」
+    
   （`POST /api/admin/credits/refresh`，候选 = 池内余额为 0 且可用）。实测**合计 65,396 → 114,578**。
+    
   ② 健康度新增「**冷却账号明细**」：账号名 + 硬/软冷却 + 剩余时间（升序，≤8 条，停用号不计入）。
 
 **点数 / 金额双口径统一 + 逐用户返点比例**（v0.17.7）：系统里并存三种数 ——
+  
 **点**（平台点数：余额/消费/限额）、**钱**（元 ＝ 点 × 折算比例：返点/提现）、
+  
 **号池积分**（上游账号 credits，与点无固定换算）。此前混着叫，现在统一：
 
 - 余额：点为主 + `≈ ¥` 副行（用户概览、用量页、提现页、管理端用户卡）；
 - 返点：**一律以 `¥` 为主**（我的返点、账号代挂收益、用户/账号卡累计收益、提现审核），点数降为副行/tooltip；
 - 号池积分：统一写作「号池积分」（不再是裸「积分」），避免与点混淆；
 - 折算比例**全站只有一个**（提现页那个「元/点」，默认 0.01），不另设第二套 —— 否则同一笔钱两处数字不同。
+    
   注意别与「计费倍率」混：那是「1 号池积分折多少**点**」，与「1 点折多少**元**」是不同的量。
 - **逐用户返点比例**：管理后台「用户」页卡片上的「号池分成 / 推广返点」标签可点开编辑
+    
   （`0~1`；留空 = 恢复跟随全局）。解析口径「用户覆盖（≥0）优先，否则全局」，
+    
   `-1`（未覆盖）与 `0`（明确不分成）语义区分。改动即时刷新展示，且**只影响之后入账、不追溯**。
+    
   入口：`GET/POST /api/admin/users/{id}/ratios`。
+    
   金额是「点的展示形态」而非独立账目：历史流水的 `¥` 会随比例调整而变（刻意，避免两个真相源）。
 
 **号池仪表盘实时化：消耗真正回写池内余额**（v0.17.6）：把「消耗」写回池内余额的函数
+  
 `pool.NoteModelCost` **只在 `internal/server` 里被调用，cmd/webapp 从来没调**（代码注释里
+  
 自己写着这一点）。后果：池内 `credits` 只在签到（9/21 点）被覆盖，两次签到之间（最长 12 小时）
+  
 仪表盘的「积分合计 / 平均积分 / 积分 Top 8」整块冻结 —— 这就是「仪表盘不实时」的根因。
+  
 现在流式与非流式两条成功路径都会读上游 `usage.credit` 并回写余额与成本账本（只为
+  
 **真实回报 credit** 的响应记账，避免估算值回灌成回音壁）。
 
 同时修掉扣减口径的一个次生缺陷：`int64(credit + 0.5)` 会丢弃不足 0.5 的小数，
+  
 便宜模型（0.019 积分/1k token）的消耗永远扣不掉；改为**余数留存累加**（过 0.5 才扣 1），
+  
 保留「单次 2.5 → 扣 3」的既有口径。
 
 另外两处：**管理密钥通道的流量也进号池台账**（原先 `settleUsage` 在无用户时直接 return，
+  
 用管理密钥自测在仪表盘上完全不可见；现在记 `user_id=0` 的零费用流水，用户账单天然隔离）；
+  
 前端 `poll()` 的停止函数补上 `visibilitychange` 解绑（此前每次切页累积一个监听器，
+  
 切回前台会一次打出多份请求）。
 
 **长请求不再被自己掐断 + 粘性跨重启保持**（v0.17.5）：两个线上实际问题一起修掉。
 
 - **会话中断**：流式转发此前用的是带 `Timeout: 180s` 的 HTTP 客户端，而 Go 的
+    
   `http.Client.Timeout` **包含读取响应体全程** —— 长回答 / Agent 多轮工具调用 / 深度思考
+    
   超过 3 分钟就被网关自己切断。现在流式请求走**无总超时**变体（只保留 30s 响应头超时），
+    
   非流式仍留 180s 上界。同时补齐中断可见性：流式断流**补 `[DONE]`** 让客户端正常收尾并记
+    
   WARN + 实时事件 + 失败流水（0 费用）；非流式聚合中断改回 **502**（此前会把半截内容
+    
   当完整回答以 200 发出）。
 - **换号**：会话粘性绑定此前是**纯内存**（`redisstore.Noop`）—— 进程一重启全清，重启后
+    
   同一场对话的下一个请求会重新分配账号。现在绑定落 `sticky_binds` 表并在启动时读回
+    
   （异步落库、队列满即丢，不阻塞转发）。
 - **可查**：响应头 `X-Wb-Account` 透出本次服务的账号；流水新增 `sticky_key_hash` +
+    
   `attempts`（>1 = 发生过失败换号回退）；新增 `GET /api/admin/selection-trace` 按会话聚合，
+    
   直接列出**被多个账号服务过**的会话。
 
 **调度状态可见 + 触发异步**（v0.17.4）：`GET /api/admin/tasks` 除台账外还返回
+  
 `running`（当前正在执行的任务类）与 `next_runs`（各类下次触发时刻，**已含抖动偏移**，
+  
 即实际会跑的时间）。管理页定时任务页据此新增「调度状态」栏，并**自动刷新**
+  
 （有任务在执行时 3 秒、空闲 20 秒）。`POST /api/admin/tasks/{kind}/run` 改为**异步**：
+  
 立即返回 `started`，撞车返回 409 —— 此前同步阻塞要等整轮跑完（保活 18 号约 6.4s、
+  
 活跃上报 2~3 分钟），期间前端无任何进度，且长请求会被反代的 60s 读超时打断；
+  
 这就是「手动有效但反馈慢 / 点了没反应」的根因。
 
 **错过窗口可手动补跑**：窗口被错过时（服务刚重启、上游当时抖动、刚加完号）不必干等到下一个整点——`POST /admin/tasks/{name}/run`（`name` ∈ `checkin` / `activity` / `keepalive` / `travel` / `school` / `cat`）立即受理并让网关在后台补跑一次。受理是**异步**的（回 202，命令不等任务跑完——这些任务遍历全池打上游、部分还起 python 子进程，耗时可达分钟级），进度看网关日志；同一任务已有一趟在跑时回 409，避免连点对上游重复写。**零上游增量**：只是把既有任务提前跑一次，不新增任何自动上游请求。需 `admin.enabled`（与账号管理端点共用开关与 `api_key`），入口另有 `./acct.sh task <name>`。
@@ -255,7 +317,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 ### 双域适配
 
-- 同时适配**国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）**账号
+- 同时适配**国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）**&#x8D26;号
 - 共享同一账号池，由账号 `realm` 或请求模型名前缀（`cn:` / `global:`）决定路由；`global.enabled` 可一键锁死纯 CN 部署
 - 国际版支持注册激活、地区完善、一次性 trial 加油包领取（`./trial.sh`）
 
@@ -271,9 +333,13 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 ## 防风控策略
 
 本项目的防风控设计与同类项目横向对比见 **[`docs/风控策略调研.md`](docs/风控策略调研.md)**（含证据强度分级）。
+  
 落地要点：请求头/请求体伪装（UA 平台段、设备指纹、模板句脱敏）、多层节流（确定性抖动、
+  
 账号间间隔、批内错峰、出口抖动）、出口隔离（出口池 + 同号主隔离 + 裸奔拦截）、
+  
 账号状态机（软/硬冷却、熔断、三振、连败降权）、重试纪律（AllFailed 才重试、失败不重试）、
+  
 指纹异常显性告警。
 
 ## 架构总览
@@ -310,7 +376,7 @@ flowchart LR
 ### Docker Compose 一键部署
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/sheng-du0521/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 ```
@@ -397,10 +463,13 @@ go build -trimpath -ldflags="-s -w" -o credit.exe ./cmd/credit
 ```
 
 PID 写入 `wb2api.pid`，标准输出与错误日志分别写入 `data/server.out.log`、
+  
 `data/server.err.log`。停止脚本会先验证 PID 对应的可执行文件确为当前目录下的
+  
 `wb2api.exe`，不会因陈旧 PID 误杀其他进程。
 
 添加账号可使用配套管理面板，或在 Git Bash 中运行现有 `login.sh`（它还负责 CN
+  
 首次签到以及 Global 注册地区/trial 流程；不建议只手工调用 `login.exe` 后跳过这些步骤）。
 
 ### 验证
@@ -466,27 +535,17 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 **7. 条款变更。** 本项目保留随时修改、补充本声明的权利。修改后的声明自发布之日起生效，继续使用本项目即视为接受修订后的声明。本项目所有内容仅供学习和研究使用，请于学习研究完成后及时删除。
 
-## ☕ Coffee
+## 联系方式
 
-如果这个项目对你有帮助，欢迎请我喝杯咖啡～
+- 微信：`tgy254160`（作者唯一联系方式；本项目**没有任何交流群 / 频道 / 付费社群**）
 
-<table>
-  <tr>
-    <td align="center"><b>💰 Solana</b></td>
-    <td><code>AZAKF74rTu7UFVSNRzsKV4HHpTwarax6cG8KAh4fP5rQ</code></td>
-  </tr>
-  <tr>
-    <td align="center"><b>💎 Ethereum</b></td>
-    <td><code>0x1d418627aD6B043900CBE11fe439759bDF2b5170</code></td>
-  </tr>
-  <tr>
-    <td align="center"><b>₿ Bitcoin</b></td>
-    <td><code>bc1q9w7h4j9msyd9q6lhl0398n4s3g8h4vchpqvc2k</code></td>
-  </tr>
-</table>
+## 赞助支持
 
-## 特别感谢
-- [@YuJunZhiXue](https://github.com/YuJunZhiXue)
+如果这个项目对你有帮助，欢迎扫码请作者喝杯咖啡（微信支付）：
+
+<p align="center">
+  <img src="assets/wx-pay.jpg" alt="微信赞赏码" width="260">
+</p>
 
 ## License
 
@@ -494,9 +553,12 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 - 在遵守 MIT License 前提下，允许使用、复制、修改、合并本项目源代码
 - **禁止商用倒卖**：不得将本项目源码（含衍生版本、修改版本）用于商业转售、倒卖或付费分发。
+    
   详见 [NOTICE](NOTICE) —— 其中同时写明了本声明的**法律边界**：MIT 授予的权利不可撤销，
+    
   本声明无法收回它们；它在作者意愿表达、授权事实记录与商标/品牌层面有效，
+    
   但不构成对 MIT 的修改
-- 再分发（源码或二进制形式）时，须保留原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`
+- 再分发（源码或二进制形式）时，须保留原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处 `https://github.com/sheng-du0521/workbuddy2api`
 - 本项目不授予任何上游（CodeBuddy）接口或服务的权利；使用者仍需自行遵守上游服务条款
 - 本项目的使用同时受上方**免责声明**约束；如免责声明与 MIT License 存在不一致，以免责声明为准

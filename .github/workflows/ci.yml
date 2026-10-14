@@ -1,0 +1,92 @@
+# ci.yml 代码质量闸门（v0.24.0 新增）。
+#
+# 为什么必须补：此前仓库的 workflow 只有「定时多架构打包」与「issue/PR 治理」，
+# **没有任何一个跑 go test / go vet / gofmt**（见 docs/项目全面审查报告-v0.23.3.md 的 P1-3）。
+# 测试全靠人工在本机跑 —— 于是 5 万行测试代码没有任何自动化守护，
+# 一次疏忽提交就可能把绿变红而无人知晓。
+#
+# 本 workflow 是那层守护，闸门从宽到严：
+#   1) gofmt：格式必须干净（最低门槛、零争议）
+#   2) go vet：静态可疑点
+#   3) go test：全量单测（含竞态敏感的并发用例）
+#   4) go test -race：**竞态检测**（本机无 gcc 跑不了，CI 上是唯一能跑到它的地方）
+#   5) go test -cover：覆盖率报告（只报告不设阈值，避免一上来就卡住存量）
+#
+# 前端（cmd/webapp/ui）没有构建步骤（原生 DOM + 内联脚本，无打包器），
+# 故这里只做「内联脚本语法检查」——等价于 tools/jscheck。
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: go vet + test (+race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # 依赖只有 3 个直接包，缓存收益明确且无副作用。
+          cache: true
+
+      # gofmt：格式漂移是最廉价的 review 噪音，先卡掉。
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未通过 gofmt："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race 需要 cgo；ubuntu-latest 自带 gcc，故这里能跑（本机 Windows 无 gcc 跑不了）。
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # 覆盖率只作报告：存量 cmd/webapp 覆盖率偏低（产品本体），
+      # 若一开始就设阈值，会把「补测试」这件长期工作变成阻断发布的即时故障。
+      - name: go test -cover
+        run: |
+          go test -count=1 -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  ui:
+    name: 前端内联脚本语法 + jsdom 冒烟
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # 前端是「内联脚本 + 无框架」，没有构建步骤；至少保证 <script> 语法正确
+      # （坏一个字符整页白屏），再跑一遍 jsdom 冒烟（逐页切导航 + 断言容器被填充）。
+      #
+      # v0.24.0：这两个脚本此前住在仓库外且硬编码绝对路径（不受版本控制、不进 CI、
+      # 换机即失效）。现已随代码入库为 tools/jscheck.mjs 与 tools/uitest.mjs。
+      - name: check inline scripts
+        run: npm run jscheck
+      - name: jsdom smoke test
+        run: npm run uitest
