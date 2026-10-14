@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 )
 
 var flushInterval = 5 * time.Second
@@ -243,8 +244,76 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost = nil
 			}
 		}
+		// 存量自愈：纠正旧实现留下的「6004 写成账号级冷却」错误形态（v0.26.4）。
+		// 放在这里而不是 load() 里：本地文件恢复与 Redis 快照恢复共用本函数，
+		// 两条路径都必须纠正，否则换一条路径启动就又回到错误形态。
+		if healLegacyModelLimitCooldown(e, now) {
+			log.Printf("WARN: [pool] 已纠正存量错误冷却：acct=%s 旧形态是「6004 模型级限额」"+
+				"却被写成了**账号级**冷却（会把该号对所有模型一起挡掉）。已清除，"+
+				"该号恢复对所有模型可用；若该模型确实被限，下一次请求会以"+
+				"**模型级**冷却重新记录（只挡那一个模型）。",
+				logfmt.Label(uid, ""))
+		}
 		p.byUID[uid] = e
 	}
+}
+
+// legacyModelLimitReason 旧实现把 6004（模型级限额）误写成**账号级**冷却时的 reason 前缀。
+//
+// 精确匹配这个前缀（而不是宽松地找 "6004"）是因为 reason 里出现 "6004" 却属于
+// **正常**形态的情形也存在：新实现的模型级冷却 reason 是
+// "6004 model rate limit [reset=body-text]"，那写在 modelCooldowns 里，不是账号级。
+const legacyModelLimitReason = "6004 model rate limit"
+
+// healLegacyModelLimitCooldown 纠正「reason 说是模型级限额、效果却是账号级冷却」的矛盾状态。
+//
+// ## 为什么这是必须修的存量问题
+//
+// 6004 的语义是**模型级**（上游用 `"code":6004` 表达"这个模型用量超限"，见
+// upstream.IsModelRateLimit）。旧实现的零值分支却写 `e.until`（账号级），于是：
+//
+//	带 Retry-After 头的 6004 → 只挡该模型，切模型即可用；
+//	不带头的 6004          → **整个账号被挡**，所有模型一起不可用。
+//
+// 后者与语义直接矛盾，而且代价不是"多等一会儿"：账号级 until 最长 2h，
+// 期间这个凭证与余额都完好的号**从池里消失**。用户看到的现象就是
+// 「某些模型接不了」——其实是号被整体摘了。
+//
+// ## 为什么是"清除"而不是"迁移成模型级"
+//
+// 旧形态**没有记录是哪个模型**（旧代码在零值分支里写了 `e.modelCooldowns = nil`，
+// 恰好把唯一的线索抹掉了），所以无从迁移。清除的代价是：如果那个模型确实被限，
+// 下一次请求会再撞一次 6004 —— 那一次由新实现按模型级记录（并尽量对齐上游重置时刻）。
+// 两害相权：**多一次上游请求** vs **一个健康号被整体挡最长 2 小时**，取前者。
+//
+// 判定条件刻意收紧到四条全中，只清"确定自相矛盾"的那一类：
+//   - reason 以 legacyModelLimitReason 开头（精确到 6004 模型级限额）
+//   - 账号级 until 在未来（确实在挡）
+//   - coolKind == CoolSoft（软冷却；硬冷却=余额类，语义不同，绝不动）
+//   - 该号此刻没有绑定任何手动停用/系统禁用（那些是**人的决定**或其他病因，不该被顺手清掉）
+func healLegacyModelLimitCooldown(e *entry, now time.Time) bool {
+	if e == nil {
+		return false
+	}
+	if !strings.HasPrefix(e.reason, legacyModelLimitReason) {
+		return false
+	}
+	if e.until.IsZero() || !now.Before(e.until) {
+		return false
+	}
+	if e.coolKind != CoolSoft {
+		return false
+	}
+	if e.disabled || e.manualDisabled || !e.breakerUntil.IsZero() {
+		return false
+	}
+	e.until = time.Time{}
+	e.reason = ""
+	// coolKind 没有"零值 = 无冷却"的显式常量（CoolHard 就是 iota 0），
+	// 所以只能连 softStreak 一起归零，并靠 until 零值表达"不在冷却中"
+	// （pool 的 cooling 判定以 until 为准，见 entry.cooling/Status）。
+	e.softStreak = 0
+	return true
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。

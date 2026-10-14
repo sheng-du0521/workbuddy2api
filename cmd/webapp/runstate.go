@@ -27,9 +27,16 @@ import "strings"
 
 // 运行态枚举（供面板与告警使用；值稳定，前端按字符串匹配）。
 const (
-	RunStateOnline         = "online"          // 正常可用
-	RunStateCooling        = "cooling"         // 一般冷却（自动恢复）
-	RunStateRateLimited    = "rate_limited"    // 限流冷却（429 / 6004 模型级）
+	RunStateOnline  = "online"  // 正常可用
+	RunStateCooling = "cooling" // 一般冷却（自动恢复）
+	// RunStateRateLimited 限流冷却（**账号级**：429 / WAF 403 等）。
+	//
+	// ⚠️ 注意 6004（模型级限额）**不落在这里**（v0.26.4 起）：它只写 (账号, 模型)
+	// 的独立冷却表，账号级仍然健康 → 该号的 run_state 保持 online。
+	// 这不是遗漏而是正确口径：run_state 回答的是"这个号整体能不能用"，
+	// 而"某个模型被限"是**独立的维度**，由账号视图的 limited_models 表达
+	// （见 main.go 的 limitedModelView）。两者都不可用时才该降级 run_state。
+	RunStateRateLimited    = "rate_limited"
 	RunStateRiskCooling    = "risk_cooling"    // 风控冷却（11140 / 11128 / WAF）—— 等下去不会好
 	RunStateExhausted      = "exhausted"       // 额度/积分耗尽（等到次日或充值）
 	RunStateRelogin        = "relogin"         // 需重新登录 / 会话失效（必须人工）
@@ -110,6 +117,11 @@ func isRiskReason(reason string) bool {
 }
 
 // isRateLimitReason 限流类 —— 可自动恢复，但应看软冷却退避（soft_streak）决定要不要换个出口。
+//
+// 这里收 "6004" 是为**账号级** reason 兜底：v0.26.3 起正常的 6004 不再写账号级 reason
+// （只写模型表），所以命中它的情形只剩两种 —— 存量旧状态（由 pool 启动自愈清除）与
+// 将来若有代码误把 6004 的 reason 写进账号级。保留它不会误伤：真正的模型级限额
+// 根本不进这个判定（accountRunStateOf 先看 v.Cooling，模型级限额时它是 false）。
 func isRateLimitReason(reason string) bool {
 	r := strings.ToLower(reason)
 	for _, k := range []string{"429", "6004", "rate limit", "限流", "soft"} {

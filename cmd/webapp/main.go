@@ -40,6 +40,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,7 +55,20 @@ import (
 var uiFS embed.FS
 
 // version Web 应用版本标记。
-const version = "0.26.0"
+//
+// ⚠️ **发布时务必与仓库根的 `version.json` 同步**（v0.26.4 起由测试强制：
+// TestVersionMatchesManifest 会红）。这个常量从 v0.26.0 起被漏改过三次
+// （0.26.1/0.26.2/0.26.3 都没动），后果不只是"banner 显示旧版本"：
+//
+//   - **版本更新提醒的 `current` 取的就是它**（updatecheck.go 的 decideUpdate(version, …)）→
+//     current 恒为 0.26.0 而清单是 0.26.4 → 页面**误报"有新版本"**，诱导用户去"升级"到
+//     自己已经在跑的版本；反向错（清单也停旧）则会**漏报真实更新**。
+//   - /healthz（已鉴权）、/api/admin/live、/metrics 的 wb_webapp_info 都回显它 →
+//     运维看到的版本与真实二进制不符，排障时会怀疑错方向。
+//
+// 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
+// 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
+const version = "0.26.4"
 
 type app struct {
 	store  *Store
@@ -537,9 +551,17 @@ type accountView struct {
 	Reason      string `json:"reason,omitempty"`
 	SoftStreak  int    `json:"soft_streak,omitempty"`
 	LimitedMods int    `json:"rate_limited_models,omitempty"`
-	ModelCosts  int    `json:"model_costs,omitempty"`
-	FailCount   int    `json:"fail_count"`
-	ExpiresAt   int64  `json:"expires_at"`
+	// LimitedDetail 被限的**具体模型**及其截止时刻（v0.26.4）。
+	//
+	// 为什么光有计数不够：6004 是**模型级**限额，账号对其它模型仍然可用。
+	// 只给一个「限模×1」运维没法判断"到底哪个模型被限、什么时候恢复"——
+	// 也就无法回答"这个号现在能不能接某个模型"。这是本轮用户明确提出的口径：
+	// 「6004 的冷却是针对对应模型的，其他模型调用正常接」——既然行为如此，
+	// 界面就必须能**看出来**它如此（否则行为正确也没人能确认）。
+	LimitedDetail []limitedModelView `json:"limited_models,omitempty"`
+	ModelCosts    int                `json:"model_costs,omitempty"`
+	FailCount     int                `json:"fail_count"`
+	ExpiresAt     int64              `json:"expires_at"`
 	// Group 账号分组；Egress 该账号实际生效的出站代理（专用优先，其次全局默认；空=直连）。
 	Group  string `json:"group"`
 	Egress string `json:"egress"`
@@ -606,6 +628,45 @@ type accountView struct {
 	DeviceTokenState string `json:"device_token_state"`
 }
 
+// limitedModelsOf 池状态 → 视图行（按模型名排序，输出**确定**：map 遍历无序，
+// 不排序会让同一份状态在界面上每次刷新顺序都变）。
+//
+// 上限 8 个：一个账号同时被限的模型数现实中极少超过 2–3 个，截断只是防病态数据
+// 把卡片撑爆；截断时会带上 "…共 N 个" 的说明（见前端），不静默丢。
+func limitedModelsOf(rows []pool.RateLimitedModel) []limitedModelView {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]limitedModelView, 0, len(rows))
+	for _, r := range rows {
+		v := limitedModelView{Model: r.Model, Reason: r.Reason}
+		if !r.Until.IsZero() {
+			v.Until = r.Until.Unix()
+		}
+		if !r.ResetAt.IsZero() {
+			v.ResetAt = r.ResetAt.Unix()
+		}
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
+	const maxShown = 8
+	if len(out) > maxShown {
+		out = out[:maxShown]
+	}
+	return out
+}
+
+// limitedModelView 单个「被限模型」的视图行（账号卡片用）。
+type limitedModelView struct {
+	Model string `json:"model"`
+	// Until 我方冷却截止（可能被 soft_rate_max 截断）。0 = 未知。
+	Until int64 `json:"until,omitempty"`
+	// ResetAt 上游明示的重置墙钟（未经截断）。0 = 上游没给时间信息。
+	ResetAt int64 `json:"reset_at,omitempty"`
+	// Reason 触发原因（含 reset 来源后缀，可看出时长是上游给的还是本地估的）。
+	Reason string `json:"reason,omitempty"`
+}
+
 // toView 由池状态生成视图；expires/分组等仅存于库的字段从 acc 补齐，
 // 出站代理取实际生效值（专用优先，其次全局默认）。
 // toView 单账号视图（积分明细缓存按主键现查一次）。
@@ -620,19 +681,20 @@ func (a *app) toViewP(st pool.Status, acc *Account, cp cachedCreditPacks) accoun
 		name = st.UID
 	}
 	v := accountView{
-		UID:         st.UID,
-		Nickname:    name,
-		Realm:       st.Realm,
-		Credits:     st.Credits,
-		Disabled:    st.Disabled,
-		ManualOff:   st.ManualDisabled,
-		Cooling:     st.Cooling,
-		CoolKind:    st.CoolKind,
-		CoolingFor:  st.CoolRemaining,
-		Reason:      st.Reason,
-		SoftStreak:  st.SoftStreak,
-		LimitedMods: len(st.RateLimitedModels),
-		ModelCosts:  len(st.ModelCosts),
+		UID:           st.UID,
+		Nickname:      name,
+		Realm:         st.Realm,
+		Credits:       st.Credits,
+		Disabled:      st.Disabled,
+		ManualOff:     st.ManualDisabled,
+		Cooling:       st.Cooling,
+		CoolKind:      st.CoolKind,
+		CoolingFor:    st.CoolRemaining,
+		Reason:        st.Reason,
+		SoftStreak:    st.SoftStreak,
+		LimitedMods:   len(st.RateLimitedModels),
+		LimitedDetail: limitedModelsOf(st.RateLimitedModels),
+		ModelCosts:    len(st.ModelCosts),
 		// CreditsSeenAt == 0 = 从未拉取过权威余额（新导入的号在首次签到/检测前都是它）。
 		CreditsKnown: st.CreditsSeenAt != 0,
 	}

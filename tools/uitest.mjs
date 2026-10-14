@@ -62,6 +62,14 @@ const FX = {
         credit_cached_remain: 1234,
         // v0.25.1：设备凭证三态。给两个账号各一种，覆盖「有/无」两个分支。
         device_token_state: 'account',
+        // v0.26.4：模型级限额（6004）必须显示**具体模型**而不只是计数 ——
+        // 6004 只挡那一个模型，账号对其它模型仍可用，界面要能看出这一点。
+        rate_limited_models: 2,
+        limited_models: [
+          { model: 'glm-5.3', until: now + 3600, reset_at: now + 3600,
+            reason: '6004 model rate limit [reset=body-text]' },
+          { model: 'hy3-x', until: now + 1800, reason: '6004 model rate limit [reset=none→退避]' },
+        ],
         // v0.24.9：积分明细缓存（服务端上次查到的结果）随列表接口一起下发。
         // 有它的账号，卡片**零出站**就能列出积分包；没有的账号仍回落到
         // 「快照值 · 点开查明细」。故意只给第一个账号，好让两个分支都被覆盖到。
@@ -793,7 +801,12 @@ function run(pageFile, meOverride, plan) {
       lacks: [['#accCards', '反代组'], ['#accCards', '未分组']],
       textIn: [['#btnImportDesktop', '批量导入 JSON'], ['#accCards', '未指定'], ['#accCards', 'SOCKS'],
         // v0.15.4：每张卡有勾选框；工具栏有全选/清除/已选计数。
-        ['#accCards', '未指定']],
+        ['#accCards', '未指定'],
+        // v0.26.4：模型级限额要显示**具体模型**与恢复时间，并明说其它模型仍可用 ——
+        // 用户口径是「6004 只挡对应模型，其他模型正常接」，界面必须能验证这一点。
+        ['#accCards', '模型级限额'], ['#accCards', 'glm-5.3'], ['#accCards', '其它模型正常可用'],
+        // 上游没给时间的那条要标出「本地估」（区分"上游说的"与"我们猜的"）
+        ['#accCards', '本地估']],
       has: [['#accCards .ecard .pick input', 2], ['#chkAll', 1], ['#btnClearSel', 1], ['#selCount', 1],
         ['#bulkConsumeGroup option', 4]],
       texts: [['selSummary', '反代选号']] },

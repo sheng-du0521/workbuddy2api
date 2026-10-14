@@ -2380,7 +2380,24 @@ function accountCard(a) {
   const notes = [];
   if (a.reason) notes.push(a.reason);
   if (a.soft_streak > 1) notes.push('连软 ' + a.soft_streak);
-  if (a.rate_limited_models > 0) notes.push('限模×' + a.rate_limited_models);
+  // 模型级限额（6004）必须显示**具体模型**而不只是计数（v0.26.4）：
+  // 6004 只挡那一个模型，账号对其它模型仍然可用 —— 界面要能回答
+  // 「这个号现在能不能接某个模型」，只给「限模×1」等于没回答。
+  // 注意：line() 走 textContent（见 app.js 的 el），所以这里**不做 escapeHTML**
+  // —— 那会把中文与特殊字符二次编码成 &amp; 之类显示出来。
+  if (a.limited_models && a.limited_models.length) {
+    const parts = a.limited_models.map((m) => {
+      const reset = m.reset_at ? fmtTime(m.reset_at)
+        : (m.until ? fmtTime(m.until) + '（本地估）' : '时间未知');
+      return m.model + '（至 ' + reset + '）';
+    });
+    line('模型级限额', '仅 ' + parts.join('、') + ' 受限；其它模型正常可用' +
+      (a.rate_limited_models > a.limited_models.length
+        ? '（共 ' + a.rate_limited_models + ' 个，此处只列前 ' + a.limited_models.length + '）' : ''),
+      'warn');
+  } else if (a.rate_limited_models > 0) {
+    notes.push('限模×' + a.rate_limited_models);
+  }
   if (a.model_costs > 0) notes.push('成本台账×' + a.model_costs);
   if (a.fail_count > 0) notes.push('失败×' + a.fail_count);
   if (notes.length) line('备注', notes.join(' · '));
