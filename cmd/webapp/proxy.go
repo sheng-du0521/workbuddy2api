@@ -39,6 +39,20 @@ const (
 	chatPath = "/v2/chat/completions"
 	// softCooldown 429/WAF 等软冷却基准时长（指数退避由 pool 内部按 streak 计算）。
 	softCooldown = 60 * time.Second
+
+	// accountFaultCooldown 11140（request illegal）的专用冷却时长 —— **刻意远长于
+	// softCooldown**（R5，v0.26.1，对齐同类项目 AgentHub 实测后的 2h 口径）。
+	//
+	// 为什么不能沿用 60s：11140 的处置是「软冷却 + 连续计数，满 accountFaultThreshold
+	// 才摘除」。冷却只有 60s 时，一个风控窗口内 3 次白撞就能在 3 分钟内凑满阈值，
+	// 把一个凭证与余额完好的健康号摘掉 —— 2026-10-13 就是这么批量误杀 30 个号的。
+	// 阈值本身要表达的是「**持续性**被风控拦」，而不是「同一分钟内撞了三次」。
+	// 冷到 2h 后，凑满 3 次至少横跨 6 小时，才真正说明这个号在当前出口/形态下长期不可用。
+	//
+	// 与 14017（trial not activated）刻意不同：那是"补完 register 就能自愈"，
+	// 沿用短软冷却即可；11140 是出口 IP / 频率 / 请求形态问题，风控不会自己好，
+	// 1 分钟后被重新选中又是一次白撞（白撞本身也是可聚类的异常信号）。
+	accountFaultCooldown = 2 * time.Hour
 	// notFoundCooldown 上游 404 的固定短冷却时长（对齐 cmd/server 的 notFoundCooldown）。
 	// 偶发路径缺失不是限流信号，不该按 soft_rate 指数升级，更不该喂熔断——固定短冷却兜雪崩。
 	notFoundCooldown = 60 * time.Second
@@ -208,7 +222,18 @@ type Proxy struct {
 func NewProxy(store *Store, stateFp string) *Proxy {
 	// 从默认 Transport 克隆，保留 ProxyFromEnvironment：
 	// 本机出网走 WORKBUDDY 代理（http_proxy），自行构造 Transport 会丢掉代理导致 Dial 失败。
+	//
+	// R3（v0.26.1）：外层再包一道「本机 / 内网目标直连」过滤。
+	// 环境代理同样会接管私网目标（Go 的 httpproxy 只特判 `localhost` 一词，
+	// 对 `10.x` / `192.168.x` / `172.16-31.x` 一律照发），后果与 egressClient 那处相同。
+	envProxy := http.ProxyFromEnvironment
 	shared := http.DefaultTransport.(*http.Transport).Clone()
+	shared.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req != nil && req.URL != nil && egress.Bypass(req.URL.Hostname()) {
+			return nil, nil
+		}
+		return envProxy(req)
+	}
 	shared.MaxIdleConns = 100
 	shared.MaxIdleConnsPerHost = 10
 	shared.IdleConnTimeout = 90 * time.Second
@@ -886,7 +911,21 @@ func (p *Proxy) egressClient(proxyURL string) (*http.Client, error) {
 		return nil, fmt.Errorf("出站代理不可用：%v", err)
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.Proxy = http.ProxyURL(u)
+	// R3（v0.26.1）：**本机 / 内网目标不经代理**。
+	//
+	// 不能直接用 http.ProxyURL(u)：那会让代理接管**所有**出站请求，包括健康探测与
+	// 局域网端点 —— 内网目标被送进代理必然连不上，而界面上线路仍显示「正常」，
+	// 于是故障表现为「本地端点不可达」，与出口配置的因果关系完全看不出来。
+	// （同类项目 2026-10-12 修过同一类 bug：「配了 WB_HTTP_PROXY 也能连上上游」。）
+	tr.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req == nil || req.URL == nil {
+			return u, nil
+		}
+		if egress.Bypass(req.URL.Hostname()) {
+			return nil, nil // 直连
+		}
+		return u, nil
+	}
 	tr.MaxIdleConnsPerHost = 10
 	tr.ResponseHeaderTimeout = 30 * time.Second
 	tr.IdleConnTimeout = 90 * time.Second
@@ -1506,7 +1545,9 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 				p.archiveAbnormal(uid, reason, false)
 			}
 		} else {
-			p.pool.Cooldown(uid, pool.CoolSoft, softCooldown,
+			// R5（v0.26.1）：改用专用的 accountFaultCooldown（2h），不再用 softCooldown（60s）——
+			// 60s 会让「连续 3 次」在几分钟内凑满，把健康号摘掉；见常量处的说明。
+			p.pool.Cooldown(uid, pool.CoolSoft, accountFaultCooldown,
 				"11140 request illegal（累计 "+itoa(fails)+"/"+itoa(pool.AccountFaultThreshold())+"，未超阈值仅软冷却）")
 		}
 	case code == 12153:

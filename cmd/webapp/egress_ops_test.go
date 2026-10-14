@@ -18,6 +18,18 @@ import (
 // 只测**纯逻辑与边界**（不打网络）：探活本身依赖外网，放在单测里会又慢又 flaky。
 // ===========================================================================
 
+// setEgressMode 显式设定线路失效处置策略。
+//
+// 为什么这 5 个用例必须显式设 migrate：本组验证的是**迁移算法本身**（容量/隔离/只动出口），
+// 而 v0.26.1 起默认策略改成 strict（不静默换出口）—— 默认值下这些用例会正确地"不迁移"，
+// 那不是回归，是策略生效。要测算法就显式选择允许迁移。
+func setEgressMode(t *testing.T, s *Store, mode string) {
+	t.Helper()
+	if err := s.SetKV(kvEgressOnLineDown, mode); err != nil {
+		t.Fatalf("SetKV: %v", err)
+	}
+}
+
 func addProxy(t *testing.T, s *Store, id, url string, enabled, lastOK bool, streak int64) {
 	t.Helper()
 	if err := s.UpsertEgressProxy(&EgressProxy{
@@ -35,6 +47,7 @@ func TestRehomeAccountsFromDeadProxies(t *testing.T) {
 		&Account{UID: "e3", AccessToken: "tok"})
 	defer store.Close()
 	defer px.Close()
+	setEgressMode(t, store, egressOnLineDownMigrate)
 
 	dead := "http://10.0.0.1:8080"
 	alive := "http://10.0.0.2:8080"
@@ -77,6 +90,7 @@ func TestRehomeRespectsCapacity(t *testing.T) {
 		&Account{UID: "c3", AccessToken: "tok"})
 	defer store.Close()
 	defer px.Close()
+	setEgressMode(t, store, egressOnLineDownMigrate)
 	if err := store.SetKV(kvEgressMaxPerProxy, "2"); err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +126,7 @@ func TestRehomeNoHealthyProxyKeepsOriginal(t *testing.T) {
 	store, px, a := newTestApp(t, &Account{UID: "d1", AccessToken: "tok"})
 	defer store.Close()
 	defer px.Close()
+	setEgressMode(t, store, egressOnLineDownMigrate)
 	dead := "http://10.0.0.1:8080"
 	addProxy(t, store, "p-dead", dead, true, false, egressFailThreshold)
 	_ = store.SetAccountEgress("d1", dead)
@@ -141,6 +156,7 @@ func TestRehomeRespectsOwnerIsolation(t *testing.T) {
 		&Account{UID: "o2", AccessToken: "tok", OwnerUserID: 7})
 	defer store.Close()
 	defer px.Close()
+	setEgressMode(t, store, egressOnLineDownMigrate)
 
 	dead := "http://10.0.0.1:8080"
 	alive1 := "http://10.0.0.2:8080"
@@ -167,6 +183,7 @@ func TestRehomeOnlyTouchesEgress(t *testing.T) {
 	store, px, a := newTestApp(t, &Account{UID: "f1", AccessToken: "tok", ConsumeGroup: cgProxy})
 	defer store.Close()
 	defer px.Close()
+	setEgressMode(t, store, egressOnLineDownMigrate)
 	dead := "http://10.0.0.1:8080"
 	addProxy(t, store, "p-dead", dead, false, false, 0)
 	addProxy(t, store, "p-alive", "http://10.0.0.2:8080", true, true, 0)

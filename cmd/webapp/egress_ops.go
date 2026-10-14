@@ -46,7 +46,15 @@ type rehomeReport struct {
 	// 与本仓「宁可请求失败也不从本机 IP 裸奔」的原则正面矛盾，故已删除该行为。
 	// 保留原状的账号会被判 egressBad 排除出选号 —— 不可服务，但出口仍是一条
 	// 已知的坏线路，而不是本机 IP。
-	Kept     int      `json:"kept"`
+	Kept int `json:"kept"`
+	// Blocked（R1，v0.26.1）严格模式（"不静默换出口"）下**被拦下、刻意不迁移**的账号数。
+	//
+	// 为什么单列而不是并进 Kept：两者的原因完全不同 ——
+	//   Kept    = 想迁但**没有可用线路**（客观约束）；
+	//   Blocked = **策略不允许换出口**（主观决定，改设置即可继续）。
+	// 合在一起运维会以为"线路不够"，实际只需改一个开关。
+	Blocked  int      `json:"blocked"`
+	Mode     string   `json:"mode"` // 本次实际生效的策略：strict / migrate
 	Warnings []string `json:"warnings,omitempty"`
 }
 
@@ -81,7 +89,7 @@ type rehomeReport struct {
 //   - **不**删账号的任何状态位 —— 迁移只改 egress_proxy 一个字段，其余（冷却 /
 //     停用 / 分组）一概不动，避免"修出口"顺手改了别的东西。
 func (a *app) rehomeAccountsFromDeadProxies() rehomeReport {
-	rep := rehomeReport{}
+	rep := rehomeReport{Mode: a.egressOnLineDownMode()}
 	proxies, err := a.store.ListEgressProxies()
 	if err != nil {
 		rep.Warnings = append(rep.Warnings, "读取线路池失败："+err.Error())
@@ -158,6 +166,14 @@ func (a *app) rehomeAccountsFromDeadProxies() rehomeReport {
 		if cur == "" || !dead[cur] {
 			continue
 		}
+		// 严格模式（R1，v0.26.1 默认）：**不静默换出口**。
+		//
+		// 账号留在原线路 → 判 egressBad → 排除出选号 → 不服务，也不裸奔。
+		// 代价是可用性下降，换来的是"出口 IP 不会被程序在无人知晓时改掉"。
+		if !a.egressAllowAutoRehome() {
+			rep.Blocked++
+			continue
+		}
 		target := pickTarget(acc.OwnerUserID)
 		if target == "" {
 			// 无可用线路（或全部满载）：**保留原状**，绝不退化为直连（v0.24.8）。
@@ -188,10 +204,19 @@ func (a *app) rehomeAccountsFromDeadProxies() rehomeReport {
 	}
 	sort.Strings(rep.DeadProxies)
 
-	if rep.Moved+rep.Kept > 0 {
+	if rep.Moved+rep.Kept+rep.Blocked > 0 {
 		_ = a.proxy.SyncAccounts()
-		log.Printf("WARN: [egress] 自动迁移：坏线路 %d 条，迁到可用线路 %d 个账号，保留原状 %d 个",
-			len(rep.DeadProxies), rep.Moved, rep.Kept)
+		log.Printf("WARN: [egress] 出口线路失效处置（mode=%s）：坏线路 %d 条，迁移 %d 个账号，"+
+			"保留原状 %d 个，策略拦截 %d 个",
+			rep.Mode, len(rep.DeadProxies), rep.Moved, rep.Kept, rep.Blocked)
+	}
+	if rep.Blocked > 0 {
+		rep.Warnings = append(rep.Warnings,
+			"当前策略为 **strict（不静默换出口）**：坏线路上的 "+itoa(rep.Blocked)+
+				" 个账号**刻意没有迁移** —— 换出口在上游眼里就是特征变化。"+
+				"它们仍留在原线路（不会从本机 IP 裸奔）但在修复前不可服务。"+
+				"处置二选一：①补一条可用线路后把账号手动改绑；②把设置项 `egress_on_line_down` "+
+				"改成 `migrate` 允许自动迁移。")
 	}
 	if rep.Kept > 0 {
 		rep.Warnings = append(rep.Warnings,

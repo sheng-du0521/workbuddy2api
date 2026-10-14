@@ -1205,6 +1205,11 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		// 出口代理池参数（v0.14.0 防封）。
 		EgressMaxPerProxy *int `json:"egress_max_per_proxy"` // 同出口账号数上限（**0 = 不限**，见 defaultMaxPerProxy）
 		EgressJitterMs    *int `json:"egress_jitter_ms"`     // 请求前抖动上限（毫秒，0=关闭）
+		// EgressOnLineDown 线路失效时的处置（R1，v0.26.1）：
+		//   strict（默认）= 不静默换出口（账号留在原线路、排除选号、等人处理）
+		//   migrate       = 自动迁移到可用线路（旧行为）
+		// 见 egress_policy.go —— 为什么默认 strict 写在那里。
+		EgressOnLineDown *string `json:"egress_on_line_down"`
 		// 选号模式（v0.15.1）：weighted（缺省，三因子加权随机）|
 		// roundrobin（顺序游标轮转，负载均匀铺开，对齐参考实现）。
 		PickMode *string `json:"pick_mode"`
@@ -1421,6 +1426,24 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		if v < 0 {
 			v = 0
 		}
+		if v := strings.TrimSpace(*req.EgressOnLineDown); v != "" {
+			m, ok := normaliseEgressOnLineDown(v)
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "egress_on_line_down 只能是 strict 或 migrate"})
+				return
+			}
+			if err := a.store.SetKV(kvEgressOnLineDown, m); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+	}
+	if req.EgressMaxPerProxy != nil {
+		v := *req.EgressMaxPerProxy
+		if v < 0 {
+			v = 0
+		}
 		if err := a.store.SetKV(kvEgressMaxPerProxy, strconv.Itoa(v)); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -1604,6 +1627,8 @@ func (a *app) settingsView() map[string]any {
 	// 出口代理池参数（v0.14.0 防封）。
 	out["egress_max_per_proxy"] = a.store.egressMaxPerProxy()
 	out["egress_jitter_ms"] = a.proxy.egressJitterMsNow()
+	// 线路失效处置策略（R1）：回显当前生效值，strict = 不静默换出口。
+	out["egress_on_line_down"] = a.egressOnLineDownMode()
 	// 导入防关联 + 积分补新（v0.25.0）。换 IP 命令**原样回显**给管理员：
 	// 它是配置项不是密钥，回显才能核对填对没有（命令里可能带插座 token，
 	// 但能看到它的人本来就有管理密钥）。

@@ -41,7 +41,14 @@ type Config struct {
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
-	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// AccountFaultCooldown 11140（request illegal）的**专用**冷却时长，默认 2h（R5）。
+	//
+	// 为什么必须与 SoftCooldown 分开：11140 是「软冷却 + 连续计数，满阈值才摘除」，
+	// 若沿用 600s，一个风控窗口内数次白撞即可凑满阈值把健康号摘掉。阈值要表达的是
+	// **持续性**被拦，而不是同一时段撞了几次。详见 cmd/webapp 的同名常量。
+	AccountFaultCooldown time.Duration
+	RefreshSkew          time.Duration // token 提前刷新窗口，默认 10m
 
 	// PromptMode "passthrough"（默认，透传客户端原始 system）/ "custom"（网关替换）。
 	PromptMode string
@@ -141,6 +148,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
+	}
+	if cfg.AccountFaultCooldown <= 0 {
+		cfg.AccountFaultCooldown = 2 * time.Hour // 11140 专用冷却（R5）：见字段注释
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
@@ -1212,7 +1222,8 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				h.cfg.Pool.RetireAccount(uid, upstream.ErrAccountFault, reasonIllegalRetire)
 				return
 			}
-			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown,
+			// R5（v0.26.1）：11140 走专用长冷却（默认 2h），不再用 SoftCooldown。
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.AccountFaultCooldown,
 				"11140 request illegal（累计 "+strconv.Itoa(fails)+"/"+strconv.Itoa(pool.AccountFaultThreshold())+"，未超阈值仅软冷却）")
 			return
 		}

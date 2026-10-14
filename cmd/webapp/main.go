@@ -544,6 +544,9 @@ type accountView struct {
 	// EgressError 出站代理不可用的原因（空 = 正常）。非空时该账号已被排除出平台选号，
 	// 目的是不让它从本机 IP 裸奔出去（见 Proxy.egressBad 的说明）。
 	EgressError string `json:"egress_error,omitempty"`
+	// RunState 运行态枚举（R9）：把布尔位与自由文案收敛成九态，见 runstate.go。
+	// 存在的理由：区分「风控冷却」与「限流冷却」—— 两者处置方向相反，此前都显示"冷却中"。
+	RunState string `json:"run_state"`
 	// ---- 用户代挂（hosting）----
 	// OwnerID：0 = 平台自持；>0 = 该用户代挂。OwnerName 供管理后台直接展示。
 	OwnerID   int64  `json:"owner_id"`
@@ -669,6 +672,7 @@ func (a *app) toViewP(st pool.Status, acc *Account, cp cachedCreditPacks) accoun
 		v.CreditCachedRemain = cachedRemain(cp, time.Now().Unix())
 	}
 	v.DeviceTokenState = a.deviceTokenState(acc)
+	v.RunState = accountRunStateOf(v.Disabled, v.ManualOff, v.Cooling, v.Reason, v.CoolKind, v.EgressError)
 	return v
 }
 
@@ -1224,6 +1228,9 @@ func (a *app) routes() *http.ServeMux {
 	// 选号轨迹诊断（v0.17.5）：按会话聚合流水，列出「被多个账号服务过」的会话 ——
 	// 直接回答「同一场对话是否在调用过程中换号」。只读，不参与运行时决策。
 	mux.HandleFunc("GET /api/admin/selection-trace", a.adminGuard(a.handleSelectionTrace))
+	// 选号可观测性（R7/R8，v0.26.1）：均衡度指标 + 候选队列预览（为什么排这 / 为什么跳过）。
+	mux.HandleFunc("GET /api/admin/selection-balance", a.adminGuard(a.handleSelectionBalance))
+	mux.HandleFunc("GET /api/admin/selection-candidates", a.adminGuard(a.handleSelectionCandidates))
 	mux.HandleFunc("GET /api/admin/accounts", a.adminGuard(a.handleListAccounts))
 	mux.HandleFunc("GET /api/admin/pool", a.adminGuard(a.handlePool))
 	mux.HandleFunc("POST /api/admin/accounts/sync", a.adminGuard(a.handleSync))
@@ -1296,6 +1303,14 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/growth/run", a.adminGuard(a.handleGrowthRun))
 	mux.HandleFunc("POST /api/admin/accounts/consume-group/batch", a.adminGuard(a.handleBatchConsumeGroup))
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/egress", a.adminGuard(a.handleAccountEgress))
+
+	// ---- 设备风控凭证（X-Device-Token，R2 / v0.26.1）----
+	// 每号写入通道 + 「共用一个即关联」审计 + 批量粘贴导入。
+	// 为什么值得单开一组：这是本仓库**唯一有逆向证据**的风控头，而此前它没有任何写入口，
+	// 全池长期为空（上游看到的是一台「无设备凭证的客户端」）。
+	mux.HandleFunc("POST /api/admin/accounts/{uid}/device-token", a.adminGuard(a.handleAccountDeviceToken))
+	mux.HandleFunc("GET /api/admin/device-tokens", a.adminGuard(a.handleDeviceTokenAudit))
+	mux.HandleFunc("POST /api/admin/device-tokens/bulk", a.adminGuard(a.handleDeviceTokenBulk))
 
 	// ---- 出口代理池（v0.14.0 防封）----
 	// 代理清单 + 批量分配 + 出口聚合看板 + 探活。
