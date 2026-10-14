@@ -972,6 +972,36 @@ func modelsCacheFreshLocked(now time.Time) bool {
 	return now.Sub(modelsCache.at) < modelsCacheTTL && len(modelsCache.payload) > 0
 }
 
+// modelsCacheSnapshotIfFresh 在**持读锁**的前提下判断新鲜度并取走 id 副本。
+//
+// v0.26.1 修的真实数据竞争：此前 refreshModelsCache 的快路径直接调用
+// modelsCacheFreshLocked（其注释已写明「调用方需持锁」）却**没持锁**，
+// 而慢路径会在写锁下改 at/payload —— 8 个并发调用时 `go test -race`
+// 稳定报 DATA RACE（TestModelsCacheSingleFlight，CI 上抓到）。
+//
+// 顺带把「判断 + 取值」放进同一个临界区，避免两次加锁之间的 TOCTOU：
+// 若先判断再单独取副本，中间可能被刷新线程插进来，虽然只影响一次返回值，
+// 但没有理由留下这个窗口。
+func modelsCacheSnapshotIfFresh() ([]string, bool) {
+	modelsCache.mu.RLock()
+	defer modelsCache.mu.RUnlock()
+	if !modelsCacheFreshLocked(time.Now()) {
+		return nil, false
+	}
+	return copyIDs(modelsCache.ids), true
+}
+
+// modelsCacheFresh 缓存是否仍然新鲜（自带读锁，供缓存外部调用者使用）。
+//
+// 存在的意义：modelsCacheFreshLocked 要求调用方持锁，而「只想知道新不新鲜」的
+// 调用方（如控制台模型列表入口）很容易忘记加锁 —— insights.go 就漏了。
+// 提供一个自带锁的版本，让外部调用方没有写错的余地。
+func modelsCacheFresh() bool {
+	modelsCache.mu.RLock()
+	defer modelsCache.mu.RUnlock()
+	return modelsCacheFreshLocked(time.Now())
+}
+
 // modelsPayload 返回缓存载荷副本（无缓存时 nil）。
 func modelsPayload() []byte {
 	modelsCache.mu.RLock()
@@ -993,8 +1023,10 @@ func modelsPayload() []byte {
 // 代价是刷新期间其他请求阻塞（最长一次上游超时），但这比"每个请求都打一次上游"好得多，
 // 且 5 分钟才发生一次。不引 golang.org/x/sync/singleflight 是为了守住 3 个直接依赖。
 func (a *app) refreshModelsCache() []string {
-	if modelsCacheFreshLocked(time.Now()) {
-		return cachedModelIDs()
+	// 快路径必须**持读锁**：modelsCacheFreshLocked 读 at/payload，
+	// 而下面的慢路径会在写锁下写它们。此处曾无锁（见 modelsCacheSnapshotIfFresh 注释）。
+	if ids, ok := modelsCacheSnapshotIfFresh(); ok {
+		return ids
 	}
 
 	modelsCache.mu.Lock()

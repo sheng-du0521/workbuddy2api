@@ -19,9 +19,16 @@ import (
 // refreshModelsCache 写）。/v1/models 又恰是客户端接入的第一个探测请求 —— 多客户端
 // 同时接入就会撞上；同时每个并发请求各自打上游（惊群）。
 //
-// 注：本环境无 gcc，`go test -race` 跑不起来（见 docs/项目全面审查报告 P1-3）。
-// 因此这里不依赖 -race，而是断言**可观测行为**：并发刷新只应触发**一轮**上游探测。
+// 注：本机（Windows）无 gcc，`go test -race` 跑不起来，所以这里不依赖 -race，
+// 而是断言**可观测行为**：并发刷新只应触发**一轮**上游探测。
 // 修复前 N=8 个并发会打出 8 轮；修复后应为 1 轮（2 次探测），差异是数量级的。
+//
+// ⚠️ 但**不要因此以为这个文件覆盖了并发安全** —— 恰恰相反：v0.24.0 声称修好的
+// 数据竞争其实只修了一半（快路径仍无锁），本文件因不依赖 -race 而漏掉了，
+// 最终由 CI 的 `go test -race -count=1 ./...` 在 2026-10-14 抓出
+// （DATA RACE: refreshModelsCache 写 at@1026 vs modelsCacheFreshLocked 读@972）。
+// 教训：**「本地跑不了 -race」不等于「可以不依赖 -race」**，CI 才是那个闸门；
+// 本机要复现得先有 cgo 工具链。
 
 // clearModelsCache 清空包级缓存（global）。
 //
@@ -96,6 +103,27 @@ func TestModelsCacheSingleFlight(t *testing.T) {
 			t.Fatalf("第 %d 个结果长度 %d 与首个 %d 不一致", i, len(ids), len(got[0]))
 		}
 	}
+
+	// 再并发打一遍**控制台模型列表入口**：它与 /v1/models 共用同一份缓存，
+	// 但走的是 insights.go 的另一条读路径。此处缓存已是热的，不会触发上游探测，
+	// 故不影响上面的调用计数断言。
+	//
+	// 加这段的原因：v0.26.1 修 modelsCache 数据竞争时，insights.go 里
+	// `time.Since(modelsCache.at)` 那处**完全无锁**的读是顺带发现的 ——
+	// 原用例只并发调 refreshModelsCache，覆盖不到它。补上后由 CI 的 -race 兜底。
+	var wg2 sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			rec := httptest.NewRecorder()
+			a.handleUserModels(rec, httptest.NewRequest(http.MethodGet, "/api/user/models", nil))
+			if rec.Code != http.StatusOK {
+				t.Errorf("handleUserModels 状态码 = %d, want 200", rec.Code)
+			}
+		}()
+	}
+	wg2.Wait()
 }
 
 // TestModelsCacheHitAvoidsUpstream 命中缓存时不再打上游（TTL 内）。

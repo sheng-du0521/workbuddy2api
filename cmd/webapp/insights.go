@@ -7,7 +7,6 @@ package main
 import (
 	"net/http"
 	"strconv"
-	"time"
 )
 
 // ======================================================================
@@ -120,7 +119,10 @@ func (a *app) hostEarnBlock(userID int64, days int) map[string]any {
 // 与 /v1/models 的区别：不消耗用户 Key 的限流桶、也不要求 Key 可用，
 // 直接复用同一份上游探测缓存（5 分钟）。
 func (a *app) handleUserModels(w http.ResponseWriter, r *http.Request) {
-	if time.Since(modelsCache.at) >= 5*time.Minute || len(modelsCache.payload) == 0 {
+	// 用自带读锁的 modelsCacheFresh：此前这里直接读 modelsCache.at/payload，
+	// 完全没有加锁（同样的数据竞争，2026-10-14 随 -race 一并修），
+	// 而且硬编码 5*time.Minute 会与 modelsCacheTTL 悄悄脱节。
+	if !modelsCacheFresh() {
 		// 触发一次刷新（与 /v1/models 共用缓存与探测逻辑）。
 		a.refreshModelsCache()
 	}
