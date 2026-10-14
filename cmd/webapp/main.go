@@ -131,6 +131,25 @@ func (a *app) initCaches() {
 // startedAt 进程启动时间（/metrics 的 uptime 基准）。
 var startedAt = time.Now()
 
+// reconcileReservationsOnStartup 启动期的预扣对账；**诊断模式必须跳过**。
+//
+// 抽成独立函数是为了让它**可测** —— 它承载一条靠肉眼守不住、又涉及钱的契约：
+// 只有「本进程将成为服务进程」时才能对账。诊断进程（`-check-update`）没有自己的在途
+// 请求，表里残留的记录只可能属于**正在服务的那个进程**，退了就是替别人退款。
+//
+// 回归测试见 TestReconcileReservationsSkippedInDiagnosticMode。
+func reconcileReservationsOnStartup(store *Store, diagnosticOnly bool) {
+	if diagnosticOnly {
+		// 刻意静默：诊断模式的输出要保持「只有一个版本检查结果」，不掺启动噪音。
+		return
+	}
+	if n, refunded, err := store.ReconcileReservations(); err != nil {
+		log.Printf("预扣对账失败: %v", err)
+	} else if n > 0 {
+		log.Printf("预扣对账：退还 %d 笔在途冻结，合计 %s 点", n, formatPoints(refunded))
+	}
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8780", "监听地址（默认仅本机）")
 	dbPath := flag.String("db", "./data/webapp.db", "SQLite 数据库路径")
@@ -152,6 +171,21 @@ func main() {
 		"只做一次版本更新检查并打印结果，然后退出（不启动服务）。\n"+
 			"供运维脚本/定时巡检使用；退出码 0=已最新 1=有新版 2=检查失败")
 	flag.Parse()
+
+	// diagnosticOnly 纯诊断模式：本进程**不会承接任何流量**，因此绝不允许做
+	// 「会改变业务状态」的启动副作用。
+	//
+	// 为什么必须有这个区分（2026-10-14 实测踩到）：`-check-update` 复用的是**完整启动
+	// 路径**，于是它也会执行 ReconcileReservations() —— 把 reservations 表里的在途预扣
+	// **全额退还给用户**。那个设计本意是回收「上个进程被强杀」留下的孤儿预扣，但它分不清
+	// 孤儿和**别的进程正在服务中的**预扣：真服务进程在服务某请求时，预扣记录同样在表里，
+	// 于是诊断进程把这笔钱退掉 → 服务随后结算时 `SettleReservation` 找不到记录 →
+	// 记 `[settle_failed:not found]` → 该笔**实际未被扣费**（方向对用户有利、不会重复
+	// 计费，但属于非预期变更，且诊断命令不该动钱）。
+	//
+	// 教训：诊断命令「只读」是错觉 —— 只要复用完整启动路径，就会带上所有启动副作用。
+	// **以后新增任何不接流量的诊断开关，都要并进这个变量。**
+	diagnosticOnly := *checkUpdate
 
 	// 可信代理集合（v0.24.1，P3-5）：不配 = 只信 loopback。
 	proxySet, err := parseIPSet(*trustedProxies)
@@ -239,11 +273,10 @@ func main() {
 	// 预扣对账：上次进程被强杀时残留在途预扣要把钱退回去。
 	// 那些请求的结果已无从得知（响应可能只发了一半），退还方向对用户有利；
 	// 也不会重复计费 —— 正常结算路径已 delete 记录，能留下的只有中断的。
-	if n, refunded, err := store.ReconcileReservations(); err != nil {
-		log.Printf("预扣对账失败: %v", err)
-	} else if n > 0 {
-		log.Printf("预扣对账：退还 %d 笔在途冻结，合计 %s 点", n, formatPoints(refunded))
-	}
+	//
+	// ⚠️ **只在服务进程里做**（diagnosticOnly == false）：诊断进程没有自己的在途请求，
+	// 表里的记录只可能属于**别人**。见上方 diagnosticOnly 的注释。
+	reconcileReservationsOnStartup(store, diagnosticOnly)
 
 	a := &app{
 		store:           store,
