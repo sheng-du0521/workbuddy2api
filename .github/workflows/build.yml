@@ -1,6 +1,6 @@
 # build.yml 定时多架构打包发布 ghcr.io + amd64 离线 tar.gz artifact。
 # 解决 issue #21「建议打包现成 docker 镜像」：NAS/离线环境拉不到 ghcr 时用 artifact。
-# 参考 /tmp/wb2api-build，适配本仓库（workflow 就住在仓库里，无需双 checkout 覆盖 Dockerfile）。
+# workflow 就住在仓库里，无需额外 checkout 覆盖 Dockerfile。
 name: Build & Publish
 
 on:
@@ -40,7 +40,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ghcr 镜像名必须全小写：github.repository 含大写（Sliverkiss/...），需转小写
+      # ghcr 镜像名必须全小写：github.repository 可能含大写字母，需转小写
       - name: Compute image name (lowercase)
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"

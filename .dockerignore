@@ -16,3 +16,28 @@ PLAN.md
 SPEC.md
 LOOP.md
 README.md
+
+# ============================================================
+# 构建上下文加固（防止把交付物 / 依赖 / 密钥送进 docker daemon）
+# 说明：Dockerfile 有 `COPY . .`，本地若有这些目录/文件会被整体打包——
+# 既拖慢构建、又会把 data/admin.key、webapp.db 之类塞进中间层。
+# ============================================================
+# 交付目录：webapp.exe(约20MB) / cloudflared.exe(53MB) / SQLite 库 / 管理密钥
+dist/
+# 前端工具链依赖（仅本地跑 UI 回归用，镜像内不需要）
+node_modules/
+# 运行期密钥与库（镜像内由挂载卷提供，绝不入镜像）
+admin.key
+secret.key
+gateway.key
+*.db
+*.log
+# 二进制与备份
+*.exe
+*.dll
+*.bak
+# 内部工作记忆与运维草稿（含真机 IP / 拓扑 / 凭据线索）
+.workbuddy/
+tools/warp/
+tools/usque/
+.tmp/
