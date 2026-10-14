@@ -84,8 +84,12 @@ jobs:
           # ---- 治理参数 ----
           canonical-label: 'canonical'
           duplicate-label: 'duplicate'
-          # 治理正式生效（2026-09-13 重放验证通过后关闭 dry-run）
-          dry-run: 'false'
+          # 本仓库自建成库、尚无任何治理历史可供验证 —— 按本文件开头的既定策略
+          # （「先 dry-run: true 跑一段时间人工确认效果，再改为 false 进入治理」），
+          # 先保持只判定不执行。确认行为符合预期后，把下面的 'true' 改成 'false' 即生效。
+          # 注：dry-run 会拦住全部写操作，包括 pr-review-close 的关闭 PR
+          #     （src/services/prReviewService.js:495 在 dryRun 时直接返回、不调用 close）。
+          dry-run: 'true'
           maintainer-exempt: 'true'
           # PR 治理：垃圾检测 + 要点提炼 + canonical 关联（永不关闭合法 PR）
           enable-pr-governance: 'true'
