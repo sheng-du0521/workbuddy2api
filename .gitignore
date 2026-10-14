@@ -18,7 +18,10 @@ data/
 /signin_bin.exe
 
 # Config with secrets (use config.example.json)
-config.json
+# ⚠️ 必须锚定到仓库根：裸 `config.json` 会连带忽略 .github/actions/ai-governance/config.json
+# —— 那是治理 Action **运行时必读**的配置（读不到直接 throw），2026-10-14 就是被这条
+#    吃掉导致仓库缺文件。锚定后只忽略根目录的真实网关配置。
+/config.json
 
 # Build artifacts
 *.tmp
@@ -44,9 +47,14 @@ PLAN.md
 SPEC.md
 docs/
 
-# 设计/计划文档（但 README.md 必须进版本库）
-*.md
+# 设计/计划文档：只挡**仓库根**的散落 .md（README.md 必须进版本库）。
+# ⚠️ 不要写成裸 `*.md`：它会把构建资源一起挡掉 —— internal/prompt/defaultprompt.md
+# 是 `//go:embed` 的必需文件，被忽略后 clone 下来直接编译失败（2026-10-14 实测）。
+# 子目录里的 .md 一律放行；文档目录已由上面的 docs/ 单独排除。
+/*.md
 !README.md
+# 仍显式放行被 `/*.md` 之外规则波及的构建资源（双保险）
+!internal/prompt/defaultprompt.md
 
 # Node 工具链（v0.24.0）：前端回归脚本已移入仓库（tools/），依赖不进版本库。
 node_modules/
