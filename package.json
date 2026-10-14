@@ -1,0 +1,14 @@
+{
+  "name": "workbuddy2api-tools",
+  "private": true,
+  "description": "仓库内前端回归工具（jsdom 冒烟测试 + 内联脚本语法检查）。测试脚本住在仓库里、随代码一起版本化，避免此前放在仓库外导致换机失效、不进 CI 的问题（见 docs/项目全面审查报告-v0.23.3.md 的 P1-3）。",
+  "type": "module",
+  "scripts": {
+    "jscheck": "node tools/jscheck.mjs cmd/webapp/ui/admin.html cmd/webapp/ui/dashboard.html cmd/webapp/ui/index.html cmd/webapp/ui/admin-login.html",
+    "uitest": "node tools/uitest.mjs",
+    "test": "npm run jscheck && npm run uitest"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.2"
+  }
+}

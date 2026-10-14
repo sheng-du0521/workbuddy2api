@@ -1,0 +1,14 @@
+{
+  "version": "0.26.0",
+  "min_supported": "0.24.0",
+  "notes": "v0.26.0：新增版本更新提醒（只提醒，不自动更新）；新增「禁止商用倒卖」声明。",
+  "released_at": 1791964976,
+  "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
+  "assets": [
+    {
+      "os": "windows",
+      "arch": "amd64",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases"
+    }
+  ]
+}

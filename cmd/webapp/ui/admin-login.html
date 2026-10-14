@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理后台登录 · WorkBuddy API</title>
+<script>
+// 首屏防闪（v0.17.8）：样式表解析前应用已保存的主题。
+(function () { try { var t = localStorage.getItem('wb_theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-panel">
+    <div class="login-brand admin">
+      <div class="logo">WB</div>
+      <div>
+        <b>WorkBuddy API · 管理后台</b>
+        <span>Administrator Console</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:12px;">
+        <span class="role-badge admin">管理入口</span>
+        <span class="sub">仅管理员账号可登录；普通用户请走用户控制台。</span>
+      </div>
+      <div class="row" style="margin-bottom:10px;">
+        <input type="text" id="adminUser" placeholder="管理员用户名" autocomplete="username" style="flex:1;">
+      </div>
+      <div class="row" style="margin-bottom:14px;">
+        <input type="password" id="adminPass" placeholder="密码" autocomplete="current-password" style="flex:1;">
+      </div>
+      <button id="btnAdminLogin" class="block">登录管理后台</button>
+      <div class="sub" style="margin:12px 0 0;">
+        普通用户登录入口：<a href="/">用户控制台</a>
+      </div>
+    </div>
+
+    <div class="sub" style="text-align:center;margin-top:6px;">
+      管理后台与用户控制台为两套入口，共用同一账号体系。
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+$('btnAdminLogin').onclick = async () => {
+  const username = $('adminUser').value.trim();
+  const password = $('adminPass').value;
+  if (!username || !password) { toast('请填写用户名和密码', 'err'); return; }
+  $('btnAdminLogin').disabled = true;
+  try {
+    const d = await post('/api/auth/admin/login', { username, password });
+    toast('登录成功', 'ok');
+    location.href = '/admin.html';
+    return d;
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('btnAdminLogin').disabled = false;
+  }
+};
+$('adminPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btnAdminLogin').click(); });
+
+// 已登录且是管理员：直接进后台；否则留在本页。
+(async function init() {
+  const u = await currentUser();
+  if (u && u.is_admin) location.href = '/admin.html';
+})();
+</script>
+</body>
+</html>

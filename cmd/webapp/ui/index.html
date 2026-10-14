@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用户登录 · WorkBuddy API</title>
+<script>
+// 首屏防闪（v0.17.8）：样式表解析前应用已保存的主题。
+(function () { try { var t = localStorage.getItem('wb_theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-panel">
+    <div class="login-brand">
+      <div class="logo">WB</div>
+      <div>
+        <b>WorkBuddy API</b>
+        <span>用户控制台 · User Console</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="tabs">
+        <button class="tab active" data-tab="login">登录</button>
+        <button class="tab" data-tab="register">注册</button>
+      </div>
+
+      <div class="pane active" data-pane="login">
+        <div class="row" style="margin-bottom:10px;">
+          <input type="text" id="loginUser" placeholder="用户名" autocomplete="username" style="flex:1;">
+        </div>
+        <div class="row" style="margin-bottom:14px;">
+          <input type="password" id="loginPass" placeholder="密码" autocomplete="current-password" style="flex:1;">
+        </div>
+        <button id="btnLogin" class="block">登录用户控制台</button>
+      </div>
+
+      <div class="pane" data-pane="register">
+        <div class="row" style="margin-bottom:10px;">
+          <input type="text" id="regUser" placeholder="用户名（3-32 位字母数字下划线）" autocomplete="username" style="flex:1;">
+        </div>
+        <div class="row" style="margin-bottom:10px;">
+          <input type="password" id="regPass" placeholder="密码（至少 8 位）" autocomplete="new-password" style="flex:1;">
+        </div>
+        <div class="row" style="margin-bottom:10px;">
+          <input type="password" id="regPass2" placeholder="确认密码" autocomplete="new-password" style="flex:1;">
+        </div>
+        <div class="row" style="margin-bottom:14px;">
+          <input type="text" id="regWechat" placeholder="微信号（可选）" style="flex:1;max-width:100%;">
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <input type="text" id="regRef" placeholder="邀请码（可选）" style="flex:1;">
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <input type="text" id="regBootstrap" placeholder="管理员引导密钥（仅首次部署需要，可留空）" style="flex:1;max-width:100%;">
+        </div>
+        <button id="btnReg" class="block">注册</button>
+        <div class="sub" style="margin:12px 0 0;">
+          首个管理员需在注册时填入<b>管理引导密钥</b>（首次启动日志里打印的那一串，也存在
+          <code>data/admin.key</code>）。留空只建普通用户 —— 这样别人抢先注册也拿不到后台。
+          填写邀请码后，你充值/号池收益时邀请人可得返点。
+        </div>
+      </div>
+
+      <div class="sub" style="margin:12px 0 0;">
+        管理员入口：<a href="/admin-login.html">管理后台登录</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>接入方式</h2>
+      <div class="sub" style="margin-bottom:8px;">拿到密钥后，把下面两行填进任意 OpenAI 兼容客户端：</div>
+      <pre class="code">Base URL: <span id="baseUrl">http://127.0.0.1:8780/v1</span>
+API Key : sk-wb-...（登录后在「API 反代」页生成）</pre>
+    </div>
+
+    <div class="sub" style="text-align:center;">
+      用户控制台与管理后台为两套独立入口，共用同一账号体系。
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+setupTabs(document.body);
+
+// baseUrl 展示当前实际访问的 Base URL（避免硬编码端口）。
+(function showBase() {
+  const b = $('baseUrl');
+  if (b) b.textContent = location.origin + '/v1';
+})();
+
+// 邀请链接兜底：/?ref=CODE 打开时自动切到「注册」并预填邀请码。
+(function applyRef() {
+  const ref = new URLSearchParams(location.search).get('ref');
+  if (!ref) return;
+  const tab = document.querySelector('.tab[data-tab="register"]');
+  if (tab) tab.click();
+  const inp = $('regRef');
+  if (inp) inp.value = String(ref).trim().toUpperCase();
+})();
+
+// 用户入口一律进用户控制台；管理员要走管理后台请到独立的管理登录页。
+function afterAuth() { location.href = '/dashboard.html'; }
+
+$('btnLogin').onclick = async () => {
+  const username = $('loginUser').value.trim();
+  const password = $('loginPass').value;
+  if (!username || !password) { toast('请填写用户名和密码', 'err'); return; }
+  $('btnLogin').disabled = true;
+  try {
+    await post('/api/auth/login', { username, password });
+    toast('登录成功', 'ok');
+    afterAuth();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('btnLogin').disabled = false;
+  }
+};
+
+$('btnReg').onclick = async () => {
+  const username = $('regUser').value.trim();
+  const password = $('regPass').value;
+  const again = $('regPass2').value;
+  if (password !== again) { toast('两次输入的密码不一致', 'err'); return; }
+  $('btnReg').disabled = true;
+  try {
+    const d = await post('/api/auth/register', {
+      username, password,
+      ref: $('regRef').value.trim(),
+      wechat: $('regWechat').value.trim(),
+      // 管理员引导密钥（v0.24.2，P3-12）：仅首次部署建管理员时填，留空 = 普通用户。
+      bootstrap: $('regBootstrap').value.trim(),
+    });
+    toast(d.first_admin ? '注册成功，你已成为管理员' : '注册成功', 'ok');
+    afterAuth();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('btnReg').disabled = false;
+  }
+};
+
+$('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btnLogin').click(); });
+$('regPass2').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btnReg').click(); });
+
+(async function init() {
+  const u = await currentUser();
+  if (u) afterAuth();
+})();
+</script>
+</body>
+</html>

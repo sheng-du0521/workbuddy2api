@@ -1,0 +1,86 @@
+WorkBuddy2API · 使用声明（NOTICE）
+===================================
+
+本项目原始版权归 Sliverkiss 所有，许可证正文见 LICENSE。
+
+
+────────────────────────────────────────────────────────────
+一、作者的明确声明：禁止商用倒卖
+────────────────────────────────────────────────────────────
+
+**禁止将本项目的源代码（含其衍生版本、修改版本，以及任何实质性相同的
+副本）用于商业转售、倒卖或付费分发。**
+
+具体包括但不限于：
+
+  · 出售本项目源码，或以"源码授权""源码版"等名义收费；
+  · 以"付费进群 / 付费教程 / 加盟费 / 代理费 / 技术支持费"等任何名义，
+    把本项目源码作为对价交付给第三方；
+  · 将本项目（或稍作修改的版本）打包后，以源码本身为卖点单独收费；
+  · 声称已获作者授权，或使用作者身份、本项目名义为上述行为背书。
+
+**允许的行为：**
+
+  · 个人学习、研究、测试；
+  · 自行部署使用（包括为你自己或你所在组织提供服务）；
+  · 非营利性的分享、fork 与二次开发（需保留本声明与 LICENSE）。
+
+
+────────────────────────────────────────────────────────────
+二、法律边界（请务必阅读，不要误读本声明）
+────────────────────────────────────────────────────────────
+
+本项目采用 MIT License 发布，而该许可证授予的权利是**不可撤销**的：
+
+  任何已经获得本项目副本的人，都已被授权"使用、复制、修改、合并、发布、
+  分发、再许可和/或销售"本软件，且该授权**不能被本声明收回**。
+
+因此，本声明的准确定位是 ——
+
+  1. **作者意愿的明确表达。** 它约束的是愿意遵守它的使用者，属于伦理与
+     社区层面的约束，而非对 MIT 条款的修改。它不产生新的法律义务。
+
+  2. **事实记录。** 它明确了"作者从未作出过商业倒卖授权"这一事实，
+     今后若发生授权争议，这是一份有用的证据。
+
+  3. **在商标与品牌层面具备实际效力。** MIT 不授予任何商标权，因此以
+     本项目名义、或以作者身份背书的方式进行商业倒卖，可以被主张侵权 ——
+     这比对源码本身的限制更容易执行，也往往是更有效的抓手。
+
+⚠️ **如果你的目标是让"禁止商用"具备完全的法律强制力**，唯一的办法是
+更换许可证（例如 PolyForm Noncommercial 1.0.0，或 AGPL-3.0 配合商业
+双许可）。但那需要版权持有人对**新发布的版本**实施，且此前已按 MIT 发布
+的版本依然按 MIT 授权。本声明不构成对 MIT 的修改，也不改变任何人的
+既有权利。
+
+
+────────────────────────────────────────────────────────────
+三、Commercial use notice (English summary)
+────────────────────────────────────────────────────────────
+
+This project is released under the MIT License (see LICENSE).
+
+The author additionally states, as an explicit request to all users:
+
+  Commercial resale of this source code — selling, reselling, or charging
+  a fee for the source itself or a substantially unmodified copy of it,
+  under any label ("source code license", "source edition", membership or
+  agency fee, etc.) — is expressly prohibited.
+
+Permitted: personal study, research, self-hosting, and non-commercial
+sharing, forking and modification.
+
+Note on legal effect: the rights granted by the MIT License are
+irrevocable and cannot be withdrawn by this notice. This statement is an
+expression of the author's intent, a record of the absence of any
+commercial-resale authorization, and — because MIT grants no trademark
+rights — it is enforceable at the trademark/branding level. If you need
+"no commercial use" to be legally binding, the license itself must be
+changed for future releases (e.g. PolyForm Noncommercial 1.0.0).
+
+
+────────────────────────────────────────────────────────────
+四、联系
+────────────────────────────────────────────────────────────
+
+如需商业授权，请通过仓库 Issues 或作者公开渠道联系。

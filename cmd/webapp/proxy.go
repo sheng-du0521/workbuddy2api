@@ -1,0 +1,2321 @@
+// WorkBuddy2API —— 禁止商用倒卖（完整声明与法律边界见仓库根目录 NOTICE）
+// 允许：个人学习 / 研究 / 自用部署 / 非营利分享与二次开发。
+// 禁止：以本源码或其衍生版本为标的的商业转售、倒卖、付费分发。
+
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/egress"
+	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/rotateguard"
+	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/upstream"
+)
+
+const (
+	// maxAttempts 单次请求最多尝试的账号数（含首次）。
+	maxAttempts = 3
+	// chatPath 上游 chat 路径（与 cmd/server 同源）。
+	chatPath = "/v2/chat/completions"
+	// softCooldown 429/WAF 等软冷却基准时长（指数退避由 pool 内部按 streak 计算）。
+	softCooldown = 60 * time.Second
+	// notFoundCooldown 上游 404 的固定短冷却时长（对齐 cmd/server 的 notFoundCooldown）。
+	// 偶发路径缺失不是限流信号，不该按 soft_rate 指数升级，更不该喂熔断——固定短冷却兜雪崩。
+	notFoundCooldown = 60 * time.Second
+	// refreshWithin token 剩余有效期低于此阈值时提前刷新。
+	refreshWithin = 5 * time.Minute
+	// maxAggregateContentBytes 非流式聚合的内容上限（v0.24.0，P2-4）。
+	// 32MB 远大于任何正常回答，只用来挡住"异常上游无限吐内容"把进程打爆。
+	// 流式路径不设这个上限：它逐行写出、受 TCP 背压约束，内存天然有界。
+	maxAggregateContentBytes = 32 << 20
+	// stickyTTL 会话粘性有效期（滚动续期）。
+	stickyTTL = 30 * time.Minute
+)
+
+// 反代选号 / 防封 配置的 kv 键。
+const (
+	// kvProxyAccounts 反代选号白名单（uid，逗号分隔）。空 = 不按 uid 过滤。
+	kvProxyAccounts = "proxy_accounts"
+	// kvProxyGroups 反代选号分组白名单（分组名，逗号分隔）。空 = 不按分组过滤。
+	kvProxyGroups = "proxy_groups"
+	// kvProxyMinGap 同账号最小复用间隔（秒）。0 = 不限。防封节流用。
+	kvProxyMinGap = "proxy_min_gap_seconds"
+	// kvPickMode 选号模式：weighted（缺省，三因子加权随机）| roundrobin（顺序游标轮转）。
+	// 空/非法一律按 weight 处理（升级后行为与现状一致，新机制须显式开启）。
+	kvPickMode = "proxy_pick_mode"
+	// kvEgressDefault 全局默认出站代理（http/https/socks5 URL）。账号未单独配置时生效。
+	kvEgressDefault = "egress_proxy_default"
+	// kvEgressJitterMs 请求前出口抖动上限（毫秒，0/缺省 = 关闭）。
+	// 见 Proxy.egressJitter：避免共用同一出口的多个账号在同一毫秒齐发。
+	kvEgressJitterMs = "egress_jitter_ms"
+	// kvHostShareRatio 代挂分成比例（0~1）。代挂账号在池中服务平台流量后，
+	// 按「该次消耗的号池积分 × 该比例」折入号主余额（以平台实收封顶，见 creditHostOwner）。
+	// 0 = 不分（关闭分成）。
+	kvHostShareRatio = "host_share_ratio"
+)
+
+// pickScope 一次选号的可用范围。
+//
+//   - HostUser == 0 → 平台通用范围：按**消耗分组**选号（v0.13.0）——
+//     只取「用户申请 / 反代」两组，并按其优先级逐组挑选；闲置 / 异常不参与。
+//     另受全局反代白名单（分组 / uid）约束。平台计费 Key 与管理员密钥走这里。
+//   - HostUser  > 0 → 代挂自用范围：仅该用户自己的代挂账号（无视平台白名单与
+//     消耗分组——号主用自用 Key 打自己的号，不该被管理员的分组设置挡住），
+//     可按 HostGroup 再过滤，并可再按 AccountUIDs（Key 绑定的账号集合）收窄。
+type pickScope struct {
+	HostUser  int64
+	HostGroup string
+	// AccountUIDs 该 Key 显式绑定的账号集合（nil = 不按账号过滤）。
+	// 生成 Key 时勾选「账号范围」即写入，用于把一把 Key 限定在若干账号上。
+	AccountUIDs map[string]bool
+}
+
+// isHostSelf 是否代挂自用范围。
+func (s pickScope) isHostSelf() bool { return s.HostUser > 0 }
+
+// isPlatform 是否平台通用范围（按消耗分组优先级选号）。
+func (s pickScope) isPlatform() bool { return s.HostUser == 0 }
+
+// Proxy 持有账号池、粘性路由器与上游客户端。
+//
+// 与 cmd/server 的关系：选号/冷却/熔断/粘性/成本分层全部复用 internal/pool 与
+// internal/session（即原网关真正的资产），webapp 只负责 Web 侧的入口与持久化。
+type Proxy struct {
+	store *Store
+	uc    *upstream.Client
+	pool  *pool.Pool
+	sess  *session.Router
+	// sessStore 粘性绑定的持久化后端（v0.17.5）。独立持有引用是为了在 Close 时
+	// 排空它内部的异步写队列 —— Router 只按接口持有，关不到它。
+	sessStore *stickyStore
+	// wafGate WAF IP 级拦截状态机（fail-fast，v0.18.x）。窗内多号接连 WAF 403 →
+	// 激活期内轮转遇 WAF 403 直接终止，不把一次客户端请求放大 N 倍打同一出口 IP。
+	// 进程内状态、重启清零（窗 60s，重建成本极低）。语义见 internal/rotateguard。
+	wafGate rotateguard.WAFGate
+	// onCreditChanged 号池积分发生**实时扣减**后的回调（v0.20.0）。
+	//
+	// 用回调而非反向持有 *app：Proxy 是底层转发组件，反向依赖 app 会形成环，
+	// 也让 Proxy 的单元测试必须构造整个 app。回调为 nil 时静默跳过（测试友好）。
+	// 生产由 main.go 接到 app.reconcilePoolGroupOne（预备组自动分组）。
+	onCreditChanged func(uid string)
+	// onAccountsAdded 同步时发现**新增**账号后的回调（v0.23.3），参数为新增 uid。
+	//
+	// 用途：新入池账号当天往往已过签到触发点（要等到次日才被排到），这里让上层
+	// 补跑一次，避免「新加入的账号没有任何定时任务执行记录」。生产由 main.go 接到
+	// taskRunner.CatchupNewAccounts；nil 时静默跳过（测试与 -no-tasks 启动路径）。
+	//
+	// 与 onCreditChanged 同口径：用回调而非反向持有 *app，避免形成依赖环。
+	// 只在「首次同步建基线之后」触发（见 SyncAccountsReport 的 prev 判断）。
+	onAccountsAdded func(uids []string)
+	// costPer1k 观测到的「模型 → credit/1k token」实测单价，用于预扣估算。
+	// 见 observeCost：取历史最大值并持久化到 kv，重启后由 loadObservedCosts 读回。
+	costMu    sync.RWMutex
+	costPer1k map[string]float64
+
+	// selMu 保护反代选号过滤（分组/白名单）与出站路由（每账号代理/默认代理/节流间隔）。
+	selMu         sync.RWMutex
+	allowUIDs     map[string]bool   // nil = 全部账号
+	allowGroups   map[string]bool   // nil = 全部分组
+	groupByUID    map[string]string // uid → 分组名
+	egressByUID   map[string]string // uid → 专用出站代理
+	defaultEgress string
+	// egressJitterMs 请求前抖动上限（毫秒，0 = 关闭）。
+	// 目的：避免共用同一出口的多个账号在同一毫秒齐发（见 egressJitter）。
+	egressJitterMs int
+	minGap         time.Duration
+
+	// ---- 用户代挂（hosting）选号与分成 ----
+	ownerByUID     map[string]int64  // uid → 号主 user_id（0 = 平台自持）
+	hostGroupByUID map[string]string // uid → 号主自定的代挂分组
+	poolInByUID    map[string]bool   // uid → 是否为「已入池」的代挂账号（参与平台反代）
+	// consumeGroupByUID uid → 生效的消耗分组（v0.13.0，见 effectiveConsumeGroup）。
+	// 平台选号据此按 platformConsumeGroups 的优先级逐组挑选；不在其中的分组不参与。
+	consumeGroupByUID map[string]string
+	// lastReconcile 上次「异常自动回归」复查的 Unix 秒（atomic 节流，见 reconcileAbnormal）。
+	lastReconcile int64
+	// lastSyncedUIDs 上一次重同步时的进池账号集合（nil = 尚未同步过）。
+	// 仅用于 SyncAccountsReport 的新增/移出计数与首次建基线，不参与选号。
+	lastSyncedUIDs map[string]bool
+	// egressBad uid → 出站代理不可用的原因（格式非法，或探活判定不可用）。
+	//
+	// 存在的意义是消灭「静默直连」：代理配错时旧实现只写一行日志、账号照走本机 IP，
+	// 管理员以为在做 IP 隔离，实际防封已失效且无感知。现在这类账号会被排除出平台选号
+	// （见 allowsSelection），并在界面上标明原因，必须由管理员修复。
+	//
+	// 注意：空代理是**有意直连**的合法配置（Validate 允许），不进这个表。
+	egressBad      map[string]string
+	hostShareRatio float64 // 代挂分成比例（0~1）
+	referralRatio  float64 // 推广返点比例（0~1）：下级充值 / 下级号池收益时给上级的返点
+
+	// hitMu/lastHit 同账号最近一次被选中的时间戳（Unix 秒），用于最小复用间隔节流。
+	hitMu   sync.Mutex
+	lastHit map[string]int64
+
+	// cliMu/clients 按出口代理 URL 缓存的 http.Client（每账号代理 = 每账号出口 IP）。
+	cliMu   sync.Mutex
+	clients map[string]*http.Client
+
+	// 实时请求计数（/metrics 用）：与 DB 流水互补——流水记录成功结算的请求，
+	// 这里的 total/ok/fail 含「未走到结算就失败」的（无可用号、上游全挂）。
+	reqTotal atomic.Uint64
+	reqOK    atomic.Uint64
+	reqFail  atomic.Uint64
+
+	// live 实时态势（/api/admin/live 的实时仪表盘）：逐分钟分桶 + 事件流 + 在途。
+	live *liveStats
+
+	// onAccountRestricted 上游判定「账号级限制」时的回调（uid, source, display）。
+	//
+	// 为什么用回调而不是在 Proxy 里直接处置：这类事件要动 **DB + 池 + 健康快照**
+	// 三处（见 app.deleteAccountsHard），那是 app 层的职责。Proxy 只做识别与转达，
+	// 免得两层边界被打穿（也便于单测只验识别、不拉起整套存储）。
+	// 未注入时退化为「停用」，绝不静默放过。
+	onAccountRestricted func(uid, source, display string) []string
+
+	// onRetire11140 「11140 连续超阈值」的最终处置回调（v0.24.8）。
+	//
+	// 为什么不在这里直接 RetireAccount：处置强度由 kv `pool_delete_on_11140` 决定
+	// （删除 or 停用 + 归档），而删除要动 DB + 池 + 健康快照三处（deleteAccountsHard）
+	// —— 那是 app 层职责，与 onAccountRestricted 同一理由。
+	//
+	// **未注入时退化为「停用 + 归档」**，等价于开关关闭：绝不静默放过，
+	// 但也绝不越权做不可逆的删除。
+	onRetire11140 func(uid string) []string
+}
+
+// NewProxy 构造转发器并做首次账号同步。
+// stateFp 传空串则不落盘池状态（纯内存）；生产建议给 data/pool_state.json。
+func NewProxy(store *Store, stateFp string) *Proxy {
+	// 从默认 Transport 克隆，保留 ProxyFromEnvironment：
+	// 本机出网走 WORKBUDDY 代理（http_proxy），自行构造 Transport 会丢掉代理导致 Dial 失败。
+	shared := http.DefaultTransport.(*http.Transport).Clone()
+	shared.MaxIdleConns = 100
+	shared.MaxIdleConnsPerHost = 10
+	shared.IdleConnTimeout = 90 * time.Second
+	shared.ResponseHeaderTimeout = 30 * time.Second
+	httpClient := &http.Client{Transport: shared, Timeout: 180 * time.Second}
+	streamClient := &http.Client{Transport: shared}
+
+	p := pool.New(stateFp)
+	p.SetMaxInFlight(0) // 0 = 不限在途（原型单用户场景）
+
+	// 粘性路由：Available* 闭包直接挂到 pool，使绑定号仍可用时才命中。
+	// Store 用 SQLite 持久化（v0.17.5，替代原 Noop）：重启不再丢粘性绑定，
+	// 直接消除「进程重启 → 同一场对话换号」这一可复现的切换来源。
+	sessStore := newStickyStore(store.db)
+	sess := session.New(session.Config{
+		TTL:               stickyTTL,
+		GCInterval:        5 * time.Minute,
+		Store:             sessStore,
+		Available:         func() []string { return p.AvailableUIDs() },
+		AvailableForModel: func(m string) []string { return p.AvailableUIDsForModel(m) },
+	})
+	sess.StartGC()
+	// 冷启动恢复：把上次进程留下的绑定读回内存。**必须在 StartGC 之后、放行请求之前** ——
+	// 此前这一句缺失（配的是 Noop，调了也没数据），现在 Store 有真实数据，漏调就等于
+	// 持久化白做：重启后内存仍空，下一个请求照样重新分配账号。
+	sess.LoadFromStore()
+
+	// 必须以 upstream.New() 为基底：字面量构造会丢掉 ChatBaseCN/BillingBaseCN 默认值，
+	// 导致签到/查余额等 billing 域请求 base 为空（unsupported protocol scheme ""）。
+	// 仅覆盖需要定制的字段（HTTP 客户端/超时/脱敏/global 路由开关）。
+	uc := upstream.New()
+	uc.HTTP = httpClient
+	uc.ChatHTTP = streamClient
+	uc.HeaderTimeout = 30 * time.Second
+	uc.IdleTimeout = 300 * time.Second
+	uc.SanitizeFingerprints = true
+	uc.GlobalEnabled = true // 与 auth 包默认开关一致：允许按 realm 路由 cn/global
+	// 设备风控头兜底（v0.25.1）：cmd/server 一直有、webapp 漏装 —— 见 devicecred.go。
+	// 不装的话 X-Device-Token 的唯一来源就只剩「每个账号的 device_token」。
+	store.installDeviceToken(uc)
+
+	px := &Proxy{
+		store:             store,
+		uc:                uc,
+		pool:              p,
+		sess:              sess,
+		sessStore:         sessStore,
+		costPer1k:         map[string]float64{},
+		lastHit:           map[string]int64{},
+		clients:           map[string]*http.Client{},
+		groupByUID:        map[string]string{},
+		egressByUID:       map[string]string{},
+		ownerByUID:        map[string]int64{},
+		hostGroupByUID:    map[string]string{},
+		poolInByUID:       map[string]bool{},
+		consumeGroupByUID: map[string]string{},
+		live:              newLiveStats(),
+	}
+	// 让 **upstream 自身**的所有出站也按账号选出口（v0.24.3）。
+	//
+	// 此前只有本文件的转发链路（自建请求 + chatClientFor(uid)）走账号代理，而
+	// upstream 包内部的出站**一律走固定 transport（即直连）**：
+	//   · 余额 / 积分查询（get-user-resource）—— 签到、健康检测、导入后刷余额全用它；
+	//   · 模型列表（FetchModels / fetchV3Models / fetchEnterpriseModels）；
+	//   · 活跃上报（report.go）、成长任务（travel.go）；
+	//   · 健康检测的对话探活。
+	// 后果：**出口代理池配了，但只有 chat 一条路真的走代理** —— 防封成了半成品；
+	// 且健康检测的结论不反映账号真实出站路径（配了代理的号，探活仍从本机出去）。
+	//
+	// 注入而不是让 upstream 认识代理配置：本包才持有 uid → 出口映射与 client 缓存，
+	// upstream 只需问一句「这个账号该用哪个 client」。
+	uc.ClientForUID = func(uid string) (*http.Client, error) {
+		c, err := px.clientFor(uid)
+		if err != nil {
+			// 配了不可用的代理：**显式报错，绝不回落直连**（v0.24.8）。
+			//
+			// 旧行为是返回 nil → upstream 回落默认 client（直连）。选号侧确实有
+			// EgressError 拦截，但那只覆盖**平台选号（chat）**；本包自己的出站
+			// （探活 / 签到 / 积分查询 / 模型列表 / 活跃上报）不看那个拦截，
+			// 于是同一个号会「chat 被挡、其它链路照常从本机 IP 出去」。
+			return nil, err
+		}
+		return c, nil
+	}
+	_ = px.SyncAccounts()
+	px.ReloadSelection()
+	px.loadObservedCosts()
+	return px
+}
+
+// Close 关停池与粘性 GC（进程退出前调用）。
+func (p *Proxy) Close() {
+	p.sess.StopGC()
+	p.pool.Close()
+	// 粘性持久化队列最后收尾（排空已入队的绑定变更）。
+	if p.sessStore != nil {
+		_ = p.sessStore.Close()
+	}
+}
+
+// SyncReport 一次「重同步」的结果计数（供管理后台展示，便于确认同步是否真的生效）。
+type SyncReport struct {
+	// Total 这次从数据库读到的账号总数。
+	Total int
+	// InPool 其中真正进入内存号池的账号数（凭证不可用的会被跳过，故可能小于 Total）。
+	InPool int
+	// Added 相比上一次同步新增进池的账号数。
+	Added int
+	// Removed 相比上一次同步移出号池的账号数。
+	Removed int
+}
+
+// SyncAccounts 重同步账号（等价于 SyncAccountsReport 丢弃计数）。
+func (p *Proxy) SyncAccounts() error {
+	_, err := p.SyncAccountsReport()
+	return err
+}
+
+// SyncAccountsReport 从数据库重建内存号池与选号映射。
+//
+// 「重同步」到底做了什么（管理后台按钮的语义，务必与文档一致）：
+//  1. 重新读 accounts 表，把**新增**的账号加入内存号池、把**已删除**的移出；
+//  2. 逐账号把「手动停用」标记同步到池（enabled/disabled）；
+//  3. 重建 uid → 分组 / 出站代理 / 代挂归属 / 生效消耗分组 的选号映射。
+//
+// 它**不**做这些（避免误解）：
+//   - 不刷新 token、不查询积分（token 刷新由上游 401 / 定时任务触发；积分由卡片异步拉）；
+//   - 不重置池内运行态（冷却、熔断计数、失败计数、已学单价）——
+//     pool.SyncToDir 只做增删，不入值，正是为了不让一次重同步抹掉运行期状态。
+//
+// Added/Removed 需要与「上一次」比较，故首次调用（lastSyncedUIDs 为空）不计新增，
+// 只建立基线——否则第一次点会显示「新增 5」，看着像刚导入，其实是既有账号。
+func (p *Proxy) SyncAccountsReport() (SyncReport, error) {
+	all, err := p.store.ListAccounts()
+	if err != nil {
+		return SyncReport{}, err
+	}
+	auths := make([]*auth.Auth, 0, len(all))
+	for _, acc := range all {
+		au := authFromAccount(acc)
+		if au == nil {
+			continue
+		}
+		auths = append(auths, au)
+	}
+	p.pool.SyncToDir(auths)
+	// 手动停用在 SyncToDir 之后同步：确保账号已入池，否则 SetManualDisabled 找不到。
+	for _, au := range auths {
+		var disabled bool
+		for _, acc := range all {
+			if acc.UID == au.UID {
+				disabled = acc.Disabled
+				break
+			}
+		}
+		p.pool.SetManualDisabled(au.UID, disabled, "web ui")
+	}
+	// 重建 uid → 分组 / 出站代理 / 代挂归属 映射（反代选号过滤、出站路由、分成用）。
+	gm := make(map[string]string, len(all))
+	em := make(map[string]string, len(all))
+	om := make(map[string]int64, len(all))
+	hg := make(map[string]string, len(all))
+	inPool := make(map[string]bool, len(all))
+	cgm := make(map[string]string, len(all))
+	for _, acc := range all {
+		gm[acc.UID] = acc.Group
+		em[acc.UID] = acc.EgressProxy
+		om[acc.UID] = acc.OwnerUserID
+		hg[acc.UID] = acc.HostGroup
+		// 「已入池」只对代挂账号有意义；平台自持账号不靠该位（allowsSelection 另行放行）。
+		inPool[acc.UID] = acc.OwnerUserID > 0 && acc.PoolState == "in"
+		// 生效消耗分组：显式设置优先，否则按来源推断（v0.13.0）。
+		cgm[acc.UID] = effectiveConsumeGroup(acc)
+	}
+	// 出口代理校验：格式不合法的账号记为「出口异常」，平台选号会跳过它们。
+	//
+	// 两类都要查：账号自己的 egress_proxy，以及**全局默认代理**——后者影响面更大，
+	// 一个默认代理填错会让所有未单独配置的账号同时失去出口隔离。
+	p.selMu.RLock()
+	defEgress := p.defaultEgress
+	p.selMu.RUnlock()
+	bad := make(map[string]string, len(all))
+	defBad := ""
+	if defEgress != "" {
+		if _, err := egress.Validate(defEgress); err != nil {
+			defBad = err.Error()
+		}
+	}
+	for _, acc := range all {
+		// 显式直连：无需校验，且**不**继承全局默认代理（这正是 direct 的语义）。
+		if egress.IsDirect(acc.EgressProxy) {
+			continue
+		}
+		if acc.EgressProxy != "" {
+			if _, err := egress.Validate(acc.EgressProxy); err != nil {
+				bad[acc.UID] = err.Error()
+			}
+			continue
+		}
+		// 留空 = 未指定 → 若全局默认代理本身有问题，则所有继承者都不可用。
+		// 影响面比单个账号大得多，必须一并标出（否则会看到「配了默认代理却全池失效」）。
+		if defBad != "" {
+			bad[acc.UID] = "全局默认出口代理配置有误：" + defBad
+		}
+	}
+	// 进池集合（用于计数）：以真正进池的凭证为准。
+	now := make(map[string]bool, len(auths))
+	for _, au := range auths {
+		now[au.UID] = true
+	}
+	rep := SyncReport{Total: len(all), InPool: len(auths)}
+	p.selMu.Lock()
+	prev := p.lastSyncedUIDs
+	p.lastSyncedUIDs = now
+	p.groupByUID = gm
+	p.egressByUID = em
+	p.ownerByUID = om
+	p.hostGroupByUID = hg
+	p.poolInByUID = inPool
+	p.consumeGroupByUID = cgm
+	p.egressBad = bad
+	p.selMu.Unlock()
+	if prev != nil { // 首次同步只建基线，不报「新增」
+		added := make([]string, 0, 4)
+		for uid := range now {
+			if !prev[uid] {
+				rep.Added++
+				added = append(added, uid)
+			}
+		}
+		for uid := range prev {
+			if !now[uid] {
+				rep.Removed++
+			}
+		}
+		// 新增账号通知（v0.23.3）：让上层为新号补跑一轮签到。
+		//
+		// 为什么放在 selMu 解锁之后：钩子会起 goroutine 打上游，持锁调用会阻塞
+		// 全部选号路径（sync 被 20 多处请求处理调用）。这里只读一次函数指针。
+		if len(added) > 0 && p.onAccountsAdded != nil {
+			p.onAccountsAdded(added)
+		}
+	}
+	return rep, nil
+}
+
+// splitKVSet 把逗号分隔的配置串拆成集合；全空则返回 nil（语义 = 不过滤）。
+func splitKVSet(csv string) map[string]bool {
+	var out map[string]bool
+	for _, part := range strings.Split(csv, ",") {
+		v := strings.TrimSpace(part)
+		if v == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[v] = true
+	}
+	return out
+}
+
+// ReloadSelection 从 kv 读回反代选号（白名单/分组）+ 防封（最小复用间隔/默认出站代理）配置。
+// 管理员改设置或账号分组后调用；只改过滤/路由参数，不触碰池状态。
+func (p *Proxy) ReloadSelection() {
+	accts, _ := p.store.GetKV(kvProxyAccounts)
+	groups, _ := p.store.GetKV(kvProxyGroups)
+	gap, _ := p.store.GetKV(kvProxyMinGap)
+	def, _ := p.store.GetKV(kvEgressDefault)
+	jitter, _ := p.store.GetKV(kvEgressJitterMs)
+	share, _ := p.store.GetKV(kvHostShareRatio)
+	refShare, _ := p.store.GetKV(kvReferralRatio)
+	pickMode, _ := p.store.GetKV(kvPickMode)
+
+	var gapDur time.Duration
+	if n, err := strconv.Atoi(strings.TrimSpace(gap)); err == nil && n > 0 {
+		gapDur = time.Duration(n) * time.Second
+	}
+	// 抖动上限：0/非法 = 关闭（默认关闭，不给正常路径凭空加延迟）。
+	jitterMs := 0
+	if n, err := strconv.Atoi(strings.TrimSpace(jitter)); err == nil && n > 0 {
+		if n > 5000 {
+			n = 5000 // 防御：上限 5 秒，再大就不是「抖动」而是故障了
+		}
+		jitterMs = n
+	}
+	ratio := 0.0
+	if f, err := strconv.ParseFloat(strings.TrimSpace(share), 64); err == nil && f > 0 {
+		if f > 1 {
+			f = 1
+		}
+		ratio = f
+	}
+	refRatio := 0.0
+	if f, err := strconv.ParseFloat(strings.TrimSpace(refShare), 64); err == nil && f > 0 {
+		if f > 1 {
+			f = 1
+		}
+		refRatio = f
+	}
+	p.selMu.Lock()
+	p.allowUIDs = splitKVSet(accts)
+	p.allowGroups = splitKVSet(groups)
+	p.defaultEgress = strings.TrimSpace(def)
+	p.minGap = gapDur
+	p.egressJitterMs = jitterMs
+	p.hostShareRatio = ratio
+	p.referralRatio = refRatio
+	p.selMu.Unlock()
+	// 选号模式注入池（pool 自带锁，与 selMu 无嵌套，故放在解锁之后调用）。
+	// 归一化交给 pool.SetPickMode（只有 roundrobin 生效，其余回落 weighted），
+	// 这里不重复判断，避免两处口径分裂。
+	p.pool.SetPickMode(strings.TrimSpace(pickMode))
+}
+
+// allowsSelection 判定某账号是否落在本次选号的可用范围内。
+//
+// 平台通用（sc.HostUser==0）：只接受**参与消耗**的消耗分组（用户申请 / 反代）；
+// 闲置与异常一律不选中，再叠加全局白名单（uid / 分组）。
+// 代挂自用（sc.HostUser>0）：仅号主本人的账号，可按代挂分组过滤，不看消耗分组。
+func (p *Proxy) allowsSelection(uid string, sc pickScope) bool {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	if sc.HostUser > 0 {
+		if p.ownerByUID[uid] != sc.HostUser {
+			return false
+		}
+		if sc.HostGroup != "" && p.hostGroupByUID[uid] != sc.HostGroup {
+			return false
+		}
+		// Key 绑定账号集合：勾过就只在集合内选号（空集合 = 未绑定，不过滤）。
+		if sc.AccountUIDs != nil && !sc.AccountUIDs[uid] {
+			return false
+		}
+		return true
+	}
+	// 平台范围（v0.13.0）：消耗分组决定是否参与。uid 不在映射中 = 未知账号，一律不选。
+	if !consumeGroupParticipates(p.consumeGroupByUID[uid]) {
+		return false
+	}
+	// 出口异常（v0.14.0）：代理配置有误的账号不参与平台流量。
+	// 宁可这个请求失败（返回无可用账号），也不让账号从本机 IP 裸奔出去 ——
+	// 后者会让管理员在毫不知情的情况下失去全部出口隔离。
+	if _, isBad := p.egressBad[uid]; isBad {
+		return false
+	}
+	if p.allowUIDs != nil && !p.allowUIDs[uid] {
+		return false
+	}
+	// 白名单同时认两种分组名：传统分组（account_group，如「桌面端」）与消耗分组
+	// 中文名（如「反代」「用户申请」）。账号卡片自 v0.13.0 起只暴露消耗分组，
+	// 若这里只认旧字段，「反代分组白名单」就会变成一个填了却永远筛不到人的陷阱。
+	if p.allowGroups != nil {
+		g, cg := p.groupByUID[uid], consumeGroupLabels[p.consumeGroupByUID[uid]]
+		if !p.allowGroups[g] && (cg == "" || !p.allowGroups[cg]) {
+			return false
+		}
+	}
+	return true
+}
+
+// hostShareRatioNow 读取代挂分成比例（0 = 关闭分成）。
+func (p *Proxy) hostShareRatioNow() float64 {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.hostShareRatio
+}
+
+// referralRatioNow 读取推广返点比例（0 = 关闭推广返点）。
+func (p *Proxy) referralRatioNow() float64 {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.referralRatio
+}
+
+// recentlyHit 该账号是否在最小复用间隔内刚被用过（防封节流；间隔为 0 时恒 false）。
+func (p *Proxy) recentlyHit(uid string) bool {
+	p.selMu.RLock()
+	gap := p.minGap
+	p.selMu.RUnlock()
+	if gap <= 0 {
+		return false
+	}
+	p.hitMu.Lock()
+	last := p.lastHit[uid]
+	p.hitMu.Unlock()
+	return last > 0 && time.Since(time.Unix(last, 0)) < gap
+}
+
+// noteHit 记账「该账号刚被用于一次请求」，供节流判定。
+func (p *Proxy) noteHit(uid string) {
+	p.hitMu.Lock()
+	if p.lastHit == nil {
+		p.lastHit = map[string]int64{}
+	}
+	p.lastHit[uid] = time.Now().Unix()
+	p.hitMu.Unlock()
+}
+
+// pickExcluding 在「未被 tried 排除」的账号里选一个，且必须通过范围过滤；
+// 若存在未在最小复用间隔内的账号则优先返回它，否则回落到任一可用账号。
+//
+// v0.13.0（消耗分组）：平台通用范围按 platformConsumeGroups 的顺序逐组选号 ——
+// 先「用户申请」（号主申请入池的账号，优先消耗其积分），选不到才轮到「反代」；
+// 闲置 / 异常不参与，**不设兜底**（宁缺勿滥，避免偷用未授权账号）。
+//
+// 每组用 tried 的**局部副本**：组内选号会把落选账号标记进 tried 以免死循环，
+// 若直接写共享的 tried，前一组的落选账号会被后一组误当作「本次已试过」。
+func (p *Proxy) pickExcluding(tried map[string]bool, model string, sc pickScope) *auth.Auth {
+	// 顺手复查「临时异常」账号是否已恢复（节流 + 异步，见 reconcileAbnormal）。
+	p.reconcileAbnormal()
+	if sc.isPlatform() {
+		for _, g := range platformConsumeGroups {
+			if au := p.pickScoped(copyTried(tried), model, sc, g); au != nil {
+				return au
+			}
+		}
+		return nil
+	}
+	// 代挂自用：不限消耗分组（号主自己的号，按 HostGroup / AccountUIDs 收窄）。
+	return p.pickScoped(tried, model, sc, "")
+}
+
+// pickPriorityGroupForModel 返回当前**有可用账号的最高优先级**消耗分组（无则空串）。
+//
+// 判定口径与 pickExcluding 的分组优先级一致：按 platformConsumeGroups 顺序找第一个
+// 「存在既通过 allowsSelection、又属于该组」的可用账号。model 非空时按模型过滤
+// （6004 模型级冷却生效）；池内无模型级可用时退回账号级可用集。
+//
+// 用于粘性会话的优先级守卫：粘性绑定不得绕过「用户申请 > 反代」。
+func (p *Proxy) pickPriorityGroupForModel(model string, sc pickScope) string {
+	avail := p.pool.AvailableUIDsForModel(model)
+	if len(avail) == 0 {
+		avail = p.pool.AvailableUIDs()
+	}
+	for _, g := range platformConsumeGroups {
+		for _, uid := range avail {
+			// 两个调用各自持锁，顺序调用不嵌套（RWMutex 不可重入读锁）。
+			if p.allowsSelection(uid, sc) && p.inConsumeGroup(uid, g) {
+				return g
+			}
+		}
+	}
+	return ""
+}
+
+// stickyPriorityOK 粘性绑定号的消耗分组是否满足当前优先级。
+//
+// 背景（实测缺陷）：session.Router 在未命中时会按 key 哈希从「池内可用集」直接分配
+// 一个账号，而该可用集**不含消耗分组过滤** —— 于是新会话可能被绑到「反代」组账号，
+// 而 handleChat 会直接复用该绑定、不经过 pickExcluding，导致「用户申请优先」被绕过。
+// 实测：apply 组有 2 个可用账号时，8 次请求仍有 3 次落到 proxy 组（全部 status=ok，
+// 不是失败回退，即 proxy 被当成首选）。
+//
+// 这里做守卫：平台范围下要求绑定号属于「当前最高优先级的可用分组」，否则视为未命中
+// （上层解绑 → 回落 pickExcluding 的正确分组选号）。代挂自用范围不受分组管辖，恒放行
+// ——避免把号主自己的粘性打散。
+func (p *Proxy) stickyPriorityOK(uid, model string, sc pickScope) bool {
+	if !sc.isPlatform() {
+		return true
+	}
+	want := p.pickPriorityGroupForModel(model, sc)
+	if want == "" {
+		return true // 无任何可用分组（理论上不会走到）：不额外限制，交给常规校验兜底
+	}
+	return p.inConsumeGroup(uid, want)
+}
+
+// copyTried 复制 tried 集合，供分组轮次隔离使用。
+func copyTried(tried map[string]bool) map[string]bool {
+	local := make(map[string]bool, len(tried))
+	for k := range tried {
+		local[k] = true
+	}
+	return local
+}
+
+// pickScoped 单轮选号：从池里反复取候选，跳过范围外的账号。
+// group 非空时额外要求候选的生效消耗分组等于 group（平台范围按组逐轮选号用）。
+//
+// 上限 512：代挂自用场景下，个人账号可能只是池中很小一部分，需要多轮跳过平台账号
+// 才能命中自己的号；512 远超实际账号规模，又不会成为死循环。
+func (p *Proxy) pickScoped(tried map[string]bool, model string, sc pickScope, group string) *auth.Auth {
+	var fallback *auth.Auth
+	for i := 0; i < 512; i++ {
+		cand := p.pool.PickExcludingForRealm(tried, model, "")
+		if cand == nil {
+			break
+		}
+		if !p.allowsSelection(cand.UID, sc) || (group != "" && !p.inConsumeGroup(cand.UID, group)) {
+			tried[cand.UID] = true
+			continue
+		}
+		if fallback == nil {
+			fallback = cand
+		}
+		if !p.recentlyHit(cand.UID) {
+			return cand
+		}
+		tried[cand.UID] = true
+	}
+	return fallback
+}
+
+// inConsumeGroup 该账号生效的消耗分组是否等于 group。
+func (p *Proxy) inConsumeGroup(uid, group string) bool {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.consumeGroupByUID[uid] == group
+}
+
+// ConsumeGroupForUID 返回账号生效的消耗分组（空串 = 未知账号）。供运维接口使用。
+func (p *Proxy) ConsumeGroupForUID(uid string) string {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.consumeGroupByUID[uid]
+}
+
+// SetConsumeGroupInMemory 只更新「uid → 生效消耗分组」这一条内存映射（v0.20.0）。
+//
+// 为什么需要：自动分组（预备组进出）在积分变更后高频触发，走不了整表
+// SyncAccounts —— 那要重读全部账号并重建全部映射，代价与账号数成正比。
+// 本方法 O(1)，只改一条，语义与 SyncAccountsReport 里对该账号的赋值一致。
+func (p *Proxy) SetConsumeGroupInMemory(uid, group string) {
+	p.selMu.Lock()
+	defer p.selMu.Unlock()
+	if p.consumeGroupByUID == nil {
+		p.consumeGroupByUID = map[string]string{}
+	}
+	p.consumeGroupByUID[uid] = group
+}
+
+// isPoolIn 该账号是否为「已入池」的代挂账号（保留供运维与测试引用）。
+func (p *Proxy) isPoolIn(uid string) bool {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.poolInByUID[uid]
+}
+
+// clientFor 返回该账号应使用的 HTTP 客户端。
+//
+// 出口解析顺序（v0.14.1 起，见 ResolveEgress）：
+//  1. 账号显式设为 direct → **真·直连**（Proxy=nil，绕过环境代理）
+//  2. 账号配了代理 URL → 该代理的专用客户端
+//  3. 账号未指定（空）→ 继承全局默认代理；默认也为空 → 共享客户端
+//
+// 严格语义（v0.14.0，消灭静默直连）：配了代理但校验不通过 → 返回 error，
+// **绝不回落到直连**。旧实现在解析失败时只打一行日志就返回直连客户端，于是
+// 「代理填错一个字符」会让账号悄悄从本机 IP 出去，而界面仍显示「已配代理」，
+// 防封静默失效。返回 error 让调用方把这个号判失败并记录明确原因。
+func (p *Proxy) clientFor(uid string) (*http.Client, error) {
+	switch eff := p.ResolveEgress(uid); {
+	case egress.IsDirect(eff):
+		// 显式直连：用不带代理的客户端，**不**走环境代理。
+		// 与「未指定」的区别在此：未指定保留环境代理行为（兼容既有部署），
+		// 显式直连则给出「一定不加代理」的强保证。
+		return p.directClient()
+	case eff == "":
+		return p.uc.HTTP, nil
+	default:
+		return p.egressClient(eff)
+	}
+}
+
+// chatClientFor 返回本次 chat 转发应使用的 HTTP 客户端。
+//
+// **为什么流式必须换掉 180s 总超时**（v0.17.5 修复）：
+// http.Client.Timeout 的官方语义是「含连接、重定向**以及读取响应体**的总时限」。
+// clientFor 返回的三个客户端（uc.HTTP / directClient / egressClient）都带
+// `Timeout: 180s` —— 用在流式上等于「上游生成超过 3 分钟就掐断连接」。
+// 现实里长回答 / Agent 多轮工具调用 / reasoning 深度思考轻易超过 3 分钟，于是
+// 连接被**网关自己**切断，客户端表现为「执行到一半会话中断」，且因为
+// streamSSE 此前不检查 scanner.Err()、不补 [DONE]，这个失败是完全静默的。
+//
+// 修法不是「把 180s 调大」（那只是把悬崖挪远一点），而是让流式请求**不受总时限约束**：
+// 只保留 Transport 层的 ResponseHeaderTimeout(30s) 守住「连上了但迟迟不给响应头」，
+// 响应体读取交给客户端断连（r.Context() 取消）与上游自然收尾来终止 ——
+// 这正是 NewProxy 里 streamClient 的既有设计（uc.ChatHTTP），只是主转发路径没用上。
+//
+// 非流式（服务端聚合）保留 180s：那时确实需要一个上界，否则单个卡死的上游会长期占住请求。
+func (p *Proxy) chatClientFor(uid string, stream bool) (*http.Client, error) {
+	c, err := p.clientFor(uid)
+	if err != nil || !stream || c == nil || c.Timeout == 0 {
+		return c, err
+	}
+	// 复用同一个 Transport（连接池/代理设置全部保留），只脱掉 Client 级总超时。
+	// 不缓存：http.Client 本身极轻，Transport 才是重的，而 Transport 是共享的。
+	return &http.Client{Transport: c.Transport}, nil
+}
+
+// ResolveEgress 解析某账号**最终生效**的出口配置。
+//
+// 返回值语义（三态，务必按此理解，否则会误判「裸奔」）：
+//
+//	"direct"       显式直连（覆盖全局默认）
+//	""             未指定且全局默认也为空 → 实际是直连（但语义上是「未指定」）
+//	"http://..."   生效的代理 URL（账号自配，或继承的全局默认）
+//
+// 需要「是否真的从本机 IP 出去」的判断时，应同时把 "direct" 与 "" 视为直连 ——
+// 见 egressOverview 与 isDirectEgress。
+func (p *Proxy) ResolveEgress(uid string) string {
+	p.selMu.RLock()
+	own := p.egressByUID[uid]
+	def := p.defaultEgress
+	p.selMu.RUnlock()
+	if egress.IsDirect(own) {
+		return egress.Direct
+	}
+	if own != "" {
+		return own
+	}
+	return def
+}
+
+// directClient 返回「真·直连」客户端（Proxy=nil，不复用环境代理）。
+//
+// 与 uc.HTTP 的区别：uc.HTTP 源自 http.DefaultTransport.Clone()，保留
+// ProxyFromEnvironment —— 在后端进程若存在 http_proxy 环境变量时，它其实会走该代理。
+// 显式直连需要的是「无论如何都不加代理」，故单独建一个并缓存。
+func (p *Proxy) directClient() (*http.Client, error) {
+	p.cliMu.Lock()
+	defer p.cliMu.Unlock()
+	const key = "\x00direct"
+	if p.clients == nil {
+		p.clients = map[string]*http.Client{}
+	}
+	if c, ok := p.clients[key]; ok {
+		return c, nil
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = nil // 显式清空：既不走环境代理，也不走任何 URL 代理
+	tr.MaxIdleConnsPerHost = 10
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	tr.IdleConnTimeout = 90 * time.Second
+	c := &http.Client{Transport: tr, Timeout: 180 * time.Second}
+	p.clients[key] = c
+	return c, nil
+}
+
+// DefaultEgress 返回当前全局默认出口代理（空 = 未配置）。
+func (p *Proxy) DefaultEgress() string {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.defaultEgress
+}
+
+// isDirectEgress 判断解析结果是否**实际**从本机 IP 出去（显式直连，或未指定且无默认）。
+func isDirectEgress(resolved string) bool {
+	return resolved == "" || egress.IsDirect(resolved)
+}
+
+// egressClient 按代理 URL 缓存一个带该代理的 http.Client（每账号代理 = 每账号出口 IP）。
+//
+// 代理 URL 非法时返回 error，**不**构造直连客户端（见 clientFor 的说明）。
+// 用 egress.Validate 而非裸 url.Parse：后者会放过 socks5h 这类 Go 不支持协商的
+// scheme，问题会推迟到真正发请求时才暴露，报错也更难懂。
+func (p *Proxy) egressClient(proxyURL string) (*http.Client, error) {
+	p.cliMu.Lock()
+	defer p.cliMu.Unlock()
+	if p.clients == nil {
+		p.clients = map[string]*http.Client{}
+	}
+	if c, ok := p.clients[proxyURL]; ok {
+		return c, nil
+	}
+	norm, err := egress.Validate(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("出站代理不可用：%v", err)
+	}
+	if norm == "" {
+		return nil, errors.New("出站代理不可用：地址为空（清空该账号的代理配置可恢复直连）")
+	}
+	u, err := url.Parse(norm)
+	if err != nil {
+		return nil, fmt.Errorf("出站代理不可用：%v", err)
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = http.ProxyURL(u)
+	tr.MaxIdleConnsPerHost = 10
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	tr.IdleConnTimeout = 90 * time.Second
+	c := &http.Client{Transport: tr, Timeout: 180 * time.Second}
+	p.clients[proxyURL] = c
+	return c, nil
+}
+
+// EgressForUID 暴露某账号当前生效的出站代理（专用优先，其次全局默认）；供 UI 展示与排障。
+func (p *Proxy) EgressForUID(uid string) string {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	if e := p.egressByUID[uid]; e != "" {
+		return e
+	}
+	return p.defaultEgress
+}
+
+// EgressErrorForUID 返回该账号出站代理不可用的原因（空串 = 正常/有意直连）。
+// 非空表示该账号已因出口配置问题被排除出平台选号，需要管理员修复。
+func (p *Proxy) EgressErrorForUID(uid string) string {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	return p.egressBad[uid]
+}
+
+// EgressBadUIDs 返回所有出口异常账号及其原因（供看板与告警聚合）。
+func (p *Proxy) EgressBadUIDs() map[string]string {
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	out := make(map[string]string, len(p.egressBad))
+	for k, v := range p.egressBad {
+		out[k] = v
+	}
+	return out
+}
+
+// SelectionSummary 返回当前选号过滤的只读摘要（供 /status、设置页展示）。
+func (p *Proxy) SelectionSummary() map[string]any {
+	p.selMu.RLock()
+	uids := make([]string, 0, len(p.allowUIDs))
+	for u := range p.allowUIDs {
+		uids = append(uids, u)
+	}
+	groups := make([]string, 0, len(p.allowGroups))
+	for g := range p.allowGroups {
+		groups = append(groups, g)
+	}
+	out := map[string]any{
+		"proxy_accounts":        strings.Join(uids, ","),
+		"proxy_groups":          strings.Join(groups, ","),
+		"proxy_min_gap_seconds": int(p.minGap / time.Second),
+		"egress_proxy_default":  p.defaultEgress,
+	}
+	p.selMu.RUnlock()
+	// 选号模式存在 pool（读取走 pool 自己的锁）：放在 selMu 释放之后，避免锁嵌套。
+	out["pick_mode"] = p.pool.PickMode()
+	return out
+}
+
+// chatBaseFor 按 realm 返回上游 chat base。
+func chatBaseFor(realm string) string {
+	if realm == "global" {
+		return "https://www.workbuddy.ai"
+	}
+	return "https://copilot.tencent.com"
+}
+
+// authFromAccount 把库里的账号记录转成 upstream 需要的 *auth.Auth。
+// realm 字段在包内未导出，唯一可靠的构造途径是走 auth.Parse 解析嵌套 JSON。
+func authFromAccount(a *Account) *auth.Auth {
+	if a == nil {
+		return nil
+	}
+	doc := map[string]any{
+		"auth": map[string]any{
+			"accessToken":  a.AccessToken,
+			"refreshToken": a.RefreshToken,
+			"expiresAt":    a.ExpiresAt,
+			"domain":       a.Domain,
+			"realm":        a.Realm,
+		},
+		"account": map[string]any{
+			"uid":          a.UID,
+			"enterpriseId": a.EnterpriseID,
+			"nickname":     a.Nickname,
+		},
+	}
+	if a.DeviceToken != "" {
+		doc["device_token"] = a.DeviceToken
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return nil
+	}
+	au, err := auth.Parse(raw)
+	if err != nil {
+		return nil
+	}
+	return au
+}
+
+// refreshIfNeeded 临近过期时刷新 token，并把新 token 写回数据库。
+func (p *Proxy) refreshIfNeeded(au *auth.Auth) error {
+	if !au.NeedsRefresh(refreshWithin) {
+		return nil
+	}
+	if err := p.uc.RefreshToken(au); err != nil {
+		return err
+	}
+	_ = p.store.UpdateTokens(au.UID, au.AccessTokenValue(), au.RefreshTokenValue(), au.ExpiresAt)
+	return nil
+}
+
+// ServeChat 处理 OpenAI 兼容的 /v1/chat/completions。
+// 出站一律强制 stream=true，再按客户端要求原样转发 SSE 或聚合为单次响应。
+func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
+	p.reqTotal.Add(1)
+	start := time.Now()
+	p.live.begin()
+	defer p.live.done()
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	model, _ := payload["model"].(string)
+	// 租户上下文由 apiKeyGuard 注入；取不到则说明该路由未挂鉴权中间件。
+	u := userFrom(r)
+	key := apiKeyFrom(r)
+	// 代挂自用 Key（kind=host）：只路由到号主自己的代挂账号，免预扣、免扣费，
+	// 也不占用平台余额/配额。平台计费 Key 与管理员密钥走默认（charge=true）。
+	scope := pickScope{}
+	charge := true
+	if key != nil && key.Kind == KeyKindHost {
+		charge = false
+		if u != nil {
+			scope = pickScope{
+				HostUser:    u.ID,
+				HostGroup:   key.HostGroup,
+				AccountUIDs: splitKVSet(key.AccountUIDs),
+			}
+		}
+	}
+	wantStream, _ := payload["stream"].(bool)
+	payload["stream"] = true
+	outBody, err := json.Marshal(payload)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "re-encode body: "+err.Error())
+		return
+	}
+
+	// 会话粘性键：优先客户端会话 ID，退化为首条 user 消息派生。
+	stickyKey := session.ExtractKey(raw)
+	if stickyKey == "" {
+		stickyKey = session.StickyFallbackKey(raw)
+	}
+	stickyUID := ""
+	if stickyKey != "" {
+		if uid, ok := p.sess.ResolveForModel(stickyKey, model); ok {
+			stickyUID = uid
+		}
+	}
+	// 选号轨迹（v0.17.5）：粘性键的短哈希随流水落库 —— 不落明文（键可能是客户端的
+	// conversation_id），只留可用于分组关联的指纹。用途是把「同一场对话的多轮」在
+	// usage_logs 里串起来：同一 sticky_key_hash 的多行若 upstream_uid 不同，
+	// 就是「调用过程中换号（消耗不同账号的积分）」的硬证据。
+	// 此前流水只有最终账号，这个问题只能靠时间聚类去猜 —— 这正是本次排查的盲区。
+	stickyHash := ""
+	if stickyKey != "" {
+		sum := sha256.Sum256([]byte(stickyKey))
+		stickyHash = hex.EncodeToString(sum[:6]) // 12 hex
+	}
+
+	// 预扣：按 max_tokens 上界冻结额度，钱不够当场 402 拒绝。
+	// 不做预扣的话，「余额 10 点」也能发起一次实际消耗 500 点的长请求（max_tokens 拉满），
+	// 结算后余额直接变 -490 —— 这就是刷爆。预扣把风险挡在请求发出之前。
+	//
+	// 返回 0 表示池内尚无该模型实测单价（新部署），此时退化为事后结算，不做预扣。
+	// 失败收尾用的分类跟踪（v0.24.0，P2-1）：把上游错误归因映射成对客户端有意义的状态码。
+	// 此前无论什么失败都回 503，而 503 是**可重试**语义 —— OpenAI 兼容客户端会照着
+	// 自动重试，一个注定失败的坏请求（模型不存在 / 上下文超长 / 内容拦截）于是被反复
+	// 放大（每次再试 3 个账号）。语义上也错：4xx 被伪装成 5xx，排障时看不出真正原因。
+	var lastErr string
+	var lastKind, clientKind upstream.ErrKind
+	var lastRetryAfter string
+
+	var resv *Reservation
+	settled := false
+	if u != nil && charge {
+		if reserve := p.estimateReserveMicro(payload, model); reserve > 0 {
+			var keyID int64
+			if key != nil {
+				keyID = key.ID
+			}
+			rv, rerr := p.store.ReserveCharge(u.ID, keyID, reserve, model)
+			switch {
+			case errors.Is(rerr, ErrInsufficientBalance):
+				writeOpenAIError(w, http.StatusPaymentRequired, fmt.Sprintf(
+					"insufficient balance: this request reserves up to %s points, current balance %s",
+					formatPoints(reserve), formatPoints(u.BalanceMicro)))
+				p.live.record(liveEvent{
+					At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
+					Err: "余额不足（预扣被拒）", ElapsedMS: time.Since(start).Milliseconds(),
+				})
+				return
+			case rerr != nil:
+				// 预扣失败（存储抖动等）不阻断：退化为事后结算，不误杀用户请求。
+				log.Printf("reserve failed, fallback to post-paid: %v", rerr)
+			default:
+				resv = rv
+			}
+		}
+	}
+	if resv != nil {
+		defer func() {
+			if !settled {
+				// 走到这里说明请求失败/中断/结算异常，把预扣原样退回。
+				if _, err := p.store.ReleaseReservation(resv.ID); err != nil {
+					log.Printf("release reservation %d failed: %v", resv.ID, err)
+				}
+			}
+		}()
+	}
+
+	// ConversationID 与网关同源解析（用于 prompt_cache_key 的会话段）：
+	// 此前 webapp 只填了请求级随机 ID，会话段恒空 → prompt_cache_key 退化为
+	// 账号级键，命中率低于网关链路（见 PrepareOutbound 注释）。
+	meta := upstream.ChatMeta{
+		ConversationID:        session.ResolveConversationID(raw),
+		ConversationRequestID: newRandomID(16),
+	}
+
+	var heldUID string
+	defer func() {
+		if heldUID != "" {
+			p.pool.Release(heldUID)
+		}
+	}()
+	tried := map[string]bool{}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// 换号退避（v0.18.x）：attempt>0 时先等一段指数退避 + ±25% 抖动再换下一号。
+		// 对齐 cmd/server 的 rotateBackoff（WAF 403 修复 P0-2）——此前 webapp 换号
+		// 零间隔，多号齐步重试会以固定周期聚团打上游（WAF 按请求密度判罚），且被
+		// IP 级拦截时会迅速把一次客户端请求放大成 N 倍打同一出口 IP。
+		if attempt > 0 {
+			if !rotateguard.SleepCtx(r.Context(), rotateguard.BackoffAfter(attempt-1)) {
+				return // 客户端断连：终止轮转（defer 释放租约与预扣）
+			}
+		}
+		var au *auth.Auth
+		if stickyUID != "" {
+			au = p.pool.PickByUIDForModel(stickyUID, model)
+			// 三重放行条件：账号在池且该模型可用 + 落在本次范围 + **满足消耗分组优先级**。
+			// 最后一条是 v0.15.2 补的（见 stickyPriorityOK 注释）：粘性绑定不得绕过
+			// 「用户申请 > 反代」，否则新会话可能被绑到反代组账号并直接被使用。
+			if au == nil || !p.allowsSelection(au.UID, scope) || !p.stickyPriorityOK(au.UID, model, scope) {
+				// 粘性号不可用（冷却/模型限额/范围外/分组优先级不满足）
+				// → 解绑回落普通轮换。代挂自用范围下不动别人的绑定
+				//（sticky key 由请求内容派生、可能与他租户碰撞），仅本次忽略。
+				if au == nil || !scope.isHostSelf() {
+					p.sess.Unbind(stickyKey)
+				}
+				stickyUID = ""
+				au = nil
+			}
+		}
+		if au == nil {
+			au = p.pickExcluding(tried, model, scope)
+		}
+		if au == nil {
+			break
+		}
+		tried[au.UID] = true
+		if !p.pool.Acquire(au.UID) {
+			continue // 在途名额被抢，换下一个
+		}
+		heldUID = au.UID
+
+		if err := p.refreshIfNeeded(au); err != nil {
+			lastErr = "refresh token: " + err.Error()
+			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			// 按 ErrKind 分流（v0.24.8）：12153 走会话失效的累计纪律，
+			// 其余保持降权口径。此前一律 NoteFailures，导致 12153 既不被摘除、
+			// 又永远重复被选中（见 applyRefreshFailure 注释）。
+			p.applyRefreshFailure(au.UID, err)
+			continue
+		}
+
+		url := chatBaseFor(au.Realm()) + chatPath
+		// 出站改写（v0.24.0 P1-1）：复用 upstream 的同一套管线和 webapp 之前**完全绕过**它，
+		// 导致指纹脱敏 / 角色归一 / efforts 降级 / prompt_cache_key 全部失效
+		// （而 p.uc.SanitizeFingerprints 明明设了 true —— 静默缺陷）。
+		// 放在循环内、按**当前账号**改写：realm/uid 决定指纹与降级桶，换号必须重算。
+		attemptBody := p.uc.PrepareOutbound(outBody, au, meta.ConversationID)
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(attemptBody))
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "build request: "+err.Error())
+			return
+		}
+		p.uc.ChatHeaders(req, au, "", meta)
+
+		// 出口抖动（缺省关闭）：让共用同一出口的不同账号错开出发时刻，
+		// 避免「同一 IP 在同一毫秒打出多个账号的请求」这一强关联信号。
+		if d := p.egressJitter(au.UID); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-r.Context().Done():
+				p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+				return
+			}
+		}
+
+		// 出站客户端按账号选择：配了专用/默认出站代理的账号从各自出口 IP 打上游（防封）。
+		// 代理配置有误时这里会返回 error —— 有意直连（未配代理）不受影响。
+		// 流式请求走「无总超时」变体（见 chatClientFor）：180s 硬超时会掐断长流。
+		client, cerr := p.chatClientFor(au.UID, wantStream)
+		if cerr != nil {
+			lastErr = cerr.Error()
+			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			p.pool.NoteFailures(au.UID)
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err.Error()
+			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			if errors.Is(err, contextDone(r)) {
+				return
+			}
+			p.pool.NoteFailures(au.UID)
+			continue
+		}
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			lastErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			retryAfter := resp.Header.Get("Retry-After")
+			kind := p.reportUpstreamError(au.UID, model, resp.StatusCode, body, retryAfter)
+			// 记录分类，供最终状态码映射（见 upstreamFailureStatus）。
+			lastKind = kind
+			if retryAfter != "" {
+				lastRetryAfter = retryAfter
+			}
+			// 客户端可修的错（请求本身的问题）单独记一份：即使后续账号报出别的
+			// 错误，最终也该回 4xx —— 根因是请求，不是账号。
+			if isClientFaultKind(kind) {
+				clientKind = kind
+			}
+			// WAF IP 级 fail-fast（v0.18.x）：该次 WAF 403 喂入 IP 级状态机，若激活
+			// （短窗内多号接连命中 = IP 被拦而非账号）则立即终止轮转——继续换号只会把
+			// 请求放大 N 倍打同一出口 IP，加重风控。账号级软冷却已由 reportUpstreamError
+			// 照常记账（单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」。与
+			// cmd/server 的 wafIP.noteWaf 同语义（逻辑见 internal/rotateguard）。
+			if kind == upstream.ErrWafBlock && p.wafGate.NoteWaf(au.UID) {
+				break
+			}
+			continue
+		}
+
+		p.pool.NoteSuccess(au.UID)
+		p.noteHit(au.UID) // 记账复用时刻，供最小复用间隔节流
+		// 响应头透出实际服务的账号（对齐 cmd/server，v0.17.5 补齐）：
+		//   - 排障时直接看到「这次是谁在答」；
+		//   - 客户端侧验证「同一会话是否换号」的最便捷抓手 —— 连续两次响应比较该头即可，
+		//     不必去翻服务端流水。
+		// 必须在写响应体之前设置：streamSSE / aggregateSSE 内部会 WriteHeader（之后再改无效）。
+		// 放在 NoteSuccess 之后：语义是「这个号成功服务了本次请求」，中途换号失败的号不冒领。
+		w.Header().Set("X-Wb-Account", au.UID)
+		// 代挂自用不写共享粘性表：粘性 key 由请求内容派生、跨租户可能碰撞，
+		// 写入会污染其他租户的绑定。
+		if stickyKey != "" && !scope.isHostSelf() {
+			p.sess.Bind(stickyKey, au.UID)
+		}
+		var ui usageInfo
+		var streamErr error
+		if wantStream {
+			ui, streamErr = streamSSE(w, resp)
+		} else {
+			ui, streamErr = aggregateSSE(w, resp)
+		}
+		resp.Body.Close()
+		if streamErr != nil {
+			// 上游流中断（读 body 出错：上游掐断 / 网络抖动 / 客户端断连传播）。
+			// 流式路径此刻 HTTP 头已发出，改不了状态码 —— 但 [DONE] 已由 streamSSE
+			// 兜底补写，客户端至少能正常收尾；非流式路径 aggregateSSE 已自行回 502。
+			// 关键变化（v0.17.5）：从这里开始**不再静默** —— 有日志、有实时事件、有流水。
+			log.Printf("WARN: [proxy] upstream stream interrupted acct=%s model=%s: %v",
+				logfmt.Label(au.UID, au.Nickname), model, streamErr)
+			p.reqFail.Add(1)
+			p.live.record(liveEvent{
+				At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
+				Err:       "上游流中断（" + streamErr.Error() + "）",
+				ElapsedMS: time.Since(start).Milliseconds(),
+			})
+			// 记一条「中断」流水：0 费用（usage 为空、status≠ok → consumedCredit=0），
+			// 预扣由 settleUsage 内部全额退还。这样「执行到一半断了」在账单里查得到。
+			settled, _ = p.settleUsage(u, key, model, au.UID, usageInfo{}, resv, "interrupted",
+				"upstream stream interrupted: "+streamErr.Error(), stickyHash, attempt+1)
+			return
+		}
+		// 计费在响应发完之后结算：上游 credit × 倍率 → 与预扣对账（多退少补）→ 写流水。
+		// 注意用 `=` 而非 `:=`：settled 是外层变量，`:=" 会在循环块里遮蔽它，
+		// 导致下面 defer 的「未结算则释放预扣」判据永远为真（成功也退一次）。
+		var chargedMicro int64
+		settled, chargedMicro = p.settleUsage(u, key, model, au.UID, ui, resv, "ok", "", stickyHash, attempt+1)
+		// 号池侧成本账簿 + 余额实时收敛（v0.17.6 修复）。
+		//
+		// **为什么必须在这里调**：cmd/webapp 不经过 internal/server，而 `pool.NoteModelCost`
+		// 只在 internal/server/handler.go 里被调用过 —— 于是 webapp 链路上它**从未执行**。
+		// 这不是「少了一个优化」，而是两个实测可见的后果：
+		//   1. 池内 credits 只在签到（9 点 / 21 点）被覆盖，两次签到之间（最长 12 小时）
+		//      完全不动 → 号池仪表盘的「积分合计 / 平均积分 / 积分 Top 8」整块冻结，
+		//      看起来就是「实时数据不实时」（实测：18 个号 12 小时纹丝不动）；
+		//   2. 池内 (账号, 模型) 成本观测恒空 → 选号的成本分层永远停在「无观测」，
+		//      「优先消耗限免号」这套机制在 webapp 里实际失效（只有 handler.go 那条链路有）。
+		//
+		// 只在**上游真实回报 credit** 时记（与 handler.go 严格同口径）：credits 与成本
+		// 账本都必须是实测值，拿估算值回灌会自我强化（估算 → 记成观测 → 下次估得更准），
+		// 把账本变成回音壁。缺 credit 时 settleUsage 仍按既有口径做计费估算，
+		// 但不污染池内观测。
+		if ui.HasCredit && ui.Total() > 0 {
+			p.pool.NoteModelCost(au.UID, model, ui.Credit, ui.Total())
+			// 余额被实时扣减后立即做一次分组判定（v0.20.0）：长期消耗会跨过
+			// 预备线（<100），需要及时把账号搬进预备组。回调内部有 1s/账号
+			// 节流（见 poolgroup.go），故热路径代价只是一次 map 查询。
+			if p.onCreditChanged != nil {
+				p.onCreditChanged(au.UID)
+			}
+		} else if ui.Total() > 0 {
+			// 有用量但无 credit（上游末帧缺字段）：只记日志，不写账本（缺失≠0）。
+			log.Printf("WARN: [proxy] usage without credit acct=%s model=%s (no cost observation)",
+				logfmt.Label(au.UID, au.Nickname), model)
+		}
+		p.reqOK.Add(1)
+		p.live.record(liveEvent{
+			At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: true,
+			Tokens: ui.Total(), Charged: MicroToPoint(chargedMicro),
+			ElapsedMS: time.Since(start).Milliseconds(),
+		})
+		return
+	}
+	if lastErr == "" {
+		lastErr = "no available account (all cooling or disabled)"
+	}
+	p.reqFail.Add(1)
+	p.live.record(liveEvent{
+		At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
+		Err: lastErr, ElapsedMS: time.Since(start).Milliseconds(),
+	})
+	// 状态码按**失败归因**映射，而不是一律 503（v0.24.0，P2-1）：
+	// 请求本身的问题回 4xx（客户端不该重试），我方容量/上游故障才回 5xx。
+	finalKind := lastKind
+	if clientKind != upstream.ErrNone {
+		finalKind = clientKind // 请求级错误优先：根因在请求，与账号/容量无关
+	}
+	if lastRetryAfter != "" {
+		w.Header().Set("Retry-After", lastRetryAfter)
+	}
+	writeOpenAIError(w, upstreamFailureStatus(finalKind), "upstream unavailable: "+lastErr)
+}
+
+// isClientFaultKind 该错误是否由**请求本身**引起（换任何账号结果相同）。
+//
+// 判据与 internal/server 的 applyErrorPolicy「请求级错误零动作」同源：这些错误
+// 既不罚账号，也不该让客户端重试 —— 必须改请求才有用。
+//
+// ErrChannelDenied（11128 渠道 / 客户端指纹拒绝）**在**此列（v0.24.8）：它的语义是
+// 「这个客户端身份被上游渠道策略拒绝」，而本仓的 UA 与身份声明是**全池一致**的
+// （只有 X-Machine-ID / X-Session-ID 按账号隔离），换号基本救不回来 ——
+// 回 400 让调用方改请求，比回 503 诱导客户端把同一份指纹再打一遍更诚实。
+//
+// 注意两件事不要混淆：① 它仍然**不罚账号**；② 轮转照常发生 —— 轮转是重试循环的
+// 默认行为，与本判定无关，本判定只决定「最终回给客户端什么状态码」。
+func isClientFaultKind(k upstream.ErrKind) bool {
+	switch k {
+	case upstream.ErrBadParams, upstream.ErrContentBlocked, upstream.ErrPromptTooLong,
+		upstream.ErrImageInvalid, upstream.ErrModelBlocked, upstream.ErrClient,
+		upstream.ErrChannelDenied:
+		return true
+	}
+	return false
+}
+
+// upstreamFailureStatus 把「最终失败原因」映射成对客户端有意义、且**重试语义正确**
+// 的 HTTP 状态码。
+//
+// 为什么重要（v0.24.0，P2-1）：此前无论什么失败都回 503，而 503 在 OpenAI 兼容
+// 客户端眼里是「服务暂时不可用，可重试」—— 于是一个注定失败的坏请求（模型名写错、
+// 上下文超长、内容被拦）会被客户端反复自动重试，每次再打最多 3 个账号，
+// 把一个客户端错误放大成持续的上游流量（也正是本仓库一直避免的风控特征）。
+//
+// 映射原则：
+//
+//	· 400 —— 请求本身的问题（参数/内容/长度/图片）。改请求才有用，重试无意义。
+//	· 404 —— 模型不存在或无权限（ErrModelBlocked）。
+//	· 429 —— 上游限流（ErrSoftRate），并透传 Retry-After。
+//	· 503 —— 无可服务账号 / 账号级故障 / 上游 5xx —— 这是我方容量问题，可重试。
+func upstreamFailureStatus(k upstream.ErrKind) int {
+	switch k {
+	case upstream.ErrBadParams, upstream.ErrContentBlocked, upstream.ErrChannelDenied,
+		upstream.ErrPromptTooLong, upstream.ErrImageInvalid, upstream.ErrClient:
+		return http.StatusBadRequest
+	case upstream.ErrModelBlocked:
+		return http.StatusNotFound
+	case upstream.ErrSoftRate:
+		return http.StatusTooManyRequests
+	default:
+		// ErrHardCredit / ErrSessionDead / ErrAccountFault / ErrWafBlock / ErrServer /
+		// ErrNotFound / ErrNone(未分类) —— 对我方或上游而言都是「暂时没有可用通道」。
+		return http.StatusServiceUnavailable
+	}
+}
+
+// releaseAndUnbind 释放租约，并在失败号正是粘性号时解绑。
+func (p *Proxy) releaseAndUnbind(held *string, stickyKey, uid string, stickyUID *string) {
+	if *held != "" {
+		p.pool.Release(*held)
+		*held = ""
+	}
+	if *stickyUID != "" && uid == *stickyUID {
+		p.sess.Unbind(stickyKey)
+		*stickyUID = ""
+	}
+}
+
+// contextDone 返回与请求上下文绑定的哨兵错误，用于识别客户端断开（不再重试换号）。
+func contextDone(r *http.Request) error {
+	if err := r.Context().Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reportUpstreamError 按上游错误分类上报冷却/熔断，语义对齐 cmd/server 的 applyErrorPolicy。
+//
+// v0.18.x 修复（误熔断）：旧实现的 default 分支无条件 NoteError（喂熔断器）——
+// 于是**请求级错误**（内容拦截 400 / 11101 请求体畸形 / 11102 模型不存在 /
+// 11115 上下文超长 / 上游 404）也记在账号头上，连 3 次即熔断一个健康账号
+// 30min~6h。这些全是「请求的问题不是账号的问题」（同一 body 换任何号结果相同），
+// cmd/server 侧对此一律零动作或按 (账号,模型) 负缓存避让（见其 applyErrorPolicy
+// 注释：「内容问题非账号问题，不罚账号」）。本次按共享的 upstream.Classify 分流。
+//
+// 与 cmd/server 的**有意差异**（勿按 server「修正」）：
+//   - status >= 500 保留 NoteFailures（连败降权，10min 级），不改成 server 的
+//     NoteError（熔断 30min 起、封顶 6h）。上游 5xx 多为全局故障，按熔断处理会
+//     把整池账号批量摘除——hub issue #271 实测「4 小时 196 次失败熔断 13 个号、
+//     池子几乎空掉」即此类尺度过激。本链路取更保守的降权口径。
+func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, retryAfter string) upstream.ErrKind {
+	// —— 账号级限制信号（v0.24.6）：先于按 code 的分流 ——
+	//
+	// 放在最前面是因为它的处置**强度最高且不可逆**（即时删除），而下面的
+	// 6004 / 11140 / 12153 / 14017 分支全是可逆冷却。上游既然明说了账号被限制，
+	// 就不该再按 11140 去累计（等 3 次只是白等两轮，期间用户请求持续失败）。
+	//
+	// 走回调而不是在这里直接删：删除要动 DB + 池 + 健康快照三处（deleteAccountsHard），
+	// 那是 app 层的职责；Proxy 只负责识别与转达，避免把两层的边界打穿。
+	if display := upstream.UpstreamDisplayMsg(string(body)); upstream.IsAccountRestricted(display) {
+		if p.onAccountRestricted != nil {
+			p.onAccountRestricted(uid, "proxy", display)
+		} else {
+			// 未注入回调（单元测试 / 极简装配）：退化为停用，绝不静默放过。
+			p.pool.RetireAccount(uid, upstream.ErrAccountFault, upstream.AccountRestrictedHint())
+		}
+		return upstream.Classify(status, string(body))
+	}
+
+	code := parseUpstreamCode(body)
+	// kind 供本函数内部分流与调用方（WAF IP 级 fail-fast 判定）共用，只分类一次。
+	kind := upstream.Classify(status, string(body))
+	var resetAt time.Time
+	if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
+		resetAt = time.Now().Add(time.Duration(sec) * time.Second)
+	}
+	switch {
+	case code == 6004:
+		// 模型级限额：只冷却该模型，账号对其他模型仍可用。
+		p.pool.CooldownSoftForModel(uid, softCooldown, resetAt, model, "6004 model rate limit")
+	case code == 11128 && (status == http.StatusBadRequest || status == http.StatusForbidden):
+		// 渠道 / 客户端指纹级拒绝（v0.24.8）：**这次请求**被上游按渠道策略挡下，
+		// 不是账号自身的问题 → 零动作（不冷却 / 不熔断 / 不计数），但**仍然轮转**：
+		// 本仓每个账号有独立的 X-Machine-ID / X-Session-ID，换号确实可能直接通过。
+		//
+		// 为什么必须按 code 判、且必须排在 11140 之前：上游对 11128 与 11140
+		// **复用同一句 msg**（"request illegal"）。只看文案会把渠道级问题读成账号级
+		// 故障 —— 旧行为下 Classify 给出 ErrAccountFault，落进本函数 default 的
+		// NoteError，直接喂熔断（30min 起、封顶 6h），把健康号错杀。
+		//
+		// status 限定 400/403：429 与 5xx 即便带 11128，语义仍是限流 / 上游故障，
+		// 交给下面的 status 分支（对齐同类项目的 "does not override throttling"）。
+	case code == 11140:
+		// 11140 = **request illegal**（请求非法），不是账号封禁（v0.24.3）。
+		//
+		// 旧实现此处是 `Disable` + 归档，reason 写「account banned by upstream」——
+		// 2026-10-13 实测：一个风控窗口内批量误杀 30 个健康账号（凭证与余额完好）。
+		// 现在与健康检测同纪律：**软冷却（可逆）+ 累计计数，连续超阈值才摘除**
+		// （见 pool.NoteAccountFault 与 docs/封号事件诊断与账号隔离核对-20261013.md）。
+		if fails, disabled := p.pool.NoteAccountFault(uid); disabled {
+			// 达阈值后的处置**必须与健康检测同源**（v0.24.8）：走 app 注入的回调，
+			// 由 `pool_delete_on_11140` 统一决定「删除 or 停用+归档」。
+			// 此前这里写死 RetireAccount，于是同一个错误码在两条链路上强度不同
+			// （健康检测可能真删、转发路径只停用），而开关保护不了后者。
+			const reason = "连续 11140（请求非法）超阈值，已暂停使用"
+			if p.onRetire11140 != nil {
+				p.onRetire11140(uid)
+			} else if p.pool.RetireAccount(uid, upstream.ErrAccountFault, reason) {
+				p.archiveAbnormal(uid, reason, false)
+			}
+		} else {
+			p.pool.Cooldown(uid, pool.CoolSoft, softCooldown,
+				"11140 request illegal（累计 "+itoa(fails)+"/"+itoa(pool.AccountFaultThreshold())+"，未超阈值仅软冷却）")
+		}
+	case code == 12153:
+		// 与健康检测**同纪律**（v0.24.7 对齐）：累计阈值后才摘除，不再一次即停。
+		// 处置收敛到 handleSessionDead（v0.24.8）—— 本码的另一个触发源是
+		// refresh 失败（见 applyRefreshFailure），两处必须共用同一份实现。
+		p.handleSessionDead(uid)
+	case code == 14017:
+		p.pool.Cooldown(uid, pool.CoolSoft, softCooldown, "account fault (14017)")
+		// autoRecover **false**（v0.23.1 修复）：14017 是「试用未开通 / 权限异常」，
+		// 与余额类不同 —— 它不是「等一等就好」，而是**必须重新登录 / 重新激活**才能解决。
+		// 此前标 true 导致：软冷却（60s）一到期，reconcileAbnormal 就把它放回原分组，
+		// 下一次请求立刻再次 14017 → 归档 → 回归 → 归档 的循环，且每次都当作正常号
+		// 参与选号、白耗一次请求。标记为需人工后，它会稳定留在异常组直到人工处置。
+		p.archiveAbnormal(uid, "账号故障（14017），需重登", false)
+	case code == 14020 || status == 402:
+		p.pool.CooldownUntilTomorrow4AM(uid, "余额不足")
+		p.archiveAbnormal(uid, "积分不足（无法消耗积分）", true)
+	case status == 429:
+		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "429 rate limit")
+	case status == 403:
+		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "waf 403 block")
+	case status == 401:
+		p.pool.NoteSessionDead(uid)
+	case status >= 500:
+		p.pool.NoteFailures(uid)
+	default:
+		// 请求级错误分流：按共享 Classify 识别，避免旧实现「一律 NoteError」把
+		// 与账号无关的失败记到账号头上（见函数头注释）。
+		switch kind {
+		case upstream.ErrContentBlocked, upstream.ErrPromptTooLong,
+			upstream.ErrImageInvalid, upstream.ErrBadParams:
+			// 零动作：不冷却 / 不熔断 / 不喂连败（内容、上下文、图片、请求体是
+			// 请求自身的问题）。调用方仍会轮转（见 ServeChat 的 continue）。
+		case upstream.ErrModelBlocked:
+			// 11102「该后端无此模型」：(账号, 模型) 负缓存避让，切模型即可用。
+			p.pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		case upstream.ErrNotFound:
+			// 404 偶发路径缺失：固定短冷却防雪崩，不随 soft_rate 退避、不喂熔断。
+			p.pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+		default:
+			p.pool.NoteError(uid)
+		}
+	}
+	return kind
+}
+
+// handleSessionDead 12153（会话失效）的**统一处置**（v0.24.8）。
+//
+// 为什么抽出来：这个码有两个触发源 —— chat 出站返回 12153（reportUpstreamError
+// 的 code 分支），以及 **refresh token 失败**返回 12153（applyRefreshFailure）。
+// 抽取前 webapp 的两条路径纪律不同：出站走「累计阈值 + 摘除闸门」，refresh 走
+// 无条件 NoteFailures（只降权 10 分钟）。于是同一个错误码，一个号该不该被摘除
+// 取决于它是"聊天时被发现"还是"刷新时被发现"—— 这正是本仓反复复发的
+// 「同一错误码多套纪律」。
+//
+// 纪律：一次不摘（12153 会被网络抖动/刷新竞态临时触发），累计达阈值才走
+// Pool.RetireAccount 闸门；未达阈值只做可逆软冷却。计数由任意一次成功请求
+// （NoteSuccess）清零，故「偶发一次」不会累积。
+func (p *Proxy) handleSessionDead(uid string) {
+	if p.pool.NoteSessionDead(uid) {
+		if p.pool.RetireAccount(uid, upstream.ErrSessionDead, "连续 12153（会话失效）超阈值，已禁用，需重登") {
+			p.archiveAbnormal(uid, "会话失效（12153）连续超阈值，已禁用", false)
+		}
+		return
+	}
+	p.pool.Cooldown(uid, pool.CoolSoft, softCooldown,
+		"12153 session dead（累计中，未超阈值仅软冷却）")
+}
+
+// applyRefreshFailure refresh token 失败时的账号处置（v0.24.8 补齐分流）。
+//
+// 修复前这里**不分错误类型**一律 NoteFailures（连败降权，10 分钟级），于是：
+//
+//	· 12153（会话真的失效、必须重登）永远走不到 sessionDeadFails —— 号被降权 10 分钟，
+//	  冷却一过又被选中、又 refresh 失败，如此往复：既服务不了请求，也永远不被摘除；
+//	· 与 scheduler keepalive/checkin、旧网关 handler 三处纪律不一致。
+//
+// 现在：12153 → 走 handleSessionDead（与出站发现 12153 完全同源）；其余（网络抖动 /
+// 5xx / 解析失败）保持既有降权口径 —— 与 reportUpstreamError 对 5xx 的处理一致，
+// **有意**不改成旧网关的 NoteError 熔断（理由见 reportUpstreamError 函数头：上游 5xx
+// 多为全局故障，按熔断处理会把整池批量摘除）。
+func (p *Proxy) applyRefreshFailure(uid string, err error) {
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+		p.handleSessionDead(uid)
+		return
+	}
+	p.pool.NoteFailures(uid)
+}
+
+// archiveAbnormal 把账号归档到「异常」消耗分组（v0.13.0）。
+//
+// autoRecover=true（积分不足 / 账号故障这类**临时**异常）时记下原分组，
+// 冷却解除后由 reconcileAbnormal 自动放回；false（封号 / 会话失效）需管理员
+// 重登后手动改回，不会被自动放回。
+//
+// 只做「库 + 内存映射」两处更新，不整体 SyncAccounts：本函数在失败重试链路上被调用，
+// 保持轻量、避免与正在进行的池同步相互干扰；下次同步自然会以库为准。
+func (p *Proxy) archiveAbnormal(uid, reason string, autoRecover bool) {
+	if uid == "" || p.store == nil {
+		return
+	}
+	acc, err := p.store.GetAccount(uid)
+	if err != nil || acc == nil {
+		return
+	}
+	if effectiveConsumeGroup(acc) == cgAbnormal {
+		return // 已归档：保留首次原因与原分组，避免后续错误覆盖
+	}
+	// prev 记**原始显式值**（可能是空串），不记生效值（v0.23.1 修正）。
+	//
+	// 为什么必须记原始值：记生效值会把「未显式设置分组」**永久固化**成显式值。
+	// 具体危害（真实路径）：
+	//   代挂号 cg="" 未入池 → 生效推断为「闲置」→ 运营停用 → 记 prev="idle"
+	//   → 运营启用 → 回归写 cg="idle"（**显式**）→ 之后用户申请入池并审批通过，
+	//   账号本应生效为「用户申请」，却因 cg 被显式锁成 idle 而**仍然不参与消耗**。
+	// 记原始空串后，回归落 cg=""，交由 inferConsumeGroup 按**当时**的
+	// pool_state / owner 推断 —— 这正是 restoreGroupValue 已支持的语义
+	// （其注释：有原分组则用它，否则回落「按来源推断」）。
+	//
+	// 与 v0.20.1 对「下架恢复分组」的同类修正保持同一原则：恢复原始语义，
+	// 而不是恢复一个当时的快照值。
+	prev := strings.TrimSpace(acc.ConsumeGroup)
+	note := reason
+	if autoRecover {
+		note = autoTagPrefix + reason
+	}
+	if err := p.store.MarkAccountAbnormal(uid, prev, note); err != nil {
+		return
+	}
+	p.selMu.Lock()
+	if p.consumeGroupByUID == nil {
+		p.consumeGroupByUID = map[string]string{}
+	}
+	p.consumeGroupByUID[uid] = cgAbnormal
+	p.selMu.Unlock()
+}
+
+// reconcileIntervalSec 异常自动回归的复查间隔（秒）。每次选号前最多触发一次。
+const reconcileIntervalSec = 60
+
+// reconcileAbnormal 轻量节流地复查「自动归档」到异常组的账号，
+// 把已恢复可用的放回原消耗分组。节流命中时异步执行，不阻塞请求。
+func (p *Proxy) reconcileAbnormal() {
+	if !p.reconcileDue() {
+		return
+	}
+	go p.reconcileAbnormalOnce()
+}
+
+// reconcileDue 原子节流：距上次复查不足 reconcileIntervalSec 则返回 false。
+func (p *Proxy) reconcileDue() bool {
+	now := time.Now().Unix()
+	last := atomic.LoadInt64(&p.lastReconcile)
+	if now-last < reconcileIntervalSec {
+		return false
+	}
+	return atomic.CompareAndSwapInt64(&p.lastReconcile, last, now)
+}
+
+// reconcileAbnormalOnce 执行一轮回归：临时异常（带 autoTagPrefix）且池中已恢复
+// 可用（未停用、未手动停用、无冷却）的账号，恢复到归档前的分组。
+//
+// 「可自动回归」由**写入时的 autoRecover 标记**决定，回归侧不再重判根因 ——
+// 这不是偷懒，而是刻意的单一来源：归档方（reportUpstreamError / 健康检测 / 停用）
+// 最清楚这次失败的根因类别，把结论编码进标记即可；回归侧若再自行推断，
+// 两处判据必然分叉。故：
+//
+//	余额耗尽（402/14020）→ autoRecover=true   余额恢复即可用，冷却到期即回归
+//	运营停用            → autoRecover=true   解除停用即可用
+//	登录失效（12153）    → autoRecover=false  需重登（且已在 Disable 路径直接禁用）
+//	上游封禁（11140）    → autoRecover=false  需重登 / 换号
+//	权限异常（14017）    → autoRecover=false  需重登激活（v0.23.1 从 true 修正为 false）
+//	管理员手动设的异常    → 无标记             视为最终裁决，永不自动回归
+//
+// 边界：`prev` 为空时回落 inferConsumeGroup（按来源推断），故回归目标未必逐字等于
+// 归档前那个值 —— 但一定是一个**合法的常规组**（RestoreAccountConsumeGroup 内部
+// 防御性拒绝把目标写成异常组自身）。
+func (p *Proxy) reconcileAbnormalOnce() {
+	if p.store == nil {
+		return // 轻量测试脚手架（无库）直接跳过
+	}
+	list, err := p.store.ListAbnormalAutoAccounts()
+	if err != nil || len(list) == 0 {
+		return
+	}
+	changed := false
+	for _, acc := range list {
+		st, ok := p.pool.Status(acc.UID)
+		if !ok {
+			continue // 不在池中（已删除 / 未同步）：等下一次同步后再判
+		}
+		if st.Disabled || st.ManualDisabled || st.Cooling || st.CoolRemaining > 0 {
+			continue // 仍未恢复
+		}
+		if err := p.store.RestoreAccountConsumeGroup(acc.UID, acc.ConsumeGroupPrev); err != nil {
+			continue
+		}
+		p.selMu.Lock()
+		if p.consumeGroupByUID != nil {
+			if g := restoreGroupValue(acc); g != "" {
+				p.consumeGroupByUID[acc.UID] = g
+			}
+		}
+		p.selMu.Unlock()
+		changed = true
+	}
+	if changed {
+		_ = p.SyncAccounts() // 以库为准整体重算（分组 / 白名单映射同步）
+	}
+}
+
+// restoreGroupValue 计算回归后的生效分组：有原分组则用它，否则回落「按来源推断」。
+func restoreGroupValue(acc *Account) string {
+	if g := normalizeConsumeGroup(acc.ConsumeGroupPrev); g != "" && g != cgAbnormal {
+		return g
+	}
+	return inferConsumeGroup(acc)
+}
+
+// parseUpstreamCode 从上游响应体里尽力解析业务错误码；解析不出返回 0。
+// 兼容 {"code":6004} 与 {"error":{"code":6004}} 两种形态。
+func parseUpstreamCode(body []byte) int {
+	var obj struct {
+		Code  any `json:"code"`
+		Error struct {
+			Code any `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return 0
+	}
+	if n, ok := toInt(obj.Code); ok {
+		return n
+	}
+	if n, ok := toInt(obj.Error.Code); ok {
+		return n
+	}
+	return 0
+}
+
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case string:
+		if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// streamSSE 把上游 SSE 原样转发给客户端，同时抽取 usage 供计费。
+// 边转发边解析：上游通常在末帧才补全 usage.credit，但逐帧覆盖式采集能兼容
+// 「首帧给 token、末帧给 credit」与「末帧一次性给全」两种形态。
+// streamSSE 逐行透传上游 SSE 到客户端，并返回本次用量。
+//
+// 返回值 err（v0.17.5 新增）：读上游 body 过程中的错误。**必须返回而不是吞掉** ——
+// 此前调用方拿不到任何信号，上游断流被记成一次成功请求（流水 status=ok、ttfb 正常），
+// 而客户端那侧是「执行到一半没下文了」。
+//
+// [DONE] 兜底（v0.17.5）：上游正常收尾会自带 `data: [DONE]`（透传时已写出），
+// 但两种情况会漏 —— 上游流被中断，或上游实现漏发。漏发对 OpenAI 兼容客户端是致命的：
+// 客户端以 `[DONE]`（或 finish_reason）判定「回答结束」，没有它就一直挂着等，
+// 表现为「会话中断 / 一直转圈」。这里无条件兜底补一个，与 internal/upstream 的
+// StreamHint 同口径（那条成熟链路一直有，本链路此前缺失）。
+func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error) {
+	var ui usageInfo
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
+	sawDone := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		parseUsageLine(line, &ui)
+		if isSSEDone(line) {
+			sawDone = true
+		}
+		fmt.Fprintf(w, "%s\n", line)
+		if line == "" && flusher != nil {
+			flusher.Flush()
+		}
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+	err := scanner.Err()
+	if !sawDone {
+		// 补 [DONE] 收尾：写失败（客户端已断）不影响——对方人都走了，收尾没有意义。
+		if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr == nil && flusher != nil {
+			flusher.Flush()
+		}
+	}
+	return ui, err
+}
+
+// isSSEDone 判定一行是否为 SSE 结束帧（容忍 "data: [DONE]" 与 "data:[DONE]" 两种写法）。
+func isSSEDone(line string) bool {
+	t := strings.TrimSpace(line)
+	if !strings.HasPrefix(t, "data:") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(t, "data:")) == "[DONE]"
+}
+
+// parseUsageLine 从一行 SSE 里抽取 usage（兼容 "data: " 与 "data:" 两种前缀）。
+func parseUsageLine(line string, ui *usageInfo) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return
+	}
+	var chunk struct {
+		Usage *struct {
+			CompletionTokens int      `json:"completion_tokens"`
+			PromptTokens     int      `json:"prompt_tokens"`
+			Credit           *float64 `json:"credit"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+		return
+	}
+	ui.PromptTokens = chunk.Usage.PromptTokens
+	ui.CompletionTokens = chunk.Usage.CompletionTokens
+	if chunk.Usage.Credit != nil {
+		ui.Credit = *chunk.Usage.Credit
+		ui.HasCredit = true
+	}
+}
+
+// sseChunk SSE data 帧的宽松解析结构（只取聚合所需字段）。
+type sseChunk struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Model   string `json:"model"`
+	Created int64  `json:"created"`
+	Choices []struct {
+		Index int `json:"index"`
+		Delta struct {
+			Content string `json:"content"`
+			Role    string `json:"role"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *json.RawMessage `json:"usage"`
+}
+
+// AggregateResult 非流式聚合输出。
+type AggregateResult struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Index   int `json:"index"`
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage json.RawMessage `json:"usage,omitempty"`
+}
+
+// aggregateSSE 消费上游 SSE 并聚合为一次非流式响应。
+// content 兼容两种上游形态：增量 delta（拼接）与累积快照（取最长）。
+// aggregateSSE 消费上游 SSE 并聚合为一次非流式响应。
+// content 兼容两种上游形态：增量 delta（拼接）与累积快照（取最长）。
+//
+// 返回值 err（v0.17.5 新增）：读上游 body 的错误。**聚合路径的静默截断比流式更危险** ——
+// 它不逐帧发给客户端，而是读完整流再一口气写 JSON：上游中途断掉时，此前的实现会把
+// 半截 content 当成**完整回答**以 200 发出，客户端完全无法察觉后半段丢了。
+// 现在改为：中断即 502（此时尚未写任何响应字节，状态码还能改），让失败可诊断、可重试。
+func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error) {
+	var (
+		content strings.Builder
+		id      string
+		model   string
+		created int64
+		finish  string
+		usage   json.RawMessage
+	)
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			if data == "[DONE]" {
+				break
+			}
+			continue
+		}
+		var ck sseChunk
+		if err := json.Unmarshal([]byte(data), &ck); err != nil {
+			continue
+		}
+		if ck.ID != "" {
+			id = ck.ID
+		}
+		if ck.Model != "" {
+			model = ck.Model
+		}
+		if ck.Created != 0 {
+			created = ck.Created
+		}
+		if ck.Usage != nil {
+			usage = *ck.Usage
+		}
+		for _, c := range ck.Choices {
+			cur := content.String()
+			inc := c.Delta.Content
+			if inc == "" {
+				continue
+			}
+			if cur == "" || strings.HasPrefix(inc, cur) {
+				content.Reset()
+				content.WriteString(inc)
+			} else {
+				content.WriteString(inc)
+			}
+			// 聚合内容总长上限（v0.24.0，P2-4）。
+			//
+			// 为什么必须有：单行受 scanner 缓冲（4MB）约束，但**整段流此前无上限** ——
+			// 聚合路径用 strings.Builder 把 content 全攒在内存里，异常/被劫持的上游
+			// 可以持续吐超长内容把进程 OOM（流式路径不受影响：逐行写出，受 TCP 背压约束）。
+			// 超限即报错（此时尚未写任何响应字节，状态码还能改），不静默截断 ——
+			// 截断出来的"完整回答"比失败更危险（客户机会当成真的）。
+			if content.Len() > maxAggregateContentBytes {
+				writeOpenAIError(w, http.StatusBadGateway,
+					fmt.Sprintf("upstream stream too large (> %d bytes)", maxAggregateContentBytes))
+				return usageInfo{}, fmt.Errorf("aggregate content exceeds %d bytes", maxAggregateContentBytes)
+			}
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				finish = *c.FinishReason
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream stream interrupted: "+err.Error())
+		return usageInfo{}, err
+	}
+	if id == "" {
+		id = "chatcmpl-" + newRandomID(12)
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	if finish == "" {
+		finish = "stop"
+	}
+	out := AggregateResult{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   model,
+	}
+	out.Choices = make([]struct {
+		Index   int `json:"index"`
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	}, 1)
+	out.Choices[0].Index = 0
+	out.Choices[0].Message.Role = "assistant"
+	out.Choices[0].Message.Content = content.String()
+	out.Choices[0].FinishReason = finish
+	out.Usage = usage
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(out)
+	return parseUsageJSON(usage), nil
+}
+
+// parseUsageJSON 从 usage 原始 JSON 抽取计费字段。
+func parseUsageJSON(raw json.RawMessage) usageInfo {
+	var ui usageInfo
+	if len(raw) == 0 {
+		return ui
+	}
+	var u struct {
+		CompletionTokens int      `json:"completion_tokens"`
+		PromptTokens     int      `json:"prompt_tokens"`
+		Credit           *float64 `json:"credit"`
+	}
+	if json.Unmarshal(raw, &u) != nil {
+		return ui
+	}
+	ui.PromptTokens = u.PromptTokens
+	ui.CompletionTokens = u.CompletionTokens
+	if u.Credit != nil {
+		ui.Credit = *u.Credit
+		ui.HasCredit = true
+	}
+	return ui
+}
+
+// settleUsage 结算一次请求：算钱 → 与预扣对账 → 写流水。
+//
+// 计费口径（v0.12.0，需求 7 明确）：**唯一基准 = 本次被消耗的号池账号积分（consumedCredit）× 倍率**。
+//
+//	用户扣费（点）= 号池积分消耗 × 计费倍率（倍率由管理员在「设置 → 计费」配置，单位：点 / 1 积分）
+//
+// consumedCredit 取上游 usage.credit —— 即该次请求从serving 账号里**实扣掉**的积分数
+// （上游计费域的直接口径）。上游没回报 credit 时（老版本 / 异常响应）才用池里已学的
+// 「账号+模型」实测单价 × token 数估算，仍估不出则按 0 计并标记 missing_credit 便于对账。
+// 代挂分成 / 推广返点同样以**号池积分消耗**为基数折算（号主按自己的积分成本拿收益，
+// 不受计费倍率缩放），分成本身再以本次平台实收封顶，见 creditHostOwner。
+//
+// 返回值：settled 表示预扣是否已被处理（false 说明结算异常，调用方应走释放路径把钱退回）；
+// chargedMicro 是本次真正记账的扣费（微点），供实时态势（/api/admin/live）展示。
+// stickyHash 与 attempts 是**选号轨迹**（仅供流水排查，不参与任何计费计算）：
+//   - stickyHash 会话粘性键的 sha256 前 12 hex（不落明文：键可能是客户端 conversation_id）；
+//   - attempts   本次实际尝试的账号数（1 = 首选即成功，>1 = 中途换过号）。
+//
+// 为什么要记：此前流水只有最终 upstream_uid，无法回答「同一场对话的多轮是否落到不同
+// 账号」—— 那正是「调用过程中切换账号」这一问题的**观测盲区**（只能靠时间聚类猜）。
+func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui usageInfo, resv *Reservation, status, errMsg, stickyHash string, attempts int) (settled bool, chargedMicro int64) {
+	if u == nil {
+		// 管理密钥通道（运维 / 后台调试直连，见 apiKeyGuardOpt）：不经用户计费、
+		// 无需结算，但**必须进号池台账**（v0.17.6）。
+		//
+		// 此前这里直接 return —— 于是用管理密钥发的每一次请求在 usage_logs 里都不存在。
+		// 后果很具体：号池仪表盘的「累计服务 / 号池消耗 Top」对自己人的自测流量**视而不见**，
+		// 排查的人一边发请求一边看仪表盘纹丝不动，很容易误判「仪表盘坏了」。
+		// 「哪个号服务了这次请求、消耗了多少号池积分」是号池事实，与向谁收费无关，故照记。
+		// user_id 记 0：用户侧账单（按 user_id 过滤）天然看不到它，只有全站报表会统计。
+		p.logAdminChannelUsage(key, model, upstreamUID, ui, status, errMsg, stickyHash, attempts)
+		return true, 0
+	}
+	mult := p.store.PricingMultiplier()
+	// consumedCredit = 号池账号本次被消耗的积分（上游 direct 口径）。
+	consumedCredit := ui.Credit
+	if !ui.HasCredit {
+		// 只对成功响应做回落估算：失败响应没有真实用量（token=0），
+		// 强行估就是凭空扣费。失败一律按 0 计。
+		if status == "ok" {
+			consumedCredit = p.estimateCredit(upstreamUID, model, ui.Total())
+		} else {
+			consumedCredit = 0
+		}
+		if consumedCredit <= 0 && status == "ok" {
+			errMsg = strings.TrimSpace(errMsg + " [missing_credit]")
+		}
+	}
+	// 记录实测单价（积分 / 1k token），供后续请求的预扣估算使用
+	// （取历史最大值，另持久化到 kv，使重启后预扣能力不丢）。
+	if ui.Total() > 0 && consumedCredit > 0 {
+		p.observeCost(model, consumedCredit/float64(ui.Total())*1000)
+	}
+	// 扣费 = 号池积分消耗 × 倍率。倍率即「1 号池积分折多少点」。
+	chargedMicro = PointToMicro(consumedCredit * mult)
+
+	// 代挂自用 Key：免费（不扣余额、不走预扣），仅记一条零费用流水便于观测/对账。
+	hostSelf := key != nil && key.Kind == KeyKindHost
+	logScope := ScopePool
+	if hostSelf {
+		chargedMicro = 0
+		logScope = ScopeHost
+		errMsg = strings.TrimSpace(errMsg + " [host_self]")
+	}
+
+	var keyID int64
+	if key != nil {
+		keyID = key.ID
+	}
+	settled = true
+	if !hostSelf {
+		switch {
+		case resv != nil:
+			// 预扣-结算：退还冻结额、扣实际消耗，净额即多退少补。
+			if _, err := p.store.SettleReservation(resv.ID, chargedMicro); err != nil {
+				errMsg = strings.TrimSpace(errMsg + " [settle_failed:" + err.Error() + "]")
+				settled = false // 交给调用方 defer 释放，避免预扣悬空
+			}
+		case chargedMicro > 0:
+			// 无预扣（池内还没有单价数据）→ 退化为事后结算。
+			if _, err := p.store.ChargeUser(u.ID, chargedMicro); err != nil {
+				// 扣费失败不阻断响应（响应已发出），但要留痕。
+				errMsg = strings.TrimSpace(errMsg + " [charge_failed:" + err.Error() + "]")
+			}
+		}
+	}
+	_ = p.store.InsertUsageLog(&UsageLog{
+		UserID:           u.ID,
+		KeyID:            keyID,
+		Model:            model,
+		PromptTokens:     ui.PromptTokens,
+		CompletionTokens: ui.CompletionTokens,
+		UpstreamCredit:   consumedCredit,
+		ChargedMicro:     chargedMicro,
+		UpstreamUID:      upstreamUID,
+		Scope:            logScope,
+		Status:           status,
+		ErrorMsg:         errMsg,
+		StickyKeyHash:    stickyHash,
+		Attempts:         attempts,
+	})
+	// 代挂分成：本次若由某号主的「已入池」代挂账号服务平台流量，
+	// 按「号池积分消耗 × 分成比例」折入号主余额（以本次实收封顶）。
+	if !hostSelf && consumedCredit > 0 {
+		p.creditHostOwner(upstreamUID, u, model, consumedCredit, chargedMicro)
+	}
+	return settled, chargedMicro
+}
+
+// logAdminChannelUsage 为「管理密钥通道」写一条号池台账（user_id=0，零费用）。
+//
+// 与 settleUsage 主路径的区别只有两点：不扣任何用户余额（无用户可扣）、
+// 不做预扣对账（管理通道本就不预扣）。其余（consumedCredit 口径、单价观测、
+// 流水字段）与计费路径完全一致 —— 台账要能横向比较。
+func (p *Proxy) logAdminChannelUsage(key *APIKey, model, upstreamUID string, ui usageInfo, status, errMsg, stickyHash string, attempts int) {
+	consumedCredit := ui.Credit
+	if !ui.HasCredit {
+		if status == "ok" {
+			consumedCredit = p.estimateCredit(upstreamUID, model, ui.Total())
+		} else {
+			consumedCredit = 0
+		}
+	}
+	// 单价观测与计费路径同口径（只认真实用量），否则管理通道的请求白白浪费一次学习机会。
+	if ui.Total() > 0 && consumedCredit > 0 {
+		p.observeCost(model, consumedCredit/float64(ui.Total())*1000)
+	}
+	var keyID int64
+	if key != nil {
+		keyID = key.ID
+	}
+	_ = p.store.InsertUsageLog(&UsageLog{
+		UserID:           0, // 0 = 无归属（运维通道）；用户侧按 user_id 过滤，天然隔离
+		KeyID:            keyID,
+		Model:            model,
+		PromptTokens:     ui.PromptTokens,
+		CompletionTokens: ui.CompletionTokens,
+		UpstreamCredit:   consumedCredit,
+		ChargedMicro:     0, // 管理通道不收费
+		UpstreamUID:      upstreamUID,
+		Scope:            ScopePool,
+		Status:           status,
+		ErrorMsg:         errMsg,
+		StickyKeyHash:    stickyHash,
+		Attempts:         attempts,
+	})
+}
+
+// creditHostOwner 把一次平台请求的分成记入所服务账号的号主余额。
+//
+// 计分成基数（v0.12.0 起）：**号池账号本次被消耗的积分 consumedCredit**，
+// 而不是「平台向调用方收取的点数 chargedMicro」。原因：后者已经乘过计费倍率，
+// 会让倍率变成号主收益的隐形缩放因子 —— 倍率 < 1 时号主结构性亏损
+// （被扣 1 积分却只拿到 0.1×比例 点）。改成积分口径后，号主收益只取决于
+// 自己账号被消耗了多少积分，与平台定价倍率解耦。
+//
+// 但设硬上限：分成不得超过平台该次实收（chargedMicro）。否则当
+// 「倍率 < 分成比例」时平台会倒贴。
+//
+//	earn = min(round(consumedCredit × ratio), chargedMicro)
+//
+// 推论（运维须知）：要让平台每次都有留成，必须保证「计费倍率 > 代挂分成比例」。
+//
+// 仅在「账号是代挂 + 已入池 + 比例为正值」时生效；分成不足 1 微点则跳过（避免刷零流水）。
+// 失败只记日志：分成是激励，不应影响主请求的响应与计费。
+func (p *Proxy) creditHostOwner(uid string, from *User, model string, consumedCredit float64, chargedMicro int64) {
+	if uid == "" || consumedCredit <= 0 {
+		return
+	}
+	p.selMu.RLock()
+	owner := p.ownerByUID[uid]
+	inPool := p.poolInByUID[uid]
+	p.selMu.RUnlock()
+	if owner <= 0 || !inPool {
+		return
+	}
+	// 比例解析放在拿到 owner 之后（v0.17.7）：逐用户覆盖优先于全局配置，
+	// 所以必须先知道这笔收益归谁，才能取到正确的比例。
+	ratio := p.hostRatioFor(owner)
+	if ratio <= 0 {
+		return
+	}
+	// 微点记账一律 math.Round（与 PointToMicro 同口径）：直接截断会让小额收益
+	// 长期归零——实测 credit=0.01、分成 0.6、推广 0.1 时 10×0.6×0.1=0.6 微点，
+	// 截断成 0，号主的上级永远拿不到返点。
+	earn := PointToMicro(consumedCredit * ratio)
+	if earn > chargedMicro {
+		earn = chargedMicro // 平台实收封顶：倍率低于分成比例时不倒贴
+	}
+	if earn <= 0 {
+		return
+	}
+	// 号池收益计**可提现额度**（v0.21.0：返点收益可提现）。
+	if err := p.store.CreditWithdrawable(owner, earn); err != nil {
+		log.Printf("host earning credit failed (owner=%d uid=%s): %v", owner, uid, err)
+		return
+	}
+	_ = p.store.AddAccountEarned(uid, earn)
+	var fromID int64
+	if from != nil {
+		fromID = from.ID
+	}
+	_ = p.store.InsertHostEarning(&HostEarning{
+		AccountUID:  uid,
+		OwnerUserID: owner,
+		FromUserID:  fromID,
+		Model:       model,
+		Charged:     chargedMicro,
+		Earned:      earn,
+	})
+	// 推广返点：号主如果是由别人邀请进来的（referred_by>0），上级再按推广比例分一杯。
+	p.creditReferrerOfPool(owner, uid, model, chargedMicro, earn)
+}
+
+// creditReferrerOfPool 号主的代挂账号在池中赚到收益时，给其上级发推广返点。
+//
+// 计返基数取「号主本次收益（earn）」而非平台收费，避免上级的返点吃掉平台全部留成：
+// 平台本次留成 = charged - earn，返点从中出，故上限钳到「留成余额」。
+func (p *Proxy) creditReferrerOfPool(owner int64, uid, model string, chargedMicro, earn int64) {
+	if owner <= 0 || earn <= 0 {
+		return
+	}
+	up, err := p.store.GetUserByID(owner)
+	if err != nil || up == nil || up.ReferredBy <= 0 || up.ReferredBy == owner {
+		return
+	}
+	// 比例按**收益人（上级）**解析（v0.17.7）：这个比例描述的是「上级能从下级收益里
+	// 抽多少」，属于上级的属性，不是下级号主的属性。用错对象会让「给 A 设的比例」
+	// 在 A 的下级身上失效。
+	ratio := p.referralRatioFor(up.ReferredBy)
+	if ratio <= 0 {
+		return
+	}
+	rebate := int64(math.Round(float64(earn) * ratio))
+	if rebate <= 0 {
+		return
+	}
+	if margin := chargedMicro - earn; rebate > margin {
+		rebate = margin // 不侵占平台留成之外的额度
+	}
+	if rebate <= 0 {
+		return
+	}
+	// 推广返点计**可提现额度**（v0.21.0）。
+	if err := p.store.CreditWithdrawable(up.ReferredBy, rebate); err != nil {
+		log.Printf("referral pool rebate failed (referrer=%d owner=%d): %v", up.ReferredBy, owner, err)
+		return
+	}
+	_ = p.store.InsertRebate(&Rebate{
+		Kind:        RebateReferralPool,
+		Beneficiary: up.ReferredBy,
+		FromUserID:  owner,
+		AccountUID:  uid,
+		BaseMicro:   earn,
+		RebateMicro: rebate,
+		Note:        model,
+	})
+}
+
+// estimateCredit 用实测成本估算缺失的 credit：per1k × tokens / 1000。
+//
+// 单价来源两级回落（v0.12.0 修复）：
+//  1. pool.ModelCost —— (账号, 模型) 粒度观测，由网关侧 pool.NoteModelCost 写入；
+//  2. Proxy.costPer1k —— (模型) 粒度观测，由本进程 settleUsage 的 observeCost 写入。
+//
+// 为什么要两级：cmd/webapp 不经过 internal/server，pool.NoteModelCost 从不被调用，
+// 故第 1 级在 webapp 运行时**永远为空**（实测：账号卡片 model_costs 恒 undefined）。
+// 旧实现只读第 1 级 → 上游不回报 credit 时直接按 0 计费，纯漏计。
+// 两级单位相同（均为「积分 / 1k token」），故可安全回落。
+func (p *Proxy) estimateCredit(upstreamUID, model string, tokens int) float64 {
+	if model == "" || tokens <= 0 {
+		return 0
+	}
+	if upstreamUID != "" {
+		if per1k, ok := p.pool.ModelCost(upstreamUID, model); ok && per1k > 0 {
+			return per1k * float64(tokens) / 1000.0
+		}
+	}
+	p.costMu.RLock()
+	per1k, ok := p.costPer1k[model]
+	p.costMu.RUnlock()
+	if ok && per1k > 0 {
+		return per1k * float64(tokens) / 1000.0
+	}
+	return 0
+}
+
+// writeOpenAIError 输出 OpenAI 兼容的错误响应。
+func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "upstream_error",
+			"code":    status,
+		},
+	})
+}

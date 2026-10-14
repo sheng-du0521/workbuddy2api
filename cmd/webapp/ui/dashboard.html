@@ -1,0 +1,2371 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>控制台 · WorkBuddy API</title>
+<script>
+// 首屏防闪（v0.17.8）：在样式表解析前就把已保存的主题打到 <html> 上，
+// 否则深色用户会先看到一次浅色白闪再切换。失败（隐私模式）静默忽略。
+(function () { try { var t = localStorage.getItem('wb_theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <!-- ============================ 侧边栏 ============================ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">WB</div>
+      <div class="brand-txt"><b>WorkBuddy API</b><span>用户控制台</span></div>
+    </div>
+    <nav class="nav">
+      <div class="nav-group">我的</div>
+      <button class="nav-item active" data-nav="overview" data-on="loadOverview" data-title="概览" data-sub="余额、用量与最近调用"><span class="ico">◎</span>概览</button>
+      <button class="nav-item" data-nav="keys" data-on="loadKeys" data-title="API 密钥" data-sub="生成调用密钥，可按账号范围绑定"><span class="ico">🔑</span>API 密钥</button>
+      <button class="nav-item" data-nav="test" data-on="loadTestChat" data-title="测试对话" data-sub="用你自己的 Key 直连测试"><span class="ico">⌘</span>测试对话</button>
+      <button class="nav-item" data-nav="usage" data-on="loadUsageLive" data-title="用量账单" data-sub="三类消耗 + 实时态势 + 逐笔流水"><span class="ico">📊</span>用量账单</button>
+      <button class="nav-item" data-nav="wallet" data-on="loadWallet" data-title="充值提现" data-sub="充值码兑换、提现申请与流水"><span class="ico">💳</span>充值提现</button>
+      <div class="nav-group">代挂</div>
+      <button class="nav-item" data-nav="host" data-on="loadHostAccounts" data-title="账号代挂" data-sub="把你的账号挂到平台：自用反代 / 申请进号池赚收益"><span class="ico">🔗</span>账号代挂</button>
+      <button class="nav-item" data-nav="market" data-on="loadMarket" data-title="账号市场" data-sub="买断在售账号，转入你的代挂序列"><span class="ico">🏷</span>账号市场</button>
+      <button class="nav-item" data-nav="growth" data-on="loadHostGrowth" data-title="成长任务" data-sub="手动选号做官方成长计划，查看完成进度"><span class="ico">🌱</span>成长任务</button>
+      <div class="nav-group">收益</div>
+      <button class="nav-item" data-nav="rebates" data-on="loadRebates" data-title="我的返点" data-sub="号池返点 + 推广返点"><span class="ico">💰</span>我的返点</button>
+      <div class="nav-group">帮助</div>
+      <button class="nav-item" data-nav="docs" data-title="接入说明" data-sub="OpenAI 兼容接口对接方式"><span class="ico">📖</span>接入说明</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="whoami" id="whoami">…</div>
+      <div class="foot-actions">
+        <a id="adminLink" href="/admin.html" class="hidden">管理后台</a>
+        <button class="ghost sm" onclick="logout()">登出</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============================ 主区 ============================ -->
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="pageTitle">概览</h1>
+        <div class="sub" id="pageSub">余额、用量与最近调用</div>
+      </div>
+      <div class="actions">
+        <span class="tag accent" id="roleHint">…</span>
+        <button class="icon-btn" id="btnRefreshAll"></button>
+      </div>
+    </header>
+
+    <!-- ==================== 概览 ==================== -->
+    <section class="pane active" data-pane="overview">
+      <!-- ==================== 公告（v0.17.8；v0.22.0 加有效时限） ====================
+           放在概览页**最前**：公告是「需要第一时间看到」的信息，压在趋势图与
+           调用流水下面等于没发。默认隐藏（display:none），有生效中的公告时
+           由 renderAnnCard 显出来 —— 否则没公告的用户会在顶部看到一大片空白。
+           可见性判据在**后端**（启用中 ∧ 已到开始时间 ∧ 未到结束时间），前端不再
+           自行算时间窗 —— 两处判据必然跑偏，只留一处。 -->
+      <div class="card" id="annBox" style="display:none;margin:0 0 16px;">
+        <div class="section-head">
+          <h2>公告</h2>
+          <span class="muted" style="font-size:12px;" id="annStamp"></span>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          仅展示<b>生效中</b>的公告（已到开始时间且未过期），<b>📌 置顶</b>的排在最前；
+          新公告会在进入控制台时弹窗提示一次（已读的不会重复弹）。过期后自动隐藏。
+        </div>
+        <div class="cards" id="annCard"></div>
+      </div>
+
+      <div class="kpis" id="ovKpis">
+        <div class="kpi-card hl"><div class="k">余额 · 点</div><div class="v" id="balance">—</div><div class="d" id="balanceCny">≈ ¥0.00</div><div class="d" id="multNote">计费倍率 —</div></div>
+        <div class="kpi-card"><div class="k">累计请求</div><div class="v" id="reqs">—</div></div>
+        <div class="kpi-card"><div class="k">累计 token</div><div class="v" id="tokens">—</div></div>
+        <div class="kpi-card"><div class="k">累计消费</div><div class="v"><span id="charged">—</span><span class="u">点</span></div></div>
+        <div class="kpi-card"><div class="k">今日消费</div><div class="v" id="dayUsed">—</div><div class="d" id="dayNote">无消费闸</div></div>
+        <div class="kpi-card"><div class="k">本月消费</div><div class="v" id="monthUsed">—</div><div class="d" id="monthNote">无消费闸</div></div>
+      </div>
+
+      <div class="live-grid" style="margin-top:16px;">
+        <div class="card" style="margin:0;">
+          <div class="section-head">
+            <h2>近 14 天用量趋势</h2>
+            <span class="muted" style="font-size:12px;" id="ovTrendNote"></span>
+          </div>
+          <div id="ovChart"></div>
+          <div class="chart-legend" id="ovChartLegend"></div>
+          <div class="section-head" style="margin:14px 0 8px;"><h2 style="font-size:12.5px;">按模型消耗 Top</h2></div>
+          <div id="ovModels"></div>
+        </div>
+
+        <div class="card" style="margin:0;">
+          <h2>今日概况</h2>
+          <div class="mini-grid" id="ovToday"></div>
+          <div class="sub" id="ovQuota" style="margin-top:10px;"></div>
+          <div class="section-head" style="margin:14px 0 8px;"><h2 style="font-size:12.5px;">近 14 天调用构成</h2></div>
+          <div style="display:flex;gap:16px;align-items:center;">
+            <div id="ovDonut"></div>
+            <div id="ovDonutLegend" style="flex:1;min-width:0;"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="section-head">
+          <h2><span class="live-dot on"></span>最近调用（每 5 秒刷新）</h2>
+          <span class="muted" style="font-size:12px;" id="ovLiveStamp"></span>
+        </div>
+        <div class="feed" id="ovFeed"></div>
+      </div>
+
+      <!-- ==================== 实时消耗排行（v0.17.8） ==================== -->
+      <div class="card" style="margin-top:16px;">
+        <div class="section-head">
+          <h2><span class="live-dot on"></span>实时消耗排行</h2>
+          <span class="muted" style="font-size:12px;" id="ovRankStamp"></span>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          统计范围：<b>近 14 天</b>在本平台产生消耗的账号，按<b>消耗点数降序</b>
+          （同分按请求数，再按用户 id 稳定排序）。<b>他人用户名已脱敏</b>，
+          你自己那一行高亮；未进前 10 名也会显示你的实际名次。
+          <span id="ovRankMe"></span>
+        </div>
+        <div id="ovRankBars"></div>
+      </div>
+
+      <div class="section-head" style="margin-top:18px;"><h2>快捷操作</h2></div>
+      <div class="action-grid">
+        <button class="action-card" onclick="navGo('keys')"><b>生成调用密钥</b><span>按账号范围绑定，接入任意 OpenAI 兼容客户端</span></button>
+        <button class="action-card" onclick="navGo('test')"><b>测试对话</b><span>在页面上直接试一把你的密钥</span></button>
+        <button class="action-card" onclick="navGo('wallet')"><b>充值提现</b><span>兑换充值码 / 发起提现申请</span></button>
+        <button class="action-card" onclick="navGo('usage')"><b>查看用量账单</b><span>三类消耗 + 逐笔调用与实时态势</span></button>
+        <button class="action-card" onclick="navGo('host')"><b>账号代挂</b><span>挂上自己的账号：免费自用 / 进池赚收益</span></button>
+        <button class="action-card" onclick="navGo('rebates')"><b>我的返点</b><span>号池返点与推广返点明细</span></button>
+        <button class="action-card" onclick="navGo('docs')"><b>接入说明</b><span>Base URL 与 cURL 示例</span></button>
+      </div>
+    </section>
+
+    <!-- ==================== API 密钥（密钥生成） ==================== -->
+    <section class="pane" data-pane="keys">
+      <div class="card">
+        <div class="section-head">
+          <h2>生成调用密钥</h2>
+          <div class="row">
+            <button class="icon-btn" id="btnGetModels"><span></span></button>
+            <span class="slot-refresh" data-refresh="loadKeyForm" data-refresh-label="刷新账号"></span>
+          </div>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          选好<b>账号范围</b>再生成密钥：勾中代挂账号即为「代挂自用 Key」（走你自己的账号、<b>不扣余额</b>）；
+          一个都不勾则为「号池计费 Key」（走平台号池、按用量扣余额）。
+        </div>
+
+        <div class="row" style="margin-bottom:12px;">
+          <input type="text" id="keyName" placeholder="备注名前缀，如 笔记本" style="min-width:200px;max-width:280px;">
+          <div id="keyKindSeg"></div>
+          <label class="muted" style="font-size:12px;">数量</label>
+          <input type="number" id="keyCount" value="1" min="1" max="20" step="1" style="width:74px;min-width:0;" title="一次生成多把（1-20），名称自动加 -1/-2 后缀">
+          <button id="btnNewKey">生成密钥</button>
+          <span id="keyNewHint" class="muted"></span>
+        </div>
+
+        <div class="section-head" style="margin:6px 0 8px;">
+          <h2 style="font-size:12.5px;">账号范围（不勾 = 全部本人代挂账号 / 平台号池）</h2>
+          <span class="muted" style="font-size:12px;" id="keyBindSummary"></span>
+        </div>
+        <div id="keyBindList"></div>
+      </div>
+
+      <div class="section-head">
+        <h2>我的密钥</h2>
+        <span class="slot-refresh" data-refresh="loadKeys" data-refresh-label="刷新"></span>
+      </div>
+      <div class="cards" id="keyCards"></div>
+    </section>
+
+    <!-- ==================== 测试对话 ==================== -->
+    <section class="pane" data-pane="test">
+      <div class="card">
+        <h2>测试对话（用你自己的密钥直连）</h2>
+        <div class="sub" style="margin:0 0 12px;">
+          选一把自己的密钥发一条消息，验证是否跑通。<b>号池计费密钥</b> 会按用量扣余额；
+          <b>代挂自用密钥</b> 不扣余额，只用你自己的代挂账号。
+        </div>
+        <div class="row" style="margin-bottom:10px;">
+          <label>密钥</label>
+          <select id="testKey" style="min-width:260px;"></select>
+          <label>模型</label>
+          <input type="text" id="testModel" value="deepseek-v4-flash" class="mono" list="modelOpts" style="min-width:180px;">
+          <datalist id="modelOpts"></datalist>
+          <span class="row tight" style="gap:6px;">
+            <span class="switch"><input type="checkbox" id="testStream" checked><i></i></span>
+            <span class="muted" style="font-size:12px;">流式</span>
+          </span>
+        </div>
+        <textarea id="testPrompt">用一句话介绍你自己。</textarea>
+        <div class="row" style="margin-top:10px;">
+          <button id="btnTestSend">发送</button>
+          <span id="testHint" class="muted"></span>
+        </div>
+        <pre class="code" id="testReply" style="margin-top:12px;">回复会显示在这里</pre>
+      </div>
+    </section>
+
+    <!-- ==================== 用量账单 ==================== -->
+    <section class="pane" data-pane="usage">
+      <div class="card">
+        <div class="section-head">
+          <h2>三类消耗</h2>
+          <span class="slot-refresh" data-refresh="loadUsageLive" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          近 14 天 · 按数据来源拆分。本页消费与余额一律以<b>点</b>为单位（余额另有 ¥ 折算副行）；
+          「号池贡献收益」属返点，按规则以<b>¥</b> 呈现。
+        </div>
+        <div class="cards" id="bkCards"></div>
+      </div>
+
+      <div class="live-grid">
+        <div class="card" style="margin:0;">
+          <div class="section-head">
+            <h2><span class="live-dot on"></span>实时态势</h2>
+            <span class="muted" style="font-size:12px;" id="usStamp"></span>
+          </div>
+          <div class="mini-grid" id="usKpis"></div>
+          <div id="usChart" style="margin-top:14px;"></div>
+          <div class="chart-legend" id="usLegend"></div>
+        </div>
+        <div class="card" style="margin:0;">
+          <h2>消耗结构</h2>
+          <div style="display:flex;gap:16px;align-items:center;">
+            <div id="usDonut"></div>
+            <div id="usDonutLegend" style="flex:1;min-width:0;"></div>
+          </div>
+          <div class="section-head" style="margin:14px 0 8px;"><h2 style="font-size:12.5px;">按模型消耗</h2></div>
+          <div id="usModels"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>最近调用</h2>
+          <span class="muted" style="font-size:12px;">最近 50 笔</span>
+        </div>
+        <div class="feed" id="usFeed"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>按日明细</h2></div>
+        <div id="myDailyTable"></div>
+      </div>
+    </section>
+
+    <!-- ==================== 充值提现 ==================== -->
+    <section class="pane" data-pane="wallet">
+      <div class="kpis" id="wdKpis"></div>
+
+      <div class="live-grid" style="margin-top:16px;">
+        <div class="card" style="margin:0;">
+          <div class="section-head">
+            <h2>充值 · 兑换码</h2>
+            <span class="slot-refresh" data-refresh="loadWallet" data-refresh-label="刷新"></span>
+          </div>
+          <div class="row">
+            <input type="text" id="redeemCode" placeholder="WB-XXXX-XXXX-XXXX" class="mono" style="min-width:240px;flex:1;">
+            <button id="btnRedeem">立即兑换</button>
+          </div>
+          <div class="sub" style="margin:10px 0 0;">充值码由管理员发放，兑换后点数立即到账。</div>
+        </div>
+
+        <div class="card" style="margin:0;">
+          <h2>提现申请</h2>
+          <div class="sub" style="margin:0 0 10px;">
+            仅支持<b>支付宝</b>提现；<b>只有返点收益与账号买卖所得可提现</b>
+            （体验点 / 充值点只能消费，不可提现）。
+          </div>
+          <div class="cfg-list">
+            <div class="cfg-row">
+              <div class="cfg-txt"><b>收款方式</b><div class="hint">当前仅支持支付宝</div></div>
+              <div class="cfg-ctl"><input type="text" id="wdMethodLocked" value="支付宝" disabled style="min-width:180px;"></div>
+            </div>
+            <div class="cfg-row">
+              <div class="cfg-txt"><b>支付宝账号</b><div class="hint">手机号 / 邮箱 / 支付宝账密</div></div>
+              <div class="cfg-ctl"><input type="text" id="wdAccount" placeholder="填写支付宝账号" maxlength="100" style="min-width:180px;"></div>
+            </div>
+            <div class="cfg-row">
+              <div class="cfg-txt"><b>姓名</b><div class="hint">支付宝实名，打款核对用</div></div>
+              <div class="cfg-ctl"><input type="text" id="wdRealName" placeholder="填写姓名" maxlength="32" style="min-width:180px;"></div>
+            </div>
+            <div class="cfg-row">
+              <div class="cfg-txt"><b>提现点数</b><div class="hint" id="wdHint">—</div></div>
+              <div class="cfg-ctl">
+                <input type="number" id="wdAmount" min="0" step="1" placeholder="点数" style="width:120px;min-width:0;">
+                <button class="icon-btn" id="btnWdAll">全部</button>
+              </div>
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <button id="btnWithdraw">提交提现申请</button>
+            <span class="muted" id="wdApplyHint"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-head" style="margin-top:18px;">
+        <h2>提现记录</h2>
+        <span class="slot-refresh" data-refresh="loadWallet" data-refresh-label="刷新"></span>
+      </div>
+      <div class="cards" id="wdCards"></div>
+
+      <div class="section-head"><h2>充值记录</h2></div>
+      <div class="cards" id="rcCards"></div>
+    </section>
+
+    <!-- ==================== 账号市场（v0.19.0） ==================== -->
+    <section class="pane" data-pane="market">
+      <div class="card">
+        <div class="section-head">
+          <h2>账号市场</h2>
+          <span class="slot-refresh" data-refresh="loadMarket" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          这里列出平台<b>在售</b>的账号。买断后账号归你所有，自动进入你的
+          <b>代挂序列</b>（分组名「买断」），随后在「API 密钥」页生成密钥时勾中它即可
+          <b>自用反代</b>。买断从你的余额扣款，金额由你填写（最多两位小数）。
+          <br><b>交易门槛</b>：账号积分须 ≥ <b>4000</b> 才能上架或被买断（上架时校验，成交前二次复核）。
+          <br><b>你也可以上架自己的账号</b>：在下方「我的账号」里点「上架」，成交后金额<b>全额</b>进你的余额；
+          挂牌期间该账号归属<b>闲置</b>（不参与平台反代），下架会自动恢复原分组。
+        </div>
+        <div id="marketBalance" class="sub"></div>
+      </div>
+      <div class="card">
+        <h3>我的账号（可上架）</h3>
+        <div id="marketOwned"></div>
+      </div>
+      <div class="card">
+        <h3>在售账号</h3>
+        <div id="marketCards"></div>
+      </div>
+      <div class="card">
+        <h3>我的买断记录</h3>
+        <div id="marketMine"></div>
+      </div>
+    </section>
+
+    <!-- ==================== 账号代挂 ==================== -->
+    <section class="pane" data-pane="host">
+      <div class="card">
+        <div class="section-head">
+          <h2>添加代挂账号（扫码授权）</h2>
+          <span class="slot-refresh" data-refresh="loadHostAccounts" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          把你的 WorkBuddy 账号挂到平台：账号仍归你所有。按版本<b>扫码添加</b>（国内版 / 国际版登录态不通用）。
+          给账号设好<b>分组</b>后，在「API 密钥」页生成密钥时勾中它即可<b>免费自用</b>；
+          也可以<b>申请进号池</b>由平台反代、按分成比例把收益折成点数入你的余额（见「我的返点」）。
+        </div>
+        <div id="hostOauthBtns"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>全部代挂账号 · 定时任务</h2>
+          <span class="muted" style="font-size:12px;" id="hostUnifiedHint"></span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          这里统一开关<b>全部</b>代挂账号的自动任务；单个账号的差异在下方每张账号卡片里单独设置。
+          账号在池中自动签到 / 做任务维持额度，改动即时生效。
+        </div>
+        <div class="cfg-list" id="hostUnifiedList"></div>
+      </div>
+
+      <div class="section-head">
+        <h2>我的代挂账号</h2>
+        <div class="row">
+          <span id="hostSummary" class="muted" style="font-size:12px;"></span>
+          <span class="slot-refresh" data-refresh="loadHostAccounts" data-refresh-label="刷新"></span>
+        </div>
+      </div>
+      <div class="chipbar" id="hostGroupBar"></div>
+      <div class="cards" id="hostCards"></div>
+
+      <div class="section-head"><h2>代挂收益</h2></div>
+      <div class="cards" id="hostEarnCards"></div>
+    </section>
+
+    <!-- ==================== 成长任务（v0.17.1） ==================== -->
+    <section class="pane" data-pane="growth">
+      <div class="card">
+        <div class="section-head">
+          <h2>我的代挂账号 · 成长任务</h2>
+          <span class="slot-refresh" data-refresh="loadHostGrowth" data-refresh-label="刷新列表"></span>
+        </div>
+        <div class="sub" style="margin:0 0 14px;">
+          官方「成长计划」有一批任务，做完能拿积分与能量。
+          <b>成长任务不会自动跑</b>（它会对账号发起真实请求），由你在这里勾选账号后手动执行：
+          后台<b>逐个串行</b>推进、账号之间随机等待数十秒到两分钟。
+          <br>执行链路是「<b>先跑不消耗额度的行为上报</b>攒积分 → <b>再跑需真实对话</b>的消耗类」；
+          已完成的由服务端自动跳过，<b>重复跑不会重复扣资源</b>。
+        </div>
+        <div class="row" style="flex-wrap:wrap;align-items:center;gap:8px;">
+          <label class="pick-all" title="全选 / 取消全选下列账号"><input type="checkbox" id="hAll"> 全选</label>
+          <span id="hgSelCount" class="muted" style="font-size:12px;"></span>
+          <button class="ghost" id="hgBtnClear">清除选择</button>
+          <button class="ghost" id="hgBtnQuery">查询进度</button>
+          <button id="hgBtnRun">跑成长任务</button>
+          <span id="hgHint" class="muted" style="font-size:12px;"></span>
+        </div>
+        <div class="sub" id="hgNote" style="margin:12px 0 0;"></div>
+      </div>
+
+      <div class="section-head">
+        <h2>完成进度</h2>
+        <span class="muted" style="font-size:12px;" id="hgSummary"></span>
+      </div>
+      <div class="cards" id="hgCards"></div>
+    </section>
+
+    <!-- ==================== 我的返点 ==================== -->
+    <section class="pane" data-pane="rebates">
+      <div class="live-grid">
+        <div class="card" style="margin:0;">
+          <div class="section-head">
+            <h2>号池返点</h2>
+            <span class="tag accent" id="rbPoolRatio">比例 —</span>
+          </div>
+          <div class="sub" style="margin:0 0 10px;">
+            你的代挂账号进入号池、被平台用来反代后，平台按「该次消耗的<b>号池积分</b> × 分成比例」把收益折入你的余额。
+            <b>本页金额一律以「钱」（¥）呈现</b>，按提现折算比例换算；括号内的点数是余额里实际入账的单位。
+            分成基数取号池积分本身，<b>不受平台计费倍率影响</b>；单次以平台实收为上限。
+          </div>
+          <div class="mini-grid" id="rbPoolKpis"></div>
+        </div>
+
+        <div class="card" style="margin:0;">
+          <div class="section-head">
+            <h2>推广返点</h2>
+            <span class="tag accent" id="rbRefRatio">比例 —</span>
+          </div>
+          <div class="sub" style="margin:0 0 10px;">
+            把你的邀请码分享出去：下级<b>兑换充值</b>、以及下级的代挂账号在号池<b>赚到收益</b>时，你都能拿返点。
+          </div>
+          <div class="row" style="margin-bottom:12px;">
+            <span class="mono" id="rbCode" style="font-size:15px;font-weight:600;">—</span>
+            <span id="rbCopyCode"></span>
+            <span id="rbCopyLink"></span>
+          </div>
+          <div class="mini-grid" id="rbRefKpis"></div>
+        </div>
+      </div>
+
+      <div class="section-head">
+        <h2>返点流水</h2>
+        <span class="slot-refresh" data-refresh="loadRebates" data-refresh-label="刷新"></span>
+      </div>
+      <div class="cards" id="rbRows"></div>
+    </section>
+
+    <!-- ==================== 接入说明 ==================== -->
+    <section class="pane" data-pane="docs">
+      <div class="card">
+        <h2>接入信息</h2>
+        <pre class="code">Base URL: <span id="baseUrl"></span>
+API Key : 在上方「API 密钥」页生成</pre>
+      </div>
+      <div class="card">
+        <h2>cURL 示例</h2>
+        <pre class="code">curl <span id="baseUrl2"></span>/chat/completions \
+  -H "Authorization: Bearer sk-wb-你的密钥" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
+        <div class="sub">支持流式（SSE）与非流式；模型名可调用 <span class="mono">/v1/models</span> 获取，
+          也可在「API 密钥」页点「获取模型 ID」直接查看。</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/app.js"></script>
+<script>
+let me = null;
+let stopUsageLive = null;
+// rate 全站折算比例（元/点，v0.17.7）：由后端各接口的 `rate` 字段写入，只作兜底换算用。
+// **不要在这里写死** —— 管理员改提现比例后，写死的值会让「点 ≈ ¥」显示错误。
+let rate = 0;
+
+// rbRatioText 返点比例标签文案：生效值 + 来源（单独设 / 跟随全局）。
+//
+// 为什么要标明来源（v0.17.7）：管理员可对单个用户覆盖比例，用户看到「我的比例 30%」
+// 时无法判断这是全站默认还是被单独设定过。来源标注让两种情形可区分。
+function rbRatioText(key, ratios, label) {
+  const eff = Number((ratios || {})[key] || 0);
+  const detail = (ratios || {})[key + '_detail'] || {};
+  const pct = Math.round(eff * 100) + '%';
+  if (detail.is_custom) return label + ' ' + pct + '（单独设定）';
+  return label + ' ' + pct + '（跟随全局）';
+}
+
+// 账号级自动任务（与后端 accountTaskKinds 对齐；标签用于展示）。
+const ACCOUNT_TASKS = [
+  { name: 'checkin',   label: '自动签到', hint: '每日自动签到领额度' },
+  { name: 'travel',    label: '猫猫旅行', hint: '自动跑猫猫旅行任务' },
+  { name: 'activity',  label: '活跃上报', hint: '维持账号活跃度' },
+  { name: 'keepalive', label: '登录保活', hint: '临期时刷新登录态' },
+  { name: 'cat',       label: '夜猫子',   hint: '夜间对话点亮' },
+];
+
+function todayStr() {
+  const d = new Date();
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// nowSec 取当前 Unix 秒（统一入口，避免各处手算）。
+function nowSec() { return Math.floor(Date.now() / 1000); }
+
+// ======================================================================
+// 顶部 KPI
+// ======================================================================
+
+async function loadTop() {
+  const d = await api('/api/usage?limit=1');
+  const s = d.summary || {};
+  setTxt('balance', fmtPoints(s.balance));
+  // 余额双口径（v0.17.7）：点为主（大字），金额为辅（≈ ¥）。用后端给的 balance_cny，
+  // 不在这里乘 rate —— 换算口径只能有一处，前端相乘迟早与后端算出的值不一致。
+  setTxt('balanceCny', s.balance_cny === undefined
+    ? ('≈ ' + fmtMoney(cnyOf(s.balance, s.rate)))
+    : ('≈ ' + fmtMoney(s.balance_cny) + ' · ' + fmtRate(s.rate)));
+  setTxt('reqs', fmtNum(s.requests));
+  setTxt('tokens', fmtNum(s.tokens));
+  setTxt('charged', fmtPoints(s.charged));
+  setTxt('multNote', '计费倍率 ' + (s.multiplier || 1) + '×');
+  if (me) {
+    setTxt('dayUsed', me.daily_limit > 0 ? `${fmtPoints(me.daily_used)} / ${fmtPoints(me.daily_limit)}` : fmtPoints(me.daily_used || 0));
+    setTxt('dayNote', me.daily_limit > 0 ? '已用 / 日限额（点）' : '无消费闸（点数）');
+    setTxt('monthUsed', me.monthly_limit > 0 ? `${fmtPoints(me.monthly_used)} / ${fmtPoints(me.monthly_limit)}` : fmtPoints(me.monthly_used || 0));
+    setTxt('monthNote', me.monthly_limit > 0 ? '已用 / 月限额（点）' : '无消费闸（点数）');
+  }
+}
+
+// ======================================================================
+// 报表数据（近 N 天）
+// ======================================================================
+
+async function fetchReport(days) {
+  return api(`/api/usage/report?days=${days || 14}`);
+}
+
+// miniGrid 渲染一小片数值块（替代旧的 mini-kpis 三列网格）。
+function miniGrid(container, items) {
+  container.textContent = '';
+  for (const it of items) {
+    const d = el('div', 'mk' + (it.cls ? ' ' + it.cls : ''));
+    d.appendChild(el('div', 'k', it.k));
+    d.appendChild(el('div', 'v', it.v));
+    // d = 副行说明（v0.17.7）：用于「点」下方补「≈ ¥」这类第二口径，
+    // 避免把两种单位塞进同一行造成误读。
+    if (it.d) d.appendChild(el('div', 'mk-d', it.d));
+    container.appendChild(d);
+  }
+}
+
+// dailyTable 按日明细表（日期 / 请求 / Tokens / 扣费 / 均次 token + 迷你条）。
+function dailyTable(container, rows) {
+  container.textContent = '';
+  if (!rows.length) { container.appendChild(el('div', 'hintbar', '近 14 天暂无调用')); return; }
+  const maxReq = Math.max(1, ...rows.map((r) => Number(r.requests) || 0));
+  const wrap = el('div');
+  const tbl = el('table');
+  const thead = el('thead');
+  const htr = el('tr');
+  for (const h of ['日期', '占比', '请求', 'Tokens', '扣费（点）', '均次 token']) htr.appendChild(el('th', '', h));
+  thead.appendChild(htr);
+  tbl.appendChild(thead);
+  const tb = el('tbody');
+  for (const r of rows) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'mono', r.day));
+    const tdBar = el('td');
+    const track = el('div', 'bk-track');
+    track.style.width = '84px';
+    const fill = el('i');
+    fill.style.width = Math.max(2, Math.round(((Number(r.requests) || 0) / maxReq) * 100)) + '%';
+    track.appendChild(fill);
+    tdBar.appendChild(track);
+    tr.appendChild(tdBar);
+    tr.appendChild(el('td', 'mono', fmtNum(r.requests)));
+    tr.appendChild(el('td', 'mono', fmtNum(r.tokens)));
+    tr.appendChild(el('td', 'mono', fmtPointsU(r.charged)));
+    tr.appendChild(el('td', 'mono', r.requests > 0 ? fmtNum(Math.round(r.tokens / r.requests)) : '—'));
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb);
+  wrap.appendChild(tbl);
+  container.appendChild(wrap);
+}
+
+// ======================================================================
+// 概览
+// ======================================================================
+
+async function loadOverview() {
+  await loadTop();
+  // 公告：概览卡片随页刷新；弹窗只对「本浏览器未读」的公告触发一次。
+  maybeShowAnnouncements().then(() => {
+    const s = $('annStamp');
+    if (s) s.textContent = '更新于 ' + fmtClock(Math.floor(Date.now() / 1000));
+  });
+  try {
+    const [rep, bk] = await Promise.all([
+      fetchReport(14),
+      api('/api/usage/breakdown?days=14').catch(() => ({})),
+    ]);
+    const daily = rep.daily || [];
+    setTxt('ovTrendNote', daily.length ? `${daily.length} 天有调用` : '近 14 天暂无调用');
+
+    // 趋势：柱状（请求数）。
+    const chart = $('ovChart');
+    chart.textContent = '';
+    if (daily.length) {
+      const svg = svgColumnChart(daily.map((r) => ({ label: r.day, value: r.requests })), { height: 40 });
+      svg.style.height = '110px';
+      chart.appendChild(svg);
+      $('ovChartLegend').textContent = '';
+      $('ovChartLegend').appendChild(legend([{ label: '每日请求数', color: 'var(--accent)' }]));
+    } else {
+      chart.appendChild(el('div', 'hintbar', '近 14 天暂无调用'));
+      $('ovChartLegend').textContent = '';
+    }
+
+    // 按模型消耗 Top（横向条）。
+    const models = (rep.models || []).slice()
+      .sort((a, b) => (Number(b.charged) || 0) - (Number(a.charged) || 0)).slice(0, 6);
+    $('ovModels').replaceChildren(svgHBars(
+      models.map((m) => ({ label: m.model || '—', value: Number(m.charged) || 0 })),
+      { fmt: fmtPointsU, unit: '' },
+    ));
+
+    const t = todayStr();
+    let todayReq = 0, todayTok = 0, todayCharge = 0;
+    for (const r of daily) { if (r.day === t) { todayReq = r.requests; todayTok = r.tokens; todayCharge = r.charged; } }
+    miniGrid($('ovToday'), [
+      { k: '今日请求', v: fmtNum(todayReq) },
+      { k: '今日 tokens', v: fmtNum(todayTok) },
+      { k: '今日消费', v: fmtPointsU(todayCharge) },
+      { k: '近 14 天消耗', v: fmtPointsU((rep.totals || {}).charged), cls: 'ok' },
+    ]);
+
+    // 今日 / 本月配额说明。
+    if (me) {
+      const parts = [];
+      if (me.daily_limit > 0) parts.push(`今日 ${fmtPointsU(me.daily_used)} / ${fmtPointsU(me.daily_limit)}`);
+      if (me.monthly_limit > 0) parts.push(`本月 ${fmtPointsU(me.monthly_used)} / ${fmtPointsU(me.monthly_limit)}`);
+      setTxt('ovQuota', parts.length ? parts.join(' · ') : '未设消费闸（不限）');
+    }
+
+    // 调用构成（三类）。
+    renderBreakdownDonut($('ovDonut'), $('ovDonutLegend'), bk);
+  } catch (e) { console.warn(e.message); }
+  await loadRecentFeed('ovFeed', 'ovLiveStamp');
+}
+
+// renderBreakdownDonut 三类消耗的调用构成环形图 + 图例。
+function renderBreakdownDonut(donutBox, legendBox, bk) {
+  bk = bk || {};
+  const items = [
+    { label: '自用反代', value: Number((bk.self_use || {}).requests) || 0, color: 'var(--accent-2)' },
+    { label: '号池调用', value: Number((bk.pool_use || {}).requests) || 0, color: 'var(--accent)' },
+    { label: '号池贡献', value: Number((bk.pool_earn || {}).requests) || 0, color: 'var(--ok)' },
+  ];
+  const total = items.reduce((s, x) => s + x.value, 0);
+  donutBox.textContent = '';
+  legendBox.textContent = '';
+  if (!total) {
+    donutBox.appendChild(svgDonut(items, '0'));
+    legendBox.appendChild(el('div', 'muted', '近 14 天暂无调用'));
+    return;
+  }
+  donutBox.appendChild(svgDonut(items, fmtNum(total)));
+  const list = el('div', 'kv-list');
+  for (const it of items) {
+    const row = el('div', 'kv-row');
+    const k = el('span', 'k');
+    const dot = el('i');
+    dot.style.cssText = 'display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px;background:' + it.color;
+    k.appendChild(dot);
+    k.appendChild(document.createTextNode(it.label));
+    row.appendChild(k);
+    const pct = total ? Math.round((it.value / total) * 100) : 0;
+    row.appendChild(el('span', 'v', fmtNum(it.value) + ' 次 · ' + pct + '%'));
+    list.appendChild(row);
+  }
+  legendBox.appendChild(list);
+}
+
+// ======================================================================
+// 最近调用（实时流）
+// ======================================================================
+
+async function loadRecentFeed(feedId, stampId, limit) {
+  const d = await api('/api/usage?limit=' + (limit || 30));
+  const feed = $(feedId);
+  if (!feed) return;
+  const logs = d.logs || [];
+  feed.textContent = '';
+  if (stampId) setTxt(stampId, '更新于 ' + fmtClock(nowSec()));
+  if (!logs.length) {
+    feed.appendChild(el('div', 'feed-empty', '还没有调用记录。用你的密钥发一次请求，这里会实时出现。'));
+    return;
+  }
+  for (const l of logs) {
+    const ok = l.status === 'ok';
+    const row = el('div', 'ev' + (ok ? '' : ' bad'));
+    row.appendChild(el('span', 'dot'));
+    row.appendChild(el('span', 't', fmtClock(l.created_at)));
+    row.appendChild(el('span', 'who', l.model || '—'));
+    row.appendChild(el('span', 'msg', ok
+      ? `${fmtNum(l.prompt_tokens)} / ${fmtNum(l.completion_tokens)} tokens`
+      : (l.error || l.status)));
+    row.appendChild(el('span', 'amt', ok ? fmtPointsU(l.charged) : '—'));
+    feed.appendChild(row);
+  }
+}
+
+// ======================================================================
+// 用量账单
+// ======================================================================
+
+async function loadUsage() {
+  await loadRecentFeed('usFeed', null, 50);
+}
+
+function usageKpis(box, daily, totals, summary) {
+  const t = todayStr();
+  let todayReq = 0, todayCharge = 0;
+  for (const r of daily) if (r.day === t) { todayReq = r.requests; todayCharge = r.charged; }
+  miniGrid(box, [
+    { k: '余额 · 点', v: fmtPoints((summary || {}).balance),
+      d: '≈ ' + fmtMoney((summary || {}).balance_cny) },
+    { k: '今日请求', v: fmtNum(todayReq) },
+    { k: '今日消费', v: fmtPointsU(todayCharge) },
+    { k: '近 14 天消费', v: fmtPointsU((totals || {}).charged) },
+    { k: '近 14 天 Tokens', v: fmtNum((totals || {}).tokens) },
+    { k: '近 14 天请求', v: fmtNum((totals || {}).requests) },
+  ]);
+}
+
+// breakdownCards 渲染「三类消耗」卡片：自用反代消耗 / 号池贡献收益 / 号池调用消耗。
+// 每张卡用横向条直观对比内部各项量级，避免只有一串数字。
+function breakdownCards(bk) {
+  const box = $('bkCards');
+  if (!box) return;
+  box.textContent = '';
+  const specs = [
+    {
+      key: 'self_use', title: '① 自用反代消耗', sub: '用代挂自用 Key 走自己的账号 · 不扣余额',
+      amount: (b) => ({ v: Number(b.charged) || 0, unit: '点扣费' }),
+      bars: (b) => [
+        { k: '请求', v: Number(b.requests) || 0, fmt: fmtNum },
+        { k: 'Tokens', v: Number(b.tokens) || 0, fmt: fmtNum },
+        { k: '号池积分消耗', v: Number(b.upstream_credit) || 0, fmt: fmtAmt },
+      ],
+    },
+    {
+      key: 'pool_earn', title: '② 号池贡献收益', sub: '自己的账号在池中服务平台流量 · 按比例折入余额',
+      // 收益＝返点 → 一律以「钱」为主展示（v0.17.7）。
+      money: (b) => Number(b.earned_cny) || cnyOf(b.total, bk.rate),
+      amount: (b) => ({ v: Number(b.total) || 0, unit: '点累计', cny: Number(b.total_cny) || cnyOf(b.total, bk.rate) }),
+      bars: (b) => [
+        { k: '平台请求', v: Number(b.requests) || 0, fmt: fmtNum },
+        { k: '服务收费', v: Number(b.charged) || 0, fmt: fmtPointsU },
+        { k: '本次收益', v: Number(b.earned) || 0, fmt: fmtPointsU, cny: Number(b.earned_cny) || cnyOf(b.earned, bk.rate) },
+      ],
+    },
+    {
+      // 计费口径（v0.12.0，需求 7）：扣费 = 本次被消耗的号池账号积分 × 计费倍率。
+      key: 'pool_use', title: '③ 号池调用消耗', sub: '用平台计费 Key 走平台号池 · 扣费 = 号池积分消耗 × 倍率',
+      amount: (b) => ({ v: Number(b.charged) || 0, unit: '点扣费' }),
+      bars: (b) => [
+        { k: '请求', v: Number(b.requests) || 0, fmt: fmtNum },
+        { k: 'Tokens', v: Number(b.tokens) || 0, fmt: fmtNum },
+        { k: '号池积分消耗', v: Number(b.upstream_credit) || 0, fmt: fmtAmt },
+      ],
+    },
+  ];
+  for (const sp of specs) {
+    const b = bk[sp.key] || {};
+    const card = el('div', 'bk-card');
+    const head = el('div', 'bk-head');
+    head.appendChild(el('span', 'bk-title', sp.title));
+    const amt = sp.amount(b);
+    // 返点类卡片（sp.money 存在）以「钱」为主展示，点数降为 title 说明（v0.17.7）。
+    const amtEl = el('span', 'bk-amt',
+      sp.money ? fmtMoney(sp.money(b)) : fmtPoints(amt.v));
+    amtEl.appendChild(el('span', 'u', sp.money ? '累计' : amt.unit));
+    if (sp.money) amtEl.title = '折合 ' + fmtPointsU(amt.v);
+    head.appendChild(amtEl);
+    card.appendChild(head);
+    card.appendChild(el('div', 'bk-sub', sp.sub));
+
+    const bars = sp.bars(b);
+    const max = Math.max(1, ...bars.map((x) => x.v));
+    const barBox = el('div', 'bk-bars');
+    for (const x of bars) {
+      const row = el('div', 'bk-bar');
+      row.appendChild(el('span', 'bl', x.k));
+      const track = el('div', 'bk-track');
+      const fill = el('i');
+      fill.style.width = Math.max(x.v > 0 ? 3 : 0, Math.round((x.v / max) * 100)) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(el('span', 'bv', x.fmt(x.v)));
+      barBox.appendChild(row);
+    }
+    card.appendChild(barBox);
+    box.appendChild(card);
+  }
+}
+
+async function loadUsageLive() {
+  try {
+    const [rep, log, bk] = await Promise.all([
+      fetchReport(14),
+      api('/api/usage?limit=1'),
+      api('/api/usage/breakdown?days=14').catch(() => ({})),
+    ]);
+    const daily = rep.daily || [];
+    usageKpis($('usKpis'), daily, rep.totals, log.summary);
+
+    const chart = $('usChart');
+    chart.textContent = '';
+    if (daily.length) {
+      const svg = svgLineChart(daily.map((r) => ({ label: r.day, value: r.requests })), { height: 40 });
+      svg.style.height = '96px';
+      chart.appendChild(svg);
+      $('usLegend').textContent = '';
+      $('usLegend').appendChild(legend([{ label: '每日请求数', color: 'var(--accent)' }]));
+    } else {
+      chart.appendChild(el('div', 'hintbar', '暂无数据'));
+      $('usLegend').textContent = '';
+    }
+    setTxt('usStamp', '更新于 ' + fmtClock(nowSec()));
+
+    breakdownCards(bk);
+    renderBreakdownDonut($('usDonut'), $('usDonutLegend'), bk);
+
+    const models = (rep.models || []).slice()
+      .sort((a, b) => (Number(b.charged) || 0) - (Number(a.charged) || 0)).slice(0, 8);
+    $('usModels').replaceChildren(svgHBars(
+      models.map((m) => ({ label: m.model || '—', value: Number(m.charged) || 0 })),
+      { fmt: fmtPointsU, unit: '' },
+    ));
+
+    dailyTable($('myDailyTable'), (rep.daily || []).slice().reverse());
+    await loadRecentFeed('usFeed', null, 50);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// 只在「用量账单」页轮询，切走即停（首次加载由导航 data-on="loadUsageLive" 触发）。
+function startUsageLive() {
+  if (stopUsageLive) return;
+  stopUsageLive = poll(5000, loadUsageLive);
+}
+function stopUsageLivePoll() { if (stopUsageLive) { stopUsageLive(); stopUsageLive = null; } }
+
+window.onNavChange = (name) => {
+  if (name === 'usage') startUsageLive();
+  else stopUsageLivePoll();
+  // 实时消耗排行只在概览页轮询，切走即停。
+  if (name === 'overview') startRankPoll();
+  else if (stopRankPoll) { stopRankPoll(); stopRankPoll = null; }
+};
+
+// ======================================================================
+// 实时消耗排行（v0.17.8）
+//
+// 「实时」的口径：概览页停留期间每 15 秒重取一次（榜单要能反映刚刚发生的消耗，
+// 但没必要跟实时态势一样 3 秒 —— 消耗是分钟级累积量，太快只是白刷）。
+// 切走即停（onNavChange），避免在别的页面白跑请求。
+// ======================================================================
+let stopRankPoll = null;
+
+async function loadRanking() {
+  let d;
+  try { d = await api('/api/usage/ranking?days=14'); } catch (e) { return; }
+  const list = d.list || [];
+  const box = $('ovRankBars');
+  const stamp = $('ovRankStamp');
+  if (stamp) stamp.textContent = list.length
+    ? `窗口内 ${fmtNum(d.total_users)} 人 · 更新于 ${fmtClock(Math.floor(Date.now() / 1000))}`
+    : '';
+  // 我的名次（无论是否进榜）。
+  const me = d.me || {};
+  const meEl = $('ovRankMe');
+  if (meEl) {
+    if (me && me.rank > 0) {
+      meEl.textContent = `我的名次：第 ${me.rank} / ${fmtNum(me.total_users)} 名（消耗 ${fmtPointsU(me.charged)}）`;
+    } else {
+      meEl.textContent = '我近 14 天还没有消耗，暂未上榜。';
+    }
+  }
+  if (!box) return;
+  box.textContent = '';
+  if (!list.length) {
+    box.appendChild(el('div', 'hintbar', '近 14 天还没有任何用户产生消耗'));
+    return;
+  }
+  // 用横向条：消耗是长尾分布，条形图比表格更容易一眼看出头部差距。
+  box.appendChild(svgHBars(
+    list.map((r) => ({
+      label: '#' + r.rank + ' ' + (r.name || '匿名') + (r.is_me ? '（我）' : ''),
+      value: Number(r.charged) || 0,
+    })),
+    { fmt: fmtPoints, unit: ' 点' },
+  ));
+}
+
+function startRankPoll() {
+  if (stopRankPoll) return;
+  loadRanking();
+  stopRankPoll = poll(15000, loadRanking);
+}
+
+// ======================================================================
+// API 密钥（密钥生成 · 参考反代页：账号范围分组框 + 逐账号开关）
+// ======================================================================
+
+let keyAll = [];
+let hostAccountsCache = [];
+let newKeyKind = 'host';      // 'host' = 代挂自用；'pool' = 号池计费
+let newKeyBind = new Set();   // 新密钥勾选的账号 uid
+let keyKindSegEl = null;
+
+// keyScopeLabel 一把密钥的作用域文案。
+function keyScopeLabel(k) {
+  if (k.kind === 'host') {
+    const n = (k.account_uids || []).length;
+    if (n) return `代挂自用 · 绑定 ${n} 个账号 · 不扣余额`;
+    return k.host_group ? ('代挂自用 · 分组 ' + k.host_group + ' · 不扣余额') : '代挂自用 · 全部本人代挂号 · 不扣余额';
+  }
+  return '号池计费 · 按用量扣余额';
+}
+
+// bindBoxes 渲染「账号范围」分组框（按代挂分组成组 + 逐账号开关）。
+// selected: Set(uid)；onToggle(uid, checked)。
+function bindBoxes(accounts, selected, onToggle) {
+  const frag = document.createDocumentFragment();
+  if (!accounts.length) {
+    frag.appendChild(el('div', 'hintbar', '还没有代挂账号。先到「账号代挂」页授权添加一个，再回来绑定。'));
+    return frag;
+  }
+  const byGroup = new Map();
+  for (const a of accounts) {
+    const g = a.host_group || '';
+    if (!byGroup.has(g)) byGroup.set(g, []);
+    byGroup.get(g).push(a);
+  }
+  for (const [g, list] of byGroup) {
+    const box = el('div', 'group-box');
+    const head = el('div', 'gb-head');
+    head.appendChild(el('span', '', g === '' ? '未分组' : g));
+    const on = list.filter((a) => selected.has(a.uid)).length;
+    head.appendChild(el('span', 'cnt', `${on} / ${list.length} 已选`));
+    box.appendChild(head);
+    for (const a of list) {
+      const row = el('div', 'group-row');
+      const txt = el('div', 'gr-txt');
+      const nm = el('div', 'gr-name', a.nickname || a.uid);
+      if (a.pool_state === 'in') nm.appendChild(el('span', 'tag ok', '已入池'));
+      txt.appendChild(nm);
+      txt.appendChild(el('div', 'gr-sub', 'UID ' + maskUID(a.uid) + (a.disabled ? ' · 已停用' : '')));
+      row.appendChild(txt);
+      row.appendChild(switchEl(selected.has(a.uid), (v) => onToggle(a.uid, v), '绑定 ' + (a.nickname || a.uid)));
+      box.appendChild(row);
+    }
+    frag.appendChild(box);
+  }
+  return frag;
+}
+
+// renderKeyBindList 刷新「新建密钥」的账号范围列表。
+function renderKeyBindList() {
+  const box = $('keyBindList');
+  if (!box) return;
+  box.textContent = '';
+  if (newKeyKind === 'pool') {
+    box.appendChild(el('div', 'notice', '号池计费密钥：不绑定账号，走平台号池并按用量扣余额。'));
+    setTxt('keyBindSummary', '号池计费模式');
+    return;
+  }
+  setTxt('keyBindSummary', newKeyBind.size ? `已选 ${newKeyBind.size} 个账号` : '未勾选 = 全部本人代挂账号');
+  const rebuild = () => {
+    box.textContent = '';
+    box.appendChild(bindBoxes(hostAccountsCache, newKeyBind, (uid, v) => {
+      if (v) newKeyBind.add(uid); else newKeyBind.delete(uid);
+      rebuild();
+    }));
+  };
+  rebuild();
+}
+
+// renderKeyKindSeg 刷新「密钥类型」分段控件。
+function renderKeyKindSeg() {
+  const host = $('keyKindSeg');
+  if (!host) return;
+  host.textContent = '';
+  keyKindSegEl = segmented([
+    { value: 'host', label: '代挂自用' },
+    { value: 'pool', label: '号池计费' },
+  ], newKeyKind, (v) => { newKeyKind = v; renderKeyKindSeg(); renderKeyBindList(); });
+  host.appendChild(keyKindSegEl);
+}
+
+// loadKeyForm 拉取代挂账号填充账号范围。
+async function loadKeyForm() {
+  try {
+    const d = await api('/api/host/accounts');
+    hostAccountsCache = d.accounts || [];
+  } catch (e) { hostAccountsCache = []; }
+  // 已删除账号从勾选集合里剔除。
+  const alive = new Set(hostAccountsCache.map((a) => a.uid));
+  for (const uid of Array.from(newKeyBind)) if (!alive.has(uid)) newKeyBind.delete(uid);
+  renderKeyKindSeg();
+  renderKeyBindList();
+}
+
+async function loadKeys() {
+  await loadKeyForm();
+  const d = await api('/api/keys');
+  keyAll = d.keys || [];
+  renderKeyCards();
+}
+
+// openKeyBindModal 修改既有密钥的账号范围。
+function openKeyBindModal(k) {
+  const sel = new Set(k.account_uids || []);
+  const m = openModal('账号范围 · ' + (k.name || '未命名'), '勾选该密钥可用的代挂账号，保存后立即生效。');
+  const box = el('div');
+  const rebuild = () => {
+    box.textContent = '';
+    box.appendChild(bindBoxes(hostAccountsCache, sel, (uid, v) => {
+      if (v) sel.add(uid); else sel.delete(uid);
+      rebuild();
+    }));
+  };
+  rebuild();
+  m.body.appendChild(box);
+  const row = el('div', 'row', null);
+  row.style.marginTop = '12px';
+  const save = el('button', '', '保存');
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      await post(`/api/keys/${k.id}/accounts`, { account_uids: Array.from(sel) });
+      toast('账号范围已更新', 'ok');
+      m.close();
+      loadKeys();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { save.disabled = false; }
+  };
+  const cancel = el('button', 'ghost', '取消');
+  cancel.onclick = m.close;
+  row.append(save, cancel);
+  m.body.appendChild(row);
+}
+
+function renderKeyCards() {
+  const box = $('keyCards');
+  box.textContent = '';
+  if (!keyAll.length) {
+    box.appendChild(el('div', 'hintbar', '还没有密钥，点上方「生成密钥」创建一把'));
+    return;
+  }
+  for (const k of keyAll) {
+    const active = k.status === 'active';
+    const host = k.kind === 'host';
+    const card = el('article', 'ecard' + (active ? '' : ' dim'));
+    const head = el('header');
+    head.appendChild(el('div', 'avatar ' + avatarTone(k.name || k.prefix), (k.name || 'K').charAt(0).toUpperCase()));
+    const who = el('div', 'who');
+    who.appendChild(el('div', 'name', k.name || '未命名'));
+    who.appendChild(el('div', 'ident', '最近使用 ' + fmtTime(k.last_used_at)));
+    head.appendChild(who);
+    card.appendChild(head);
+
+    const chips = el('div', 'chips');
+    chips.appendChild(el('span', 'tag ' + (host ? 'accent' : ''), keyScopeLabel(k)));
+    if (host) chips.appendChild(el('span', 'tag ok', '不扣余额'));
+    chips.appendChild(el('span', 'tag ' + (active ? 'ok' : 'warn'), active ? '启用' : '已禁用'));
+    card.appendChild(chips);
+
+    const body = el('div', 'body');
+    const line = el('div', 'line');
+    const code = el('span', 'mono');
+    code.style.fontSize = '12px';
+    // 默认只渲染**掩码**（v0.17.8）：完整密钥既不进初始渲染结果，也不常驻页面。
+    // 用户点「查看」时才向后端单取一次，并缓存在 k._plain（离开本页即失效）。
+    code.textContent = k.masked || k.prefix || '••••••••';
+    line.appendChild(code);
+    body.appendChild(line);
+    const btnRow = el('div', 'row tight');
+    btnRow.style.marginTop = '8px';
+    const canReveal = k.revealable !== false;
+    // 查看 / 复制都需要完整值，二者共用同一次「显式取回」（取回后缓存复用）。
+    const reveal = async () => {
+      if (k._plain) return k._plain;
+      const d = await api(`/api/keys/${k.id}/reveal`);
+      k._plain = d.key || '';
+      return k._plain;
+    };
+    const eyeBtn = iconBtn({
+      icon: 'eye', label: '查看',
+      title: canReveal ? '显式取回完整密钥（仅本次显示）' : '这把密钥创建于更早版本，无密文可回显，请重新生成',
+      onClick: async () => {
+        if (!canReveal) { toast('该密钥无密文可回显，请重新生成', 'err'); return; }
+        if (k._plain) { // 已展开 → 收起回掩码
+          k._plain = null;
+          code.textContent = k.masked || k.prefix || '••••••••';
+          eyeBtn.dataset.on = '';
+          eyeBtn.replaceChildren(icon('eye'), el('span', '', '查看'));
+          return;
+        }
+        try {
+          code.textContent = await reveal();
+          eyeBtn.dataset.on = '1';
+          eyeBtn.replaceChildren(icon('eyeOff'), el('span', '', '隐藏'));
+        } catch (e) { toast(e.message, 'err'); }
+      },
+    });
+    btnRow.appendChild(eyeBtn);
+    if (canReveal) {
+      const cp = el('button', 'icon-btn');
+      cp.type = 'button';
+      cp.appendChild(icon('copy'));
+      cp.appendChild(el('span', '', '复制'));
+      cp.onclick = async () => {
+        let val = k._plain;
+        try { if (!val) val = await reveal(); } catch (e) { toast(e.message, 'err'); return; }
+        try { await navigator.clipboard.writeText(String(val || '')); }
+        catch (e) { toast('复制失败，请手动选择', 'err'); return; }
+        toast('已复制完整密钥', 'ok');
+      };
+      btnRow.appendChild(cp);
+    }
+    if (host) {
+      const bind = iconBtn({ icon: 'list', label: '账号范围', onClick: () => openKeyBindModal(k) });
+      btnRow.appendChild(bind);
+    }
+    body.appendChild(btnRow);
+    card.appendChild(body);
+
+    const foot = el('footer');
+    foot.appendChild(switchEl(active, async (v) => {
+      await post(`/api/keys/${k.id}/${v ? 'enable' : 'disable'}`);
+      k.status = v ? 'active' : 'banned';
+      renderKeyCards();
+    }, '启用 ' + (k.name || '')));
+    const del = el('button', 'danger', '删除');
+    del.onclick = async () => {
+      if (!confirm('删除后使用该密钥的客户端会立即失效，确认？')) return;
+      try { await api(`/api/keys/${k.id}`, { method: 'DELETE' }); loadKeys(); }
+      catch (e) { toast(e.message, 'err'); }
+    };
+    foot.appendChild(del);
+    card.appendChild(foot);
+    box.appendChild(card);
+  }
+}
+
+// 获取模型 ID 弹窗（对齐参考反代页）。
+async function openModelsModal(btn) {
+  let ids = [];
+  try { const m = await api('/api/models'); ids = m.models || []; }
+  catch (e) { toast(e.message, 'err'); return; }
+  const m = openModal('可用模型 ID', '共 ' + ids.length + ' 个 · 点右侧按钮复制，粘贴到客户端即可');
+  if (!ids.length) { m.body.appendChild(el('div', 'hintbar', '暂未探测到模型列表（上游可能不可达）')); return; }
+  const list = el('div', 'cfg-list');
+  for (const id of ids) {
+    list.appendChild(cfgRow(id, '', copyBtn(() => id, '')));
+  }
+  m.body.appendChild(list);
+  const row = el('div', 'row');
+  row.style.marginTop = '12px';
+  row.appendChild(copyBtn(() => ids.join('\n'), '复制全部'));
+  m.body.appendChild(row);
+}
+
+$('btnNewKey').onclick = async () => {
+  $('btnNewKey').disabled = true;
+  try {
+    // 数量：一次可生成多把（v0.12.0，需求 2）。后端限定 1-20，这里先做前端钳制。
+    let count = Number($('keyCount').value) || 1;
+    count = Math.max(1, Math.min(20, Math.round(count)));
+    $('keyCount').value = count;
+    const body = { name: $('keyName').value.trim(), count };
+    if (newKeyKind === 'host') {
+      body.kind = 'host';
+      body.host_group = '';
+      body.account_uids = Array.from(newKeyBind);
+    } else {
+      body.kind = '';
+      body.host_group = '';
+    }
+    const d = await post('/api/keys', body);
+    $('keyName').value = '';
+    newKeyBind = new Set();
+    const created = d.keys || (d.key ? [d.key] : []);
+    await loadKeys();
+    if (created.length > 1) {
+      // 多把：弹窗逐条列出、各自可复制（单把静默复制到剪贴板）。
+      toast(`已生成 ${created.length} 把密钥`, 'ok');
+      showNewKeys(created);
+    } else {
+      toast('已生成，密钥已复制到剪贴板', 'ok');
+      if (created[0] && created[0].key) {
+        try { await navigator.clipboard.writeText(created[0].key); } catch (e) { /* 剪贴板不可用时忽略 */ }
+      }
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('btnNewKey').disabled = false;
+  }
+};
+
+// showNewKeys 批量生成的密钥清单弹窗（每条可单独复制）。
+function showNewKeys(keys) {
+  const m = openModal('已生成 ' + keys.length + ' 把密钥', '密钥仅在此处完整展示，请及时保存；每条可单独复制。');
+  const list = el('div', 'cfg-list');
+  for (const k of keys) {
+    list.appendChild(cfgRow(k.name || '未命名', k.key || '', copyBtn(() => k.key || '', '')));
+  }
+  m.body.appendChild(list);
+  const row = el('div', 'row');
+  row.style.marginTop = '12px';
+  row.appendChild(copyBtn(() => keys.map((k) => k.key).join('\n'), '复制全部'));
+  m.body.appendChild(row);
+}
+
+// ======================================================================
+// 账号代挂
+// ======================================================================
+
+let hostAll = [];
+let hostGroupFilter = '__all__';
+// 统一任务模型（全部代挂账号共用）。
+let hostUnified = { enabled: true, disabled: new Set() };
+
+// hostStateTag 见 app.js（v0.24.2，P3-13 下沉，与管理后台共用一份）。
+
+async function hostPoolAction(uid, action) {
+  try {
+    await post('/api/host/accounts/' + encodeURIComponent(uid) + '/pool', { action });
+    toast(action === 'apply' ? '已提交入池申请，等待管理员审核' : (action === 'cancel' ? '已撤回申请' : '已退出号池'), 'ok');
+    loadHostAccounts();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// taskBox 逐任务开关的分组框。model={enabled, disabled:Set}
+// onToggle(name, checked) 由调用方落库并刷新。
+function taskBox(model, onToggle) {
+  const box = el('div', 'group-box');
+  const head = el('div', 'gb-head');
+  head.appendChild(el('span', '', '自动任务'));
+  head.appendChild(el('span', 'cnt', model.enabled ? '总开关：已启用' : '总开关：已停用'));
+  box.appendChild(head);
+  for (const k of ACCOUNT_TASKS) {
+    const row = el('div', 'group-row');
+    const txt = el('div', 'gr-txt');
+    txt.appendChild(el('div', 'gr-name', k.label));
+    txt.appendChild(el('div', 'gr-sub', k.hint));
+    row.appendChild(txt);
+    row.appendChild(switchEl(!model.disabled.has(k.name), (v) => onToggle(k.name, v), k.label));
+    box.appendChild(row);
+  }
+  return box;
+}
+
+// taskModelOf / taskModelToJSON 见 app.js（v0.24.2，P3-13：与管理后台共用一份，
+// 此前两份实现只差缩进，属于「同源分叉」，已收敛）。
+
+// 单账号任务落库。
+async function applyAccountTask(uid, model) {
+  await post('/api/host/accounts/' + encodeURIComponent(uid) + '/task', taskModelToJSON(model));
+}
+
+// renderUnifiedTasks 渲染「全部代挂账号」统一开关。
+function renderUnifiedTasks() {
+  const list = $('hostUnifiedList');
+  if (!list) return;
+  list.textContent = '';
+  const master = switchEl(hostUnified.enabled, async (v) => {
+    hostUnified.enabled = v;
+    await post('/api/host/task-all', taskModelToJSON(hostUnified));
+    toast(v ? '已启用全部账号自动任务' : '已停用全部账号自动任务', 'ok');
+    renderUnifiedTasks();
+  }, '全部账号自动任务');
+  list.appendChild(cfgRow('总开关', hostUnified.enabled ? '全部代挂账号参与自动任务' : '全部代挂账号不参与自动任务', master));
+  for (const k of ACCOUNT_TASKS) {
+    const sw = switchEl(!hostUnified.disabled.has(k.name), async (v) => {
+      if (v) { hostUnified.disabled.delete(k.name); hostUnified.enabled = true; }
+      else hostUnified.disabled.add(k.name);
+      await post('/api/host/task-all', taskModelToJSON(hostUnified));
+      toast('已更新：' + k.label, 'ok');
+      renderUnifiedTasks();
+    }, k.label);
+    list.appendChild(cfgRow(k.label, k.hint, sw));
+  }
+  setTxt('hostUnifiedHint', hostAll.length ? `作用于 ${hostAll.length} 个代挂账号` : '暂无代挂账号');
+}
+
+function hostCard(h) {
+  const name = h.nickname || h.uid;
+  const model = taskModelOf(h.task);
+  const card = el('article', 'ecard' + (h.disabled ? ' dim' : ''));
+  const head = el('header');
+  head.appendChild(el('div', 'avatar ' + avatarTone(name), name.charAt(0).toUpperCase()));
+  const who = el('div', 'who');
+  who.appendChild(el('div', 'name', name));
+  who.appendChild(el('div', 'ident', 'UID · ' + maskUID(h.uid)));
+  head.appendChild(who);
+  card.appendChild(head);
+
+  const chips = el('div', 'chips');
+  chips.appendChild(el('span', 'tag', h.realm === 'global' ? '国际版' : '国内版'));
+  if (h.host_group) chips.appendChild(el('span', 'tag accent', '代挂组：' + h.host_group));
+  chips.appendChild(hostStateTag(h.pool_state));
+  // 消耗分组（v0.13.0）：由管理员设定，决定该账号是否参与平台消耗。只读展示。
+  if (h.consume_group_text) {
+    const cgTone = h.consume_group_effective === 'apply' ? 'ok'
+      : (h.consume_group_effective === 'proxy' ? 'accent' : (h.consume_group_effective === 'abnormal' ? 'err' : ''));
+    chips.appendChild(el('span', 'tag ' + cgTone, '消耗组：' + h.consume_group_text));
+  }
+  chips.appendChild(el('span', 'tag ' + (model.enabled ? 'ok' : ''), '自动任务：' + (model.enabled ? '开' : '关')));
+  // 收益＝返点 → 以「钱」为主展示（v0.17.7），点数进 title。
+  if (h.earned > 0) {
+    const t = el('span', 'tag ok', '累计收益 ' + fmtMoney(h.earned_cny));
+    t.title = '折合 ' + fmtPointsU(h.earned);
+    chips.appendChild(t);
+  }
+  card.appendChild(chips);
+
+  const body = el('div', 'body');
+  // 积分展示（v0.24.3 安全修复）：**默认只读池内快照，不再渲染即出站**。
+  // 见 app.js 的 creditSnapshotLine 与 docs/封号事件诊断与账号隔离核对-20261013.md。
+  body.appendChild(creditSnapshotLine(h, '查积分明细',
+    '/api/host/accounts/' + encodeURIComponent(h.uid) + '/resources', name));
+  if (h.served_requests > 0) {
+    const d = el('div', 'line');
+    d.appendChild(el('span', '', '号池消耗'));
+    d.appendChild(el('b', 'ok', fmtCreditU(h.consumed_credit) + ' · 收取 ' + fmtPointsU(h.charged_points)));
+    body.appendChild(d);
+  }
+  if (h.host_note) {
+    const d = el('div', 'line');
+    d.appendChild(el('span', '', '备注'));
+    d.appendChild(el('b', '', h.host_note));
+    body.appendChild(d);
+  }
+  card.appendChild(body);
+
+  // 任务完成情况（今日签到 / 猫猫旅行）：只给开关看不出今天跑没跑成，故直接显示结果。
+  card.appendChild(taskStatusPanel('/api/host/accounts/' + encodeURIComponent(h.uid) + '/task-status'));
+
+  // ---- 该账号的独立定时任务开关 ----
+  const taskCard = el('div');
+  taskCard.style.cssText = 'padding:0 14px 12px;';
+  const master = switchEl(model.enabled, async (v) => {
+    model.enabled = v;
+    await applyAccountTask(h.uid, model);
+    h.task = taskModelToJSON(model);
+    toast(v ? '已启用该账号自动任务' : '已停用该账号自动任务', 'ok');
+    renderHostCards();
+  }, '该账号自动任务');
+  taskCard.appendChild(cfgRow('该账号自动任务', '关闭后该账号不参与任何自动任务', master));
+  taskCard.appendChild(taskBox(model, async (kname, v) => {
+    if (v) { model.disabled.delete(kname); model.enabled = true; }
+    else model.disabled.add(kname);
+    await applyAccountTask(h.uid, model);
+    h.task = taskModelToJSON(model);
+    toast('已更新：' + (ACCOUNT_TASKS.find((x) => x.name === kname) || {}).label, 'ok');
+    renderHostCards();
+  }));
+  card.appendChild(taskCard);
+
+  const foot = el('footer');
+  // 分组设置
+  const sel = el('select');
+  const presets = ['', '主力', '备用', '闲置'];
+  const cur = h.host_group || '';
+  const opts = presets.slice();
+  if (cur && !opts.includes(cur)) opts.push(cur);
+  opts.push('__custom__');
+  for (const g of opts) {
+    const o = el('option', '', g === '' ? '未分组' : (g === '__custom__' ? '自定义…' : g));
+    o.value = g;
+    if (g === cur) o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.onchange = async () => {
+    let g = sel.value;
+    if (g === '__custom__') { g = prompt('输入代挂分组名（留空 = 取消分组）', cur) || ''; if (g === '__custom__') return; }
+    try {
+      await post('/api/host/accounts/' + encodeURIComponent(h.uid) + '/group', { group: g });
+      toast('分组已更新', 'ok');
+      loadHostAccounts();
+    } catch (e) { toast(e.message, 'err'); loadHostAccounts(); }
+  };
+  foot.appendChild(sel);
+
+  // 入池动作
+  if (h.pool_state === 'in') {
+    const out = el('button', 'ghost', '退出号池');
+    out.onclick = () => { if (confirm('退出后平台将不再用该账号反代，也不再产生收益。确认？')) hostPoolAction(h.uid, 'leave'); };
+    foot.appendChild(out);
+  } else if (h.pool_state === 'pending') {
+    const cancel = el('button', 'ghost', '撤回申请');
+    cancel.onclick = () => hostPoolAction(h.uid, 'cancel');
+    foot.appendChild(cancel);
+  } else {
+    // 入池积分门槛（v0.20.0）：账号积分需 ≥ 2000，页面先给出提示，后端仍会复核。
+    //
+    // v0.23.1：把「积分**未知**」与「积分**不足**」分开 —— 两者给用户的提示与可做的事
+    // 完全不同：未知只需同步一次即可（点「同步积分」），不足只能等积分涨上去。
+    // 此前一律显示「积分不足 2000」，会把「没拉过积分」误报成「积分太少」，
+    // 用户对着一个有积分的号反复重试也无法入池（历史缺陷）。
+    const unknown = h.credits_known === false || h.credits_known === undefined;
+    const enough = (h.credits || 0) >= 2000;
+    const apply = el('button', '', '申请进号池');
+    apply.title = unknown
+      ? '需先同步一次积分（下方「同步积分」）才能申请入池'
+      : '账号积分需 ≥ 2000 才可申请入池（当前 ' + fmtCredit(h.credits || 0) + '）';
+    if (unknown || !enough) {
+      apply.disabled = true;
+      apply.classList.add('ghost');
+    }
+    apply.onclick = () => hostPoolAction(h.uid, 'apply');
+    foot.appendChild(apply);
+    if (unknown) {
+      // 同步入口：调用积分查询接口（该接口会**把权威读数写回号池**，v0.23.1），
+      // 然后刷新卡片 —— 刷新后 credits_known 变 true，门槛即可判定。
+      const sync = el('button', 'ghost', '同步积分');
+      sync.title = '查询该账号最新积分，并同步到号池（用于解锁入池申请）';
+      sync.onclick = async () => {
+        sync.disabled = true;
+        sync.textContent = '同步中…';
+        try {
+          const r = await api('/api/host/accounts/' + encodeURIComponent(h.uid) + '/resources');
+          if (r && r.ok) toast('已同步积分：' + fmtCredit(r.remain) + '（≥2000 即可申请入池）', 'ok');
+          else toast((r && r.error) || '积分同步失败', 'err');
+        } catch (e) { toast(e.message, 'err'); }
+        loadHostAccounts();
+      };
+      foot.appendChild(sync);
+      foot.appendChild(el('span', 'muted', '积分未获取：点「同步积分」后再申请（代挂组未分组不影响入池）'));
+    } else if (!enough) {
+      foot.appendChild(el('span', 'muted', '积分不足 2000，暂不可入池'));
+    }
+  }
+
+  const del = el('button', 'danger', '删除');
+  del.onclick = async () => {
+    if (!confirm('从平台移除该代挂账号？（不影响你上游账号本身）')) return;
+    try { await api('/api/host/accounts/' + encodeURIComponent(h.uid), { method: 'DELETE' }); loadHostAccounts(); }
+    catch (e) { toast(e.message, 'err'); }
+  };
+  foot.appendChild(del);
+  card.appendChild(foot);
+  return card;
+}
+
+function renderHostGroupBar(groups) {
+  const bar = $('hostGroupBar');
+  bar.textContent = '';
+  const entries = [['__all__', hostAll.length], ...Object.entries(groups || {})];
+  for (const [g, n] of entries) {
+    const chip = el('button', 'chip' + (hostGroupFilter === g ? ' active' : ''), (g === '__all__' ? '全部' : (g === '' ? '未分组' : g)) + ' (' + n + ')');
+    chip.onclick = () => { hostGroupFilter = g; renderHostCards(); };
+    bar.appendChild(chip);
+  }
+}
+
+function renderHostCards() {
+  const box = $('hostCards');
+  box.textContent = '';
+  const list = hostAll.filter((h) => hostGroupFilter === '__all__' || (h.host_group || '') === hostGroupFilter);
+  if (!list.length) {
+    box.appendChild(el('div', 'hintbar', hostAll.length ? '该分组下暂无账号' : '还没有代挂账号，先在上方授权添加一个'));
+    return;
+  }
+  for (const h of list) box.appendChild(hostCard(h));
+}
+
+async function loadHostEarnings() {
+  try {
+    const d = await api('/api/host/earnings?limit=50');
+    const box = $('hostEarnCards');
+    box.textContent = '';
+    if (!(d.rows || []).length) { box.appendChild(el('div', 'hintbar', '还没有收益记录（账号进池并被平台调用后产生）')); return; }
+    for (const r of d.rows) {
+      const card = el('article', 'ecard');
+      const head = el('header');
+      head.appendChild(el('div', 'name', r.account_uid ? maskUID(r.account_uid) : '—'));
+      const earnTag = el('span', 'tag ok', fmtMoneySigned(r.earned_cny));
+      earnTag.title = '折合 ' + fmtPointsU(r.earned);
+      head.appendChild(earnTag);
+      card.appendChild(head);
+      const body = el('div', 'body');
+      const mk = el('div', 'mini-grid');
+      const cell = (k, v) => { const x = el('div', 'mk'); x.appendChild(el('div', 'k', k)); x.appendChild(el('div', 'v', v)); mk.appendChild(x); };
+      cell('模型', r.model || '—');
+      cell('平台收费', fmtPointsU(r.charged));
+      cell('时间', fmtTime(r.created_at));
+      body.appendChild(mk);
+      card.appendChild(body);
+      box.appendChild(card);
+    }
+  } catch (e) { /* 收益读取失败不阻塞 */ }
+}
+
+// ==================== 账号市场（v0.19.0） ====================
+// 用户侧：浏览在售账号 → 填写金额买断 → 账号转入本人「代挂序列」。
+// 数据源 GET /api/sale/accounts；买断 POST /api/sale/accounts/{uid}/buy。
+// salePriceText 挂牌价的展示文本（v0.21.0）：卡片上以「元」为主、点数为辅。
+// 需求 2 要求以货币（元）为单位，故元是主口径。
+function salePriceText(a, rate) {
+  const pts = Number(a.price || 0);
+  const yuan = pts * rate;
+  return fmtMoney(yuan) + '（' + fmtPointsU(pts) + '）';
+}
+
+// onSaleCard 在售账号卡片（用户侧，v0.21.0 需求 1）。
+// 呈现：价格（元为主）、账号核心信息（编号/积分/归属/到期）、买断入口。
+function onSaleCard(a, balance, rate) {
+  const card = el('article', 'ecard');
+  const head = el('header');
+  head.appendChild(el('div', 'name', (a.nickname || '未命名') + '　' + (a.realm === 'global' ? '国际版' : '国内版')));
+  head.appendChild(el('span', 'tag accent', '在售'));
+  card.appendChild(head);
+
+  // 价格行（最醒目）
+  const price = el('div', 'body');
+  const pr = el('div', 'line');
+  pr.appendChild(el('span', '', '挂牌价'));
+  pr.appendChild(el('b', 'accent', salePriceText(a, rate)));
+  price.appendChild(pr);
+  card.appendChild(price);
+
+  // 核心信息
+  const body = el('div', 'body');
+  const line = (k, v) => {
+    const dd = el('div', 'line');
+    dd.appendChild(el('span', '', k));
+    dd.appendChild(el('b', '', v));
+    body.appendChild(dd);
+  };
+  line('账号编号', (a.uid || '').slice(0, 8));
+  line('号池积分', fmtCredit(a.credits || 0));
+  line('归属', a.owner_name ? ('用户 ' + a.owner_name) : '平台自持');
+  if (a.expires_at) line('积分到期', new Date(a.expires_at * 1000).toLocaleDateString());
+  if (a.sale_note) line('备注', a.sale_note);
+  card.appendChild(body);
+
+  const act = el('div', 'body');
+  const b = el('button', '', '买断（' + salePriceText(a, rate) + '）');
+  b.title = '按卖家挂牌价成交，从你的余额扣除';
+  b.onclick = async () => {
+    if (!confirm('确认买断该账号？\n\n账号：' + (a.nickname || a.uid.slice(0, 8)) +
+      '\n成交价：' + salePriceText(a, rate) + '\n你的余额：' + fmtPointsU(balance) +
+      '\n\n成功后账号归你所有，并进入你的代挂序列。')) return;
+    try {
+      const r = await post('/api/sale/accounts/' + encodeURIComponent(a.uid) + '/buy', {});
+      toast(r.message || '买断成功', 'ok');
+      loadMarket(); loadHostAccounts();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  act.appendChild(b);
+  card.appendChild(act);
+  return card;
+}
+
+// ownedAccountCard 「我的账号」卡片（用户侧，v0.21.0 需求 1/2）。
+// 呈现：积分与状态；操作入口为「上架」（需填金额，元）或「下架」。
+function ownedAccountCard(a, rate) {
+  const card = el('article', 'ecard' + (a.on_sale ? ' dim' : ''));
+  const head = el('header');
+  head.appendChild(el('div', 'name', (a.nickname || '未命名') + '　' + (a.realm === 'global' ? '国际版' : '国内版')));
+  head.appendChild(el('span', 'tag ' + (a.on_sale ? 'accent' : ''), a.on_sale ? '在售' : '未在售'));
+  card.appendChild(head);
+
+  const body = el('div', 'body');
+  const line = (k, v) => {
+    const dd = el('div', 'line');
+    dd.appendChild(el('span', '', k));
+    dd.appendChild(el('b', '', v));
+    body.appendChild(dd);
+  };
+  line('账号编号', (a.uid || '').slice(0, 8));
+  line('号池积分', a.credits_known === false ? '未获取' : fmtCredit(a.credits || 0));
+  line('池内状态', a.pool_state === 'in' ? '已入池' : (a.pool_state === 'pending' ? '待审' : '未入池'));
+  if (a.on_sale) line('挂牌价', salePriceText(a, rate));
+  card.appendChild(body);
+
+  const act = el('div', 'body');
+  if (a.on_sale) {
+    const b = el('button', 'ghost', '下架');
+    b.onclick = async () => {
+      try {
+        await post('/api/sale/accounts/' + encodeURIComponent(a.uid) + '/list', { action: 'unlist' });
+        toast('已下架（已恢复原分组）', 'ok');
+        loadMarket();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+    act.appendChild(b);
+  } else if (a.blocked) {
+    act.appendChild(el('div', 'muted', a.blocked));
+  } else {
+    const b = el('button', '', '上架');
+    b.title = '设置挂牌价（元）后上架';
+    b.onclick = async () => {
+      // 需求 2：上架时设置金额，以**元**为单位，前端做输入校验。
+      const input = prompt('请设置挂牌价（元，最多两位小数）：\n账号：' +
+        (a.nickname || a.uid.slice(0, 8)) + '\n积分：' + fmtCredit(a.credits || 0) +
+        '\n\n挂牌期间账号归属「闲置」（不参与平台反代）；成交后金额全额进你的余额。');
+      if (input === null) return;
+      const yuan = Number(String(input).trim());
+      if (!Number.isFinite(yuan) || yuan <= 0) { toast('挂牌价必须大于 0', 'err'); return; }
+      // 两位小数校验（与后端 parseSalePriceYuan 同口径）
+      if (Math.abs(yuan * 100 - Math.round(yuan * 100)) > 1e-6) {
+        toast('挂牌价最多两位小数', 'err'); return;
+      }
+      if (!confirm('确认以 ' + fmtMoney(yuan) + ' 上架该账号？')) return;
+      try {
+        await post('/api/sale/accounts/' + encodeURIComponent(a.uid) + '/list',
+          { action: 'list', price: yuan });
+        toast('已上架（归属闲置分组）', 'ok');
+        loadMarket();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+    act.appendChild(b);
+  }
+  card.appendChild(act);
+  return card;
+}
+
+async function loadMarket() {
+  const box = $('marketCards'), mine = $('marketMine'), bal = $('marketBalance'), own = $('marketOwned');
+  if (!box) return;
+  try {
+    const d = await api('/api/sale/accounts');
+    const accs = d.accounts || [], buys = d.purchases || [], owned = d.owned || [];
+    const balance = d.balance || 0, rate = d.rate || 0, minC = d.min_trade_credits || 4000;
+    if (bal) {
+      bal.textContent = '当前余额：' + fmtPointsU(balance) + '（≈ ' + fmtMoney(balance * rate) + '）'
+        + ' · 成交后先从余额扣除；若卖家是用户，金额全额进其余额。交易门槛：账号积分 ≥ ' + minC + '。';
+    }
+
+    // ================= 我的账号（可上架）—— 卡片化（v0.21.0 需求 1） =================
+    if (own) {
+      own.textContent = '';
+      if (!owned.length) {
+        own.appendChild(el('div', 'muted', '你还没有代挂账号。可到「账号代挂」页添加。'));
+      } else {
+        const grid = el('div', 'cards');
+        for (const a of owned) grid.appendChild(ownedAccountCard(a, rate));
+        own.appendChild(grid);
+      }
+    }
+
+    // ================= 在售账号 —— 卡片化（v0.21.0 需求 1） =================
+    box.textContent = '';
+    if (!accs.length) {
+      box.appendChild(el('div', 'muted', '当前没有在售账号。管理员或用户上架后会显示在这里。'));
+    } else {
+      const grid = el('div', 'cards');
+      for (const a of accs) grid.appendChild(onSaleCard(a, balance, rate));
+      box.appendChild(grid);
+    }
+
+    mine.textContent = '';
+    if (!buys.length) {
+      mine.appendChild(el('div', 'muted', '还没有买断记录。'));
+    } else {
+      const tbl = el('table');
+      const thead = el('thead'); const hr = el('tr');
+      for (const t of ['账号编号', '金额', '成交时间']) hr.appendChild(el('th', '', t));
+      thead.appendChild(hr); tbl.appendChild(thead);
+      const tb = el('tbody');
+      for (const p of buys) {
+        const tr = el('tr');
+        tr.appendChild(el('td', '', (p.uid || '').slice(0, 8)));
+        tr.appendChild(el('td', '', fmtPointsU(p.amount || 0)));
+        tr.appendChild(el('td', '', p.created_at ? new Date(p.created_at * 1000).toLocaleString() : '—'));
+        tb.appendChild(tr);
+      }
+      tbl.appendChild(tb); mine.appendChild(tbl);
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function loadHostAccounts() {
+  try {
+    const d = await api('/api/host/accounts');
+    hostAll = d.accounts || [];
+    const s = d.summary || {};
+    setTxt('hostSummary', `共 ${s.total || 0} 个 · 已入池 ${s.in_pool || 0} · 待审 ${s.pending || 0} · 累计收益 ${fmtMoney(d.summary && d.summary.earned_cny)}`);
+    renderHostGroupBar(d.groups);
+    // 统一开关的初始值取「全部账号都启用 → 启用」，逐项取「全部账号都关闭 → 关闭」。
+    if (hostAll.length) {
+      hostUnified.enabled = hostAll.every((h) => (h.task || {}).enabled !== false);
+      const disabled = new Set(ACCOUNT_TASKS.map((k) => k.name));
+      for (const h of hostAll) {
+        const dis = new Set(((h.task || {}).disabled) || []);
+        for (const k of ACCOUNT_TASKS) if (!dis.has(k.name)) disabled.delete(k.name);
+      }
+      hostUnified.disabled = disabled;
+    }
+    renderUnifiedTasks();
+    renderHostCards();
+    await loadHostEarnings();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// ======================================================================
+// 成长任务（v0.17.1）：手动选号执行 + 完成进度
+//
+// 只作用于本人的代挂账号（后端 /api/host/growth/* 会按 owner 过滤）。
+// 进度要打上游读任务列表，故设计成「首次自动查一次 + 手动刷新」并缓存 5 分钟。
+// ======================================================================
+
+let hgRows = [];
+const hgSelected = new Set();
+const hgOpen = new Set();
+const HG_PHASE_TEXT = { zero: '零消耗', talk: '对话', night: '夜猫', manual: '人工', other: '其他' };
+
+async function loadHostGrowth() {
+  try {
+    const d = await api('/api/host/growth/overview');
+    hgRows = d.accounts || [];
+    const uids = new Set(hgRows.map((r) => r.uid));
+    for (const u of Array.from(hgSelected)) if (!uids.has(u)) hgSelected.delete(u);
+    renderHostGrowthCards();
+    const need = hgRows.filter((r) => !r.progress && !r.disabled && r.has_token).map((r) => r.uid);
+    if (need.length) {
+      setTxt('hgNote', `正在查询 ${Math.min(need.length, 20)} 个账号的进度…`);
+      await hgQuery(need.slice(0, 20), false, true);
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function hgQuery(uids, force, silent) {
+  if (!uids.length) { if (!silent) toast('没有可查询的账号', 'err'); return; }
+  const btn = $('hgBtnQuery');
+  if (btn) btn.disabled = true;
+  try {
+    const d = await post('/api/host/growth/progress', { uids, force: !!force });
+    const map = new Map((d.views || []).map((v) => [v.uid, v]));
+    for (const r of hgRows) { const v = map.get(r.uid); if (v) r.progress = v; }
+    renderHostGrowthCards();
+    const n = (d.views || []).length;
+    const bad = (d.views || []).filter((v) => !v.ok).length;
+    setTxt('hgNote', `已查询 ${n} 个账号${bad ? `，其中 ${bad} 个查询失败（见卡片提示）` : ''}。进度缓存 5 分钟。`);
+  } catch (e) {
+    if (!silent) toast(e.message, 'err');
+    setTxt('hgNote', '查询失败：' + e.message);
+  } finally { if (btn) btn.disabled = false; }
+}
+
+function renderHostGrowthCards() {
+  const box = $('hgCards');
+  box.textContent = '';
+  if (!hgRows.length) {
+    box.appendChild(el('div', 'muted', '还没有代挂账号 —— 先到「账号代挂」页扫码添加'));
+    renderHostGrowthBar();
+    return;
+  }
+  for (const r of hgRows) box.appendChild(hostGrowthCard(r));
+  renderHostGrowthBar();
+}
+
+function renderHostGrowthBar() {
+  const n = hgSelected.size;
+  setTxt('hgSelCount', n ? `已选 ${n} 个` : '');
+  const usable = hgRows.filter((r) => !r.disabled && r.has_token);
+  const all = $('hAll');
+  if (all) {
+    const selU = usable.filter((r) => hgSelected.has(r.uid)).length;
+    all.checked = usable.length > 0 && selU === usable.length;
+    all.indeterminate = selU > 0 && selU < usable.length;
+  }
+  const run = $('hgBtnRun');
+  if (run) {
+    run.textContent = n ? `跑成长任务（已选 ${n}）` : '跑成长任务';
+    run.disabled = n === 0;
+    run.title = n ? `对你勾选的 ${n} 个账号逐个执行成长任务` : '先勾选要执行成长任务的账号';
+  }
+  const sm = $('hgSummary');
+  if (sm) {
+    const done = hgRows.filter((r) => r.progress && r.progress.ok && r.progress.auto_total > 0
+      && r.progress.auto_done >= r.progress.auto_total).length;
+    sm.textContent = `可执行 ${usable.length} 个${done ? ` · 已做满 ${done} 个` : ''}`;
+  }
+}
+
+function hostGrowthCard(r) {
+  const name = r.nickname || r.uid;
+  const off = r.disabled;
+  const card = el('article', 'ecard' + (off ? ' dim' : ''));
+  if (hgSelected.has(r.uid)) card.classList.add('sel');
+
+  const head = el('header');
+  const pickBox = el('label', 'pick');
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = hgSelected.has(r.uid);
+  cb.disabled = off || !r.has_token;
+  cb.title = cb.disabled
+    ? (off ? '该账号已停用' : '该账号缺少凭证，暂时无法执行')
+    : '勾选后可批量执行成长任务';
+  cb.onchange = () => {
+    if (cb.checked) hgSelected.add(r.uid); else hgSelected.delete(r.uid);
+    card.classList.toggle('sel', cb.checked);
+    renderHostGrowthBar();
+  };
+  pickBox.appendChild(cb);
+  head.appendChild(pickBox);
+  head.appendChild(el('div', 'avatar ' + avatarTone(name), name.charAt(0).toUpperCase()));
+  const who = el('div', 'who');
+  who.appendChild(el('div', 'name', name));
+  who.appendChild(el('div', 'ident', 'UID · ' + maskUID(r.uid)));
+  head.appendChild(who);
+  card.appendChild(head);
+
+  const chips = el('div', 'chips');
+  chips.appendChild(el('span', 'tag', r.realm === 'global' ? '国际版' : '国内版'));
+  if (off) chips.appendChild(el('span', 'tag err', '已停用'));
+  else if (!r.has_token) chips.appendChild(el('span', 'tag warn', '缺凭证'));
+  const p = r.progress;
+  if (p) {
+    if (!p.ok) chips.appendChild(chipWithTitle('查询失败', 'err', p.error || '未知错误'));
+    else if (p.auto_done >= p.auto_total) chips.appendChild(chipWithTitle('已做满', 'ok', '可自动完成的项目已全部领取'));
+    else if (p.ready > 0) chips.appendChild(chipWithTitle(`可领 ${p.ready}`, 'warn', '已达标未领取，跑一轮即可入账'));
+  } else {
+    chips.appendChild(el('span', 'tag', '未查询'));
+  }
+  chips.appendChild(el('span', 'tag' + (r.growth_done_at > 0 ? ' ok' : ''),
+    r.growth_done_at > 0 ? ('上次执行 ' + fmtTime(r.growth_done_at)) : '从未执行'));
+  card.appendChild(chips);
+
+  const body = el('div', 'body');
+  if (p && p.ok) {
+    const pct = p.auto_total > 0 ? Math.round((p.auto_done / p.auto_total) * 100) : 0;
+    const bar = el('div', 'progress' + (pct >= 100 ? '' : (p.ready > 0 ? ' warn' : '')));
+    const fill = el('i');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    body.appendChild(bar);
+    const lab = el('div', 'pg-label');
+    lab.appendChild(el('span', '', `自动项 ${p.auto_done}/${p.auto_total}（${pct}%）`));
+    lab.appendChild(el('span', '', `全部 ${p.done}/${p.total} 已领`));
+    body.appendChild(lab);
+
+    const det = el('div');
+    det.style.marginTop = '8px';
+    const open = hgOpen.has(r.uid);
+    if (!open) det.className = 'hidden';
+    for (const it of (p.items || [])) {
+      const row = el('div', 'line');
+      const left = el('span');
+      const tone = it.done ? 'ok' : (it.ready ? 'warn' : '');
+      left.appendChild(el('span', 'tag ' + tone, it.done ? '已领' : (it.ready ? '可领' : '未完成')));
+      left.appendChild(document.createTextNode(' ' + (it.name || it.code)));
+      if (!it.auto) left.appendChild(document.createTextNode('（非自动）'));
+      row.appendChild(left);
+      const cur = (it.target > 1) ? `${it.current}/${it.target}` : '';
+      row.appendChild(el('b', it.done ? 'ok' : '', cur || HG_PHASE_TEXT[it.phase] || ''));
+      det.appendChild(row);
+    }
+    body.appendChild(det);
+
+    const btns = el('div', 'row');
+    btns.style.marginTop = '8px';
+    const tgl = el('button', 'ghost', open ? '收起明细' : '明细');
+    tgl.onclick = () => {
+      if (hgOpen.has(r.uid)) hgOpen.delete(r.uid); else hgOpen.add(r.uid);
+      renderHostGrowthCards();
+    };
+    btns.appendChild(tgl);
+    const re = el('button', 'ghost', '重查进度');
+    re.onclick = () => hgQuery([r.uid], true, false);
+    btns.appendChild(re);
+    body.appendChild(btns);
+  } else if (p && !p.ok) {
+    body.appendChild(el('div', 'muted', '进度查询失败：' + (p.error || '未知错误')));
+    const re = el('button', 'ghost', '重试');
+    re.onclick = () => hgQuery([r.uid], true, false);
+    body.appendChild(re);
+  } else {
+    body.appendChild(el('div', 'muted', '尚未查询进度'));
+    const re = el('button', 'ghost', '查进度');
+    re.onclick = () => hgQuery([r.uid], true, false);
+    body.appendChild(re);
+  }
+  card.appendChild(body);
+
+  const foot = el('footer');
+  const run = el('button', '', '跑这个号');
+  run.disabled = off || !r.has_token;
+  run.onclick = () => hgRun([r.uid], name);
+  foot.appendChild(run);
+  card.appendChild(foot);
+  return card;
+}
+
+// hgRun 执行成长任务（仅本人账号；后端会再过滤一次归属）。
+async function hgRun(uids, label) {
+  if (!uids || !uids.length) { toast('请先勾选要执行成长任务的账号', 'err'); return; }
+  const who = label ? `「${label}」` : `${uids.length} 个账号`;
+  if (!confirm(`对${who}执行成长任务？\n\n`
+    + '· 会向账号发起真实请求（上报 / 领奖）\n'
+    + '· 已完成的会自动跳过，不会重复扣积分\n'
+    + '· 后台逐个串行，账号之间随机等待，多个账号需要较长时间')) return;
+  try {
+    const d = await post('/api/host/growth/run', { uids });
+    toast(d.note || `已开始执行 ${uids.length} 个账号`, 'ok');
+    hgSelected.clear();
+    renderHostGrowthBar();
+    setTxt('hgNote', '已提交执行：后台正在逐个串行推进，完成后点「查询进度」查看结果。');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+$('hAll').onchange = () => {
+  const usable = hgRows.filter((r) => !r.disabled && r.has_token);
+  if ($('hAll').checked) for (const r of usable) hgSelected.add(r.uid);
+  else for (const r of usable) hgSelected.delete(r.uid);
+  renderHostGrowthCards();
+};
+$('hgBtnClear').onclick = () => {
+  if (!hgSelected.size) return;
+  hgSelected.clear();
+  renderHostGrowthCards();
+};
+$('hgBtnQuery').onclick = () => {
+  const list = hgRows.filter((r) => !r.disabled && r.has_token).map((r) => r.uid);
+  if (!list.length) { toast('没有可查询的账号', 'err'); return; }
+  hgQuery(list.slice(0, 20), false, false);
+};
+$('hgBtnRun').onclick = () => {
+  const uids = hgRows.filter((r) => hgSelected.has(r.uid)).map((r) => r.uid);
+  hgRun(uids, '');
+};
+
+// 授权流程（v0.12.0：参考项目同款扫码弹窗，含国内版 / 国际版两个入口）
+$('hostOauthBtns').appendChild(oauthScanButtons({
+  startUrl: '/api/host/oauth/start',
+  pollUrl: '/api/host/oauth/poll',
+  onDone: () => loadHostAccounts(),
+}));
+
+// ======================================================================
+// 充值提现
+// ======================================================================
+
+let wdMethod = '支付宝';
+
+const WD_METHODS = [
+  { value: '支付宝', label: '支付宝' },
+  { value: '微信', label: '微信' },
+  { value: '银行卡', label: '银行卡' },
+];
+
+const WD_STATUS_LABEL = { pending: '待审核', approved: '已打款', rejected: '已驳回' };
+
+function wdStatusTag(st) {
+  return el('span', 'wd-status ' + (st || 'pending'), WD_STATUS_LABEL[st] || st || '—');
+}
+
+async function loadWallet() {
+  let d;
+  try { d = await api('/api/wallet'); } catch (e) { toast(e.message, 'err'); return; }
+  const s = d.summary || {}, p = d.params || {};
+
+  // KPI
+  // 提现页是「点 / 钱」并存的主场：每个金额块都同时给出两种口径（v0.17.7），
+  // 主值保持「点」（提现按点申请），副行给出「≈ ¥」。金额一律用后端 *_cny 字段。
+  miniGrid($('wdKpis'), [
+    { k: '余额 · 点', v: fmtPoints(d.balance), cls: 'accent',
+      d: '≈ ' + fmtMoney(d.balance_cny) },
+    { k: '可提现 · 点', v: fmtPoints(s.withdrawable), cls: 'ok',
+      d: '≈ ' + fmtMoney(s.withdrawable_cny) },
+    // 分桶（v0.21.0）：这两个是**累计**统计（历史共到账多少），不是可花余额
+    // —— 余额已在上面单独展示。两类点都只能消费、不可提现。
+    { k: '累计体验点', v: fmtPoints(d.exp_points || 0),
+      d: '不可提现 · 不产生返点' },
+    { k: '累计充值点', v: fmtPoints(d.recharge_points || 0),
+      d: '不可提现 · 已并入余额消费' },
+    { k: '待审核 · 点', v: fmtPoints(s.pending), cls: 'warn',
+      d: '≈ ' + fmtMoney(s.pending_cny) },
+    { k: '已打款 · 点', v: fmtPoints(s.approved),
+      d: '≈ ' + fmtMoney(s.approved_cny) },
+    { k: '已驳回 · 点', v: fmtPoints(s.rejected),
+      d: '≈ ' + fmtMoney(s.rejected_cny) },
+    { k: '提现笔数', v: fmtNum(s.count) },
+  ]);
+  // 折算说明：同时给出「元/点」与反向「1 元 ≈ N 点」——用户按点申请，需要的是后者。
+  setTxt('wdHint', `最小 ${fmtPoints(p.min_points)} 点（≈ ${fmtMoney(p.min_cny)}） · ${fmtRate(p.rate)}`);
+  setTxt('wdApplyHint', s.withdrawable > 0
+    ? `可提现 ${fmtPointsU(s.withdrawable)} ≈ ${fmtMoney(s.withdrawable_cny)}（已扣待审申请）`
+    : '当前没有可提现额度');
+
+  // 收款方式分段控件
+  loadWalletMethods();
+
+  // 提现记录
+  const wbox = $('wdCards');
+  wbox.textContent = '';
+  const rows = d.withdrawals || [];
+  if (!rows.length) {
+    wbox.appendChild(el('div', 'hintbar', '还没有提现记录。填好上方表单即可发起第一笔申请。'));
+  } else {
+    for (const x of rows) {
+      const card = el('article', 'ecard' + (x.status === 'rejected' ? ' dim' : ''));
+      const head = el('header');
+      head.appendChild(el('div', 'name', fmtPointsU(x.amount)));
+      head.appendChild(wdStatusTag(x.status));
+      card.appendChild(head);
+      const chips = el('div', 'chips');
+      chips.appendChild(el('span', 'tag accent', '≈ ' + fmtMoney(x.cny)));
+      chips.appendChild(el('span', 'tag', x.method || '—'));
+      card.appendChild(chips);
+      const body = el('div', 'body');
+      const line = (k, v) => {
+        const dd = el('div', 'line');
+        dd.appendChild(el('span', '', k));
+        dd.appendChild(el('b', '', v));
+        body.appendChild(dd);
+      };
+      // v0.21.0：展示支付宝账号与姓名（均已由后端打码）。
+      line('收款账号', x.alipay_account || x.account_info || '—');
+      if (x.real_name) line('姓名', x.real_name);
+      line('申请时间', fmtTime(x.created_at));
+      if (x.reviewed_at) line('审核时间', fmtTime(x.reviewed_at));
+      if (x.note) line('审核备注', x.note);
+      card.appendChild(body);
+      wbox.appendChild(card);
+    }
+  }
+
+  // 充值记录
+  const rbox = $('rcCards');
+  rbox.textContent = '';
+  const rc = d.recharges || [];
+  if (!rc.length) {
+    rbox.appendChild(el('div', 'hintbar', '还没有充值记录。用管理员发放的充值码兑换后会出现在这里。'));
+  } else {
+    for (const r of rc) {
+      const card = el('article', 'ecard');
+      const head = el('header');
+      head.appendChild(el('div', 'name mono', r.code));
+      head.appendChild(el('span', 'tag ok', '+' + fmtPointsU(r.credits)));
+      // 兑换码类型（v0.21.0）：体验 / 充值，两者都不可提现。
+      if (r.kind_label) head.appendChild(el('span', 'tag', r.kind_label + '码'));
+      card.appendChild(head);
+      const body = el('div', 'body');
+      const dd = el('div', 'line');
+      dd.appendChild(el('span', '', '兑换时间'));
+      dd.appendChild(el('b', '', fmtTime(r.added_at)));
+      body.appendChild(dd);
+      card.appendChild(body);
+      rbox.appendChild(card);
+    }
+  }
+}
+
+// loadWalletMethods v0.21.0：提现方式**仅支付宝**，不再需要分段控件。
+// 保留空函数是为了不改动既有调用点（loadWallet 等），减少回归面。
+function loadWalletMethods() {}
+
+$('btnWdAll').onclick = async () => {
+  try {
+    const d = await api('/api/wallet');
+    const w = ((d.summary || {}).withdrawable) || 0;
+    $('wdAmount').value = String(Math.floor(w));
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+$('btnWithdraw').onclick = async () => {
+  const amount = Number($('wdAmount').value);
+  const account = $('wdAccount').value.trim();
+  const realName = $('wdRealName').value.trim();
+  // 前端校验（与后端校验口径一致，但后端仍会复核一遍）：
+  //   点数必须 > 0；支付宝账号与姓名都必填。
+  if (!(amount > 0)) { toast('请输入提现点数', 'err'); return; }
+  if (!account) { toast('请填写支付宝账号', 'err'); return; }
+  if (!realName) { toast('请填写姓名', 'err'); return; }
+  if (account.length > 100) { toast('支付宝账号过长（最多 100 字）', 'err'); return; }
+  if (realName.length > 32) { toast('姓名过长（最多 32 字）', 'err'); return; }
+  $('btnWithdraw').disabled = true;
+  try {
+    // 仅支付宝：方式恒为 alipay，字段为支付宝账号 + 姓名。
+    const d = await post('/api/wallet/withdraw', {
+      amount, method: 'alipay', alipay_account: account, real_name: realName,
+    });
+    toast(d.message || '提现申请已提交', 'ok');
+    $('wdAmount').value = '';
+    $('wdAccount').value = '';
+    $('wdRealName').value = '';
+    loadWallet();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('btnWithdraw').disabled = false;
+  }
+};
+
+$('btnRedeem').onclick = async () => {
+  const code = $('redeemCode').value.trim();
+  if (!code) { toast('请输入兑换码', 'err'); return; }
+  $('btnRedeem').disabled = true;
+  try {
+    const d = await post('/api/redeem', { code });
+    $('redeemCode').value = '';
+    toast(`兑换成功，到账 ${fmtPointsU(d.added)}`, 'ok');
+    me = await currentUser();
+    loadTop();
+    loadWallet();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    $('btnRedeem').disabled = false;
+  }
+};
+
+// ======================================================================
+// 测试对话
+// ======================================================================
+
+let testModelsLoaded = false;
+
+async function loadTestChat() {
+  try {
+    const d = await api('/api/keys');
+    const sel = $('testKey');
+    const cur = sel.value;
+    sel.textContent = '';
+    // v0.17.8：下拉里放的是**密钥 id**，不是明文 —— 列表接口已不再返回明文，
+    // 且本页的初始渲染同样不该出现完整 key（见需求 1）。
+    // 明文只在「发送」那一刻向后端单取一次。
+    const list = (d.keys || []).filter((k) => k.status === 'active' && k.revealable !== false);
+    for (const k of list) {
+      const o = el('option', '', (k.name || '未命名') + ' · ' + keyScopeLabel(k));
+      o.value = String(k.id);
+      sel.appendChild(o);
+    }
+    if (!list.length) {
+      const o = el('option', '', '（没有可用的密钥，请先到「API 密钥」页生成）');
+      o.value = '';
+      sel.appendChild(o);
+    } else if (Array.from(sel.options).some((o) => o.value === cur)) {
+      sel.value = cur;
+    }
+  } catch (e) { /* 忽略 */ }
+  if (!testModelsLoaded) {
+    testModelsLoaded = true;
+    try {
+      const m = await api('/api/models');
+      const dl = $('modelOpts');
+      dl.textContent = '';
+      for (const id of (m.models || [])) { const o = el('option'); o.value = id; dl.appendChild(o); }
+    } catch (e) { /* 忽略 */ }
+  }
+}
+
+async function sendTest() {
+  const out = $('testReply');
+  out.className = 'code';
+  out.textContent = '';
+  const keyID = $('testKey').value;
+  if (!keyID) { toast('请先创建一把可用的密钥', 'err'); return; }
+  $('testHint').textContent = '请求中…';
+  $('btnTestSend').disabled = true;
+  // 明文在发送这一刻才单取（本页全程不缓存）：既满足「初始渲染无明文」，
+  // 也避免把长期有效的凭证留在 DOM/内存里。
+  let key = '';
+  try {
+    const d = await api('/api/keys/' + encodeURIComponent(keyID) + '/reveal');
+    key = d.key || '';
+  } catch (e) {
+    $('testHint').textContent = '';
+    $('btnTestSend').disabled = false;
+    toast('取回密钥失败：' + e.message, 'err');
+    return;
+  }
+  if (!key) {
+    $('testHint').textContent = '';
+    $('btnTestSend').disabled = false;
+    toast('该密钥无密文可回显，请重新生成', 'err');
+    return;
+  }
+  const stream = $('testStream').checked;
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: $('testModel').value.trim(), stream, messages: [{ role: 'user', content: $('testPrompt').value }] }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    if (!stream) {
+      const d = await res.json();
+      out.textContent = (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || JSON.stringify(d, null, 2);
+    } else {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '', acc = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+          try { const c = JSON.parse(data).choices?.[0]; if (c && c.delta && c.delta.content) acc += c.delta.content; } catch (e) {}
+        }
+        out.textContent = acc;
+      }
+    }
+    $('testHint').textContent = '完成';
+  } catch (e) {
+    out.className = 'code err';
+    out.textContent = e.message;
+    $('testHint').textContent = '失败';
+  } finally {
+    $('btnTestSend').disabled = false;
+  }
+}
+
+$('btnTestSend').onclick = sendTest;
+
+// ======================================================================
+// 我的返点
+// ======================================================================
+
+function rebateKindLabel(kind) {
+  if (kind === 'referral_recharge') return '下级充值返点';
+  if (kind === 'referral_pool') return '下级号池返点';
+  return kind || '返点';
+}
+
+async function loadRebates() {
+  let d;
+  try { d = await api('/api/referral?limit=100'); } catch (e) { toast(e.message, 'err'); return; }
+  const s = d.summary || {}, r = d.ratios || {};
+  rate = Number(d.rate) || rate; // 全页统一折算口径（后端给，不前端猜）
+  // 比例标签：显示生效值 + 来源（单独设 / 跟随全局），避免「为什么我的比例和别人不一样」无从判断。
+  setTxt('rbPoolRatio', rbRatioText('pool', r, '号池分成'));
+  setTxt('rbRefRatio', rbRatioText('referral', r, '推广返点'));
+
+  // 返点一律以「钱」为主展示（v0.17.7），点数降为副行/title 说明。
+  miniGrid($('rbPoolKpis'), [
+    { k: '累计号池返点', v: fmtMoney(s.pool_total_cny), cls: 'ok',
+      d: '折合 ' + fmtPointsU(s.pool_total) },
+    { k: '返点笔数', v: fmtNum(s.pool_count) },
+  ]);
+  miniGrid($('rbRefKpis'), [
+    { k: '下级充值返点', v: fmtMoney(s.referral_recharge_cny),
+      d: '折合 ' + fmtPointsU(s.referral_recharge) },
+    { k: '下级号池返点', v: fmtMoney(s.referral_pool_cny),
+      d: '折合 ' + fmtPointsU(s.referral_pool) },
+    { k: '返点合计', v: fmtMoney(s.referral_total_cny),
+      d: '折合 ' + fmtPointsU(s.referral_total) },
+    { k: '已邀请（人）', v: fmtNum(d.referred_count) },
+  ]);
+
+  setTxt('rbCode', d.invite_code || '—');
+  const link = location.origin + (d.invite_link || ('/?ref=' + (d.invite_code || '')));
+  $('rbCopyCode').textContent = '';
+  $('rbCopyCode').appendChild(copyBtn(() => d.invite_code || '', '复制邀请码'));
+  $('rbCopyLink').textContent = '';
+  $('rbCopyLink').appendChild(copyBtn(() => link, '复制邀请链接'));
+
+  const box = $('rbRows');
+  box.textContent = '';
+  const rows = d.rows || [];
+  if (!rows.length) { box.appendChild(el('div', 'hintbar', '还没有返点记录。分享邀请码给下级，或让你的代挂账号进池赚收益。')); return; }
+  for (const row of rows) {
+    const card = el('article', 'ecard');
+    const head = el('header');
+    head.appendChild(el('div', 'name', rebateKindLabel(row.kind)));
+    // 流水金额一律用「钱」（v0.17.7）；点数放进 title，保持可核对但不占主视觉。
+    const amtTag = el('span', 'tag ok', fmtMoneySigned(row.rebate_cny));
+    amtTag.title = '折合 ' + fmtPointsU(row.rebate);
+    head.appendChild(amtTag);
+    card.appendChild(head);
+    const body = el('div', 'body');
+    const mk = el('div', 'mini-grid');
+    const cell = (k, v, sub) => {
+      const x = el('div', 'mk'); x.appendChild(el('div', 'k', k)); x.appendChild(el('div', 'v', v));
+      if (sub) x.appendChild(el('div', 'mk-d', sub));
+      mk.appendChild(x);
+    };
+    cell('计返基数', fmtMoney(row.base_cny), '折合 ' + fmtPointsU(row.base));
+    cell('来源', row.account ? maskUID(row.account) : ('用户#' + row.from_user));
+    cell('时间', fmtTime(row.created_at));
+    body.appendChild(mk);
+    card.appendChild(body);
+    box.appendChild(card);
+  }
+}
+
+// ======================================================================
+// 全局刷新 / 启动
+// ======================================================================
+
+function activePane() {
+  const el2 = document.querySelector('.pane.active');
+  return el2 ? el2.dataset.pane : 'overview';
+}
+
+async function refreshActive() {
+  const name = activePane();
+  if (name === 'overview') await loadOverview();
+  else if (name === 'keys') await loadKeys();
+  else if (name === 'test') await loadTestChat();
+  else if (name === 'usage') await loadUsageLive();
+  else if (name === 'wallet') await loadWallet();
+  else if (name === 'host') await loadHostAccounts();
+  else if (name === 'rebates') await loadRebates();
+  else toast('已刷新', 'ok');
+}
+
+(async function init() {
+  me = await requireLogin();
+  if (!me) return;
+  setTxt('whoami', '你好，' + me.username);
+  setTxt('roleHint', me.is_admin ? '管理员账号' : '普通账号');
+  if (me.is_admin) $('adminLink').classList.remove('hidden');
+  const base = location.origin + '/v1';
+  setTxt('baseUrl', base);
+  setTxt('baseUrl2', base);
+
+  // 顶部「刷新」→ 带旋转反馈的图标按钮。
+  const rb = iconBtn({ icon: 'refresh', label: '刷新', title: '刷新当前页', onClick: refreshActive });
+  rb.id = 'btnRefreshAll';
+  $('btnRefreshAll').replaceWith(rb);
+  // 「获取模型 ID」按钮。
+  const gm = iconBtn({ icon: 'list', label: '获取模型 ID', title: '查看可用模型', onClick: () => openModelsModal() });
+  gm.id = 'btnGetModels';
+  $('btnGetModels').replaceWith(gm);
+  mountRefreshSlots();
+  mountThemeToggle(); // 深色 / 浅色切换（偏好落 localStorage，刷新与重新登录均保持）
+  mountAccountTools(); // 「改密码」入口
+
+  loadWalletMethods();
+  setupNav(document.body); // 初始页的数据加载与轮询由 onNavChange 钩子按需启动
+})();
+</script>
+</body>
+</html>
