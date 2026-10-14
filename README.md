@@ -545,7 +545,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 如果这个项目对你有帮助，欢迎扫码请作者喝杯咖啡（微信支付）：
 
 <p align="center">
-  <img src="assets/wx-pay.jpg" alt="微信赞赏码" width="260">
+  <img src="assets/wx-pay.png" alt="微信赞赏码" width="260">
 </p>
 
 ## License
