@@ -182,3 +182,94 @@ func TestFingerprintSampleSkipsEmptySample(t *testing.T) {
 	}
 	_ = time.Now()
 }
+
+// TestFingerprintSamplesViewStats 视图的统计字段（体积 / 行数 / 模型 Top / 最近时刻）
+// 必须准确 —— 界面的占用条与"还能装多少"直接读它们，报错的代价是运维误判"还早"。
+func TestFingerprintSamplesViewStats(t *testing.T) {
+	useTempSampleFile(t)
+	store, px, a := newTestApp(t, &Account{UID: "u1", AccessToken: "t"})
+	defer store.Close()
+	defer px.Close()
+	if err := a.store.SetKV(kvFingerprintSamples, "on"); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"model":"glm-5.3","messages":[{"role":"system","content":"S-a"}],"tools":[{"name":"bash"}]}`)
+	px.maybeSampleFingerprint(upstream.ErrContentBlocked, "u1", "glm-5.3", body, nil)
+	// 同模型、不同内容 → 第二条。
+	body2 := []byte(`{"model":"glm-5.3","messages":[{"role":"system","content":"S-b"}],"tools":[{"name":"bash"}]}`)
+	px.maybeSampleFingerprint(upstream.ErrChannelDenied, "u1", "glm-5.3", body2, nil)
+
+	rec := httptest.NewRecorder()
+	a.handleFingerprintSamples(rec, httptest.NewRequest(http.MethodGet, "/api/admin/fingerprint-samples", nil))
+	var v fingerprintSamplesView
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Max != fpSampleFileMaxBytes {
+		t.Errorf("max = %d，期望 %d", v.Max, fpSampleFileMaxBytes)
+	}
+	if v.Size <= 0 || v.Lines != 2 {
+		t.Errorf("size/lines 不符：size=%d lines=%d", v.Size, v.Lines)
+	}
+	if v.Full {
+		t.Error("未到上限时 full 应为 false")
+	}
+	if v.LastAt <= 0 {
+		t.Error("last_at 应被回填")
+	}
+	if len(v.Models) != 1 || v.Models[0].Name != "glm-5.3" || v.Models[0].Count != 2 {
+		t.Errorf("模型分布不符：%+v", v.Models)
+	}
+}
+
+// TestClearFingerprintSamples 清空：删文件 + 重置去重表（否则"清空后文件一直是空的"）。
+func TestClearFingerprintSamples(t *testing.T) {
+	path := useTempSampleFile(t)
+	store, px, a := newTestApp(t, &Account{UID: "u1", AccessToken: "t"})
+	defer store.Close()
+	defer px.Close()
+	if err := a.store.SetKV(kvFingerprintSamples, "on"); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"messages":[{"role":"system","content":"S"}],"tools":[{"name":"bash"}]}`)
+	px.maybeSampleFingerprint(upstream.ErrContentBlocked, "u1", "m", body, nil)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("样本文件应存在：%v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	a.handleFingerprintSamplesClear(rec, httptest.NewRequest(http.MethodDelete, "/api/admin/fingerprint-samples", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("清空应 200，得 %d：%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("文件应被删除，stat err=%v", err)
+	}
+	// 去重表必须一并重置：同一条样本应能重新写回。
+	px.maybeSampleFingerprint(upstream.ErrContentBlocked, "u1", "m", body, nil)
+	raw, err := os.ReadFile(path)
+	if err != nil || strings.TrimSpace(string(raw)) == "" {
+		t.Fatalf("清空后同一条样本应能重新写回：err=%v raw=%q", err, string(raw))
+	}
+
+	// 幂等：再清一次（文件已不存在）仍应成功。
+	rec2 := httptest.NewRecorder()
+	a.handleFingerprintSamplesClear(rec2, httptest.NewRequest(http.MethodDelete, "/api/admin/fingerprint-samples", nil))
+	if rec2.Code != http.StatusOK {
+		t.Errorf("重复清空应幂等成功，得 %d", rec2.Code)
+	}
+}
+
+// TestTopFpCountsOrdering 数量相同时按名字升序 —— map 遍历无序，不排序会让界面每次刷新都跳。
+func TestTopFpCountsOrdering(t *testing.T) {
+	got := topFpCounts(map[string]int{"b": 2, "a": 2, "c": 5, "d": 1}, 3)
+	want := []fpCount{{"c", 5}, {"a", 2}, {"b", 2}}
+	if len(got) != len(want) {
+		t.Fatalf("got=%+v want=%+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 项 = %+v，期望 %+v", i, got[i], want[i])
+		}
+	}
+}

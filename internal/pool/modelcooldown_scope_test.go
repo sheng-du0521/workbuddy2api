@@ -214,12 +214,16 @@ func TestModelCooldownEmptyUIDNoOp(t *testing.T) {
 	}
 }
 
-// TestModelCooldownResetAtKeptWhenCapped 重置时刻被 soft_rate_max 截断时，
-// 台账仍保留上游原始时刻（ResetAt），运维可看到权威时点。
-func TestModelCooldownResetAtKeptWhenCapped(t *testing.T) {
+// TestModelCooldownResetAtHonoredInLedger 台账里该模型的 Until 按上游重置时刻走
+// （用户口径「都按照时间」），且 ResetAt 保留上游原始时刻供运维对照。
+//
+// v0.26.5 改断言：旧版断言 Until 被 **soft_rate_max**（账号级上限）截断。
+// 现在模型级只受 modelRateMax 约束 —— 下面第二段用 SetModelRateMax 演示
+// "上限确实还在，只是换成了模型级那一档"，且截断时 ResetAt 依然如实保留。
+func TestModelCooldownResetAtHonoredInLedger(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
+	p.SetSoftRateMax(10 * time.Minute) // 账号级上限，对模型级不生效
 	reset := time.Now().Add(5 * time.Hour)
 	p.CooldownSoftForModel("u1", time.Minute, reset, "m", "6004")
 	st, _ := p.Status("u1")
@@ -227,11 +231,27 @@ func TestModelCooldownResetAtKeptWhenCapped(t *testing.T) {
 		t.Fatalf("台账缺失：%+v", st.RateLimitedModels)
 	}
 	row := st.RateLimitedModels[0]
-	if d := row.Until.Sub(time.Now()); d > 10*time.Minute+2*time.Second {
-		t.Errorf("Until 应被截断到 soft_rate_max，得 %v", d)
+	if d := row.Until.Sub(time.Now()); d < 5*time.Hour-2*time.Second || d > 5*time.Hour+2*time.Second {
+		t.Errorf("Until 应跟随上游重置时刻（~5h，不被 soft_rate_max 截断），得 %v", d)
 	}
 	if d := row.ResetAt.Sub(reset); d > time.Second || d < -time.Second {
 		t.Errorf("ResetAt 应保留上游原始时刻 %v，得 %v", reset, row.ResetAt)
+	}
+
+	// 模型级上限生效时：Until 被截断，但 ResetAt 仍保留权威时点。
+	pc := New("")
+	pc.Add(&auth.Auth{UID: "u1"})
+	pc.SetModelRateMax(time.Hour)
+	pc.CooldownSoftForModel("u1", time.Minute, reset, "m", "6004")
+	stc, _ := pc.Status("u1")
+	if len(stc.RateLimitedModels) != 1 {
+		t.Fatalf("台账缺失：%+v", stc.RateLimitedModels)
+	}
+	if d := stc.RateLimitedModels[0].Until.Sub(time.Now()); d > time.Hour+2*time.Second {
+		t.Errorf("SetModelRateMax(1h) 后 Until 应被截断到 1h，得 %v", d)
+	}
+	if d := stc.RateLimitedModels[0].ResetAt.Sub(reset); d > time.Second || d < -time.Second {
+		t.Errorf("截断时 ResetAt 仍应保留上游原始时刻 %v，得 %v", reset, stc.RateLimitedModels[0].ResetAt)
 	}
 }
 

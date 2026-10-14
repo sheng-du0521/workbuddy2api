@@ -940,11 +940,15 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	}
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 模型级冷却 until 截断到 soft_rate_max（不无限期拉黑）。
+func TestCooldownSoftForModelCappedByModelRateMax(t *testing.T) {
+	// 解析时间超出 modelRateMax → 模型级 until 截断到 modelRateMax（不无限期拉黑一个模型）。
+	//
+	// v0.26.5：截断基准从 soft_rate_max（账号级，2h）换成 model_rate_max（模型级，24h）。
+	// 理由见 pool.CooldownSoftForModel 与 cappedModelUntilLocked 的注释：
+	// 只挡一个模型的冷却不需要"防白扣一个健康号"这条账号级理由。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
+	p.SetModelRateMax(10 * time.Minute)
 	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
 	before := time.Now()
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
@@ -953,7 +957,7 @@ func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
 		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
 	}
 	if d := st.RateLimitedModels[0].Until.Sub(before); d > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+		t.Errorf("model until=%v want capped at model_rate_max=10m", st.RateLimitedModels[0].Until)
 	}
 }
 
@@ -1191,12 +1195,14 @@ func TestRateLimitedModelsInStatus(t *testing.T) {
 	}
 }
 
-// TestRateLimitedModelsRetainsUncappedResetAt soft_rate_max 截断了 until，
+// TestRateLimitedModelsRetainsUncappedResetAt model_rate_max 截断了 until，
 // 但台账必须保留上游未截断的原始重置墙钟（issue #36：运维按真实恢复时刻观察）。
+//
+// v0.26.5：截断基准由 soft_rate_max 改为 model_rate_max（模型级专用，默认 24h）。
 func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
+	p.SetModelRateMax(10 * time.Minute)
 	reset := time.Now().Add(2 * time.Hour) // 远超封顶 10m
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 
@@ -1205,7 +1211,7 @@ func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
 	}
 	row := st.RateLimitedModels[0]
-	// row.Until = 该模型的冷却截止（被截断到封顶 ≤ 10m）。
+	// row.Until = 该模型的冷却截止（被截断到模型级封顶 ≤ 10m）。
 	if rem := row.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
 		t.Errorf("row.until 应在 (0, 10m] 区间，实际剩余 %v", rem)
 	}

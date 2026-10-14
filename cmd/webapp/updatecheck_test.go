@@ -6,11 +6,14 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -284,39 +287,234 @@ func TestFetchUpdateManifest(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	m, err := fetchUpdateManifest(context.Background(), srv.URL+"/ok.json", "0.25.1")
+	m, used, err := fetchUpdateManifest(context.Background(), srv.URL+"/ok.json", "0.25.1", "")
 	if err != nil || m == nil || m.Version != "0.26.0" || len(m.Assets) != 1 {
 		t.Fatalf("正常清单解析失败: m=%+v err=%v", m, err)
 	}
-	if _, err := fetchUpdateManifest(context.Background(), srv.URL+"/bad.json", "0.25.1"); err == nil {
+	if used != srv.URL+"/ok.json" {
+		t.Errorf("used=%q，期望命中的候选地址 %q", used, srv.URL+"/ok.json")
+	}
+	if _, _, err := fetchUpdateManifest(context.Background(), srv.URL+"/bad.json", "0.25.1", ""); err == nil {
 		t.Fatal("坏 JSON 应返回错误")
 	}
-	if _, err := fetchUpdateManifest(context.Background(), srv.URL+"/noversion.json", "0.25.1"); err == nil {
+	if _, _, err := fetchUpdateManifest(context.Background(), srv.URL+"/noversion.json", "0.25.1", ""); err == nil {
 		t.Fatal("缺 version 字段应返回错误")
 	}
-	if _, err := fetchUpdateManifest(context.Background(), srv.URL+"/err.json", "0.25.1"); err == nil {
+	// 403 必须把状态码带进错误里，且错误汇总要能看出是哪个 host 失败的。
+	_, _, err = fetchUpdateManifest(context.Background(), srv.URL+"/err.json", "0.25.1", "")
+	if err == nil {
 		t.Fatal("403 应返回错误（带状态码，便于判断是不是被 CDN 拦了）")
 	}
-	if _, err := fetchUpdateManifest(context.Background(), "", "0.25.1"); err == nil {
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("错误信息应含状态码 403，得 %v", err)
+	}
+	if _, _, err := fetchUpdateManifest(context.Background(), "", "0.25.1", ""); err == nil {
 		t.Fatal("空地址应返回错误")
+	}
+}
+
+// ---------------------------------------------------------------- v0.26.5 候选回退
+
+// TestUpdateManifestCandidates GitHub raw 地址应派生出 API / CDN / 反代三个等价候选；
+// 非 raw 地址（自建 CDN、内网服务）**不得**被塞进第三方站点。
+func TestUpdateManifestCandidates(t *testing.T) {
+	got := updateManifestCandidates("https://raw.githubusercontent.com/o/r/main/dist/version.json")
+	want := []string{
+		"https://raw.githubusercontent.com/o/r/main/dist/version.json",
+		"https://api.github.com/repos/o/r/contents/dist/version.json?ref=main",
+		"https://cdn.jsdelivr.net/gh/o/r@main/dist/version.json",
+		"https://ghproxy.net/https://raw.githubusercontent.com/o/r/main/dist/version.json",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("候选数 = %d，期望 %d：%v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("候选[%d] = %q，期望 %q", i, got[i], want[i])
+		}
+	}
+	// 非 raw：只有它自己，不引入任何第三方。
+	if c := updateManifestCandidates("https://cdn.example.com/version.json"); len(c) != 1 {
+		t.Errorf("非 raw 地址不该派生候选，得 %v", c)
+	}
+	if c := updateManifestCandidates(""); len(c) != 0 {
+		t.Errorf("空地址应无候选，得 %v", c)
+	}
+	// 段数不足（缺 branch/path）不是合法 raw 形态 → 不派生。
+	if c := updateManifestCandidates("https://raw.githubusercontent.com/o/r/main"); len(c) != 1 {
+		t.Errorf("缺 path 的 raw 地址不该派生候选，得 %v", c)
+	}
+}
+
+// TestSplitRawGitHubURL 解析形态（含多段 path 与 http 老形态）。
+func TestSplitRawGitHubURL(t *testing.T) {
+	cases := []struct {
+		in                        string
+		owner, repo, branch, path string
+		ok                        bool
+	}{
+		{"https://raw.githubusercontent.com/o/r/main/version.json", "o", "r", "main", "version.json", true},
+		{"https://raw.githubusercontent.com/o/r/main/a/b/c.json", "o", "r", "main", "a/b/c.json", true},
+		{"http://raw.githubusercontent.com/o/r/main/v.json", "o", "r", "main", "v.json", true},
+		{"https://raw.githubusercontent.com/o/r/main", "", "", "", "", false},
+		{"https://example.com/v.json", "", "", "", "", false},
+	}
+	for _, c := range cases {
+		o, r, b, p, ok := splitRawGitHubURL(c.in)
+		if ok != c.ok || o != c.owner || r != c.repo || b != c.branch || p != c.path {
+			t.Errorf("%s → (%q,%q,%q,%q,%v)，期望 (%q,%q,%q,%q,%v)",
+				c.in, o, r, b, p, ok, c.owner, c.repo, c.branch, c.path, c.ok)
+		}
+	}
+}
+
+// TestParseUpdateManifestBodyGitHubContentsAPI Contents API 的 base64 信封必须能解析 ——
+// 它正是 raw 不可达时那条回退路径的返回形态。
+//
+// body 用 json.Marshal 构造而不是手拼字符串：真实响应里 content 的折行是
+// **转义过的**（`\n` 两个字符），手拼一个真换行会让 JSON 本身非法 ——
+// 那样测的就不是"解析口径"而是"我这个字符串写错了"。
+func TestParseUpdateManifestBodyGitHubContentsAPI(t *testing.T) {
+	inner := `{"version":"9.9.9","notes":"来自 API","url":"https://example.com/rel"}`
+	enc := base64.StdEncoding.EncodeToString([]byte(inner))
+	var folded strings.Builder
+	for i := 0; i < len(enc); i += 60 {
+		end := i + 60
+		if end > len(enc) {
+			end = len(enc)
+		}
+		folded.WriteString(enc[i:end])
+		folded.WriteByte(0x0a) // 真实 GitHub 响应每 60 字符折一行
+	}
+	body, err := json.Marshal(map[string]any{
+		"name": "version.json", "encoding": "base64", "content": folded.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := parseUpdateManifestBody(body)
+	if err != nil {
+		t.Fatalf("Contents API 信封解析失败: %v", err)
+	}
+	if m.Version != "9.9.9" || m.Notes != "来自 API" {
+		t.Errorf("解析结果 = %+v", m)
+	}
+	// 裸清单仍走原路径。
+	if m2, err := parseUpdateManifestBody([]byte(inner)); err != nil || m2.Version != "9.9.9" {
+		t.Errorf("裸清单解析回归: m=%+v err=%v", m2, err)
+	}
+}
+
+// TestUpdateManifestURLDefaults 未配置时回落默认地址；配置了就用配置的。
+func TestUpdateManifestURLDefaults(t *testing.T) {
+	store, _, a := newTestApp(t)
+	defer store.Close()
+
+	if got := a.updateManifestURL(); got != defaultUpdateManifestURL {
+		t.Errorf("未配置时应回落默认地址，得 %q", got)
+	}
+	if err := store.SetKV(kvUpdateManifest, "https://self.example/version.json"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.updateManifestURL(); got != "https://self.example/version.json" {
+		t.Errorf("显式配置应优先，得 %q", got)
+	}
+	// 清空（写空格）→ 回落默认：运维"清空"的意图是回到默认，不是"永不检查"。
+	if err := store.SetKV(kvUpdateManifest, "   "); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.updateManifestURL(); got != defaultUpdateManifestURL {
+		t.Errorf("空白配置应回落默认地址，得 %q", got)
+	}
+}
+
+// TestOrderUpdateCandidates 上次命中的候选排到最前；
+// **不在候选里的值必须被忽略**（否则一个陈旧 kv 值就能让程序去访问任意 URL）。
+func TestOrderUpdateCandidates(t *testing.T) {
+	cands := updateManifestCandidates("https://raw.githubusercontent.com/o/r/main/version.json")
+	if len(cands) != 4 {
+		t.Fatalf("候选数 = %d，期望 4", len(cands))
+	}
+	// 取第 3 个（jsdelivr）作为"上次成功"，它应被提到最前，其余保持相对顺序。
+	last := cands[2]
+	got := orderUpdateCandidates(cands, last)
+	if got[0] != last {
+		t.Errorf("首项 = %q，期望 %q", got[0], last)
+	}
+	if len(got) != len(cands) {
+		t.Fatalf("候选数量不得变化：%v", got)
+	}
+	seen := map[string]bool{}
+	for _, c := range got {
+		if seen[c] {
+			t.Errorf("候选重复：%v", got)
+		}
+		seen[c] = true
+	}
+	// 已在首位 → 原样。
+	if c := orderUpdateCandidates(cands, cands[0]); c[0] != cands[0] {
+		t.Error("已在首位时不该变动")
+	}
+	// 陌生值 → 原样返回（不注入）。
+	out := orderUpdateCandidates(cands, "https://evil.example/version.json")
+	if len(out) != len(cands) || out[0] != cands[0] {
+		t.Errorf("未命中的 lastUsed 不得进入候选：%v", out)
+	}
+	// 单候选 / 空 lastUsed → 原样。
+	if out := orderUpdateCandidates(cands[:1], last); len(out) != 1 {
+		t.Error("单候选不该变动")
+	}
+	if out := orderUpdateCandidates(cands, ""); out[0] != cands[0] {
+		t.Error("空 lastUsed 不该变动")
 	}
 }
 
 // ---------------------------------------------------------------- checkUpdate
 
-func TestCheckUpdateNotConfigured(t *testing.T) {
+// TestCheckUpdateUsesDefaultManifestURLAndReportsFailure 未显式配置清单地址时
+// 走默认地址（v0.26.5：默认值让"提醒"这件事不需要先手工配置就成立）。
+//
+// 出站被替换成必定失败的 transport，因此本用例**不发任何真实请求**：
+// 断言的是"它确实去试了默认地址 + 全部失败时给出可读原因 + 不谎报有更新"。
+func TestCheckUpdateUsesDefaultManifestURLAndReportsFailure(t *testing.T) {
+	old := updateHTTPClient
+	updateHTTPClient = &http.Client{
+		Timeout:   time.Second,
+		Transport: failTransport{},
+	}
+	t.Cleanup(func() { updateHTTPClient = old })
+
 	a := newUpdateTestApp(t)
 	st := a.checkUpdate(context.Background(), true)
 	if st.Current != version {
 		t.Fatalf("应回填当前版本，得 %q", st.Current)
 	}
+	if st.ManifestURL != defaultUpdateManifestURL {
+		t.Fatalf("生效地址 = %q，期望默认 %q", st.ManifestURL, defaultUpdateManifestURL)
+	}
 	if st.Error == "" {
-		t.Fatal("未配置清单地址时应给出明确提示，而不是静默返回空结果")
+		t.Fatal("全部候选失败时应给出明确提示，而不是静默返回空结果")
+	}
+	if !strings.Contains(st.Error, "所有候选地址均失败") {
+		t.Errorf("错误应说明是候选回退全失败，得 %q", st.Error)
+	}
+	// 失败原因要能区分"哪个站挂了"：错误里必须出现至少两个候选的 host。
+	if !strings.Contains(st.Error, "raw.githubusercontent.com") || !strings.Contains(st.Error, "api.github.com") {
+		t.Errorf("错误应逐个候选说明原因，得 %q", st.Error)
 	}
 	if st.HasUpdate {
-		t.Fatal("未配置时不该报有更新")
+		t.Fatal("检查失败时不该报有更新")
 	}
 }
+
+// failTransport 让所有出站请求立即失败（不碰网络，测试确定性）。
+type failTransport struct{}
+
+func (failTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errNetworkDownForTest
+}
+
+var errNetworkDownForTest = errors.New("test: network disabled")
 
 func TestCheckUpdateDisabled(t *testing.T) {
 	a := newUpdateTestApp(t)

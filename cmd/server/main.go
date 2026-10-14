@@ -88,6 +88,7 @@ func main() {
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetModelRateMax(cfg.ModelRateMaxDur)             // 模型级冷却对齐重置墙钟的封顶（model_rate_max，默认 24h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 

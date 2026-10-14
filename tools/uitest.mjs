@@ -307,6 +307,16 @@ const FX = {
       { uid: 'acc-sys0000001', name: '被封号', reason: '系统禁用（session dead）', manual: false },
     ],
     disabled_truncated: false,
+    // v0.26.5：模型级冷却明细（与账号级冷却**分开**）。刻意给两条不同来源：
+    // 一条上游明示、一条本地估 —— 两者在排障时含义完全不同，必须都能显示。
+    model_cooling: [
+      { uid: 'acc-aaaaaaaaaaaa', name: '测试账号', model: 'glm-5.3', remaining_sec: 3600,
+        reset_at: now + 3600, source: 'upstream' },
+      { uid: 'acc-bbbbbbbbbbbb', name: '代挂号B', model: 'kimi-k3-1', remaining_sec: 600,
+        source: 'local' },
+    ],
+    model_cooling_accounts: 2,
+    model_cooling_truncated: false,
     cn: 2, global: 0, hosting: 0,
     credit_sum: 1234, credit_avg: 617, credit_max: 1234, served_sum: 13, consumed_sum: 0.05,
     growth_done: 1,
@@ -635,6 +645,13 @@ function run(pageFile, meOverride, plan) {
         return;
       }
       const stage = plan[i++];
+      // fx: [[path, value]] —— 用例级覆盖某个接口的返回体。
+      //
+      // 为什么需要：有些面板的正确性恰恰体现在**两种状态**上（样本回流面板
+      // "未开启"与"已收集"要说完全不同的话）。共享一份静态桩的话，只能测到
+      // 其中一种，另一种只能靠人眼 —— 而人眼恰好最容易漏掉"未开启被画成 0 条"
+      // 这类误报。
+      for (const [fxPath, fxVal] of (stage.fx || [])) FX[fxPath] = fxVal;
       if (stage.nav) clickNav(stage.nav);
       // click: [selector] —— 点击元素（用于打开弹窗、勾选复选框等）。
       // 复选框特殊处理：jsdom 不保证合成 click 会触发它的「激活行为」（勾选态可能不变），
@@ -648,6 +665,23 @@ function run(pageFile, meOverride, plan) {
         } else {
           target.dispatchEvent(new win.Event('click', { bubbles: true }));
         }
+      }
+      // clickText: [[selector, text]] —— 按**可见文案**点击，而不是按位置。
+      //
+      // 为什么必须按文案：位置型选择器（`.seg:nth-child(4)`）在选项列表变动时会
+      // **静默指向另一个选项** —— 断言照样"通过"，但测的已经不是原来那件事了。
+      // v0.26.5 插入一个「限模」筛选档时就踩到了这个坑：nth-child 整体后移一位，
+      // 失败信息（"卡片里没有'被封号'"）看不出根因，只会让人以为筛选坏了。
+      for (const [sel, txt] of (stage.clickText || [])) {
+        const cands = Array.from(doc.querySelectorAll(sel));
+        const target = cands.find((x) => (x.textContent || '').includes(txt));
+        if (!target) {
+          ok = false;
+          lines.push(`[FAIL] clickText ${sel} 含 "${txt}" 未找到（现有：`
+            + cands.map((x) => (x.textContent || '').trim()).join(' | ') + '）');
+          continue;
+        }
+        target.dispatchEvent(new win.Event('click', { bubbles: true }));
       }
       // input: [[id, value]] —— 给输入框赋值并派发 input 事件（验证即时过滤等交互）。
       for (const [id, value] of (stage.input || [])) {
@@ -762,7 +796,19 @@ function run(pageFile, meOverride, plan) {
       textIn: [['#poolKpis', '积分合计'], ['#poolKpis', '1,234'], ['#poolKpis', '出口异常'],
         ['#poolKpis', '指纹'], ['#poolHealth', '可用'], ['#poolGroup', '反代'],
         ['#poolTaskCover', '自动签到'],
-        ['#poolCooling', '代挂号B'], ['#poolCooling', '硬冷却'], ['#poolCooling', '1 分 30 秒']] },
+        ['#poolCooling', '代挂号B'], ['#poolCooling', '硬冷却'], ['#poolCooling', '1 分 30 秒'],
+        // v0.26.5：模型级冷却明细（用户口径「软冷却模型的时候冷却账号明细是否显示」）。
+        // 它不是"复制"进账号级明细，而是**独立一块** —— 且必须能区分时长来源。
+        ['#poolModelCooling', 'glm-5.3'], ['#poolModelCooling', 'kimi-k3-1'],
+        ['#poolModelCooling', '上游明示'], ['#poolModelCooling', '本地估'],
+        ['#poolModelCooling', '1 小时'], ['#poolModelCoolingNote', '2 个账号受影响']] },
+    { nav: 'overview',
+      has: [['#poolModelCooling', 1], ['#poolModelCooling .egr-help-table', 1],
+        ['#poolModelCooling tbody tr', 2],
+        // ★ 关键：模型级冷却**不得**混进账号级冷却明细（口径不同，混了会把
+        // 「整号不可用」与「只是某模型不可用」算成同一个数字）。
+        ['#poolCooling .hbar-row', 1]],
+      lacks: [['#poolCooling', 'glm-5.3'], ['#poolCooling', 'kimi-k3-1']] },
     { nav: 'overview',
       has: [['#poolCooling .hbar-row', 1], ['#btnCreditRefresh', 1]] },
     // v0.23.3：停用明细从「冷却账号明细」里**拆出来单列**（一个会自己好、一个要人工介入）。
@@ -880,16 +926,32 @@ function run(pageFile, meOverride, plan) {
     // 分组 chip 回答「参不参与消耗」，这两样回答「哪个在冷却 / 哪些没积分 /
     // 那个昵称叫什么」—— 都是分组答不了的问题。
     { nav: 'pool',
-      has: [['#accStateFilter .seg', 8], ['#accQuery', 1], ['#accFilterHint', 1]],
+      // v0.26.5：新增第 9 档「限模」（模型级冷却）。
+      has: [['#accStateFilter .seg', 9], ['#accQuery', 1], ['#accFilterHint', 1]],
+      textIn: [['#accStateFilter', '限模']],
       counts: [['accCards', 2]] },
     // 状态筛选：点「已停用」→ 只剩那张停用卡（计数由卡片数体现）。
-    { nav: 'pool', click: ['#accStateFilter .seg:nth-child(4)'],
+    { nav: 'pool', clickText: [['#accStateFilter .seg', '已停用']],
       counts: [['accCards', 1]],
       textIn: [['#accCards', '被封号'], ['#accFilterHint', '状态：已停用'],
         ['#accFilterHint', '命中 1 个']],
       lacks: [['#accCards', '测试账号']] },
+    // v0.26.5：「限模」是**正交**维度 —— 该号有模型级冷却，但它对其它模型仍可用，
+    // 所以它同时命中「可用」与「限模」。这不是矛盾，正是 6004 语义的正确表达。
+    { nav: 'pool', clickText: [['#accStateFilter .seg', '限模']],
+      counts: [['accCards', 1]],
+      textIn: [['#accCards', '测试账号'], ['#accFilterHint', '状态：限模'],
+        ['#accCards', '模型级限额'], ['#accCards', 'glm-5.3'],
+        // 必须有这句：只给一个"限模×2"的计数，运维没法判断是哪些模型、什么时候恢复。
+        ['#accCards', '其它模型正常可用']],
+      lacks: [['#accCards', '被封号']] },
+    // 限模的号**仍然算可用**（模型级冷却不吃账号可用性）——这是最关键的一条口径断言：
+    // 若哪天有人"顺手"把它并进 cooling/off，这条会立刻红。
+    { nav: 'pool', clickText: [['#accStateFilter .seg', '可用']],
+      counts: [['accCards', 1]],
+      textIn: [['#accCards', '测试账号'], ['#accFilterHint', '状态：可用']] },
     // 同一按钮再点一次不切回全部（分段控件语义）；切回「全部」恢复 2 张。
-    { nav: 'pool', click: ['#accStateFilter .seg:nth-child(1)'],
+    { nav: 'pool', clickText: [['#accStateFilter .seg', '全部']],
       counts: [['accCards', 2]] },
     // 关键词搜索：昵称子串命中 1 张。
     { nav: 'pool', input: [['accQuery', '测试']],
@@ -949,7 +1011,7 @@ function run(pageFile, meOverride, plan) {
       display: [['[data-egr-sub="pool"]', 'shown'], ['[data-egr-sub="accounts"]', 'none'],
         ['[data-egr-sub="device"]', 'none'], ['[data-egr-sub="help"]', 'none']] },
     // 切到「账号代理」：KPI 6 块 + 5 张账号卡 + 筛选段控件，且 pool 子区被藏起。
-    { click: ['#egrTabs .seg:nth-child(2)'],
+    { clickText: [['#egrTabs .seg', '账号代理']],
       counts: [['egrAccKpis', 6], ['egrAccCards', 5]],
       has: [['#egrAccFilter .seg', 6], ['#egrAccQuery', 1], ['#egrAccCards .ecard footer button', 15]],
       display: [['[data-egr-sub="accounts"]', 'shown'], ['[data-egr-sub="pool"]', 'none']],
@@ -957,7 +1019,7 @@ function run(pageFile, meOverride, plan) {
         ['#egrAccCards', '香港 01'], ['#egrAccCards', '本机 IP 直连'],
         ['#egrAccCards', '继承默认'], ['#egrAccCards', '配置值'], ['#egrAccCards', '实际出口']] },
     // 帮助子区可切换到达。
-    { click: ['#egrTabs .seg:nth-child(4)'],
+    { clickText: [['#egrTabs .seg', '去哪弄代理']],
       has: [['[data-egr-sub="help"] .egr-help-table', 1], ['[data-egr-sub="help"] .egr-help-list', 4]],
       display: [['[data-egr-sub="help"]', 'shown'], ['[data-egr-sub="accounts"]', 'none']],
       textIn: [['[data-egr-sub="help"]', '方案 A：自建'], ['[data-egr-sub="help"]', '3proxy'],
@@ -980,7 +1042,7 @@ function run(pageFile, meOverride, plan) {
         // 策略表整体回显（含未命中的码，便于区分"没出现"与"没声明"）
         ['#cfPolicies', '11140'], ['#cfPolicies', '需人工']] },
     // v0.26.1：新增「设备与选号诊断」子区 —— 设备凭证共用检测 + 均衡度 + 候选队列。
-    { click: ['#egrTabs .seg:nth-child(3)'],
+    { clickText: [['#egrTabs .seg', '设备与选号诊断']],
       has: [['[data-egr-sub="device"]', 1], ['#devTokSummary', 1], ['#devTokRows', 1],
         ['#devTokText', 1], ['#btnDevTokImport', 1], ['#selBalance', 1], ['#selCands', 1], ['#fpSamples', 1],
         // 三张表：凭证逐号、均衡度 Top、候选队列
@@ -1000,6 +1062,33 @@ function run(pageFile, meOverride, plan) {
         ['#fpSamples', '未开启']],
       // 凭证原文绝不出现（接口只回指纹与长度）
       lacks: [['[data-egr-sub="device"]', 'AUTHTOKEN']] },
+    // v0.26.5：样本面板的**启用态** —— 关着时测的是"必须明说未开启"，
+    // 这里测它真的把容量 / 分布 / 明细画出来了（两态都要钉住，缺一即为漏测）。
+    { fx: [['/api/admin/fingerprint-samples', {
+        enabled: true, file: 'data/fingerprint_samples.jsonl', count: 2, full: false,
+        size: 1048576, max: 2097152, lines: 3, last_at: 1791972000,
+        kinds: { content_blocked: 1, channel_denied: 1 },
+        models: [{ name: 'glm-5.3', count: 2 }],
+        samples: [
+          { at: 1791972000, kind: 'content_blocked', model: 'glm-5.3', key: 'k1',
+            system: 'You are Claude Code, Anthropic official CLI', tools: ['bash'] },
+          { at: 1791971000, kind: 'channel_denied', model: 'deepseek-v4-pro', key: 'k2',
+            system: 'Main branch (', tools: ['read_file'] },
+        ],
+      }]],
+      clickText: [['#egrTabs .seg', '设备与选号诊断']],
+      has: [['#fpSampleKpis .stat-card', 5], ['#fpSampleDist', 1],
+        ['#btnFpSampleRefresh', 1], ['#btnFpSampleClear', 1],
+        ['#fpSamples .egr-help-table', 1], ['[data-fp-copy]', 2],
+        // 两条横条分布（类型 + 模型）各自成组
+        ['#fpSampleDist .progress', 1]],
+      textIn: [
+        ['#fpSampleKpis', '去重样本'], ['#fpSampleKpis', '1.00 MB / 2.00 MB'],
+        ['#fpSampleKpis', '50%'],
+        ['#fpSampleDist', '按拦截类型'], ['#fpSampleDist', 'content_blocked'],
+        ['#fpSampleDist', '按模型'], ['#fpSampleDist', 'glm-5.3'],
+        ['#fpSamples', 'You are Claude Code'], ['#fpSamples', '复制全文'],
+      ] },
     // R1：线路失效处置策略 = 面板可读可改（默认「不静默换出口」）
     { nav: 'egress',
       has: [['#egrOnLineDown', 1], ['#btnEgrOnLineDown', 1], ['#egrOnLineDown option', 2]],
@@ -1008,6 +1097,8 @@ function run(pageFile, meOverride, plan) {
     { nav: 'settings', has: [['#setEgressMaxPer', 1], ['#setEgressJitter', 1], ['#setEgress', 1],
         // v0.26.1：两个默认关闭的开关（R6 降档 / R4 样本回流）
         ['#setPickSink', 1], ['#setFpSamples', 1],
+        // v0.26.5：样本面板的跨页入口 + 实时条数；更新提醒的导航徽标容器
+        ['#btnFpGo', 1], ['#fpCfgCount', 1], ['#updBadge', 1],
         ['#setPickSink option', 2], ['#setFpSamples option', 2],
         // v0.26.3：设备凭证的派生兜底与陈旧阈值
         ['#setDevTokFallback', 1], ['#setDevTokStaleDays', 1],

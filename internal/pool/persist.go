@@ -152,6 +152,10 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
+	// healed 记录本函数内的存量自愈是否动过状态。动过就置 dirty，让下一次落盘
+	// 立刻把**纠正后**的状态物化 —— 否则修正只活在内存里，重启一次又要重算重打日志
+	//（自愈是幂等的，但"每次启动都刷一屏 WARN"会让真正的告警被淹没）。
+	healed := false
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -248,13 +252,26 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		// 放在这里而不是 load() 里：本地文件恢复与 Redis 快照恢复共用本函数，
 		// 两条路径都必须纠正，否则换一条路径启动就又回到错误形态。
 		if healLegacyModelLimitCooldown(e, now) {
+			healed = true
 			log.Printf("WARN: [pool] 已纠正存量错误冷却：acct=%s 旧形态是「6004 模型级限额」"+
 				"却被写成了**账号级**冷却（会把该号对所有模型一起挡掉）。已清除，"+
 				"该号恢复对所有模型可用；若该模型确实被限，下一次请求会以"+
 				"**模型级**冷却重新记录（只挡那一个模型）。",
 				logfmt.Label(uid, ""))
 		}
+		// 存量自愈之二：模型级冷却的截止被**账号级**上限（soft_rate_max，默认 2h）
+		// 截断过（v0.26.5）。同样必须两条恢复路径都纠正，理由同上。
+		if n := healTruncatedModelCooldowns(e, now, p.modelRateMaxOr()); n > 0 {
+			healed = true
+			log.Printf("INFO: [pool] 已按上游重置时刻放长 %d 条模型级冷却：acct=%s "+
+				"（旧的截止被账号级上限截断过；现在改为按上游明示时刻，封顶 %v）。"+
+				"该号仅这些模型仍受限，其它模型不受影响。",
+				n, logfmt.Label(uid, ""), p.modelRateMaxOr())
+		}
 		p.byUID[uid] = e
+	}
+	if healed {
+		p.dirty.Store(true)
 	}
 }
 
@@ -314,6 +331,64 @@ func healLegacyModelLimitCooldown(e *entry, now time.Time) bool {
 	// （pool 的 cooling 判定以 until 为准，见 entry.cooling/Status）。
 	e.softStreak = 0
 	return true
+}
+
+// healTruncatedModelCooldowns 把被**账号级**上限截断过的模型级冷却放长到上游明示的重置时刻。
+//
+// ## 为什么这是必须修的存量问题（v0.26.5）
+//
+// v0.26.3/v0.26.4 的模型级冷却截止走的是 `cappedSoftUntilLocked` —— 上限是
+// **账号级**的 soft_rate_max（默认 2h）。上游明说"这个模型 5 小时后恢复"时，写进
+// 磁盘的就是 `Until = now+2h`，而真正的权威时刻只留在 `ResetAt` 字段里。
+//
+// 后果不是账目错误，而是**在真实窗口里反复撞墙**：2h 一到，该号对这个模型重新
+// 进入候选 → 打一次必然失败的请求（每次都在上游留下一次更明显的风控痕迹）→
+// 再被 6004 打回、再等 2h …… 直到窗口真的滑过。生产实测：27 个号里 25 个的
+// `until` 都被截断过（`ResetAt - Until` 最长差了 2.8 小时）。
+//
+// 判据直接来自"字段自相矛盾"，不需要 reason 文案：
+//
+//	ResetAt 非零（有权威时刻）且 Until 落在 ResetAt **之前**
+//
+// 这正好只命中被截断的那一类：新实现写出来的条目 `Until = min(ResetAt, now+24h)`，
+// 在 resetAt ≤ 24h（模型级限额的现实形态）时两者**相等**；11102 的负缓存条目
+// ResetAt 恒为零值，天然被排除。
+//
+// ## 只放长、不放短
+//
+// `min(ResetAt, now+modelRateMax)` 一定 ≥ 现有 Until（前提 Until ≤ ResetAt），
+// 所以本函数只会把冷却放长。绝不因为"我算出来更短"而提前放出一个可能仍在
+// 被限的模型 —— 那等于制造热循环。
+//
+// 返回被修正的条目数（供日志；0 表示无需处理）。
+func healTruncatedModelCooldowns(e *entry, now time.Time, modelMax time.Duration) int {
+	if e == nil || len(e.modelCooldowns) == 0 {
+		return 0
+	}
+	if modelMax <= 0 {
+		modelMax = defaultModelRateMax
+	}
+	cap := now.Add(modelMax)
+	fixed := 0
+	for model, mc := range e.modelCooldowns {
+		if mc.ResetAt.IsZero() {
+			continue // 无权威时刻（11102 负缓存 / 无时间信息的退避）：没有"该到什么时候"可对齐
+		}
+		if mc.Until.IsZero() || !mc.Until.Before(mc.ResetAt) {
+			continue // 已经对齐（或本来就更晚）：不动
+		}
+		want := mc.ResetAt
+		if want.After(cap) {
+			want = cap
+		}
+		if !want.After(mc.Until) {
+			continue
+		}
+		mc.Until = want
+		e.modelCooldowns[model] = mc
+		fixed++
+	}
+	return fixed
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。

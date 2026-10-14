@@ -85,12 +85,16 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // ## 两条分支
 //
 //   - resetAt 非零（解析到权威恢复时刻，见 upstream.ResolveResetAt）→
-//     modelCooldowns[model] = {Until: min(resetAt, now+soft_rate_max), ResetAt: resetAt}。
+//     modelCooldowns[model] = {Until: min(resetAt, now+modelRateMax), ResetAt: resetAt}。
 //     **不写 until**（账号级）—— 6004 只挡这一个模型，切别的模型立即可用，
 //     这正是本入口存在的意义。
+//     v0.26.5：上限从 softRateMax（2h）改为 modelRateMax（默认 24h）——
+//     用户口径是"设定重置时间的都按照时间"，而 2h 会让上游明说的更长窗口被提前放出来
+//     再撞一次（每次都是失败请求 + 风控痕迹）。理由详见 cappedModelUntilLocked。
 //   - resetAt 零值（上游没给时间信息 / 给的时间已过期）→ 模型级**有界退避**：
-//     base 起按该模型在本账号上的连续被判次数翻倍、封顶 soft_rate_max。
-//     同样**不写 until**。
+//     base 起按该模型在本账号上的连续被判次数翻倍、封顶 softRateMax。
+//     同样**不写 until**。本地估算的量级刻意保持保守（2h）且**不享受** modelRateMax ——
+//     上游没给权威时刻时，我们没有任何依据押一个"一天"的长度。
 //
 // ## 为什么零值分支必须走模型级（v0.26.3 修正，此前是账号级）
 //
@@ -142,7 +146,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	}
 	prev := e.modelCooldowns[model]
 	if !resetAt.IsZero() {
-		until := p.cappedSoftUntilLocked(now, resetAt)
+		// 模型级封顶用 modelRateMax（默认 24h），**不是** softRateMax（2h）：
+		// 上游明说多久就等多久（有界），理由见 cappedModelUntilLocked 注释。
+		until := p.cappedModelUntilLocked(now, resetAt)
 		if !prev.Until.IsZero() && prev.Until.After(until) {
 			// 已有更晚的冷却：保留（并发乱序不得把冷却改短）。
 			return
@@ -273,7 +279,36 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 // 取较早者）。resetAt 已过期（时钟偏移/文案过期）时日长短钳到时间零点附近，立即恢复。
 // 调用方必须已持有 p.mu。
 func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
-	cap := now.Add(p.softRateMaxOr())
+	return p.cappedUntilLocked(now, resetAt, p.softRateMaxOr())
+}
+
+// cappedModelUntilLocked 模型级冷却的封顶：与 cappedSoftUntilLocked 同构，
+// 但上限用 modelRateMax（默认 24h，见 defaultModelRateMax）。
+//
+// 为什么模型级要单独一档上限（v0.26.5，用户口径「设定重置时间的都按照时间」）：
+//
+//	账号级上限 2h 的理由是"上游说的窗口可能是一整天，照着挡等于白扣一个健康号"；
+//	而模型级冷却只挡**一个模型** —— 同一个号的其它模型照常服务，"白扣一个号"这个
+//	代价根本不存在。反过来，把上限压到 2h 是有实际代价的：上游明说 5h 后恢复时，
+//	2h 一到我们就把它放回候选，白打一次（一次必然失败的请求 + 一次更明显的风控痕迹），
+//	随后再次被 6004 打回、再等 2h …… 直到窗口真正滑过。
+//
+// 上限仍然存在（24h）而不是"完全不设"：解析出来的时刻是外部输入（文案/字段/头），
+// 万一时区或格式被误读成遥远的未来，不设上限就等于**永久**放弃该 (账号, 模型)。
+// 24h 的选取：上游的模型级限额窗口是「按天」计（常见说法就是"明天重置"），
+// 一天正好覆盖最长的一档；再长就该人工看一眼了。
+// 调用方必须已持有 p.mu。
+func (p *Pool) cappedModelUntilLocked(now, resetAt time.Time) time.Time {
+	return p.cappedUntilLocked(now, resetAt, p.modelRateMaxOr())
+}
+
+// cappedUntilLocked cappedSoftUntilLocked / cappedModelUntilLocked 的公共实现。
+// 调用方必须已持有 p.mu。
+func (p *Pool) cappedUntilLocked(now, resetAt time.Time, max time.Duration) time.Time {
+	if max <= 0 {
+		max = defaultSoftRateMax
+	}
+	cap := now.Add(max)
 	if resetAt.After(cap) {
 		return cap
 	}
@@ -290,6 +325,15 @@ func (p *Pool) softRateMaxOr() time.Duration {
 		return p.softRateMax
 	}
 	return defaultSoftRateMax
+}
+
+// modelRateMaxOr 返回生效的 modelRateMax（未注入时按默认 24h）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) modelRateMaxOr() time.Duration {
+	if p.modelRateMax > 0 {
+		return p.modelRateMax
+	}
+	return defaultModelRateMax
 }
 
 // softDurationLocked 按连续软冷却次数把基数 d 指数放大：d << (streak-1)，封顶 softRateMax。

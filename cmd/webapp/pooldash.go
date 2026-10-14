@@ -93,6 +93,25 @@ type poolDashView struct {
 	DisabledAccounts []poolDashDisabled `json:"disabled_accounts"`
 	// DisabledTruncated 停用账号数是否超过展示上限。
 	DisabledTruncated bool `json:"disabled_truncated,omitempty"`
+
+	// ModelCooling 模型级冷却明细（v0.26.5）。
+	//
+	// ## 为什么单列一块（用户口径：「软冷却模型的时候冷却账号明细是否显示」）
+	//
+	// 6004（模型级限额）**不写账号级 until** —— 它只挡那一个模型，账号对其它模型
+	// 仍然可用（见 pool.CooldownSoftForModel）。这是刻意设计，但它带来一个
+	// 观测盲区：`av.Cooling` / `CoolingAccounts` 判的是**账号级**冷却，于是
+	// 「某号对 glm-5.3 被限流 4 小时」这件事在仪表盘上**一处都不显示** ——
+	// 既不进「冷却中」计数，也不进明细。运维只会看到"这个号健康"，
+	// 却接不了那个模型，然后把时间花在怀疑上游。
+	//
+	// 与 CoolingAccounts **分开列**（不合并计数）：口径不同，合并会把
+	// 「一个号完全不可用」和「一个号只是某个模型不可用」混成同一个数字。
+	ModelCooling []poolDashModelCooling `json:"model_cooling"`
+	// ModelCoolingAccounts 受影响账号数（去重：一个号可能多个模型同时被限）。
+	ModelCoolingAccounts int `json:"model_cooling_accounts"`
+	// ModelCoolingTruncated 条目数是否超过展示上限。
+	ModelCoolingTruncated bool `json:"model_cooling_truncated,omitempty"`
 }
 
 // poolDashDisabled 停用账号条目。
@@ -115,8 +134,26 @@ type poolDashCooling struct {
 	Reason       string `json:"reason,omitempty"`
 }
 
+// poolDashModelCooling 模型级冷却条目（一个 (账号, 模型) 一对，不是一个账号一行 ——
+// 同一账号可能同时对多个模型被限，合成一行会丢掉"是哪些模型"，而那正是本表的全部意义）。
+type poolDashModelCooling struct {
+	UID   string `json:"uid"`
+	Name  string `json:"name"`
+	Model string `json:"model"`
+	// RemainingSec 距恢复的剩余秒数（0 = 未知/已到期）。
+	RemainingSec int64 `json:"remaining_sec"`
+	// ResetAt 上游明示的恢复墙钟（0 = 上游没给时间信息，时长是本地估的）。
+	ResetAt int64 `json:"reset_at,omitempty"`
+	// Source 时长来源：upstream（上游明示）/ local（本地有界退避）。
+	Source string `json:"source"`
+}
+
 // poolDashCoolingMax 冷却明细最多列出多少个（再多就该去账号池页筛了）。
 const poolDashCoolingMax = 8
+
+// poolDashModelCoolingMax 模型级冷却明细上限（略大于账号级：条目是 (账号,模型) 对，
+// 天然比账号多，压到 8 条在生产里（实测 26 条同时存在）等于什么都看不到）。
+const poolDashModelCoolingMax = 12
 
 // poolDashDisabledMax 停用明细上限（与冷却同口径）。
 const poolDashDisabledMax = 8
@@ -156,6 +193,10 @@ func aggregatePoolDash(views []accountView) poolDashView {
 	cooling := make([]poolDashCooling, 0, 4)
 	// disabled 收集停用账号明细（v0.23.3）：与冷却分开，见 DisabledAccounts 注释。
 	disabled := make([]poolDashDisabled, 0, 4)
+	// modelCooling 收集模型级冷却明细（v0.26.5）。
+	modelCooling := make([]poolDashModelCooling, 0, 8)
+	// modelCoolUIDs 用于统计"受影响账号数"：同一账号多个模型被限只算一个号。
+	modelCoolUIDs := map[string]bool{}
 
 	for _, av := range views {
 		off := av.Disabled || av.ManualOff
@@ -217,6 +258,24 @@ func aggregatePoolDash(views []accountView) poolDashView {
 			v.Egress["proxy"]++
 		default:
 			v.Egress["none"]++
+		}
+
+		// 模型级冷却明细：与账号级开关（off/cooling/healthy）正交，故放在 switch **之外** ——
+		// 一个号完全可以同时"账号级冷却中"且"另有一些模型被限"，两种状态都要能看到。
+		for _, lm := range av.LimitedDetail {
+			rem := lm.Until - now
+			if rem < 0 {
+				rem = 0
+			}
+			src := "local"
+			if lm.ResetAt > 0 {
+				src = "upstream"
+			}
+			modelCooling = append(modelCooling, poolDashModelCooling{
+				UID: av.UID, Name: av.displayName(), Model: lm.Model,
+				RemainingSec: rem, ResetAt: lm.ResetAt, Source: src,
+			})
+			modelCoolUIDs[av.UID] = true
 		}
 
 		if av.Realm == "global" {
@@ -295,6 +354,27 @@ func aggregatePoolDash(views []accountView) poolDashView {
 		disabled = disabled[:poolDashDisabledMax]
 	}
 	v.DisabledAccounts = disabled
+
+	// 模型级冷却明细排序：**恢复时刻**升序（最先恢复的在前 → 与账号级同口径），
+	// 同级按名、再按模型，保证 3 秒轮询顺序稳定。
+	sort.SliceStable(modelCooling, func(i, j int) bool {
+		if modelCooling[i].RemainingSec != modelCooling[j].RemainingSec {
+			return modelCooling[i].RemainingSec < modelCooling[j].RemainingSec
+		}
+		if modelCooling[i].Name != modelCooling[j].Name {
+			return modelCooling[i].Name < modelCooling[j].Name
+		}
+		return modelCooling[i].Model < modelCooling[j].Model
+	})
+	v.ModelCoolingAccounts = len(modelCoolUIDs)
+	if len(modelCooling) > poolDashModelCoolingMax {
+		v.ModelCoolingTruncated = true
+		modelCooling = modelCooling[:poolDashModelCoolingMax]
+	}
+	if modelCooling == nil {
+		modelCooling = []poolDashModelCooling{}
+	}
+	v.ModelCooling = modelCooling
 	return v
 }
 

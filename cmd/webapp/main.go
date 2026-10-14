@@ -40,6 +40,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -68,7 +69,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.26.4"
+const version = "0.26.5"
 
 type app struct {
 	store  *Store
@@ -371,7 +372,7 @@ func main() {
 		Addr: *addr,
 		// 中间件顺序：安全头最外（错误响应也要带）→ 请求体上限 → CSRF。
 		// CSRF 放在最内层：它需要读 Origin/Host，且拦截时希望已带上安全头。
-		Handler:           securityHeaders(limitRequestBody(a.csrfGuard(mux), maxRequestBody)),
+		Handler:           recoverer(securityHeaders(limitRequestBody(a.csrfGuard(mux), maxRequestBody))),
 		ReadHeaderTimeout: 30 * time.Second,
 		// IdleTimeout / ReadTimeout 此前缺失（v0.24.0 补）：只有 ReadHeaderTimeout
 		// 挡不住「连上但不发完请求」的慢速连接占资源。写超时不给 —— 流式回答
@@ -506,6 +507,41 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverer 兜住 handler 里的 panic，把它变成一条**可读的 500**（v0.26.5）。
+//
+// ## 为什么必须有
+//
+// net/http 对 handler panic 的默认处置是：打一行日志 + **关闭连接**、**不发任何响应**。
+// 对浏览器来说这不是"服务器错误"，而是一次网络失败 —— fetch 抛 TypeError，
+// 前端 catch 到的是 "Failed to fetch" 之类无从查起的文案。
+//
+// 这不是假设：v0.26.4 之前「反代选号 · 防封」页的保存按钮正是踩在这上面
+// （可选字段守卫被误嵌进外层块 → nil 解引用），运维看到的全部信息就是
+// 「保存报错」四个字，既不知道是哪个接口、也不知道是服务端炸了还是网络不通。
+// 一次 nil 解引用因此拖了很久才定位。
+//
+// 处置口径与 errsafe.go 一致：**细节写日志、对外只回稳定文案** ——
+// panic 栈里常有内部路径与变量值，不能直接吐给调用方。
+//
+// 位置：放在最外层（securityHeaders 之外），这样连安全头中间件自己的 panic 也兜得住。
+func recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			// 日志里带完整栈：panic 是"程序性缺陷"，唯一有效的排障手段就是栈。
+			// 对外只回稳定文案（别把内部路径/变量值吐给调用方）。
+			log.Printf("ERROR: [panic] %s %s: %v\n%s", r.Method, r.URL.Path, rec, debug.Stack())
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": "服务器内部错误（已记录日志，请把发生时间告知管理员）",
+			})
+		}()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1377,6 +1413,7 @@ func (a *app) routes() *http.ServeMux {
 
 	// 指纹被拦样本回流（R4 / v0.26.1）：默认关闭，开启后落 system 原文前 300 字 + 工具清单。
 	mux.HandleFunc("GET /api/admin/fingerprint-samples", a.adminGuard(a.handleFingerprintSamples))
+	mux.HandleFunc("DELETE /api/admin/fingerprint-samples", a.adminGuard(a.handleFingerprintSamplesClear))
 
 	// 消耗失败台账（v0.26.3，见 failures.go）：统计 + 明细 + 错误码处置策略表。
 	mux.HandleFunc("GET /api/admin/consume-failures", a.adminGuard(a.handleConsumeFailures))

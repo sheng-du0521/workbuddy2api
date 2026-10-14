@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,6 +82,20 @@ const (
 	kvUpdateLastAt   = "update_last_check"
 	kvUpdateLastJSON = "update_last_result"
 	kvUpdateSkip     = "update_skip_version"
+	// kvUpdateUsed 上一次**真正拉到清单**的那个候选地址（程序自写）。
+	// 存在的原因很实际：同一份清单往往有 3 个等价地址（GitHub raw / Contents API /
+	// 公共镜像），而它们在不同网络下的可达性差距是"0.6 秒"与"超时"的区别。
+	// 记住上一次成功的那个、下次优先试它，可以避免每次检查都先在不可达的地址上
+	// 白等一个 8 秒超时。
+	kvUpdateUsed = "update_manifest_used"
+
+	// defaultUpdateManifestURL 未配置清单地址时的默认值（v0.26.5）。
+	//
+	// 为什么要有默认值：本功能的整个意义是"提醒有新版本"，而"提醒"这件事
+	// 一旦需要运维先手工填一个 raw URL 才会发生，实际结果就是**永远不发生**。
+	// 这正是它此前在本项目线上被关掉（update_check_enabled=0、URL 为空）的原因链。
+	// 默认指向本仓的 version.json —— 与程序同源，改版本时一起改，不需要额外维护。
+	defaultUpdateManifestURL = "https://raw.githubusercontent.com/sheng-du0521/workbuddy2api/main/version.json"
 
 	// updateManifestMaxBytes 清单体积上限。列表本身只有几百字节，给 64KB 足够，
 	// 同时保证一个畸形/恶意响应不会把内存吃掉。
@@ -259,7 +274,8 @@ type updateStatus struct {
 	ReleaseURL  string       `json:"release_url,omitempty"`
 	ReleasedAt  int64        `json:"released_at,omitempty"`
 	CheckedAt   int64        `json:"checked_at,omitempty"`
-	ManifestURL string       `json:"manifest_url"` // 生效的清单地址（空 = 未配置）
+	ManifestURL string       `json:"manifest_url"`            // 生效的清单地址（空 = 未配置）
+	ManifestUse string       `json:"manifest_used,omitempty"` // 实际拉成功的候选地址（多地址回退时与上面不同）
 	Enabled     bool         `json:"enabled"`
 	Skipped     string       `json:"skipped,omitempty"`       // 已跳过的版本
 	MinSupport  string       `json:"min_supported,omitempty"` // 清单声明的最低支持版本
@@ -349,8 +365,18 @@ func (a *app) updateCheckEnabled() bool {
 	return strings.TrimSpace(v) != "0"
 }
 
+// updateManifestURL 生效的清单地址：显式配置优先，未配置时回落默认（见
+// defaultUpdateManifestURL 的注释）。**返回的一定是非空值**，除非默认值被显式清空。
 func (a *app) updateManifestURL() string {
-	v, _ := a.store.GetKV(kvUpdateManifest)
+	if v, _ := a.store.GetKV(kvUpdateManifest); strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	return defaultUpdateManifestURL
+}
+
+// updateManifestUsed 上一次成功拉到清单的候选地址（空 = 还没成功过）。
+func (a *app) updateManifestUsed() string {
+	v, _ := a.store.GetKV(kvUpdateUsed)
 	return strings.TrimSpace(v)
 }
 
@@ -374,8 +400,121 @@ func (a *app) updateCacheFresh(now time.Time) bool {
 
 // ---------------------------------------------------------------- 出站拉取
 
-// fetchUpdateManifest 真实出站拉清单。任何失败都返回 error 由调用方决定如何降级。
-func fetchUpdateManifest(ctx context.Context, url, curVersion string) (*updateManifest, error) {
+// updateManifestCandidates 列出一个地址的**等价候选**，按建议尝试顺序返回。
+//
+// ## 为什么需要回退（v0.26.5）
+//
+// `raw.githubusercontent.com` 在部分网络下**直接不可达**（本项目实测：本机连不通，
+// 12 秒超时；而 `api.github.com` 0.6 秒返回）。于是"检查更新"在这类环境里恒失败，
+// 提醒功能等于不存在 —— 而它恰恰是私有化部署最需要的那个功能（用户不会天天来翻仓库）。
+//
+// 候选的来源是**从 raw 地址推导**，不是硬编码一个第三方域名列表：
+//
+//	https://raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH
+//	  → https://api.github.com/repos/OWNER/REPO/contents/PATH?ref=BRANCH   （GitHub 官方 API，可解析 base64）
+//	  → https://cdn.jsdelivr.net/gh/OWNER/REPO@BRANCH/PATH                （公共 CDN 镜像）
+//	  → https://ghproxy.net/https://raw.githubusercontent.com/...          （反代）
+//
+// 非 raw 形态的地址（自建 CDN、内网文件服务）**不做推导**：那种情况下"多试几个
+// 第三方站点"没有任何依据，只会把出站面扩大。此时候选就是它自己。
+//
+// ⚠️ 安全边界：回退只改**传输路径**，不改**校验口径** —— 清单里给出的下载地址与
+// SHA-256 照旧原样展示给运维，程序从不自动下载替换 exe（见文件头"为什么不做自动更新"）。
+// 也就是说镜像被投毒的影响面是"提示里的说明文字"，不是"被自动装上的二进制"。
+func updateManifestCandidates(primary string) []string {
+	p := strings.TrimSpace(primary)
+	if p == "" {
+		return nil
+	}
+	out := []string{p}
+	owner, repo, branch, path, ok := splitRawGitHubURL(p)
+	if !ok {
+		return out
+	}
+	out = append(out,
+		fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repo, path, branch),
+		fmt.Sprintf("https://cdn.jsdelivr.net/gh/%s/%s@%s/%s", owner, repo, branch, path),
+		"https://ghproxy.net/https://raw.githubusercontent.com/"+owner+"/"+repo+"/"+branch+"/"+path,
+	)
+	return out
+}
+
+// splitRawGitHubURL 解析 raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH... 形态。
+// 路径可以有多段（如 dist/version.json），故只切前三段、其余整体作为 path。
+func splitRawGitHubURL(u string) (owner, repo, branch, path string, ok bool) {
+	const prefix = "https://raw.githubusercontent.com/"
+	rest, found := strings.CutPrefix(u, prefix)
+	if !found {
+		// 也接受 http:// 形态（老配置里可能有）。
+		rest, found = strings.CutPrefix(u, "http://raw.githubusercontent.com/")
+		if !found {
+			return "", "", "", "", false
+		}
+	}
+	rest = strings.TrimPrefix(rest, "/")
+	parts := strings.SplitN(rest, "/", 4)
+	if len(parts) < 4 {
+		return "", "", "", "", false
+	}
+	owner, repo, branch, path = parts[0], parts[1], parts[2], parts[3]
+	if owner == "" || repo == "" || branch == "" || path == "" {
+		return "", "", "", "", false
+	}
+	return owner, repo, branch, path, true
+}
+
+// parseUpdateManifestBody 把响应体解析成清单，**同时接受两种封装**：
+//
+//  1. 裸清单 JSON（version.json 本体，raw / CDN 镜像返回的就是它）；
+//  2. GitHub Contents API 信封：{name,path,size,content:"<base64>",encoding:"base64",...}。
+//
+// 第 2 种必须支持 —— 它正是 raw 不可达时的那条回退路径。不支持的话"回退"
+// 只会拿到一个没有 version 字段的 JSON 然后报"清单缺少 version 字段"，
+// 看起来像清单写错了，实际是解析口径没跟上。
+func parseUpdateManifestBody(body []byte) (*updateManifest, error) {
+	var m updateManifest
+	if err := json.Unmarshal(body, &m); err == nil && strings.TrimSpace(m.Version) != "" {
+		return &m, nil
+	}
+	var env struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("清单解析失败: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(env.Encoding), "base64") && strings.TrimSpace(env.Content) != "" {
+		// Contents API 的 content 是**折行**的 base64（每 60 字符一个 \n）。
+		raw, err := base64.StdEncoding.DecodeString(stripSpace(env.Content))
+		if err != nil {
+			return nil, fmt.Errorf("清单 base64 解码失败: %w", err)
+		}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("清单解析失败（Contents API 内容）: %w", err)
+		}
+	}
+	if strings.TrimSpace(m.Version) == "" {
+		return nil, fmt.Errorf("清单缺少 version 字段")
+	}
+	return &m, nil
+}
+
+// stripSpace 去掉字符串里所有空白（base64 折行、缩进、\r）。
+func stripSpace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// fetchManifestOnce 在**一个**候选地址上拉一次清单。失败返回 error 由调用方决定是否换地址。
+func fetchManifestOnce(ctx context.Context, url, curVersion string) (*updateManifest, error) {
 	if url == "" {
 		return nil, fmt.Errorf("未配置更新清单地址")
 	}
@@ -383,7 +522,7 @@ func fetchUpdateManifest(ctx context.Context, url, curVersion string) (*updateMa
 	if err != nil {
 		return nil, err
 	}
-	// 带 UA 是礼貌也是实践：GitHub raw / CDN 会拒绝空 UA 的客户端。
+	// 带 UA 是礼貌也是实践：GitHub raw / CDN / 反代都可能拒绝空 UA 的客户端。
 	req.Header.Set("User-Agent", "workbuddy2api/"+curVersion)
 	req.Header.Set("Accept", "application/json")
 
@@ -395,20 +534,75 @@ func fetchUpdateManifest(ctx context.Context, url, curVersion string) (*updateMa
 	if resp.StatusCode != http.StatusOK {
 		// 403/429 常见于被限流；这里不做重试（下次周期再试即可），
 		// 把状态码如实带回，便于运维判断是不是被 CDN 拦了。
-		return nil, fmt.Errorf("清单返回 HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, updateManifestMaxBytes))
 	if err != nil {
 		return nil, err
 	}
-	var m updateManifest
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, fmt.Errorf("清单解析失败: %w", err)
+	return parseUpdateManifestBody(body)
+}
+
+// fetchUpdateManifest 依候选顺序尝试，返回第一个成功的清单与其实际地址。
+//
+// 每个候选各自受 ctx 约束（ctx 的预算由调用方给足，见 handleAdminUpdateStatus）；
+// **逐个试**而不是并发打，是因为候选之间有明确的主次（canonical 优先），
+// 并发只会让我们对外多打几个包。
+//
+// 全部失败时 error 汇总每个候选的失败原因 —— 排障时一眼能看出"是全都超时
+// （网络不通）"还是"只有 raw 超时而 API 报 404（路径写错了）"。
+func fetchUpdateManifest(ctx context.Context, primary, curVersion, lastUsed string) (*updateManifest, string, error) {
+	cands := updateManifestCandidates(primary)
+	if len(cands) == 0 {
+		return nil, "", fmt.Errorf("未配置更新清单地址")
 	}
-	if strings.TrimSpace(m.Version) == "" {
-		return nil, fmt.Errorf("清单缺少 version 字段")
+	// 上次成功的候选提到最前：避免每次都在已知不可达的地址上白等一个超时。
+	cands = orderUpdateCandidates(cands, lastUsed)
+	errs := make([]string, 0, len(cands))
+	for _, c := range cands {
+		m, err := fetchManifestOnce(ctx, c, curVersion)
+		if err == nil {
+			return m, c, nil
+		}
+		errs = append(errs, shortHost(c)+": "+err.Error())
+		if ctx.Err() != nil {
+			break // 预算用尽：剩下的候选不必再试（免得把"超时"记成"全部不可达"）
+		}
 	}
-	return &m, nil
+	return nil, "", fmt.Errorf("所有候选地址均失败（%s）", strings.Join(errs, "；"))
+}
+
+// orderUpdateCandidates 把上次命中的候选提到最前（抽成纯函数以便钉进测试：
+// "优先试上次成功的地址"这条规则看不见摸不着，只靠端到端很难断言）。
+//
+// lastUsed 不在候选里（运维改了清单地址 / 候选推导规则变了）时**原样返回** ——
+// 不把外部输入塞进候选列表，否则一个陈旧的 kv 值就能让程序去访问任意 URL。
+func orderUpdateCandidates(cands []string, lastUsed string) []string {
+	if lastUsed == "" || len(cands) < 2 {
+		return cands
+	}
+	for i, c := range cands {
+		if c == lastUsed {
+			if i == 0 {
+				return cands
+			}
+			out := make([]string, 0, len(cands))
+			out = append(out, lastUsed)
+			out = append(out, cands[:i]...)
+			out = append(out, cands[i+1:]...)
+			return out
+		}
+	}
+	return cands
+}
+
+// shortHost 把地址压成 host+路径，用于错误汇总（完整 URL 太长，且反代形态会嵌套）。
+func shortHost(u string) string {
+	s := strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
+	if i := strings.IndexByte(s, '/'); i > 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // checkUpdate 执行一次检查（带缓存与单飞），返回给前端的状态。
@@ -434,6 +628,7 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 		if m := a.cachedManifest(); m != nil {
 			out := decideUpdate(version, m, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL = true, st.ManifestURL
+			out.ManifestUse = a.updateManifestUsed()
 			return out
 		}
 	}
@@ -445,11 +640,12 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 		if m := a.cachedManifest(); m != nil {
 			out := decideUpdate(version, m, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL = true, st.ManifestURL
+			out.ManifestUse = a.updateManifestUsed()
 			return out
 		}
 	}
 
-	m, err := fetchUpdateManifest(ctx, st.ManifestURL, version)
+	m, used, err := fetchUpdateManifest(ctx, st.ManifestURL, version, a.updateManifestUsed())
 	if err != nil {
 		// 失败：**保留上一次的好结果**（如果有），只把 error 标出来。
 		// 覆盖成空会让"暂时网络不通"看起来像"项目已停止维护"。
@@ -457,19 +653,22 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 		if m2 := a.cachedManifest(); m2 != nil {
 			out := decideUpdate(version, m2, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL, out.Error = true, st.ManifestURL, st.Error
+			out.ManifestUse = a.updateManifestUsed()
 			out.Stale = true
 			return out
 		}
 		return st
 	}
 
-	// 成功：写缓存（含时间戳）。
+	// 成功：写缓存（含时间戳）与**命中的候选地址**（下次优先试它）。
 	if blob, err := json.Marshal(m); err == nil {
 		_ = a.store.SetKV(kvUpdateLastJSON, string(blob))
 		_ = a.store.SetKV(kvUpdateLastAt, strconv.FormatInt(now.Unix(), 10))
+		_ = a.store.SetKV(kvUpdateUsed, used)
 	}
 	out := decideUpdate(version, m, st.Skipped, now.Unix())
 	out.Enabled, out.ManifestURL = true, st.ManifestURL
+	out.ManifestUse = used
 	return out
 }
 
@@ -539,7 +738,14 @@ func (a *app) updateLoop(ctx context.Context) {
 // 默认走缓存；缓存新鲜时**完全不出站**，所以打开页面不会因为"检查更新"而变慢。
 func (a *app) handleAdminUpdateStatus(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force") == "1"
-	ctx, cancel := context.WithTimeout(r.Context(), updateNetTimeout+2*time.Second)
+	// 预算要能容纳**多个候选**（raw 超时后还要试 API / CDN），否则回退逻辑
+	// 会在第一个候选的超时上把预算耗尽、永远走不到第二个。
+	// 用候选数而不是硬编码 3：推导规则变了这里自动跟着变。
+	budget := time.Duration(len(updateManifestCandidates(a.updateManifestURL())))*updateNetTimeout + 2*time.Second
+	if budget < updateNetTimeout+2*time.Second {
+		budget = updateNetTimeout + 2*time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), budget)
 	defer cancel()
 	writeJSON(w, http.StatusOK, a.checkUpdate(ctx, force))
 }
@@ -585,6 +791,9 @@ func printUpdateStatus(st updateStatus) {
 		return
 	}
 	fmt.Printf("更新源:   %s\n", st.ManifestURL)
+	if st.ManifestUse != "" && st.ManifestUse != st.ManifestURL {
+		fmt.Printf("实际命中: %s\n", st.ManifestUse)
+	}
 	if st.Error != "" {
 		fmt.Printf("检查结果: 失败 —— %s\n", st.Error)
 		return

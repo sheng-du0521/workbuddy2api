@@ -35,7 +35,7 @@
       <button class="nav-item" data-nav="report" data-on="loadReport" data-title="用量报表" data-sub="实时态势 + 按日 / 按模型分解"><span class="ico">📊</span>用量报表</button>
       <div class="nav-group">系统</div>
       <button class="nav-item" data-nav="announce" data-on="loadAnnounce" data-title="公告" data-sub="发布 / 编辑 / 启停 / 删除站内公告"><span class="ico">📣</span>公告<span class="badge hidden" id="annBadge">0</span></button>
-      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="计费、反代防封、预扣、限流告警"><span class="ico">⚙</span>设置</button>
+      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="计费、反代防封、预扣、限流告警"><span class="ico">⚙</span>设置<span class="badge hidden" id="updBadge">1</span></button>
       <button class="nav-item" data-nav="test" data-title="调试对话" data-sub="用管理密钥直连上游，不走用户计费"><span class="ico">⌘</span>调试对话</button>
     </nav>
     <div class="sidebar-foot">
@@ -144,9 +144,12 @@
         </div>
         <div class="sub" style="margin:0 0 10px;">
           健康度环形图只回答「冷却几个 / 停用几个」；这里回答「<b>是哪几个</b>」——
-          两块分开列，因为两者的处置方式完全不同：
-          <br><b>冷却中</b>：临时状态，会自己恢复（等 N 分钟 / 到次日 4 点），
+          三块<b>分开列</b>，因为三者的处置方式完全不同：
+          <br><b>冷却中</b>（账号级）：临时状态，会自己恢复（等 N 分钟 / 到次日 4 点），
           按剩余时间升序（最先恢复的排前），最多 8 条。
+          <br><b>模型级冷却</b>：<b>只挡那一个模型</b>的临时状态 —— 该号对其它模型仍然可用，
+          因此它<b>不计入</b>上面的「冷却中」数字，也不会让账号变成"不健康"。
+          列出 <b>账号 → 模型 → 剩余时间</b>，并标明时长是<b>上游明示</b>的还是<b>本地估</b>的，最多 12 条。
           <br><b>已停用</b>：需要人工介入的终态 —— 等多久都不会好。
           按来源排序（<b>手动停用</b>在前，那是你刚做的决定；系统禁用（原因）在后），最多 8 条。
           <br>「<b>刷新余额</b>」解决另一个问题：池内余额是<b>内存快照</b>，新导入的号
@@ -155,6 +158,11 @@
         </div>
         <div class="row" style="margin:0 0 6px;"><span class="muted" style="font-size:12px;">冷却中</span></div>
         <div id="poolCooling"></div>
+        <div class="row" style="margin:12px 0 6px;">
+          <span class="muted" style="font-size:12px;">模型级冷却（只挡该模型，其它模型正常）</span>
+          <span class="muted" style="font-size:12px;" id="poolModelCoolingNote"></span>
+        </div>
+        <div id="poolModelCooling"></div>
         <div class="row" style="margin:12px 0 6px;">
           <span class="muted" style="font-size:12px;">已停用</span>
           <span class="muted" style="font-size:12px;" id="poolDisabledNote"></span>
@@ -639,14 +647,21 @@
         <div class="card" style="margin-top:16px;">
           <div class="section-head">
             <h2>指纹被拦样本</h2>
-            <span class="muted" style="font-size:12px;">默认关闭，开关在「设置 → 反代选号 · 防封」</span>
+            <span class="muted" style="font-size:12px;">开关在「设置 → 反代选号 · 防封」<span id="fpSampleStamp"></span></span>
           </div>
           <div class="sub" style="margin:0 0 10px;">
             上游按内容策略拦下请求时（11128 / 内容审核 / 11140），把 <b>system 提示词前 300 字 + 工具名</b>
             留下来。用途是<b>扩指纹黑名单</b>：对照这些片段就能知道是哪句话触发了拦截，
             不必再靠"从头抓包复现"。同一模式只留最新一条。
           </div>
-          <div id="fpSamples"></div>
+          <div id="fpSampleKpis" class="kpis"></div>
+          <div id="fpSampleDist" style="margin-top:14px;"></div>
+          <div class="row" style="margin-top:14px;gap:8px;align-items:center;">
+            <button class="ghost sm" id="btnFpSampleRefresh">刷新样本</button>
+            <button class="ghost sm" id="btnFpSampleClear">清空样本文件</button>
+            <span id="fpSampleMsg" class="muted" style="font-size:12px;"></span>
+          </div>
+          <div id="fpSamples" style="margin-top:12px;"></div>
         </div>
       </div>
 
@@ -1292,6 +1307,10 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
               <option value="off">关闭（默认）</option>
               <option value="on">开启</option>
             </select>
+            <div class="row" style="margin-top:8px;gap:8px;align-items:center;">
+              <button class="ghost sm" id="btnFpGo">查看样本面板</button>
+              <span class="muted" id="fpCfgCount" style="font-size:12px;"></span>
+            </div>
             <div class="hint">上游按内容策略拦下请求时，把 <b>system 提示词前 300 字 + 工具名</b>落盘，
               供你扩指纹黑名单（把对抗节奏从"发版"变成"运营"）。
               ⚠️ 这是本项目中<b>唯一会把请求内容写到磁盘</b>的功能，因此默认关闭；
@@ -1854,9 +1873,15 @@ function consumeTone(g) {
 //   · 未入池 = 代挂号还没通过入池审批（平台自持号恒为 in，不会命中）
 //   · 积分未获取 = 从未拉到权威余额（新号在首次签到/检测前）
 //   · 零积分 = 拉到过但为 0（真的花光了，与"还没拉过"是两回事）
+//   · 限模 = 有 **模型级**冷却（rate_limited_models > 0）
+//
+// ⚠️ 「限模」是**正交**维度，刻意不改变「可用」的判定：模型级冷却只挡那一个模型，
+// 该号对其它模型照常服务。所以一个号可以同时是「可用」和「限模」——
+// 这不是矛盾，而是 6004 语义的正确表达（v0.26.5 用户口径）。
 const ACC_STATES = [
   ['__all__', '全部'],
   ['usable', '可用'],
+  ['model_limited', '限模'],
   ['cooling', '冷却中'],
   ['off', '已停用'],
   ['abnormal', '异常组'],
@@ -1871,6 +1896,8 @@ function accStateOf(a) {
   const set = new Set();
   if (!off && !a.cooling) set.add('usable');
   if (a.cooling) set.add('cooling');
+  // 模型级冷却独立成档（v0.26.5）：它**不吃**「可用」——见 ACC_STATES 顶部注释。
+  if (Number(a.rate_limited_models) > 0) set.add('model_limited');
   if (off) set.add('off');
   if ((a.consume_group_effective || 'idle') === 'abnormal') set.add('abnormal');
   if (Number(a.owner_id) > 0 && a.pool_state !== 'in') set.add('pending');
@@ -2634,6 +2661,50 @@ function poolDonutRow(box, items, centerLabel, emptyText) {
 // 为什么要有它：健康度环形图的「冷却中 N」只给了数量，运营无法据此判断
 // 「等两分钟就好」还是「这个号在反复软冷却，得去看看」。这里把账号名、
 // 冷却类型与剩余时间摆出来。
+// renderPoolModelCooling 渲染**模型级**冷却明细（v0.26.5）。
+//
+// ## 为什么要单独一块（用户口径：「软冷却模型的时候冷却账号明细是否显示」）
+//
+// 6004 这类模型级限额**不写账号级 until** —— 它只挡那一个模型，账号对其它模型照常服务。
+// 这是刻意的，但它带来一个观测盲区：账号级冷却明细（上面那块）判的是 `until`，
+// 于是「某号对 glm-5.3 被限 4 小时」**一处都不显示**，既不进计数也不进明细。
+// 运维看到的是"这个号健康"，却接不了那个模型，然后把时间花在怀疑上游。
+//
+// ## 为什么用表格而不是横条
+//
+// 横条（账号级冷却那块）比的是"还剩多久"，一个号一条；这里的行是 **(账号, 模型) 对** ——
+// 同一账号可能同时对多个模型被限，条长相同却分不出是哪个模型，反而更难读。
+// 表格天然能放「模型」这一列，还能直接把"上游明示 / 本地估"标出来。
+function renderPoolModelCooling(list, truncated, accountCount) {
+  const box = $('poolModelCooling');
+  if (!box) return;
+  box.textContent = '';
+  const note = $('poolModelCoolingNote');
+  if (!list.length) {
+    if (note) note.textContent = '';
+    box.appendChild(el('div', 'hintbar', '当前没有模型处于模型级冷却'));
+    return;
+  }
+  if (note) {
+    note.textContent = truncated
+      ? `共 ${accountCount} 个账号受影响，列出最先恢复的 ${list.length} 条`
+      : `共 ${accountCount} 个账号受影响`;
+  }
+  const rows = list.map((m) => '<tr>'
+    + '<td>' + escapeHTML(m.name || '') + '</td>'
+    + '<td class="mono">' + escapeHTML(m.model || '—') + '</td>'
+    + '<td>' + escapeHTML(fmtDuration(Math.max(0, Number(m.remaining_sec) || 0))) + '</td>'
+    + '<td>' + (m.source === 'upstream'
+      // 两者在排障时含义完全不同：upstream = 上游确实在限这个模型；
+      // local = 我们连上游说的时间都没读到，只是本地有界退避。
+      ? '<span class="tag warn" title="冷却截止来自上游明示的重置时刻">上游明示</span>'
+      : '<span class="tag" title="上游没给时间信息，冷却时长由本地有界退避估算">本地估</span>')
+    + '</td></tr>');
+  box.insertAdjacentHTML('beforeend',
+    '<table class="egr-help-table"><thead><tr><th>账号</th><th>模型</th><th>剩余</th>'
+    + '<th>时长来源</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>');
+}
+
 function renderPoolCooling(list, truncated, totalCooling) {
   const box = $('poolCooling');
   if (!box) return;
@@ -2792,6 +2863,9 @@ function renderPoolDash(d) {
 
   // ---- 冷却账号明细（v0.17.8）----
   renderPoolCooling(d.cooling_accounts || [], !!d.cooling_truncated, cooling);
+  // 模型级冷却明细（v0.26.5）：与账号级冷却**分开**，理由见 renderPoolModelCooling 注释。
+  renderPoolModelCooling(d.model_cooling || [], !!d.model_cooling_truncated,
+    Number(d.model_cooling_accounts) || 0);
   // 停用明细（v0.23.3）：与冷却并列但独立一块，见 renderPoolDisabled 注释。
   renderPoolDisabled(d.disabled_accounts || [], !!d.disabled_truncated, disabled);
 
@@ -3818,6 +3892,7 @@ async function loadSettings() {
     $('setDevTokFallback').value = d.device_token_fallback === 'derive' ? 'derive' : 'off';
     $('setDevTokStaleDays').value = String(d.device_token_stale_days ?? 30);
     $('setFpSamples').value = d.fingerprint_samples === 'on' ? 'on' : 'off';
+    loadFpCfgCount();
     // 选号模式：回读实际生效值（后端归一化后返回），空/未知一律显示默认项。
     $('setPickMode').value = (d.pick_mode === 'roundrobin') ? 'roundrobin' : 'weighted';
     // 导入防关联 + 积分补新（v0.25.0）。
@@ -4598,6 +4673,19 @@ if ($('btnClearDeviceToken')) $('btnClearDeviceToken').onclick = async () => {
 
 // ---- 版本更新提醒（v0.26.0）----
 // 只读展示 + 手动触发，**不做自动更新**（理由见 updatecheck.go 顶部注释）。
+// loadFpCfgCount 在设置页显示样本条数 —— 让"要不要点进面板"这件事有个依据。
+// 失败静默（它只是提示，不该在设置页弹错误）。
+async function loadFpCfgCount() {
+  const box = $('fpCfgCount');
+  if (!box) return;
+  try {
+    const d = await api('/api/admin/fingerprint-samples');
+    box.textContent = d && d.enabled
+      ? ('已收集 ' + (d.count || 0) + ' 条（' + fmtBytes(d.size || 0) + '/' + fmtBytes(d.max || 0) + '）')
+      : '当前未开启收集';
+  } catch (e) { box.textContent = ''; }
+}
+
 async function loadUpdateStatus(force) {
   const box = $('updateStatus');
   if (!box) return;
@@ -4618,6 +4706,9 @@ function renderUpdateStatus(d) {
   box.textContent = '';
   const skip = $('btnSkipUpdate');
   if (skip) skip.style.display = 'none';
+  // 导航徽标：有更新时在「设置」上点一个红点 —— 否则提示只存在于一个
+  // 默认收在「设置 → 关于」里的卡片中，等于没有提醒。
+  setUpdateBadge(!!(d && d.has_update));
 
   const head = el('div', 'row');
   head.style.gap = '10px';
@@ -4625,6 +4716,13 @@ function renderUpdateStatus(d) {
   if (d.latest) head.appendChild(el('span', 'muted', '最新 ' + d.latest));
   if (d.checked_at) head.appendChild(el('span', 'muted', fmtClock(d.checked_at) + ' 检查'));
   box.appendChild(head);
+  // 生效地址与实际命中地址分开显示：多候选回退时两者不同（raw 走不通时命中的是
+  // API / CDN 镜像），排障时要能一眼看出"它到底从哪拿到清单的"。
+  if (d.manifest_url) {
+    box.appendChild(el('div', 'muted',
+      '更新源 ' + d.manifest_url + (d.manifest_used && d.manifest_used !== d.manifest_url
+        ? '（实际命中 ' + d.manifest_used + '）' : '')));
+  }
 
   if (d.enabled === false) { box.appendChild(el('div', 'muted', '版本检查已关闭。')); return; }
   if (d.error && !d.latest) { box.appendChild(el('div', 'credit-err', '检查未成功：' + d.error)); return; }
@@ -4649,6 +4747,14 @@ function renderUpdateStatus(d) {
   }
   if (d.stale) box.appendChild(el('div', 'muted', '离线：显示的是上次成功检查的结果。'));
   if (d.error && d.latest) box.appendChild(el('div', 'muted', '本次检查未成功：' + d.error));
+}
+
+// setUpdateBadge 设置导航上的更新徽标（true=显示）。
+function setUpdateBadge(on) {
+  const b = $('updBadge');
+  if (!b) return;
+  b.classList.toggle('hidden', !on);
+  if (on) b.textContent = '新';
 }
 
 // extLink 外链一律 noopener，且**只接受 http(s)** ——
@@ -5757,32 +5863,184 @@ async function loadDeviceDiag() {
   renderFpSamples(fps);
 }
 
-// renderFpSamples 被拦样本（R4）。关着的时候必须**明确说"当前没在收集"**，
-// 而不是显示"0 条"—— 后者会让人以为"没被拦过"，两件事完全不同。
+// 样本面板的两个按钮（在子区里，故用条件挂载）。
+if ($('btnFpSampleRefresh')) $('btnFpSampleRefresh').onclick = async () => {
+  const d = await refreshFpSamples();
+  toast(d && d.error ? ('刷新失败：' + d.error) : '样本已刷新', (d && d.error) ? 'err' : 'ok');
+};
+if ($('btnFpSampleClear')) {
+  $('btnFpSampleClear').onclick = async () => {
+    const m = $('fpSampleMsg');
+    if (!confirm('确认清空样本文件？\n\n这是本程序唯一会落盘的请求内容片段，清掉后不可恢复。')) return;
+    try {
+      const r = await api('/api/admin/fingerprint-samples', { method: 'DELETE' });
+      if (m) { m.textContent = '已清空（释放 ' + fmtBytes(r.removed_bytes || 0) + '）'; m.style.color = 'var(--ok)'; }
+      await refreshFpSamples();
+    } catch (e) {
+      if (m) { m.textContent = '清空失败：' + e.message; m.style.color = 'var(--err)'; }
+    }
+  };
+}
+// 设置页 →「查看样本面板」：跨页跳转由 navGo（setupNav 暴露）+ showEgrSub 完成。
+if ($('btnFpGo')) {
+  $('btnFpGo').onclick = () => {
+    if (typeof window.navGo === 'function') window.navGo('egress');
+    if (typeof window.showEgrSub === 'function') window.showEgrSub('device');
+  };
+}
+
+// renderFpSamples 被拦样本回流面板（R4 可视化）。
+//
+// 设计要点（三条都是踩过坑之后的取舍）：
+//   1. **关着的时候必须说"当前没在收集"**，而不是显示"0 条" ——
+//      后者会让人以为"没被拦过"，两件事的处置方向完全相反；
+//   2. 占用条优先于"是否已满"的布尔：文件满了是**拒绝写入**（不轮转），
+//      所以"还能装多少"决定了是"顺手看一眼"还是"现在就得清理"；
+//   3. 分布（类型 / 模型）画成横条而不是只列数字：扩黑名单时要先看
+//      "是哪一类拦截在重复出现"，条形能让这件事不用逐行读表。
 function renderFpSamples(d) {
   const box = $('fpSamples');
+  const kbox = $('fpSampleKpis');
+  const dist = $('fpSampleDist');
   if (!box) return;
-  if (!d || d.error) { box.textContent = '读取失败：' + ((d && d.error) || '未知错误'); return; }
-  if (!d.enabled) {
-    box.innerHTML = '<div class="sub">当前<b>未开启</b>收集 —— 一个字都没落盘。'
-      + '需要排查拦截原因时，去「设置 → 反代选号 · 防封」把它打开。</div>';
+  const stamp = $('fpSampleStamp');
+  if (stamp) stamp.textContent = '';
+
+  const clearMsg = (t, tone) => {
+    const m = $('fpSampleMsg');
+    if (!m) return;
+    m.textContent = t || '';
+    m.style.color = tone === 'err' ? 'var(--err)' : (tone === 'ok' ? 'var(--ok)' : '');
+  };
+  clearMsg('');
+
+  if (!d || d.error) {
+    if (kbox) kbox.textContent = '';
+    if (dist) dist.textContent = '';
+    box.textContent = '读取失败：' + ((d && d.error) || '未知错误');
     return;
   }
-  const kinds = d.kinds || {};
-  const kindText = Object.keys(kinds).map((k) => k + ' ' + kinds[k]).join(' · ');
-  let html = '<div class="sub" style="margin:0 0 8px;">已收集 <b>' + d.count + '</b> 条去重样本'
-    + (kindText ? '（' + escapeHTML(kindText) + '）' : '')
-    + (d.full ? '　⚠️ <b>文件已达上限，暂停写入</b>，请先清理 ' + escapeHTML(d.file) : '') + '</div>';
+
+  if (stamp) stamp.textContent = d.file ? ('（' + d.file + '）') : '';
+
+  // 未开启：**不渲染任何"0 条"的 KPI / 分布**。
+  //
+  // 这是本面板最容易做错的一处：把"没在收集"画成"去重样本 0 / 已用容量 0%"
+  // 看起来信息更全，实际是**误报** —— 运维会读成"最近没被拦过，挺好"，
+  // 而真相是"上游随时可能拦，我们一个字都没记"。两者的下一步动作完全相反。
+  if (!d.enabled) {
+    if (kbox) kbox.textContent = '';
+    if (dist) dist.textContent = '';
+    emptyBlock(box, '当前未开启收集 —— 一个字都没落盘。需要排查拦截原因时，'
+      + '去「设置 → 反代选号 · 防封」把「被拦样本回流」打开。');
+    return;
+  }
+
+  const pct = d.max > 0 ? Math.min(100, Math.round((Number(d.size || 0) / d.max) * 100)) : 0;
+  const kpis = [
+    ['去重样本', fmtNum(d.count || 0)],
+    ['文件体积', fmtBytes(d.size || 0) + ' / ' + fmtBytes(d.max || 0)],
+    ['已用容量', pct + '%'],
+    ['物理行数', fmtNum(d.lines || 0)],
+    ['最近一条', d.last_at ? fmtTime(d.last_at) : '—'],
+  ];
+  if (kbox) {
+    // statCard() 返回的是**元素节点**，必须 DOM 追加；拼进 innerHTML 会变成
+    // "[object HTMLDivElement]"（这个坑历史上真踩过一次）。
+    kbox.textContent = '';
+    for (const k of kpis) kbox.appendChild(statCard(k[0], k[1], { cls: pct >= 90 ? 'warn' : '' }));
+  }
+
+  if (dist) {
+    dist.textContent = '';
+    dist.appendChild(el('div', 'sub', '容量占用 ' + pct + '%'
+      + (d.full ? '：⚠️ 已达上限，**暂停写入**，请先清空（样本不轮转）。' : '。')));
+    const bar = el('div', 'progress' + (d.full ? ' err' : ''));
+    const fill = el('i');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    dist.appendChild(bar);
+    dist.appendChild(barsBox('按拦截类型', (d.kinds ? Object.keys(d.kinds).map((k) => ({ name: k, count: d.kinds[k] })) : []), 'warn'));
+    dist.appendChild(barsBox('按模型（Top 8）', d.models || [], 'accent'));
+  }
+
   const list = d.samples || [];
-  if (!list.length) { emptyBlock(box, '还没有样本（没被拦过，或拦住的是没有 system 的请求）。'); return; }
-  html += '<table class="egr-help-table"><thead><tr><th>时间</th><th>类型</th><th>模型</th><th>system 片段</th><th>工具</th></tr></thead><tbody>'
-    + list.slice().reverse().map((s) => '<tr><td class="mono">' + escapeHTML(fmtTime(s.at)) + '</td>'
+  if (!list.length) {
+    emptyBlock(box, '还没有样本（没被拦过，或拦住的是没有 system 的请求）。');
+    return;
+  }
+  // 最新的排最前（at 降序）：运维要的是"刚刚发生了什么"，不是"最初被拦的是什么"。
+  const rows = list.slice().sort((a, b) => (b.at || 0) - (a.at || 0));
+  box.innerHTML = '<table class="egr-help-table"><thead><tr><th>时间</th><th>类型</th><th>模型</th>'
+    + '<th>system 片段（前 120 字）</th><th>工具</th><th></th></tr></thead><tbody>'
+    + rows.map((s) => '<tr><td class="mono">' + escapeHTML(fmtTime(s.at)) + '</td>'
       + '<td><span class="tag warn">' + escapeHTML(s.kind) + '</span></td>'
       + '<td class="mono">' + escapeHTML(s.model || '—') + '</td>'
       + '<td style="font-size:12px;">' + escapeHTML((s.system || '').slice(0, 120)) + '</td>'
-      + '<td style="font-size:12px;">' + escapeHTML((s.tools || []).slice(0, 6).join(', ') || '—') + '</td></tr>').join('')
+      + '<td style="font-size:12px;">' + escapeHTML((s.tools || []).slice(0, 6).join(', ') || '—') + '</td>'
+      + '<td><button class="ghost sm" data-fp-copy="' + escapeHTML(s.key || '') + '">复制全文</button></td></tr>').join('')
     + '</tbody></table>';
-  box.innerHTML = html;
+  // 复制全文：黑名单要的是 system 原文（表里只截了 120 字，截断处可能正好是指纹词）。
+  for (const b of Array.from(box.querySelectorAll('[data-fp-copy]'))) {
+    b.onclick = () => {
+      const s2 = rows.find((x) => (x.key || '') === b.dataset.fpCopy);
+      if (!s2) return;
+      const NL = String.fromCharCode(10);
+      copyText('system:' + NL + (s2.system || '') + NL + NL + 'tools: '
+        + ((s2.tools || []).join(', ') || '—'));
+    };
+  }
+}
+
+// fmtBytes 人类可读的体积（KB / MB）。样本文件的上限是 2MB 量级，
+// 用 "1.4 MB / 2.0 MB" 比 "1468006 字节" 让人一眼判断得出"还剩多少"。
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+// barsBox 一组横条分布（按数量降序，长度按组内最大值归一）。
+// 用于"哪一类拦截在重复出现"这类判断 —— 只给数字的话得先在心里排序。
+function barsBox(title, items, tone) {
+  const wrap = el('div');
+  wrap.style.marginTop = '10px';
+  wrap.appendChild(el('div', 'muted', title));
+  if (!items.length) {
+    wrap.appendChild(el('div', 'sub', '—'));
+    return wrap;
+  }
+  const sorted = items.slice().sort((a, b) => (b.count - a.count) || String(a.name).localeCompare(String(b.name)));
+  const max = Math.max(1, ...sorted.map((x) => Number(x.count) || 0));
+  for (const it of sorted) {
+    const row = el('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:4px;';
+    const label = el('span', 'mono');
+    label.style.cssText = 'min-width:150px;font-size:12px;';
+    label.textContent = it.name;
+    const track = el('div');
+    track.style.cssText = 'flex:1;height:10px;border-radius:6px;background:var(--tint);overflow:hidden;';
+    const fill = el('div');
+    const w = Math.max(2, Math.round(((Number(it.count) || 0) / max) * 100));
+    fill.style.cssText = 'height:100%;width:' + w + '%;background:var(--' + tone + ');';
+    track.appendChild(fill);
+    const num = el('span', 'muted');
+    num.style.cssText = 'min-width:44px;text-align:right;font-size:12px;';
+    num.textContent = String(it.count);
+    row.appendChild(label);
+    row.appendChild(track);
+    row.appendChild(num);
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+// refreshFpSamples 只刷样本面板（不清空其它面板）——「刷新样本」按钮与清空后回显都用它。
+async function refreshFpSamples() {
+  const d = await api('/api/admin/fingerprint-samples').catch((e) => ({ error: String(e.message || e) }));
+  renderFpSamples(d);
+  return d;
 }
 
 function renderDeviceTok(d) {
@@ -6940,6 +7198,10 @@ annWindowHintPreview();
   mountEgrTabs();      // 代理页子区（出口代理 / 账号代理 / 去哪弄代理）
 
   setupNav(document.body); // 初始页的实时轮询由 onNavChange 钩子按需启动
+
+  // 版本更新提醒（v0.26.5 恢复）：进后台就查一次，让「设置」上的徽标立即可见 ——
+  // 走缓存、缓存新鲜时不出站，所以这一步不会拖慢任何东西（见 updatecheck.go）。
+  loadUpdateStatus(false);
 })();
 </script>
 </body>

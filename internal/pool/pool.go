@@ -29,6 +29,11 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// modelRateMax **模型级**冷却对齐上游重置墙钟时的封顶（SetModelRateMax 注入；
+	// 默认 defaultModelRateMax）。与 softRateMax 分开的原因见 cooldown.go 的
+	// CooldownSoftForModel 注释：账号级封顶要防"白扣一个健康号"，而模型级只挡
+	// 一个模型 —— 上限压到 2h 会让「上游明说 5h 后恢复」在 2h 后白白重试一次。
+	modelRateMax time.Duration
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -129,6 +134,21 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetModelRateMax 注入**模型级**冷却对齐上游重置墙钟时的封顶（默认 defaultModelRateMax）。
+// 非正值保留原值，风格同 SetSoftRateMax。
+//
+// 与 SetSoftRateMax 分开是刻意的：账号级封顶（2h）的职责是"别把健康号白扣太久"；
+// 模型级冷却只挡一个模型、其它模型照常服务，把上限也压到 2h 只会让
+// 「上游明说 5h 后恢复」在 2h 后被白试一次（一次失败请求 + 一次风控痕迹）。
+// 见 cooldown.go 的 CooldownSoftForModel。
+func (p *Pool) SetModelRateMax(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.modelRateMax = d
 	}
 }
 

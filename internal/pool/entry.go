@@ -545,7 +545,18 @@ const (
 
 // defaultSoftRateMax 软冷却指数退避的默认封顶：softRateMax 未注入（<=0）时按此值算，
 // 避免测试/裸用池时退避无上限。
+//
+// 注意它同时是**账号级**「对齐上游重置墙钟」的上限（cappedSoftUntilLocked）——
+// 那是刻意的：上游的 429/WAF 窗口可能是按天计的，照单全收等于白扣一个健康号。
 const defaultSoftRateMax = 2 * time.Hour
+
+// defaultModelRateMax **模型级**冷却对齐上游重置墙钟的默认上限（modelRateMax 未注入时）。
+//
+// 为什么不复用 defaultSoftRateMax（2h）：模型级冷却只挡一个模型，同号的其它模型照常
+// 服务，"白扣一个号"这个代价不存在；而 2h 上限会让上游明说的更长窗口被"提前放出来
+// 再撞一次"。取 24h 是因为上游的模型级限额窗口就是按天说的（"明天重置"）；
+// 上限仍要存在，避免解析被误读成遥远未来时永久放弃该 (账号, 模型)。
+const defaultModelRateMax = 24 * time.Hour
 
 // 11102「该后端无此模型」负缓存的退避参数（吸收 model_blocks.py 语义，复用 modelCooldowns
 // 机制承载）。首次命中冷却 6h，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），

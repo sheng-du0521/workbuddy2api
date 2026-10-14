@@ -95,13 +95,20 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelFollowsResetAt 6004 写 modelCooldowns：
+// until **按上游重置时刻**（用户口径「设定重置时间的都按照时间」），只受
+// modelRateMax（模型级专用上限）约束；reset_at 保留上游原始墙钟。
+//
+// ⚠️ 本用例 v0.26.5 改过断言：此前断言 until 被 **soft_rate_max**（账号级上限）
+// 截断。那是把"账号级防白扣"的上限套到模型级头上的结果 —— 模型级冷却只挡一个模型，
+// 同号其它模型照常服务，"白扣一个健康号"的代价根本不存在；而截断会让上游明说的
+// 更长窗口在 2h 后被提前放出来，白撞一次（一次失败请求 + 一次更明显的风控痕迹）。
+// **账号级路径（CooldownSoftRate）的 soft_rate_max 截断没有变。**
+func TestCooldownSoftForModelFollowsResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	p.SetSoftRateMax(10 * time.Minute) // 账号级上限：对模型级**不再生效**
+	reset := time.Now().Add(2 * time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -109,11 +116,26 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	if rem := mc.Until.Sub(time.Now()); rem <= 10*time.Minute || rem > 2*time.Hour+time.Second {
+		t.Errorf("Until 应跟随上游重置时刻（~2h，不被 soft_rate_max 截断），实际剩余 %v", rem)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+	}
+
+	// 模型级上限仍然存在（默认 24h），且可由 SetModelRateMax 收紧。
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.SetModelRateMax(10 * time.Minute)
+	p2.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
+	p2.mu.RLock()
+	mc2 := p2.byUID["u1"].modelCooldowns["glm-5.3"]
+	p2.mu.RUnlock()
+	if rem := mc2.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
+		t.Errorf("SetModelRateMax(10m) 后 Until 应在 (0,10m]，实际剩余 %v", rem)
+	}
+	if d := mc2.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("被截断时 ResetAt 仍须保留上游原始时刻：%v want %v", mc2.ResetAt, reset)
 	}
 }
 

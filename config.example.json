@@ -5,7 +5,8 @@
   "state_file": "./data/state.json",
   "cooldown": {
     "soft_rate": "600s",
-    "soft_rate_max": "2h"
+    "soft_rate_max": "2h",
+    "model_rate_max": "24h"
   },
   "schedule": {
     "checkin_hours": [

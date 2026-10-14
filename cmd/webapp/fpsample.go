@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -251,6 +252,87 @@ type fingerprintSamplesView struct {
 	Full    bool                `json:"full"`  // 文件是否已到上限
 	Kinds   map[string]int      `json:"kinds"`
 	Samples []fingerprintSample `json:"samples"`
+	// Size / Max / Lines 供界面画占用条与"还能装多少"的判断。
+	//
+	// 为什么要透出体积而不是只给一个 full 布尔：文件到上限时写入会被**拒绝**
+	// （不轮转，样本是运维资产），而"还能装多少"决定了运维是"顺手看一眼"
+	// 还是"必须现在处理"。只给布尔的话，90% 与 100% 看起来一样。
+	Size  int64 `json:"size"`
+	Max   int64 `json:"max"`
+	Lines int   `json:"lines"` // 文件里的物理行数（含被去重合并掉的重复样本）
+	// Models 各模型的样本数（Top 8）：定位"是哪个模型在触发内容策略"的第一手线索。
+	Models []fpCount `json:"models"`
+	// LastAt 最近一条样本的时刻（0 = 无）。
+	LastAt int64 `json:"last_at"`
+}
+
+// fpCount 一个分组计数（类型 / 模型通用）。
+type fpCount struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+// topFpCounts 取计数最大的前 n 项，按「数量降序，同数量按名字升序」排序。
+//
+// 名字升序是刻意的：数量相同时 map 遍历顺序随机，不排序会让同一份数据每次
+// 刷新出来的顺序都不一样 —— 表现是"这个界面在跳"，很难查。
+func topFpCounts(m map[string]int, n int) []fpCount {
+	out := make([]fpCount, 0, len(m))
+	for k, c := range m {
+		out = append(out, fpCount{Name: k, Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Name < out[j].Name
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// clearFingerprintSamples 清空样本文件并重置进程内去重表。
+//
+// 为什么必须提供这个入口：文件到上限后 appendFingerprintSample 会**拒绝写入**，
+// 接口只回一句"请先清理 <路径>" —— 而此前没有任何界面或接口能做这件事，
+// 等于把"采样到顶"变成必须登录服务器手删文件。运维手册里那句"请先清理"
+// 于是变成了空话（这正是用户反馈"缺少可视化面板"背后的实际问题之一）。
+//
+// 返回被清掉的字节数与行数，供界面回显"清掉了多少"。
+func clearFingerprintSamples() (int64, error) {
+	var size int64
+	if st, err := os.Stat(fpSampleFile); err == nil {
+		size = st.Size()
+	} else if !os.IsNotExist(err) {
+		return 0, err
+	}
+	// 直接删除而不是截断：少一个"文件存在但为空"的中间态。
+	// 不存在（还没采样过）不算错误 —— 清空一个空文件应当是幂等的成功。
+	if err := os.Remove(fpSampleFile); err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	// 去重表也要清：只删文件的话，同样的样本在本进程余下的生命周期里
+	// 依然被内存表挡着、再也写不回来 —— 表现是"清空之后文件一直是空的"。
+	fpSampleDedup.Lock()
+	fpSampleDedup.seen = map[string]bool{}
+	fpSampleDedup.Unlock()
+	return size, nil
+}
+
+// handleFingerprintSamplesClear DELETE /api/admin/fingerprint-samples
+//
+// 只清本功能自己的样本文件 —— 路径是程序启动时按 -db 目录定的包级变量，
+// **不接受任何来自请求的参数**（否则就成了一个任意文件删除接口）。
+func (a *app) handleFingerprintSamplesClear(w http.ResponseWriter, r *http.Request) {
+	size, err := clearFingerprintSamples()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	log.Printf("INFO: [fpsample] 管理侧清空样本文件 %s（释放 %d 字节）", fpSampleFile, size)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed_bytes": size, "file": fpSampleFile})
 }
 
 // handleFingerprintSamples GET /api/admin/fingerprint-samples
@@ -258,7 +340,8 @@ type fingerprintSamplesView struct {
 // 读样本文件并**按去重键合并**（同一模式只留最新一条），最多返回 fpSampleMaxLines 条。
 func (a *app) handleFingerprintSamples(w http.ResponseWriter, r *http.Request) {
 	v := fingerprintSamplesView{Enabled: a.proxy.fingerprintSamplesEnabled(),
-		File: fpSampleFile, Kinds: map[string]int{}, Samples: []fingerprintSample{}}
+		File: fpSampleFile, Kinds: map[string]int{}, Samples: []fingerprintSample{},
+		Max: fpSampleFileMaxBytes, Models: []fpCount{}}
 	raw, err := os.ReadFile(fpSampleFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -268,16 +351,22 @@ func (a *app) handleFingerprintSamples(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, v) // 还没写过 = 空清单，不是错误
 		return
 	}
-	if st, err := os.Stat(fpSampleFile); err == nil && st.Size() >= fpSampleFileMaxBytes {
-		v.Full = true
+	v.Size = int64(len(raw))
+	if st, err := os.Stat(fpSampleFile); err == nil {
+		v.Size = st.Size()
+		if st.Size() >= fpSampleFileMaxBytes {
+			v.Full = true
+		}
 	}
 	byKey := map[string]fingerprintSample{}
 	order := []string{}
+	modelCount := map[string]int{}
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+		v.Lines++
 		var s fingerprintSample
 		if err := json.Unmarshal([]byte(line), &s); err != nil {
 			continue // 半行 / 坏行直接跳过（文件是追加写的，崩溃可能留半行）
@@ -287,7 +376,14 @@ func (a *app) handleFingerprintSamples(w http.ResponseWriter, r *http.Request) {
 		}
 		byKey[s.Key] = s // 同键取最新
 		v.Kinds[s.Kind]++
+		if s.Model != "" {
+			modelCount[s.Model]++
+		}
+		if s.At > v.LastAt {
+			v.LastAt = s.At
+		}
 	}
+	v.Models = topFpCounts(modelCount, 8)
 	// 只回最近的 N 条（order 是写入顺序，取尾部）。
 	start := 0
 	if len(order) > fpSampleMaxLines {

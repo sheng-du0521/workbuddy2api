@@ -1435,10 +1435,31 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		reloadSel = true
 	}
 	if req.EgressMaxPerProxy != nil {
+		// 0 = 不限（见 defaultMaxPerProxy）。负数钳到 0 而不是报错：它是"上限"参数，
+		// 取最宽松值比让整个「反代选号 · 防封」保存失败更合理。
 		v := *req.EgressMaxPerProxy
 		if v < 0 {
 			v = 0
 		}
+		if err := a.store.SetKV(kvEgressMaxPerProxy, strconv.Itoa(v)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	// ⚠️ 以下每个可选字段都必须**各自判空**（各自的 `if req.X != nil`）。
+	//
+	// 这里修的是一个真实缺陷（v0.26.4 前）：这批块曾被误嵌进上面
+	// `if req.EgressMaxPerProxy != nil` 的花括号里，于是
+	//   - 只要请求带了 egress_max_per_proxy（前端"保存"总是带），
+	//     就会执行 `strings.TrimSpace(*req.EgressOnLineDown)` —— 而前端那个请求
+	//     **不带** egress_on_line_down → 解引用 nil 指针 → panic；
+	//   - net/http 对 handler panic 的处置是打日志 + **断开连接**，于是页面侧只看得到
+	//     「保存报错」（fetch 抛 TypeError），拿不到任何可读的错误文案；
+	//   - 更隐蔽的是它看起来"偶发"：只有带了 egress_max_per_proxy 的请求才会踩到。
+	//
+	// 教训：**可选字段的守卫不能靠外层块"顺带"提供**。任何新增字段都要从
+	// `if req.X != nil` 开始写，不要寄望于外层恰好非 nil。
+	if req.EgressOnLineDown != nil {
 		if v := strings.TrimSpace(*req.EgressOnLineDown); v != "" {
 			m, ok := normaliseEgressOnLineDown(v)
 			if !ok {
@@ -1451,6 +1472,8 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+	if req.DeviceTokenFallback != nil {
 		if v := strings.ToLower(strings.TrimSpace(*req.DeviceTokenFallback)); v != "" {
 			if v != "off" && v != "derive" {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -1466,18 +1489,20 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				a.proxy.uc.DeviceTokenFallback = v == "derive"
 			}
 		}
-		if v := req.DeviceTokenStaleDays; v != nil {
-			n := *v
-			if n < 0 || n > 3650 {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": "device_token_stale_days 需在 0..3650 之间（0 = 关闭检测）"})
-				return
-			}
-			if err := a.store.SetKV(kvDeviceTokenStaleDays, strconv.Itoa(n)); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
+	}
+	if req.DeviceTokenStaleDays != nil {
+		n := *req.DeviceTokenStaleDays
+		if n < 0 || n > 3650 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "device_token_stale_days 需在 0..3650 之间（0 = 关闭检测）"})
+			return
 		}
+		if err := a.store.SetKV(kvDeviceTokenStaleDays, strconv.Itoa(n)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	if req.PickSinkOn5xx != nil {
 		if v := strings.ToLower(strings.TrimSpace(*req.PickSinkOn5xx)); v != "" {
 			if v != "on" && v != "off" {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -1489,6 +1514,8 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+	if req.FingerprintSamples != nil {
 		if v := strings.ToLower(strings.TrimSpace(*req.FingerprintSamples)); v != "" {
 			if v != "on" && v != "off" {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -1499,16 +1526,6 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
-		}
-	}
-	if req.EgressMaxPerProxy != nil {
-		v := *req.EgressMaxPerProxy
-		if v < 0 {
-			v = 0
-		}
-		if err := a.store.SetKV(kvEgressMaxPerProxy, strconv.Itoa(v)); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
 		}
 	}
 	// 导入防关联（v0.25.0）：

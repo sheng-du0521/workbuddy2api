@@ -388,3 +388,120 @@ func TestAggregatePoolDashNoDisabled(t *testing.T) {
 		t.Fatalf("无停用时应为空：%+v", v.DisabledAccounts)
 	}
 }
+
+// ======================================================================
+// v0.26.5：模型级冷却明细（用户口径「软冷却模型的时候冷却账号明细是否显示」）
+// ======================================================================
+
+// TestAggregatePoolDashModelCooling 模型级冷却必须**单独成表**且不影响账号级计数。
+//
+// 这是本轮用户直接问的那件事：6004 只挡一个模型，账号对其它模型照常服务 ——
+// 既然行为如此，就必须**看得出来**它如此，否则"行为正确"没人能确认。
+// 而且它**不能**混进「冷却中」计数：那是"整个号不可用"，两者数量级不同。
+func TestAggregatePoolDashModelCooling(t *testing.T) {
+	now := time.Now().Unix()
+	views := []accountView{
+		{UID: "u1", Nickname: "甲", Credits: 100,
+			LimitedMods: 1,
+			LimitedDetail: []limitedModelView{
+				{Model: "glm-5.3", Until: now + 3600, ResetAt: now + 3600, Reason: "6004 [reset=body-text]"},
+			}},
+		// 同一账号两个模型被限 → 两条明细，但"受影响账号数"只算一个。
+		{UID: "u2", Nickname: "乙", Credits: 100,
+			LimitedDetail: []limitedModelView{
+				{Model: "glm-5.3", Until: now + 600, Reason: "6004 [reset=none→退避]"},
+				{Model: "kimi-k3-1", Until: now + 9000, ResetAt: now + 9000},
+			}},
+		// 账号级冷却（与模型级正交）：必须只进 Cooling，不进 ModelCooling。
+		{UID: "u3", Nickname: "丙", Credits: 100, Cooling: true, CoolKind: "soft", CoolingFor: 120},
+		{UID: "u4", Nickname: "丁", Credits: 100},
+	}
+	v := aggregatePoolDash(views)
+
+	if len(v.ModelCooling) != 3 {
+		t.Fatalf("模型级冷却应有 3 条 (账号,模型) 对，得 %d：%+v", len(v.ModelCooling), v.ModelCooling)
+	}
+	if v.ModelCoolingAccounts != 2 {
+		t.Errorf("受影响账号数应为 2（甲、乙；同一账号多模型只算一个），得 %d", v.ModelCoolingAccounts)
+	}
+	// 排序：剩余时间升序（最先恢复的在前）。
+	if v.ModelCooling[0].Model != "glm-5.3" || v.ModelCooling[0].Name != "乙" {
+		t.Errorf("首条应为剩余最短的乙/glm-5.3，得 %+v", v.ModelCooling[0])
+	}
+	if got := v.ModelCooling[0].RemainingSec; got < 590 || got > 610 {
+		t.Errorf("剩余秒数应约 600，得 %d", got)
+	}
+	if v.ModelCooling[0].Source != "local" {
+		t.Errorf("无 reset_at 的条目来源应为 local，得 %q", v.ModelCooling[0].Source)
+	}
+	if v.ModelCooling[2].Source != "upstream" {
+		t.Errorf("有 reset_at 的条目来源应为 upstream，得 %q", v.ModelCooling[2].Source)
+	}
+	// 不得因模型级冷却把账号算成"不健康"或"冷却中"。
+	if v.Cooling != 1 {
+		t.Errorf("冷却数应只含账号级那 1 个，得 %d", v.Cooling)
+	}
+	// 甲/乙/丁 三个都算可用：模型级冷却不吃账号可用性（只有账号级的丙进 cooling）。
+	if v.Healthy != 3 {
+		t.Errorf("甲/乙/丁 应仍算可用（模型级冷却不吃账号可用性），healthy=%d", v.Healthy)
+	}
+	if v.Disabled != 0 {
+		t.Errorf("不该有停用，得 %d", v.Disabled)
+	}
+}
+
+// TestAggregatePoolDashModelCoolingTruncated 超过上限时截断 + 打标记，且顺序稳定。
+func TestAggregatePoolDashModelCoolingTruncated(t *testing.T) {
+	now := time.Now().Unix()
+	views := make([]accountView, 0, 20)
+	for i := 0; i < 20; i++ {
+		// 刻意用 strconv 而不是本包的 itoa：那个 helper 是给"连续失败次数"用的，
+		// n<=0 会钳成 "3"（见 tasks.go），拿它拼 uid 会让 i=0 与 i=3 撞成同一个 uid。
+		views = append(views, accountView{
+			UID: "u" + strconv.Itoa(i), Nickname: "n" + strconv.Itoa(i),
+			// 同一个剩余时长 → 必须靠 (名, 模型) 稳定排序，否则 3 秒轮询会看到顺序乱跳。
+			LimitedDetail: []limitedModelView{{Model: "m", Until: now + 60}},
+		})
+	}
+	v := aggregatePoolDash(views)
+	if !v.ModelCoolingTruncated {
+		t.Error("超过上限应打 truncated 标记")
+	}
+	if len(v.ModelCooling) != poolDashModelCoolingMax {
+		t.Fatalf("应截断到 %d 条，得 %d", poolDashModelCoolingMax, len(v.ModelCooling))
+	}
+	if v.ModelCoolingAccounts != 20 {
+		t.Errorf("受影响账号数仍应是全量 20，得 %d", v.ModelCoolingAccounts)
+	}
+	if v.ModelCooling[0].Name != "n0" || v.ModelCooling[1].Name != "n1" {
+		t.Errorf("同级应按名升序稳定排序，得 %q, %q", v.ModelCooling[0].Name, v.ModelCooling[1].Name)
+	}
+}
+
+// TestAggregatePoolDashNoModelCooling 空态：必须是**空切片**而不是 nil
+// （前端直接读数组，nil 会让 JSON 里该字段变成 null 而不是 []）。
+func TestAggregatePoolDashNoModelCooling(t *testing.T) {
+	v := aggregatePoolDash([]accountView{{UID: "u1", Credits: 1}})
+	if v.ModelCooling == nil {
+		t.Error("无模型级冷却时也应回空切片（JSON 里是 [] 不是 null）")
+	}
+	if len(v.ModelCooling) != 0 || v.ModelCoolingAccounts != 0 || v.ModelCoolingTruncated {
+		t.Errorf("空态不符：%+v", v)
+	}
+}
+
+// TestAggregatePoolDashModelCoolingExpiredClamped 已到期的条目剩余时间不能是负数
+// （负值会让界面显示 "-1分" 这类荒唐文案）。
+func TestAggregatePoolDashModelCoolingExpiredClamped(t *testing.T) {
+	now := time.Now().Unix()
+	v := aggregatePoolDash([]accountView{{
+		UID: "u1", Credits: 1,
+		LimitedDetail: []limitedModelView{{Model: "m", Until: now - 500}},
+	}})
+	if len(v.ModelCooling) != 1 {
+		t.Fatalf("应有 1 条，得 %d", len(v.ModelCooling))
+	}
+	if v.ModelCooling[0].RemainingSec != 0 {
+		t.Errorf("已到期应钳到 0，得 %d", v.ModelCooling[0].RemainingSec)
+	}
+}

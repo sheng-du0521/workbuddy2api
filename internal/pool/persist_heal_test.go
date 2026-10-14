@@ -229,3 +229,107 @@ func hasUID(list []string, uid string) bool {
 	}
 	return false
 }
+
+// ======================================================================
+// v0.26.5 存量自愈之二：模型级冷却的截止被**账号级**上限截断过
+// ======================================================================
+
+// 生产实测的最短形态（写成测试）：某个号对 glm-5.3 的模型级冷却
+// `until` 被 soft_rate_max（2h）截断，而 `reset_at` 才是上游明示的时刻。
+//
+// 不修的话，2h 一到该号对这个模型重新进入候选 → 打一次必然失败的请求
+// （每次都在上游留下更明显的风控痕迹）→ 再被 6004 打回、再等 2h。
+func TestHealTruncatedModelCooldownFollowsResetAt(t *testing.T) {
+	reset := time.Now().Add(5 * time.Hour)
+	fp := writeLegacyState(t, map[string]stateAccount{
+		"trunc-1": {
+			ModelCooldowns: map[string]stateModelCooldown{
+				"glm-5.3": {Until: time.Now().Add(2 * time.Hour), ResetAt: reset,
+					Reason: "6004 model rate limit [reset=body-text]"},
+			},
+		},
+	})
+
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "trunc-1"})
+	until, ok := modelCoolUntil(t, p, "trunc-1", "glm-5.3")
+	if !ok {
+		t.Fatal("模型级冷却条目应仍在（这是放长，不是清除）")
+	}
+	if d := time.Until(until); d < 5*time.Hour-time.Minute || d > 5*time.Hour+time.Minute {
+		t.Errorf("冷却截止应被放长到上游重置时刻（~5h），得剩余 %v", d)
+	}
+	// 兄弟模型不受影响。
+	if _, ok := modelCoolUntil(t, p, "trunc-1", "kimi-k3-1"); ok {
+		t.Error("不该给其它模型也写冷却")
+	}
+}
+
+// TestHealTruncatedModelCooldownRespectsModelCap 放长仍受**模型级**上限约束：
+// 解析出来的时刻若荒谬地遥远（时区/格式误读），不能被当成无限期拉黑。
+func TestHealTruncatedModelCooldownRespectsModelCap(t *testing.T) {
+	reset := time.Now().Add(365 * 24 * time.Hour)
+	fp := writeLegacyState(t, map[string]stateAccount{
+		"trunc-2": {
+			ModelCooldowns: map[string]stateModelCooldown{
+				"m": {Until: time.Now().Add(time.Hour), ResetAt: reset, Reason: "6004"},
+			},
+		},
+	})
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "trunc-2"})
+	until, _ := modelCoolUntil(t, p, "trunc-2", "m")
+	if d := time.Until(until); d > defaultModelRateMax+time.Minute {
+		t.Errorf("放长后不应超过模型级上限 %v，得 %v", defaultModelRateMax, d)
+	}
+}
+
+// TestHealTruncatedModelCooldownLeavesAlignedAlone 已经对齐（或更晚）的条目一律不动 ——
+// 这是"只碰确定被截断的那一类"的边界。尤其要保证 11102 负缓存（ResetAt 恒零值）不被误伤：
+// 它的 Until 是本地算的 TTL，拿它去对齐一个不存在的时刻会让负缓存彻底失效。
+func TestHealTruncatedModelCooldownLeavesAlignedAlone(t *testing.T) {
+	reset := time.Now().Add(3 * time.Hour)
+	cases := []struct {
+		name string
+		mc   stateModelCooldown
+		want time.Duration // 期望修正后的剩余时长（近似）
+	}{
+		{"已对齐", stateModelCooldown{Until: reset, ResetAt: reset, Reason: "6004"}, 3 * time.Hour},
+		{"更晚于 reset（不该被缩短）", stateModelCooldown{Until: time.Now().Add(4 * time.Hour), ResetAt: reset, Reason: "6004"}, 4 * time.Hour},
+		{"11102 负缓存（无权威时刻）", stateModelCooldown{Until: time.Now().Add(90 * time.Minute), Reason: "11102 no such model"}, 90 * time.Minute},
+		{"无时间信息的本地退避", stateModelCooldown{Until: time.Now().Add(40 * time.Minute), Reason: "6004 model rate limit"}, 40 * time.Minute},
+	}
+	for _, c := range cases {
+		fp := writeLegacyState(t, map[string]stateAccount{
+			"keep-1": {ModelCooldowns: map[string]stateModelCooldown{"m": c.mc}},
+		})
+		p := New(fp)
+		p.Add(&auth.Auth{UID: "keep-1"})
+		until, ok := modelCoolUntil(t, p, "keep-1", "m")
+		if !ok {
+			t.Fatalf("%s：条目应保留", c.name)
+		}
+		if d := time.Until(until); d < c.want-2*time.Minute || d > c.want+2*time.Minute {
+			t.Errorf("%s：剩余 %v，期望 ~%v（不该被改动）", c.name, d, c.want)
+		}
+	}
+}
+
+// TestHealTruncatedModelCooldownAppliesToSnapshotPath Redis 快照恢复路径同样要纠正
+// （两条恢复路径共用 applyAccountsLocked，任何一条漏掉都会在下一次重启时退回旧形态）。
+func TestHealTruncatedModelCooldownAppliesToSnapshotPath(t *testing.T) {
+	reset := time.Now().Add(4 * time.Hour)
+	p := New("") // 无本地文件
+	p.mu.Lock()
+	p.applyAccountsLocked(map[string]stateAccount{
+		"snap-1": {ModelCooldowns: map[string]stateModelCooldown{
+			"m": {Until: time.Now().Add(time.Hour), ResetAt: reset, Reason: "6004"},
+		}},
+	})
+	p.mu.Unlock()
+	if until, ok := modelCoolUntil(t, p, "snap-1", "m"); !ok {
+		t.Fatal("条目应存在")
+	} else if d := time.Until(until); d < 4*time.Hour-time.Minute {
+		t.Errorf("快照路径也应放长到上游时刻，得剩余 %v", d)
+	}
+}
