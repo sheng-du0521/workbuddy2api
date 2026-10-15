@@ -34,6 +34,16 @@ type Pool struct {
 	// CooldownSoftForModel 注释：账号级封顶要防"白扣一个健康号"，而模型级只挡
 	// 一个模型 —— 上限压到 2h 会让「上游明说 5h 后恢复」在 2h 后白白重试一次。
 	modelRateMax time.Duration
+	// modelProbeDelay / modelProbeInterval 模型级半开探测的两个节奏参数
+	// （SetModelProbe 注入；默认见 defaultModelProbe*）。**interval <= 0 = 关停**
+	// 探测 —— 与 costExploreInterval 同风格：0 是合法值（关停开关），
+	// 所以默认值在 New() 里就写好，不靠"零值即默认"的约定。
+	modelProbeDelay    time.Duration
+	modelProbeInterval time.Duration
+	// modelProbeGlobal **全池**同一模型两次探测的最小间隔（见 defaultModelProbeGlobal）。
+	// 它是"客户端连续请求逐个号去探"这一缺口的堵口：没有它，池里 N 个冷却号就等于
+	// N 次连续的上游调用。
+	modelProbeGlobal time.Duration
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -103,7 +113,12 @@ func New(stateFp string) *Pool {
 		// 探索缺省 30m：tier 0 垄断下的 tier 1 探索窗口（issue #136）。用户经
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
-		exploreLast:         map[string]time.Time{},
+		// 半开探测缺省开（20m 后首探、之后每小时一次）：6004 的恢复只能靠试。
+		// 关停：SetModelProbe(_, 0) / config 显式 "0"。
+		modelProbeDelay:    defaultModelProbeDelay,
+		modelProbeInterval: defaultModelProbeInterval,
+		modelProbeGlobal:   defaultModelProbeGlobal,
+		exploreLast:        map[string]time.Time{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -163,6 +178,37 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 		return // 负值非法，保留现值
 	}
 	p.costExploreInterval = d
+}
+
+// SetModelProbe 注入模型级半开探测的节奏（main 从 config 解析后调用，v0.31.6）。
+//
+// interval <= 0 = **关停**探测（回到"严格等上游墙钟"的旧行为，与 config 的 "0" 关停
+// 语义对齐，风格同 SetCostExploreInterval）；delay <= 0 时保留默认 20m ——
+// "进入冷却后立刻探"不是一个有意义的配置（窗口刚开始，上限必然还在）；
+// global 传 0 = **关闭全池间隔**（只剩每号间隔），负值保留默认 5m。
+//
+// ⚠️ global 是出站强度的**主闸门**（见 defaultModelProbeGlobal）：把它设成 0 只在
+// "池里只有一个号"或测试里是安全的，多号池上等于放回"客户端连续请求逐个号探一遍"。
+//
+// 为什么要有这两个旋钮：探测是**唯一**会为"已经被判定不可用"的 (账号, 模型) 主动
+// 发出上游请求的路径。它的强度必须可以被运维按出站压力调小或关停，而不是写死在代码里。
+func (p *Pool) SetModelProbe(delay, interval, global time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if delay > 0 {
+		p.modelProbeDelay = delay
+	}
+	if global >= 0 {
+		p.modelProbeGlobal = global
+	}
+	p.modelProbeInterval = interval
+}
+
+// ModelProbeConfig 读回当前生效的探测节奏（/status 与单测用）。
+func (p *Pool) ModelProbeConfig() (delay, interval, global time.Duration) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.modelProbeDelay, p.modelProbeInterval, p.modelProbeGlobal
 }
 
 // CostExploreStatus 透出探索台账（/status 用）：累计探索事件数 + 各 (域, 模型)

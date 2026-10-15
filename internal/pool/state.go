@@ -758,6 +758,17 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 			if !mc.ResetAt.IsZero() {
 				row.ResetAt = mc.ResetAt
 			}
+			// 半开探测可见性（v0.31.6）：机制存在却看不见，排障时只能翻代码。
+			// next 为零值 = 本窗口内不会再探（剩余不足 delay），字段自然缺席。
+			if mc.Probeable {
+				row.Probeable = true
+				if !mc.ProbedAt.IsZero() {
+					row.ProbedAt = mc.ProbedAt
+				}
+				if _, next := probeGate(now, mc, p.modelProbeDelay, p.modelProbeInterval); !next.IsZero() {
+					row.NextProbeAt = next
+				}
+			}
 			rows = append(rows, row)
 		}
 	}

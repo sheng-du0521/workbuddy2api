@@ -339,6 +339,105 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	return best.a
 }
 
+// ── 模型级半开探测选号（v0.31.6）─────────────────────────────────────────────
+
+// PickProbeForModelRealm 半开探测选号（v0.31.6，webapp 在"常规候选已耗尽"之后调用）。
+//
+// 在「账号级完全健康、但对该模型正处**可探测**的模型级冷却」的账号里，选出**最早到期**
+// 的那一个，并**原子地**记下本次探测时刻。返回 nil = 本次不探（没有可探的号）。
+//
+// ## 为什么"判定"与"记时刻"必须在同一把锁里
+//
+// 闸门的全部意义是「同一 (账号, 模型) 在 interval 内只放一次」。若分成两步判定，
+// 并发请求会同时通过判定 → 一次探测变 N 次 → 出站强度瞬间放大 N 倍。
+// 本项目最贵的一类教训就是出站强度（59 张卡同时出站 = 一次风控事件）。
+//
+// ## 候选口径为什么要求"账号级完全健康"
+//
+// 账号级冷却/熔断/降权/停用的号有各自的兜底路径（pickEarliestExpiryLocked）。
+// 模型级探测要回答的是一个具体问题：「这个号的这个模型恢复了吗」—— 只有当账号本身
+// 没有别的问题时，答案才只取决于模型维度。把两种病混在一起探，失败了也分不清是谁的问题。
+//
+// ## 与 pickEarliestExpiryLocked 的分工（刻意保留的差异）
+//
+// 那个函数仍然**排除**模型级冷却号（v0.31.0 的决定）。有人会问"现在有探测了，为什么不
+// 一起放行"—— 因为它选出的号一定在账号级冷却中，那次发送本身就是一次面向**账号维度**的
+// 探测；用"账号级刚到期"去猜"模型级也好了"是拿错误的证据下判断。两个维度两个入口。
+//
+// ## 已知的取舍
+//
+// 调用方（proxy）在拿到候选后还要过范围/消耗分组校验，若被拒会把该 UID 记入 tried 再要
+// 下一个 —— 被拒的那个号已经吃掉了本次探测名额（ProbedAt 已写）。即在"探测号全部被范围
+// 过滤掉"的极端配置下会浪费探测名额；代价是该号晚 interval 才再探一次，不影响正确性，
+// 换取的是"闸门原子、不可能被并发绕过"这一更重要的性质。
+func (p *Pool) PickProbeForModelRealm(tried map[string]bool, model, realm string) *auth.Auth {
+	if model == "" {
+		return nil
+	}
+	delay, interval, global := p.modelProbeDelay, p.modelProbeInterval, p.modelProbeGlobal
+	if interval <= 0 {
+		return nil // 关停（SetModelProbe 传 <=0）：回到"严格等上游墙钟"
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var best *entry
+	// 全池间隔：本模型最近**有没有探过**（不管探的是哪个号）。
+	// 用"扫 ProbedAt"而不是另开一张 map 记录时刻：ProbedAt 已经在每条条目里，
+	// 且随 state.json 持久化 —— 少一份状态就少一处可能漂移的地方（重启也不会失忆）。
+	// 缺口背景见 defaultModelProbeGlobal 注释：没有这一层，客户端连续请求就能让
+	// "一次请求探一个号"，N 个号 = N 次上游调用。
+	if global > 0 {
+		for _, e := range p.byUID {
+			mc, ok := e.modelCooldowns[model]
+			if !ok || mc.ProbedAt.IsZero() {
+				continue
+			}
+			if now.Sub(mc.ProbedAt) < global {
+				return nil
+			}
+		}
+	}
+	for uid, e := range p.byUID {
+		if tried != nil && tried[uid] {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue // 域过滤：跨域号不参与本域探测
+		}
+		if !e.healthy(now) {
+			continue // 账号级有别的病：交给账号级兜底，探测分不清根因
+		}
+		if !e.modelCooled(now, model) {
+			continue
+		}
+		if ok, _ := probeGate(now, e.modelCooldowns[model], delay, interval); !ok {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		if best == nil || e.modelCooldowns[model].Until.Before(best.modelCooldowns[model].Until) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	mc := best.modelCooldowns[model]
+	mc.ProbedAt = now
+	best.modelCooldowns[model] = mc
+	p.dirty.Store(true)
+	// 与 pick() 正常路径、兜底路径同一契约：被选中必须推进 usedSeq，否则被反复选中的
+	// 账号在 LRU 眼里永远"最旧"，刚探完立刻又被探（防集中失效）。
+	best.lastUsed = time.Now()
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
+	log.Printf("INFO: [pool] model_probe acct=%s model=%s until=%s reason=%q",
+		logfmt.Label(best.a.UID, best.a.Nickname), model, mc.Until.Format(time.RFC3339), mc.Reason)
+	return best.a
+}
+
 // inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
 // 调用方需已持 p.mu（读锁或写锁均可，本方法只读上限字段）。上限按 realm
 // 分档（global 档 maxInFlightGlobal，WAF 403 修复 P1-1；未设置回落 maxInFlight）。

@@ -2570,7 +2570,13 @@ function accountCard(a) {
     const parts = a.limited_models.map((m) => {
       const reset = m.reset_at ? fmtTime(m.reset_at)
         : (m.until ? fmtTime(m.until) + '（本地估）' : '时间未知');
-      return m.model + '（至 ' + reset + '）';
+      // 半开探测（v0.31.6）：6004 冷却会被自动试探，用来发现"上游提前解除"。
+      // 不标出来的话，运维看到「至 明天 00:00」会以为这个号今天彻底没救。
+      let probe = '';
+      if (m.next_probe_at) probe = '，' + fmtTime(m.next_probe_at) + ' 自动试一次';
+      else if (m.probeable) probe = '，本窗口不再自动试';
+      if (m.probed_at) probe += '（已试过 ' + fmtTime(m.probed_at) + '）';
+      return m.model + '（至 ' + reset + probe + '）';
     });
     line('模型级限额', '仅 ' + parts.join('、') + ' 受限；其它模型正常可用' +
       (a.rate_limited_models > a.limited_models.length

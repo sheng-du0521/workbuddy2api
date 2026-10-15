@@ -114,6 +114,15 @@ type RateLimitedModel struct {
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string `json:"reason,omitempty"`
+	// Probeable 该条目是否允许半开探测（v0.31.6）：只有 6004 限额为 true；
+	// 11102 负缓存恒 false（重试无意义）。字段缺席 = false。
+	Probeable bool `json:"probeable,omitempty"`
+	// ProbedAt 最近一次半开探测的放行时刻（缺席 = 从未探测）。
+	ProbedAt time.Time `json:"probed_at,omitempty"`
+	// NextProbeAt 下一次自动探测的最早时刻（缺席 = **本次冷却窗口内不会再探**：
+	// 剩余时间已不足 delay，等它自然到期比白打一次上游更诚实）。
+	// 运维据此回答"这个号的这个模型还要等多久才会自己试一次"。
+	NextProbeAt time.Time `json:"next_probe_at,omitempty"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -472,11 +481,19 @@ type stateAccount struct {
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的 6004 独立冷却持久化记录，与运行态
-// modelCooldown 同构（Until/ResetAt/Reason 字段名与语义对齐），落盘/恢复往返无损。
+// modelCooldown 同构（Until/ResetAt/Reason/Since/ProbedAt/Probeable 字段名与语义
+// 对齐），落盘/恢复往返无损。Hits 刻意不落盘（运行态学习量，见 modelCooldown 注释）。
+//
+// v0.31.6 新增后三个字段的**必要性**：半开探测是"进冷却后等 delay、之后每 interval 探一次"，
+// 三个量分别回答"窗口何时开始""上次探过没""这条能不能探"。任何一个不落盘，
+// 重启就等于给全池冷却号重置一次探测节奏（`probeable` 丢失更糟：功能直接静默失效）。
 type stateModelCooldown struct {
-	Until   time.Time `json:"until,omitempty"`
-	ResetAt time.Time `json:"reset_at,omitempty"`
-	Reason  string    `json:"reason,omitempty"`
+	Until     time.Time `json:"until,omitempty"`
+	ResetAt   time.Time `json:"reset_at,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+	Since     time.Time `json:"since,omitempty"`
+	ProbedAt  time.Time `json:"probed_at,omitempty"`
+	Probeable bool      `json:"probeable,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
@@ -529,6 +546,29 @@ type modelCooldown struct {
 	// 运行态不落盘（同 modelCost 口径：重启后从基数重新学习）；带上游重置时间的
 	// 6004 条目 Hits 恒 0。持久化来回不会写入该字段。
 	Hits int
+	// Since 本条冷却**当前窗口的写入时刻**（每次写入新 Until 都刷新为 now）。
+	// 半开探测的「进入冷却后先等 delay 再探」用它起算；"已在冷却中只刷新 reason"
+	// 的分支保持原值不动（那时并没有开新窗口）。**必须持久化**（否则重启后
+	// 无人知道窗口何时开始）。
+	Since time.Time
+	// ProbedAt 最近一次**半开探测**的放行时刻（零值 = 从未探测）。与 Since 一起构成
+	// 探测节奏闸门：同一 (账号, 模型) 两次探测至少间隔 modelProbeInterval。
+	//
+	// 窗口被重写（探测失败后上游又给了新的重置时刻）时**跨窗口保留**：把节奏绑在
+	// 「键」上而不是「窗口」上，否则「失败→新窗口→延迟一过又探」会把节奏从 1h
+	// 悄悄退化到 delay（20m），出站强度变成设计的 3 倍。
+	ProbedAt time.Time
+	// Probeable 该条目**是否允许半开探测**。
+	//
+	// 只有「上游 6004 模型级限额」为 true：它的恢复时刻来自上游墙钟（≤24h），上游
+	// 提前解除时我们无从得知 —— 主动探测是唯一的发现手段。
+	// 11102（该后端无此模型）恒 false：重试无意义（负缓存自己的 TTL 到期即放行）。
+	//
+	// 用**显式布尔**而不是"看 reason 前缀像不像 11102"：本项目最贵的一条教训就是
+	// 「同一件事有两套判据」。BlockModelClear 按前缀判 11102 是既有包袱，新逻辑
+	// 不再加一个同类的字符串嗅探。必须持久化（否则重启后 6004 条目全变不可探，
+	// 功能静默失效）。
+	Probeable bool
 }
 
 // stateFile 持久化格式。
@@ -557,6 +597,31 @@ const defaultSoftRateMax = 2 * time.Hour
 // 再撞一次"。取 24h 是因为上游的模型级限额窗口就是按天说的（"明天重置"）；
 // 上限仍要存在，避免解析被误读成遥远未来时永久放弃该 (账号, 模型)。
 const defaultModelRateMax = 24 * time.Hour
+
+// 模型级**半开探测**（v0.31.6）的两个节奏参数（SetModelProbe 注入）。
+//
+// 要解决的问题：6004 的恢复时刻来自上游给的墙钟（封顶 24h），而**上游提前解除**
+// 时我们完全无从得知 —— 严格等墙钟意味着一个其实已经恢复的 (账号, 模型) 被白白
+// 闲置到最晚一天。半开探测是唯一的发现手段。
+//
+//   - delay（默认 20m）：进入冷却后**先等多久**才允许第一次探测。窗口刚开始时上限
+//     必然还在生效，早探只是白打一次上游（一次失败请求 + 一次风控痕迹）。
+//   - interval（默认 1h）：同一 (账号, 模型) 两次探测的最小间隔。
+//   - global（默认 5m）：**全池**同一个模型两次探测的最小间隔。
+//
+// 为什么必须有 global（实测发现的缺口）：interval 是"每号每 interval 一次"，于是池里有
+// 33 个冷却号时，客户端**连续发请求**就能让每个请求探一个不同的号 —— 33 次必然失败的上游
+// 调用、同一出口 IP、几十秒内打完。这正是本项目最贵的一类事故（出站脉冲触发风控）。
+// global 把上限压到"每模型每 5 分钟最多一次探测"（12 次/小时/模型），
+// 与池规模、客户端请求密度都无关。
+//
+// interval <= 0 = 关停探测（回到 v0.31.5 的"严格等墙钟"行为，config 显式 "0"）；
+// global == 0 = 关闭全池间隔（仅单号池/测试安全，见 SetModelProbe 的警告）。
+const (
+	defaultModelProbeDelay    = 20 * time.Minute
+	defaultModelProbeInterval = time.Hour
+	defaultModelProbeGlobal   = 5 * time.Minute
+)
 
 // 11102「该后端无此模型」负缓存的退避参数（吸收 model_blocks.py 语义，复用 modelCooldowns
 // 机制承载）。首次命中冷却 6h，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），

@@ -215,10 +215,20 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if smc.Until.IsZero() || !now.Before(smc.Until) {
 					continue // 过期/零值丢弃
 				}
+				// 恢复半开探测字段；`Since` 缺失（v0.31.5 及更早写的 state.json）
+				// 时按**恢复时刻**起算 —— 宁可晚探 delay，也不要把"不知道冷却了
+				// 多久"读成"已经冷却够了"（后者会让一次升级立刻变成一轮探测脉冲）。
+				since := smc.Since
+				if since.IsZero() {
+					since = now
+				}
 				e.modelCooldowns[m] = modelCooldown{
-					Until:   smc.Until,
-					ResetAt: smc.ResetAt,
-					Reason:  smc.Reason,
+					Until:     smc.Until,
+					ResetAt:   smc.ResetAt,
+					Reason:    smc.Reason,
+					Since:     since,
+					ProbedAt:  smc.ProbedAt,
+					Probeable: smc.Probeable,
 				}
 			}
 			if len(e.modelCooldowns) == 0 {
@@ -512,6 +522,12 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					Until:   mc.Until,
 					ResetAt: mc.ResetAt,
 					Reason:  mc.Reason,
+					// 半开探测的三个量必须落盘（v0.31.6）：丢了 Since 等于"不知道冷却了
+					// 多久"（重启后可探时刻被重置）、丢了 Probeable 等于功能静默失效、
+					// 丢了 ProbedAt 等于重启就重置探测节奏。
+					Since:     mc.Since,
+					ProbedAt:  mc.ProbedAt,
+					Probeable: mc.Probeable,
 				}
 			}
 			if len(mcs) == 0 {

@@ -673,18 +673,41 @@ func (p *Proxy) noteHit(uid string) {
 // 每组用 tried 的**局部副本**：组内选号会把落选账号标记进 tried 以免死循环，
 // 若直接写共享的 tried，前一组的落选账号会被后一组误当作「本次已试过」。
 func (p *Proxy) pickExcluding(tried map[string]bool, model string, sc pickScope) *auth.Auth {
+	return p.pickExcludingWith(tried, model, sc, func(t map[string]bool, m string) *auth.Auth {
+		return p.pool.PickExcludingForRealm(t, m, "")
+	})
+}
+
+// pickProbeExcluding 模型级**半开探测**取号（v0.31.6）：与 pickExcluding 同构，
+// 只把取号原语换成"对该模型正处可探测冷却、且账号级完全健康"的号。
+//
+// 为什么复用同一套范围/分组/节流逻辑而不是另写一个简化版：探测发出的是**真实请求**，
+// 它必须和正常请求受同样的约束 —— 代挂自用不能拿平台号去探测（越权）、平台范围不能
+// 用别人分组的号、节流（recentlyHit）同样要生效。任何"探测路径放宽一点"都是权限漏洞。
+func (p *Proxy) pickProbeExcluding(tried map[string]bool, model string, sc pickScope) *auth.Auth {
+	return p.pickExcludingWith(tried, model, sc, func(t map[string]bool, m string) *auth.Auth {
+		return p.pool.PickProbeForModelRealm(t, m, "")
+	})
+}
+
+// pickOneFn 单次取号原语：常规轮换与半开探测共用同一套「分组优先级 + 范围过滤 + 节流」
+// 外壳，只有"从池里怎么挑一个"这一步不同。抽出来是为了让两条路径的**约束**不可能漂移
+// —— 本项目最贵的一类教训就是"同一件事两套实现"。
+type pickOneFn func(tried map[string]bool, model string) *auth.Auth
+
+func (p *Proxy) pickExcludingWith(tried map[string]bool, model string, sc pickScope, one pickOneFn) *auth.Auth {
 	// 顺手复查「临时异常」账号是否已恢复（节流 + 异步，见 reconcileAbnormal）。
 	p.reconcileAbnormal()
 	if sc.isPlatform() {
 		for _, g := range platformConsumeGroups {
-			if au := p.pickScoped(copyTried(tried), model, sc, g); au != nil {
+			if au := p.pickScopedWith(copyTried(tried), model, sc, g, one); au != nil {
 				return au
 			}
 		}
 		return nil
 	}
 	// 代挂自用：不限消耗分组（号主自己的号，按 HostGroup / AccountUIDs 收窄）。
-	return p.pickScoped(tried, model, sc, "")
+	return p.pickScopedWith(tried, model, sc, "", one)
 }
 
 // pickPriorityGroupForModel 返回当前**有可用账号的最高优先级**消耗分组（无则空串）。
@@ -746,10 +769,10 @@ func copyTried(tried map[string]bool) map[string]bool {
 //
 // 上限 512：代挂自用场景下，个人账号可能只是池中很小一部分，需要多轮跳过平台账号
 // 才能命中自己的号；512 远超实际账号规模，又不会成为死循环。
-func (p *Proxy) pickScoped(tried map[string]bool, model string, sc pickScope, group string) *auth.Auth {
+func (p *Proxy) pickScopedWith(tried map[string]bool, model string, sc pickScope, group string, one pickOneFn) *auth.Auth {
 	var fallback *auth.Auth
 	for i := 0; i < 512; i++ {
-		cand := p.pool.PickExcludingForRealm(tried, model, "")
+		cand := one(tried, model)
 		if cand == nil {
 			break
 		}
@@ -1257,6 +1280,10 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	tried := map[string]bool{}
+	// probeAttempt 本次轮转是否由**半开探测**拿到号（v0.31.6）：决定成功时是否
+	// 提前解除该 (账号, 模型) 的 6004 冷却，以及失败时是否补一条可读日志。
+	// probedThisRequest 本请求是否**已经**做过一次探测（一次请求最多一次，见下方注释）。
+	var probeAttempt, probedThisRequest bool
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// 换号退避（v0.18.x）：attempt>0 时先等一段指数退避 + ±25% 抖动再换下一号。
@@ -1285,8 +1312,31 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 				au = nil
 			}
 		}
+		probeAttempt = false
 		if au == nil {
 			au = p.pickExcluding(tried, model, scope)
+		}
+		if au == nil && !probedThisRequest {
+			// 常规候选耗尽 → **模型级半开探测**（v0.31.6）。
+			//
+			// 场景：池里每个号对该模型都还在 6004 冷却里（≤24h），但上游可能已经提前
+			// 解除 —— 严格等墙钟意味着"其实早就恢复了"的容量被白放到最晚一天。
+			// 这里放行**一次**"带着答案去问上游"的请求，把提前恢复的容量拿回来。
+			//
+			// ## 两层强度闸门（缺一层就变成出站脉冲）
+			//
+			//  1. 池侧：每 (账号, 模型) 每 interval（默认 1h）一次，且要过了 delay（20m）；
+			//  2. **本处**：一次客户端请求最多探测一次。
+			//
+			// 第 2 条不是冗余：池侧闸门只管"同一个号"，而轮转会把 `tried` 里已试过的号
+			// 排除后**继续挑下一个可探号** —— 没有这一条，一个客户端请求就会把池内所有
+			// 冷却号依次探一遍（33 个号 = 33 次上游调用、同一出口 IP、几秒内打完），
+			// 正是本项目最贵的一类事故。一次请求做一次实验，足够了。
+			au = p.pickProbeExcluding(tried, model, scope)
+			if au != nil {
+				probeAttempt = true
+				probedThisRequest = true
+			}
 		}
 		if au == nil {
 			break
@@ -1379,6 +1429,13 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			}
 			// 记录分类，供最终状态码映射（见 upstreamFailureStatus）。
 			lastKind = kind
+			// 探测失败：**只加日志**，处置一律走下面统一的分类分支（探测不是"另一种
+			// 错误"，它只是"一次注定被拒也值得试的请求"）。冷却由 reportUpstreamError
+			// 按既有纪律续期；池侧 ProbedAt 已在放行时写好，故不会立刻再探。
+			if probeAttempt {
+				log.Printf("WARN: [proxy] model_probe_failed model=%s acct=%s kind=%s status=%d",
+					model, au.UID, kind, resp.StatusCode)
+			}
 			if retryAfter != "" {
 				lastRetryAfter = retryAfter
 			}
@@ -1417,6 +1474,13 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		p.noteChatSuccess(au.UID, model)
+		if probeAttempt && p.pool.ProbeSucceeded(au.UID, model) {
+			// 半开探测**成功** = 直接证据：上游对该 (账号, 模型) 的限额已经解除。
+			// 这是唯一允许"用成功清 6004 冷却"的路径（普通成功刻意不清，见
+			// pool.ProbeSucceeded 与 noteChatSuccess 的注释）。
+			log.Printf("INFO: [proxy] model_probe_recovered model=%s acct=%s（已提前解除该模型的 6004 冷却）",
+				model, au.UID)
+		}
 		p.noteHit(au.UID) // 记账复用时刻，供最小复用间隔节流
 		// 响应头透出实际服务的账号（对齐 cmd/server，v0.17.5 补齐）：
 		//   - 排障时直接看到「这次是谁在答」；

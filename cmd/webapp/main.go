@@ -71,7 +71,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.5"
+const version = "0.31.6"
 
 type app struct {
 	store  *Store
@@ -184,6 +184,15 @@ func main() {
 	importRoots := flag.String("import-roots", "",
 		"「服务端路径导入」额外允许读取的目录（逗号分隔，绝对路径）。\n"+
 			"默认只允许账号文件的规范目录（%USERPROFILE%\\.wb-switch）；数据目录恒不可读")
+	modelProbeDelay := flag.Duration("model-probe-delay", 20*time.Minute,
+		"模型级冷却的半开探测：进入冷却后先等多久才允许首次探测（<=0 = 用默认 20m）。\n"+
+			"探测是唯一会为'已被判定不可用'的 (账号, 模型) 主动发上游请求的路径，见 pool.SetModelProbe")
+	modelProbeInterval := flag.Duration("model-probe-interval", time.Hour,
+		"模型级冷却的半开探测间隔（同一账号+模型两次探测的最小间隔；\n"+
+			"0/负 = 关停探测，回到'严格等上游墙钟'）")
+	modelProbeGlobal := flag.Duration("model-probe-global", 5*time.Minute,
+		"模型级冷却的半开探测**全池**间隔（同一模型两次探测之间的全局最小间隔）。\n"+
+			"这是出站强度的主闸门：没有它，池里 N 个冷却号会被客户端连续请求逐个探一遍")
 	checkUpdate := flag.Bool("check-update", false,
 		"只做一次版本更新检查并打印结果，然后退出（不启动服务）。\n"+
 			"供运维脚本/定时巡检使用；退出码 0=已最新 1=有新版 2=检查失败")
@@ -294,6 +303,10 @@ func main() {
 	dataDir := filepath.Dir(*dbPath)
 	stateFp := filepath.Join(dataDir, "pool_state.json")
 	px := NewProxy(store, stateFp)
+	// 模型级半开探测的三档节奏（v0.31.6）：6004 的恢复时刻来自上游墙钟（封顶 24h），
+	// 上游提前解除时只能靠主动试出来。三档分别管「进冷却后多久才可探」「同号多久可再探」
+	// 「全池同模型多久可再探」。出站强度可按需下调或关停（interval=0）。
+	px.pool.SetModelProbe(*modelProbeDelay, *modelProbeInterval, *modelProbeGlobal)
 
 	// 凭证落盘接到 SQLite：必须在任何 token 刷新之前装好，否则刷新成功的凭证
 	// 会因「无 FilePath」而丢失（详见 tasks.go installCredentialHook）。
@@ -714,6 +727,15 @@ func limitedModelsOf(rows []pool.RateLimitedModel) []limitedModelView {
 		if !r.ResetAt.IsZero() {
 			v.ResetAt = r.ResetAt.Unix()
 		}
+		if r.Probeable {
+			v.Probeable = true
+		}
+		if !r.ProbedAt.IsZero() {
+			v.ProbedAt = r.ProbedAt.Unix()
+		}
+		if !r.NextProbeAt.IsZero() {
+			v.NextProbeAt = r.NextProbeAt.Unix()
+		}
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
@@ -733,6 +755,15 @@ type limitedModelView struct {
 	ResetAt int64 `json:"reset_at,omitempty"`
 	// Reason 触发原因（含 reset 来源后缀，可看出时长是上游给的还是本地估的）。
 	Reason string `json:"reason,omitempty"`
+	// Probeable / NextProbeAt / ProbedAt 半开探测可见性（v0.31.6）。
+	//
+	// 为什么必须透出：6004 的冷却上限是 24h，运维看到「至 明天 00:00」会以为
+	// 这个号今天彻底没救；而实际系统会在 delay 之后自动试探。**机制存在却看不见**，
+	// 排障时只能翻代码 —— 这是本项目反复出现的一类问题，故在此显式暴露。
+	// NextProbeAt 缺席 = 本次冷却窗口内不会再探（剩余时间不足 delay）。
+	Probeable   bool  `json:"probeable,omitempty"`
+	ProbedAt    int64 `json:"probed_at,omitempty"`
+	NextProbeAt int64 `json:"next_probe_at,omitempty"`
 }
 
 // toView 由池状态生成视图；expires/分组等仅存于库的字段从 acc 补齐，

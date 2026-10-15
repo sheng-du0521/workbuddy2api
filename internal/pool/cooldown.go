@@ -154,7 +154,14 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			return
 		}
 		// Hits 归零：本条冷却的时长来自上游权威时刻，与本地退避次数无关。
-		e.modelCooldowns[model] = modelCooldown{Until: until, ResetAt: resetAt, Reason: reason}
+		//
+		// Since 刷新为 now（新窗口开始）；ProbedAt 从上一窗口**继承**（探测节奏绑键
+		// 不绑窗口，理由见 modelCooldown.ProbedAt 注释）；Probeable 恒 true ——
+		// 本分支就是"上游 6004 给了重置时刻"，正是半开探测唯一有意义的那种载荷。
+		e.modelCooldowns[model] = modelCooldown{
+			Until: until, ResetAt: resetAt, Reason: reason,
+			Since: now, ProbedAt: prev.ProbedAt, Probeable: true,
+		}
 	} else if !prev.Until.IsZero() && now.Before(prev.Until) {
 		// 已在模型级冷却中：不推进计数、不延长，只把 reason 刷新为最新一次
 		// （运维看到的原因应是"最近一次为什么"，而时长保持不变）。
@@ -164,7 +171,11 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 		// 无时间信息且不在冷却中：模型级有界退避（base 起，按连续次数翻倍、封顶）。
 		d := p.softDurationLocked(base, prev.Hits+1)
 		hits := prev.Hits + 1
-		e.modelCooldowns[model] = modelCooldown{Until: now.Add(d), Reason: reason, Hits: hits}
+		// 同样可探测：零值分支只是"上游没给时刻、由本地估算"，恢复依然只能靠试。
+		e.modelCooldowns[model] = modelCooldown{
+			Until: now.Add(d), Reason: reason, Hits: hits,
+			Since: now, ProbedAt: prev.ProbedAt, Probeable: true,
+		}
 	}
 	p.dirty.Store(true)
 }
@@ -194,10 +205,8 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
-	hits := 0
-	if e.modelCooldowns != nil {
-		hits = e.modelCooldowns[model].Hits
-	}
+	prev := e.modelCooldowns[model] // 零值安全：map 缺键即零值
+	hits := prev.Hits
 	hits++
 	ttl := modelBlockBaseTTL
 	if d := ttl * (1 << uint(min(hits-1, modelBlockShift))); d < modelBlockMaxTTL {
@@ -212,6 +221,12 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		Until:  now.Add(ttl),
 		Reason: reason,
 		Hits:   hits,
+		Since:  now,
+		// ProbedAt 继承：本条不可探测（Probeable 保持零值 false），继承只是为了
+		// "同一个键的节奏历史"不被一次 11102 覆盖而白白重置。
+		ProbedAt: prev.ProbedAt,
+		// Probeable 刻意保持 false（零值，不写出来）：11102 = 上游明说该后端没有
+		// 这个模型，重试无意义；它的恢复路径是自己的 TTL 到期 + BlockModelClear。
 	}
 	p.dirty.Store(true)
 }
@@ -241,7 +256,80 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.dirty.Store(true)
 }
 
-// CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
+// ── 模型级半开探测（v0.31.6）─────────────────────────────────────────────────
+
+// probeGate 半开探测闸门的**纯判据**（无锁、无副作用，便于单测钉住每个边界）：
+// 返回 (当前是否可探, 下一次可探的最早时刻)。
+//
+// 判据（全部满足才可探）：
+//  1. mc.Probeable —— 只有 6004 限额可探（11102 重试无意义）；
+//  2. 冷却仍在有效期内（已到期由正常路径接管，探测纯属多余）；
+//  3. mc.Since 非零 —— 有"窗口开始时刻"才谈得上"已经冷却了多久"；零值一律不探
+//     （宁可少探：一次部署不该变成一轮对全池冷却号的探测脉冲）；
+//  4. 自窗口开始已过 delay —— 窗口刚开时上限必然还在，早探白打一次上游；
+//  5. 距上次探测已过 interval —— 出站强度上限。
+//
+// 另外用"剩余时间必须严格大于 delay"做一次**窗口长度**过滤：若这条冷却本来
+// 就短于 delay，等它自然到期比探测更省事（探测只是把一次必然失败的请求提前打出去）。
+// 这个过滤使 next 返回零值（= 本窗口内不会再探），运维在台账上看到的就是"没有下次"。
+func probeGate(now time.Time, mc modelCooldown, delay, interval time.Duration) (bool, time.Time) {
+	if !mc.Probeable || mc.Until.IsZero() || !now.Before(mc.Until) {
+		return false, time.Time{}
+	}
+	if mc.Since.IsZero() || delay <= 0 || interval <= 0 {
+		return false, time.Time{}
+	}
+	if mc.Until.Sub(now) <= delay {
+		// 剩余不足 delay：本窗口内不探（等自然到期）
+		return false, time.Time{}
+	}
+	next := mc.Since.Add(delay)
+	if !mc.ProbedAt.IsZero() {
+		if t := mc.ProbedAt.Add(interval); t.After(next) {
+			next = t
+		}
+	}
+	if now.Before(next) {
+		return false, next
+	}
+	return true, now
+}
+
+// ProbeSucceeded 半开探测**成功**后的提前解除（v0.31.6）：清掉该 (账号, 模型) 的模型级冷却。
+// 返回是否真的解除了一条（供日志/测试断言）。
+//
+// ## 证据强度
+//
+// 这是"该 (账号, 模型) 刚刚完成了一次成功的往返" —— 没有比它更直接的证据能证明那条
+// 冷却已经过期。因此它是**唯一**允许通过"成功"清 6004 冷却的路径：
+// 普通成功（noteChatSuccess / NoteSuccess）**刻意不清** 6004 —— 6004 的墙钟来自上游，
+// 一个并发窗口里的成功不足以否定整条窗口（那是 11102 的清理口径，见 BlockModelClear）。
+//
+// 只清 Probeable（6004）条目：11102 的清除仍走 BlockModelClear，两条路径各管一种载荷，
+// 语义不混（也就是"同一个键的两种语义各有各的闸门"）。
+func (p *Pool) ProbeSucceeded(uid, model string) bool {
+	if uid == "" || model == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || len(e.modelCooldowns) == 0 {
+		return false
+	}
+	mc, exists := e.modelCooldowns[model]
+	if !exists || !mc.Probeable {
+		return false
+	}
+	delete(e.modelCooldowns, model)
+	if len(e.modelCooldowns) == 0 {
+		e.modelCooldowns = nil
+	}
+	p.dirty.Store(true)
+	return true
+}
+
+// // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
 //
 // 语义：
 //   - resetAt 非零（上游带权威重置时间，无论 6004 还是 11140 rate-limiting）→
