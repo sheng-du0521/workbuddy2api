@@ -1085,6 +1085,28 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		payload = map[string]any{}
 	}
 	model, _ := payload["model"].(string)
+	// 模型名归一化（v0.31.2）：去空白 / 剥 realm 前缀 / 按已知清单折回规范写法。
+	//
+	// **必须在 Marshal 之前**改 payload：出站请求体是从 payload 重新编码的，
+	// 只改本地变量上游照样收到旧写法（照样 11102）。
+	// 归一化后 model 变量同时用于选号 / 冷却键 / 负缓存键 / 台账，
+	// 因此"同一模型的不同写法"不会再各占一个冷却槽（见 modelname.go 注释）。
+	//
+	// 失败（拿不到已知清单）时只做去空白与剥前缀，不影响别处；
+	// 归一化说明只在真的改动时打一条 INFO —— 静默改写客户端的请求是坏事，
+	// 但也不该为每个正常请求写日志。
+	known := knownModelIDs(p.pool.ObservedModels())
+	if norm, how := normalizeModelName(model, known); norm != model {
+		log.Printf("INFO: [proxy] 模型名归一化 %q → %q（%s）", model, norm, how)
+		model = norm
+		payload["model"] = norm
+	}
+	// 归一化之后仍不在已知清单里 → 记一条 WARN（同名一次）。
+	// 这正是"客户端模型名配置错"的直接症状：每次调用都会拿到上游 400/11102，
+	// 而我们回 404 —— 没有这条日志时，运维要在台账、上游原文与客户端配置之间来回对账。
+	if !knownModelSet(known, model) {
+		noteUnknownModel(model, known)
+	}
 	// 把 model 回填给实时面板的兜底层（liveCapture）：它在 ServeChat 返回**之后**
 	// 才知道结果，那时请求体早已读完，无法再解析一次。
 	setLiveModel(r, model)
@@ -2269,6 +2291,12 @@ func parseUsageJSON(raw json.RawMessage) usageInfo {
 // 为什么要记：此前流水只有最终 upstream_uid，无法回答「同一场对话的多轮是否落到不同
 // 账号」—— 那正是「调用过程中切换账号」这一问题的**观测盲区**（只能靠时间聚类猜）。
 func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui usageInfo, resv *Reservation, status, errMsg, stickyHash string, attempts int) (settled bool, chargedMicro int64) {
+	// 成功的模型名进入"上游认过"清单（v0.31.2），供模型名写法归一使用。
+	// 只记成功：失败记录里的名字可能正是写法错的，把它写进清单会让下一次
+	// 把**正确**写法归一成错的（最危险的方向）。
+	if status == "ok" {
+		rememberModel(model)
+	}
 	if u == nil {
 		// 管理密钥通道（运维 / 后台调试直连，见 apiKeyGuardOpt）：不经用户计费、
 		// 无需结算，但**必须进号池台账**（v0.17.6）。

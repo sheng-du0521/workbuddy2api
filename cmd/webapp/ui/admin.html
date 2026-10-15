@@ -6341,14 +6341,18 @@ function renderCfRows(d) {
   if (!rows.length) { emptyBlock(box, '窗口内没有明细。'); return; }
   let html = '<div class="sub" style="margin:0 0 8px;">明细（最新 100 条，倒序）</div>' +
     '<table class="egr-help-table"><thead><tr>' +
-    '<th>时间</th><th>阶段</th><th>码</th><th>状态</th><th>账号</th><th>模型</th>' +
-    '<th>重置来源</th><th>摘要</th></tr></thead><tbody>';
+    '<th>时间</th><th>阶段</th><th>码</th><th>上游 HTTP</th><th>回客户端</th>' +
+    '<th>账号</th><th>模型</th><th>重置来源</th><th>摘要</th></tr></thead><tbody>';
   for (const r of rows) {
     const sm = CF_STAGE_META[r.stage] || ['', r.stage];
     html += '<tr><td class="mono">' + escapeHTML(fmtTime(r.at)) + '</td>' +
       '<td><span class="tag ' + sm[0] + '">' + sm[1] + '</span></td>' +
       '<td class="mono">' + escapeHTML(r.code ? String(r.code) : (r.code_key || '—')) + '</td>' +
+      // 上游给我们 vs 我们回客户端：**两个不同的数**，分开列。
+      // 实测有人把这里的 400（上游给的）读成"网关回客户端 400"，据此误判整站故障 ——
+      // 并排显示后这个歧义就不存在了（上游 11102 模型不存在 → 上游 400、客户端 404）。
       '<td class="mono">' + (r.status || '—') + '</td>' +
+      '<td class="mono">' + (r.client_status ? String(r.client_status) : '—') + '</td>' +
       '<td class="mono">' + (r.uid ? escapeHTML(maskUID(r.uid)) : '—') + '</td>' +
       '<td class="mono">' + escapeHTML(r.model || '—') + '</td>' +
       // 重置来源只在限流类有意义：它区分"上游明说的时长"与"我们本地估的"，

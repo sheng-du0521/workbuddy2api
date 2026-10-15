@@ -69,7 +69,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.1"
+const version = "0.31.2"
 
 type app struct {
 	store  *Store
@@ -262,6 +262,12 @@ func main() {
 		log.Fatalf("打开数据库失败: %v", err)
 	}
 	defer store.Close()
+
+	// 模型名清单种子化（v0.31.2）：把历史**成功**用过的模型名装进内存，
+	// 供模型名写法归一使用（见 modelname_seed.go 的"为什么必须做"）。
+	// 放在服务开始接流量之前：否则重启后的前若干请求会因为清单空而漏掉归一化
+	// （实测过：`GLM-5.3` 仍 404，而 `" glm-5.3 "` 已 200 —— 差别就在清单）。
+	seedRecentModels(store)
 
 	// 主密钥：用于加密入库的用户 API Key（可回显给本人，但不明文落库）。
 	secretFile := *secretPath

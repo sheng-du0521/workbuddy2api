@@ -453,6 +453,45 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	return e.a
 }
 
+// ObservedModels 返回池内**成功服务过**的模型名（去重、稳定排序）。
+//
+// 用途：模型名归一化（cmd/webapp/modelname.go）需要一份"上游认得的写法"清单，
+// 而权威清单（/v1/models）是**出站结果**：热路径绝不能为了归一化去拉一次。
+// 这里给的是**零出站**的本地证据 —— (账号, 模型) 成本台账只在该模型真的成功
+// 服务过之后才写入（NoteModelCost），所以里面的名字一定是上游认得的。
+//
+// ⚠️ **刻意不取 modelCooldowns 的键**（v0.31.2 实测踩到）：那个表的键是**客户端传来的
+// 原样字符串** —— 11102「该后端无此模型」负缓存的键恰恰是**写错的名字**（`GLM-5.3`、
+// `gpt-4o` 都进得来）。把它们当"已知模型名"会让归一化**反向确认错误写法**：
+// 实测现象是 `GLM-5.3` 明明在 /v1/models 清单里却不再被折回 `glm-5.3`
+// （因为 `GLM-5.3` 自己成了"已知名"之一，归一化认为它无需改动）。
+// **规律：只有"成功"才能作为命名权威，任何"失败记录"的键都是污染的来源** ——
+// 这与 modelname_seed.go 只取 status='ok' 是同一条纪律。
+func (p *Pool) ObservedModels() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 16)
+	add := func(m string) {
+		if m == "" {
+			return
+		}
+		if _, ok := seen[m]; ok {
+			return
+		}
+		seen[m] = struct{}{}
+		out = append(out, m)
+	}
+	for _, e := range p.byUID {
+		// 只取**成功**观测（NoteModelCost）。冷却键刻意排除，理由见函数注释。
+		for m := range e.modelCost {
+			add(m)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
 // cooling 含常规冷却（until）与熔断期（breakerUntil）。
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；

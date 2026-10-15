@@ -338,3 +338,69 @@ func TestCoolingFromInStream6004Frame(t *testing.T) {
 		t.Errorf("第二次只应有 1 次上游调用，got %d", got)
 	}
 }
+
+// TestModelNameNormalizationFeedsPickCooldownAndUpstream 模型名写法归一后：
+// 出站收到规范名、冷却键落在规范名上、且不会为变体再开一个冷却槽。
+//
+// 这是「同一模型的不同写法被当成两个模型」这条问题的端到端验收：
+// 修复前 ` [global:]GLM-5.3 ` 会被原样转发 → 上游回 400/11102（"model [...] 不存在"）
+// → 客户端 404；即便侥幸通，冷却/负缓存键也会与 `glm-5.3` 分裂成两个槽，
+// 于是 `GLM-5.3` 撞出的 6004 拦不住随后用 `glm-5.3` 发来的请求。
+func TestModelNameNormalizationFeedsPickCooldownAndUpstream(t *testing.T) {
+	restore := seedModelsCache(t, []string{"glm-5.3", "kimi-k3-1"})
+	defer restore()
+
+	stub, resetAt := newStub()
+	stub.fail429["glm-5.3"] = 1 // 上游只认规范名：写法不对时根本走不到这里
+	_, px, srv, raw := newCoolingApp(t, stub)
+
+	resp := doChat(t, srv, raw,
+		`{"model":" [global:]GLM-5.3 ","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("归一化后应正常成功，got %d", resp.StatusCode)
+	}
+	served := resp.Header.Get("X-Wb-Account")
+	failedUID := coolUIDB
+	if served == coolUIDB {
+		failedUID = coolUIDA
+	}
+
+	// ① 上游只应见过**规范名**（变体一个字都没发出去）。
+	stub.mu.Lock()
+	models := make([]string, 0, len(stub.calls))
+	for m, n := range stub.calls {
+		models = append(models, fmt.Sprintf("%s×%d", m, n))
+	}
+	stub.mu.Unlock()
+	if len(stub.calls) != 1 || stub.calls["glm-5.3"] != 2 {
+		t.Fatalf("上游应只收到规范名 glm-5.3 共 2 次，实际 %v", models)
+	}
+
+	// ② 冷却（与负缓存）键落在规范名上，且时长仍对齐上游重置墙钟。
+	mc, ok := modelCoolingOf(t, px, failedUID, "glm-5.3")
+	if !ok {
+		t.Fatalf("冷却键应为规范名 glm-5.3（账号 %s）", failedUID)
+	}
+	if d := mc.Until.Sub(resetAt); d < -2*time.Second || d > 2*time.Second {
+		t.Errorf("冷却时长应对齐上游重置 %v，got %v", resetAt, mc.Until)
+	}
+
+	// ③ 变体不得有自己的冷却槽（否则就是"同一模型两个冷却键"）。
+	st, _ := px.pool.Status(failedUID)
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("应恰好 1 条模型冷却（规范名那条），got %d: %v", len(st.RateLimitedModels), st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Errorf("冷却条目应是规范名，got %q", st.RateLimitedModels[0].Model)
+	}
+
+	// ④ 端到端：紧接着用**规范名**发同一模型，必须被同一把冷却拦住（键是同一把）。
+	before := stub.callCount("glm-5.3")
+	resp2 := doChat(t, srv, raw, `{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`)
+	if got := resp2.Header.Get("X-Wb-Account"); got != served {
+		t.Errorf("规范名请求应由另一个账号承接（被冷却的号不再参与），got %q want %q", got, served)
+	}
+	if got := stub.callCount("glm-5.3") - before; got != 1 {
+		t.Errorf("规范名请求只应有 1 次上游调用，got %d", got)
+	}
+}

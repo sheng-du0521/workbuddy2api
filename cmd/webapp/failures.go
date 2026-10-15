@@ -327,6 +327,13 @@ type ConsumeFailure struct {
 	Detail string `json:"detail,omitempty"`
 	// ResetSource 上游重置时间的来源（仅限流类有意义；空 = 不适用）。
 	ResetSource string `json:"reset_source,omitempty"`
+	// ClientStatus 这条失败**若成为最终结果**，客户端会收到的 HTTP 状态码。
+	//
+	// 与 Status 刻意并列（不落库，读取时按 kind 现算）：Status 是**上游给我们的**
+	// 状态码（例如模型不存在时上游固定回 400），ClientStatus 是**我们回客户端的**
+	// （同一个例子是 404）。实测有人把前者读成后者，据此判断"网关全都回 400" ——
+	// 两个数放在一起看，这个歧义就没有了。0 = 不适用（非上游阶段 / 未分类）。
+	ClientStatus int `json:"client_status,omitempty"`
 }
 
 // migrationConsumeFailures consume_failures 建表语句（由 Store.migrate 调用）。
@@ -466,9 +473,38 @@ func (s *Store) ListConsumeFailures(limit int, codeKey, stage string, since int6
 			return nil, err
 		}
 		f.AutoRecover = autoRecover != 0
+		f.ClientStatus = clientStatusOf(f.Stage, f.Status, f.Kind)
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// clientStatusOf 由「阶段 + 上游状态码 + 错误分类」推出**回给客户端**的状态码。
+//
+// 口径与真实响应严格同源：上游阶段的映射直接复用 `upstreamFailureStatus`
+// （ServeChat 末端就是用它），因此台账里这一列不会与线上行为分叉。
+// 只有真正能确定的才给值，其余返回 0（面板显示"—"）—— 宁可留空也不猜，
+// 猜出来的状态码会让人据此判断"客户端没收到这个码，是不是别处的问题"。
+func clientStatusOf(stage string, upstreamStatus int, kind string) int {
+	switch stage {
+	case FailStageUpstream:
+		k := upstream.ParseErrKind(kind)
+		if k == upstream.ErrNone {
+			return 0 // 未分类：末端会按 ErrNone 走默认分支，但那不是"这条失败"的结论
+		}
+		return upstreamFailureStatus(k)
+	case FailStageReserve:
+		// 预扣阶段唯一会回给客户端的确定性错误是余额不足（402）；
+		// "预扣失败退化为事后结算"这类记录不代表客户端收到过错误码。
+		if upstreamStatus == http.StatusPaymentRequired {
+			return http.StatusPaymentRequired
+		}
+		return 0
+	default:
+		// settle / charge：结算与扣费失败发生在响应发出之后（或只影响账目），
+		// 客户端拿不到对应状态码 —— 这正是它们与上游阶段"处置不同"的体现。
+		return 0
+	}
 }
 
 // ConsumeFailureStat 按 Key 聚合的一行统计。
@@ -681,4 +717,31 @@ func atoiDefault(s string, def int) int {
 		return n
 	}
 	return def
+}
+
+// RecentOKModels 近期**成功**服务过的模型名（去重，最多 limit 个）。
+//
+// 供模型名归一化做启动种子化（见 modelname_seed.go）：它要的是一份
+// "上游认得的写法"清单，而这正是 status='ok' 的语义。
+// 失败行刻意排除：失败记录里的模型名可能是写法错的。
+func (s *Store) RecentOKModels(limit int) ([]string, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.Query(
+		`SELECT DISTINCT model FROM usage_logs
+		 WHERE status = 'ok' AND model <> '' ORDER BY model LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }

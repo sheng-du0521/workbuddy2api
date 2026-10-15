@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // TestModelCooldownSurvivesCreditsRefresh 余额同步（签到/探活/代挂刷新）不得清模型级冷却。
@@ -129,5 +130,41 @@ func TestFallbackSkipsModelCooledAccount(t *testing.T) {
 	// 空模型（如元信息类请求）不因模型维度受限，照常兜底。
 	if got := p.PickExcludingForRealm(nil, "", ""); got == nil || got.UID != "u1" {
 		t.Errorf("空 reqModel 应等价账号级口径（照常兜底）, got %+v", got)
+	}
+}
+
+// TestObservedModelsOnlyFromSuccess 池内模型清单**只**取成功观测（(账号,模型) 成本台账），
+// 刻意排除模型级冷却键。
+//
+// 为什么排除（v0.31.2 实测踩到）：11102 负缓存的键是**客户端传来的原样字符串** ——
+// `GLM-5.3`、`gpt-4o` 这类写错的名字都在里面。把它们当"已知模型名"会让归一化
+// **反向确认错误写法**：现象是 `GLM-5.3` 明明在 /v1/models 清单里却不再被折回
+// `glm-5.3`（因为 `GLM-5.3` 自己成了"已知名"，归一化认为无需改动）。
+// 规律：**只有"成功"可以作为命名权威**（与 modelname_seed.go 只取 status='ok' 同一条纪律）。
+func TestObservedModelsFromCostAndCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	if got := p.ObservedModels(); len(got) != 0 {
+		t.Fatalf("未服务过任何模型时应为空，got %v", got)
+	}
+	p.NoteModelCost("u1", "glm-5.3", 1, 1000)
+	p.NoteModelCost("u2", "glm-5.3", 1, 1000) // 重复：应去重
+	p.NoteModelCost("u2", "kimi-k3-1", 1, 1000)
+	p.NoteModelCost("u1", "", 1, 1000) // 空名不入清单
+	// 冷却/负缓存键：**不得**进清单（可能正是客户端写错的名字）。
+	p.CooldownSoftForModel("u2", time.Minute, time.Now().Add(time.Hour), "GLM-5.3-WRONG", "6004")
+	p.BlockModelBackoff("u2", "gpt-4o", upstream.ModelBlockReason)
+
+	got := p.ObservedModels()
+	if len(got) != 2 || got[0] != "glm-5.3" || got[1] != "kimi-k3-1" {
+		t.Fatalf("应只含成功观测并去重排序 [glm-5.3 kimi-k3-1]，got %v", got)
+	}
+	for _, bad := range []string{"GLM-5.3-WRONG", "gpt-4o"} {
+		for _, m := range got {
+			if m == bad {
+				t.Errorf("冷却/负缓存键 %q 不得进模型名清单（会反向确认错误写法）", bad)
+			}
+		}
 	}
 }
