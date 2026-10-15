@@ -1,16 +1,16 @@
 {
-  "version": "0.31.8",
+  "version": "0.31.9",
   "min_supported": "0.24.0",
-  "notes": "v0.31.8：v0.31.7 的收尾 —— 清单拉取的私网直连修复 + 更新通道端到端验证证据 + 重新发布产物。① **修复**：清单拉取用的 HTTP 客户端此前直接吃 `http_proxy/https_proxy` 环境变量，而 Go 的 httpproxy 只特判 `localhost` 这一个词 —— `127.0.0.1` / `10.x` / `192.168.x` / `172.16-31.x` 一律照发给代理。后果是「把清单放在内网文件服务或本机自测」这种正当用法会被代理拦成 502，表现为「更新检查莫名失败」且看不出与代理有关（与本项目在出站链路上修过的 R3 同类，复用 internal/egress.Bypass 判据）。② **为什么另发一版而不是改 v0.31.7 的产物**：release 产物一旦发布就不该改字节 —— 已缓存的清单里写着旧 sha256，换了产物会让那些客户端校验失败。版本号不要钱，语义正确更值钱。③ **端到端验证证据（本轮实测）**：本地起 HTTP 服务提供「清单 + 产物」，隔离实例触发检测→自动下载→**sha256 校验通过**→落盘 `webapp.exe.new`（262144 字节，实测摘要与夹具一致）+ 生成 `apply-update.bat`；再把清单摘要改成 64 个 0 重跑 → `WARN: [update] 产物下载失败：sha256 校验不通过（已丢弃）`、状态落 `failed`、**磁盘上零落盘**。④ 发布：release v0.31.8 承载 windows/amd64 产物（本条目 sha256/size 即其实测值），发布脚本上传前会校验「清单声明 == 实际字节」。",
-  "released_at": 1792094200,
+  "notes": "v0.31.9：P2-7 拆包第二刀 —— 用量台账的只读聚合下沉 `internal/usage`（约 470 行，零行为变化）。① **先量化再动刀**：`store.go` + `store_user.go` 共 115 个方法（只读 57），而「只读**且**只依赖 db」的簇只有一个 —— 用量统计（10 个方法里 9 个只碰 `s.db`，第 10 个只调本簇内的另一个方法）。② 搬走：`ListUsageLogs`/`UsageLogsBySticky`/`UserUsageSummary`/`UsageByAccount`/`UsageByUser`/`CountUsageUsers`/`UsageDailyScoped`/`UsageByModel`/`UsageByModelScoped`/`UsagePerf` + 6 个结果类型 + 3 个纯 helper（`LocalDayStart`/`LocalDayOffset`/`Percentile`）。**写入刻意留在原处**：INSERT usage_logs 要参与预扣/结算事务，与报表读取不是一件事（第三刀的起点）。③ **零调用点改动**：本刀用比第一刀更彻底的接线 —— **嵌入 + 方法提升**（`Store` 嵌 `*usage.Queries`，方法名保持原样 → 33 个调用点一行不改）+ 类型别名。④ **独立测试 11 条**（这才是收益）：聚合 SQL 是\"错了不会崩、只会给出错误数字\"的那类代码，过去只能通过整个 app 间接跑到。现在用临时 SQLite 建表插数逐条钉：本地日界（含 v0.26.7 \"窗口起点落在今天 16:00（未来）\"那类缺陷的回归）、**边界秒归属**（今天零点前一秒必须算昨天）、`user_id>0` 系统行不进用户维度但进全站、`upstream_uid<>''` 排除、scope 过滤、分页排序、缓存采样口径（**\"没回报\" ≠ \"没命中\"**，否则命中率被稀释）。⑤ 验证：既有 cmd/webapp 测试一行未改全绿（零行为变化的证据）+ 全量 23 包绿；真机 8780 已升级。",
+  "released_at": 1792095000,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.8/webapp.exe",
-      "sha256": "a0b6faef719cbbb3b0c98d5aad16d0569e2f466711bb7a4fac759d2dab77d48b",
-      "size": 14883840
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.9/webapp.exe",
+      "sha256": "4dc01657733827c979ad3d45105b478e82b717d5d8162ee4321887dd4b2e7441",
+      "size": 14884864
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.7）；换版本时同步换 url 与 sha256。"

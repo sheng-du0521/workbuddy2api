@@ -197,6 +197,7 @@ v0.31.5 起本仓**只有一个产品**（`cmd/webapp`）。下列口径当年�
 | 刀 | 范围 | 状态 |
 |---|---|---|
 | 1 | 更新子系统纯逻辑 → `internal/selfupdate`（约 600 行） | ✅ v0.31.7 |
+| 2 | 用量台账只读聚合 → `internal/usage`（约 470 行） | ✅ v0.31.9 |
 | 2 | `Store` 只读查询面 | ⬜ |
 | 3 | `Proxy` 计费结算 → `internal/billing` | ⬜ |
 | 4 | `app` 的 admin HTTP 面 → `internal/api/*` | ⬜ |

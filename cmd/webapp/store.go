@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"workbuddy2api/internal/usage"
 
 	_ "modernc.org/sqlite"
 )
@@ -105,6 +106,13 @@ func (a Account) CooldownRemaining() int64 {
 type Store struct {
 	db  *sql.DB
 	sec *SecretBox // 可选：账号 token 静态加密箱（nil = 不加密，向后兼容）
+
+	// *usage.Queries 用量台账（usage_logs）的**只读聚合**（v0.31.9，P2-7 第二刀下沉）。
+	//
+	// **嵌入**而不是再加一个字段：这样 `store.UsageByModel(...)` / `store.ListUsageLogs(...)`
+	// 等 33 个既有调用点**一行不改**继续编译（方法提升），本刀才能做到"零行为变化"
+	// —— 由既有测试全绿证明。写入（INSERT usage_logs）仍在本包，它要参与预扣/结算事务。
+	*usage.Queries
 }
 
 // SetSecret 注入加密箱，用于账号 AccessToken/RefreshToken/DeviceToken 的静态加密。
@@ -165,7 +173,7 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, Queries: usage.New(db)}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
