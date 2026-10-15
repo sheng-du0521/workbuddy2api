@@ -369,15 +369,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .pane { display: none; }
 .pane.active { display: block; }
 
-/* ---------- Toast ---------- */
-#toast {
-  position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
-  padding: 9px 18px; border-radius: 10px; font-size: 13px; z-index: 99;
-  background: var(--card); border: 1px solid var(--border); display: none;
-  box-shadow: var(--shadow); max-width: 88vw;
-}
-#toast.ok { border-color: var(--ok); color: var(--ok); }
-#toast.err { border-color: var(--err); color: var(--err); }
+/* ---------- Toast（v0.26.6 起改为右上角堆叠卡片，样式见文件末尾 UI 套件段） ---------- */
 
 /* ---------- 账号任务完成情况（今日签到 / 猫猫旅行） ---------- */
 /* 卡片上直接显示「是否完成」，与开关区相邻，避免只看开关不知结果。 */
@@ -681,4 +673,202 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .egr-help-list code {
   background: var(--tint); border: 1px solid var(--border); border-radius: 5px;
   padding: 0 4px; font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+}
+
+/* ===================================================================
+   v0.26.6 · 共享 UI 套件样式
+   （管理后台与用户控制台共用；对照 workbuddy-manager 的交互调研结论）
+   ------------------------------------------------------------------
+   设计取向：沿用本项目既有的设计令牌（--card / --border / --muted …），
+   不引入新的色板。动效一律走 transform/opacity，且 @media
+   (prefers-reduced-motion) 下全部关掉 —— 动画是锦上添花，不该成为障碍。
+   =================================================================== */
+
+/* ---------- ① 通知：右上角堆叠卡片 ---------- */
+.toast-host {
+  position: fixed; top: 16px; right: 16px; z-index: 200;
+  display: flex; flex-direction: column; gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none; /* 容器不吃点击，只有卡片吃 */
+}
+.toast-card {
+  position: relative; overflow: hidden; pointer-events: auto;
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 10px 10px 12px 12px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: var(--shadow);
+  font-size: 12.5px; line-height: 1.55; color: var(--text);
+  animation: toast-in .22s cubic-bezier(.2,.9,.3,1.2);
+}
+.toast-card.out { animation: toast-out .2s ease forwards; }
+@keyframes toast-in { from { opacity: 0; transform: translateX(14px) scale(.97); } to { opacity: 1; transform: none; } }
+@keyframes toast-out { to { opacity: 0; transform: translateX(14px) scale(.97); } }
+.toast-ico {
+  flex: 0 0 auto; width: 16px; height: 16px; border-radius: 50%; margin-top: 1px;
+  display: grid; place-items: center; font-size: 10px; font-weight: 700;
+  background: var(--tint); color: var(--accent);
+}
+.toast-card.ok .toast-ico { background: var(--ok-tint); color: var(--ok); }
+.toast-card.err .toast-ico { background: var(--err-tint); color: var(--err); }
+.toast-card.warn .toast-ico { background: var(--warn-tint); color: var(--warn); }
+.toast-msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.toast-x {
+  flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
+  font-size: 15px; line-height: 1; padding: 0 2px; border-radius: 6px;
+}
+.toast-x:hover { background: var(--tint); color: var(--text); }
+/* 底部倒计时线：一眼看出"它还会待多久"，比毫无征兆地消失友好。 */
+.toast-bar {
+  position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+  background: currentColor; opacity: .28; transform-origin: left center;
+  animation: toast-bar linear forwards;
+}
+.toast-card.ok .toast-bar { color: var(--ok); }
+.toast-card.err .toast-bar { color: var(--err); }
+.toast-card.warn .toast-bar { color: var(--warn); }
+@keyframes toast-bar { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+
+/* ---------- ② 确认对话框 ---------- */
+.dlg-back {
+  position: fixed; inset: 0; z-index: 210;
+  background: rgba(15, 23, 42, .42);
+  display: grid; place-items: center; padding: 20px;
+  animation: fade-in .16s ease;
+}
+.dlg {
+  width: min(440px, 100%); background: var(--card);
+  border: 1px solid var(--border); border-radius: 16px;
+  box-shadow: var(--shadow); padding: 18px;
+  animation: dlg-in .2s cubic-bezier(.2,.9,.3,1.15);
+}
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes dlg-in { from { opacity: 0; transform: translateY(8px) scale(.98); } }
+.dlg-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.dlg-title { font-size: 15px; font-weight: 650; }
+.dlg.danger .dlg-title { color: var(--err); }
+.dlg-msg { font-size: 13px; line-height: 1.65; color: var(--text); }
+.dlg-detail {
+  margin-top: 8px; padding: 9px 11px; border-radius: 10px;
+  background: var(--tint); font-size: 12px; line-height: 1.6; color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.dlg-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.dlg-foot button { min-width: 78px; }
+
+/* ---------- ③ 命令面板 ---------- */
+.pal-trigger { gap: 6px; }
+.pal-trigger-ico { font-size: 13px; }
+.pal-kbd {
+  font-family: inherit; font-size: 10.5px; line-height: 1.5;
+  padding: 0 5px; border-radius: 5px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--muted);
+}
+.pal-bk {
+  position: fixed; inset: 0; z-index: 220;
+  background: rgba(15, 23, 42, .38);
+  display: flex; justify-content: center; align-items: flex-start;
+  padding: 10vh 16px 16px; animation: fade-in .14s ease;
+}
+.pal {
+  width: min(560px, 100%); max-height: 74vh; display: flex; flex-direction: column;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 16px; box-shadow: var(--shadow); overflow: hidden;
+  animation: dlg-in .18s cubic-bezier(.2,.9,.3,1.15);
+}
+.pal-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 0 14px; border-bottom: 1px solid var(--border);
+}
+.pal-ico { color: var(--muted); font-size: 15px; }
+.pal-input {
+  flex: 1 1 auto; height: 46px; border: 0; background: transparent;
+  font-size: 14px; color: var(--text); outline: none;
+}
+.pal-list { overflow-y: auto; padding: 4px 0; }
+.pal-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 9px 14px; font-size: 13px; cursor: pointer; color: var(--text);
+}
+.pal-item.on { background: var(--tint); }
+.pal-lb { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 右侧归属：光看名字「用户」不知道是页面还是数据行，分组列把这个歧义消掉。 */
+.pal-gp { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
+.pal-empty { padding: 26px 16px; text-align: center; }
+.pal-empty-t { font-size: 13px; }
+.pal-empty-d { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+.pal-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  border-top: 1px solid var(--border); padding: 7px 14px;
+  font-size: 11px; color: var(--muted);
+}
+.pal-count { font-variant-numeric: tabular-nums; }
+
+/* ---------- ④ 常驻失败横幅 ---------- */
+.load-banner {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 12px; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: 12px;
+  background: var(--warn-tint); font-size: 12px; line-height: 1.55;
+}
+.load-banner-ico {
+  flex: 0 0 auto; width: 15px; height: 15px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 10px; font-weight: 700;
+  background: var(--warn); color: #fff;
+}
+.load-banner-msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.load-banner button { flex: 0 0 auto; }
+
+/* ---------- ⑤ 骨架屏 ---------- */
+.skel {
+  display: block; height: 10px; border-radius: 6px;
+  background: linear-gradient(90deg, var(--border) 25%, var(--tint) 37%, var(--border) 63%);
+  background-size: 400% 100%;
+  animation: skel-shimmer 1.25s ease-in-out infinite;
+}
+@keyframes skel-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.skel-line { margin: 6px 0; }
+.skel-line.short { width: 45%; }
+.skel-row td { padding: 10px; }
+.skel-card {
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 14px; background: var(--card);
+}
+
+/* ---------- ⑥ 侧边栏过滤 ---------- */
+.nav-filter-wrap {
+  position: relative; display: flex; align-items: center; gap: 6px;
+  margin: 0 10px 8px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg);
+}
+.nav-filter-ico { color: var(--muted); font-size: 12px; }
+.nav-filter {
+  flex: 1 1 auto; min-width: 0; border: 0; background: transparent;
+  height: 30px; font-size: 12.5px; color: var(--text); outline: none;
+}
+.nav-filter-x {
+  border: 0; background: transparent; color: var(--muted);
+  font-size: 14px; line-height: 1; padding: 0 2px; border-radius: 6px;
+}
+.nav-filter-x:hover { background: var(--tint); color: var(--text); }
+.nav-filter-empty { margin: 6px 12px; font-size: 12px; color: var(--muted); }
+
+/* ---------- ⑦ 表格：粘性表头 + 行悬停 ---------- */
+.egr-help-table thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
+.egr-help-table tbody tr:hover td { background: var(--tint); }
+
+/* ---------- ⑧ 无障碍：键盘焦点必须看得见 ---------- */
+/* 鼠标点击不该出现焦点环，键盘导航必须出现 —— `:focus-visible` 正是这个语义。 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+.nav-item:focus-visible, .seg:focus-visible { outline-offset: -2px; }
+
+/* ---------- ⑨ 仅屏幕阅读器可见 ---------- */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-card, .toast-card.out, .dlg-back, .dlg, .pal-bk, .pal { animation: none !important; }
+  .skel { animation: none; background: var(--border); }
+  .toast-bar { animation: none; opacity: 0; }
 }

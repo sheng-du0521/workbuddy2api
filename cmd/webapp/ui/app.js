@@ -5,19 +5,10 @@
 
 const $ = (id) => document.getElementById(id);
 
-function toast(msg, kind) {
-  let el = $('toast');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'toast';
-    document.body.appendChild(el);
-  }
-  el.textContent = msg;
-  el.className = kind || '';
-  el.style.display = 'block';
-  clearTimeout(el._t);
-  el._t = setTimeout(() => { el.style.display = 'none'; }, 2800);
-}
+// toast 的实现见文件末尾「共享 UI 套件」段（v0.26.6 改为**堆叠卡片**：
+// 图标 / 可关闭 / 悬停暂停 / aria-live）。旧实现是单元素、2.8 秒自动消失，
+// 错误提示切个页就找不到了 —— 而"刚才失败过"恰恰是最需要留下的信息。
+// 签名保持 toast(msg, kind) 兼容，第三参可选 { duration, sticky }。
 
 async function api(path, opts = {}) {
   const res = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts, {
@@ -1232,6 +1223,17 @@ function toggleTheme() {
   toast('已切换到' + (next === 'dark' ? '深色' : '浅色') + '模式', 'ok');
 }
 
+// setTheme 显式设置主题（v0.26.6）。命令面板里"切换到深色/浅色"直接用它 ——
+// 面板是**另一个入口**，不该逼用户先去侧边栏底部找那个小按钮。
+// 与 toggleTheme 共用 applyTheme + localStorage，口径只有一份。
+function setTheme(next) {
+  if (next !== 'dark' && next !== 'light') return;
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* 隐私模式：仅本次会话生效 */ }
+  applyTheme(next);
+  toast('已切换到' + (next === 'dark' ? '深色' : '浅色') + '模式', 'ok');
+}
+window.setTheme = setTheme;
+
 // mountThemeToggle 挂载侧边栏的主题切换按钮（由各页 init 调用一次；幂等）。
 function mountThemeToggle() {
   if (document.getElementById('btnTheme')) { syncThemeBtn(); return; }
@@ -1458,3 +1460,615 @@ async function maybeShowAnnouncements() {
   }
 }
 
+// ======================================================================
+// v0.26.6 · 共享 UI 套件（管理后台 + 用户控制台共用，原生 DOM 无依赖）
+//
+// 这一批的取舍完全来自对 workbuddy-manager（Next.js + shadcn 面板）的对照调研，
+// 但**只吸收交互与信息结构，不引入任何框架/构建**：
+//
+//   1. 通知：单元素自动消失 → **语义化堆叠卡片**（图标 / 可关闭 / 悬停暂停 /
+//      aria-live）。旧实现的问题很具体：错误弹 2.8 秒就没了，用户切回来时
+//      根本不知道刚才失败过（而页面上的数字看起来一切正常）。
+//   2. 确认：原生 `confirm()`（不可样式化、阻塞、无 busy 态）→ **自定义对话框**。
+//      危险操作要能一眼看出"这是破坏性的"，且点击后要有"正在执行"的反馈。
+//   3. 导航：13 个菜单项靠眼睛找 → **⌘K / Ctrl+K 命令面板**（可发现性优先：
+//      右上角有一个能点的按钮，快捷键只是第二条路径）。
+//   4. 取数：失败只弹 toast → **常驻失败横幅 + 重试**（不自动消失）。
+//   5. 首屏：文字"加载中…" → **骨架屏**（形状先出现，内容后到位，避免跳动）。
+//   6. KPI：数字直接跳变 → **数字滚动**（从上一帧的数字滚到新值）。
+// ======================================================================
+
+// prefersReduced 尊重系统「减少动效」偏好。动画是锦上添花，不该对前庭敏感的人
+// 造成困扰 —— 这是无障碍要求，不是可选项。
+function prefersReduced() {
+  try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; }
+}
+
+// ---------------------------------------------------------------- ① 通知
+//
+// 兼容旧签名：toast(msg, 'ok' | 'err')。第三参可选：{ duration, sticky, action }。
+// sticky = 不自动消失（失败类提示默认更久，但不是永久 —— 永久提示请用 loadBanner）。
+const TOAST_ICON = { ok: '✓', err: '!', warn: '!', info: 'i' };
+
+function toast(msg, kind, opts) {
+  opts = opts || {};
+  let host = $('toastHost');
+  if (!host) {
+    host = el('div', 'toast-host');
+    host.id = 'toastHost';
+    // 礼貌播报：成功/信息不打断屏幕阅读器，错误用 assertive 由卡片自身声明。
+    host.setAttribute('aria-live', 'polite');
+    host.setAttribute('aria-atomic', 'false');
+    document.body.appendChild(host);
+  }
+  const card = el('div', 'toast-card ' + (kind || 'info'));
+  card.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+  card.appendChild(el('span', 'toast-ico', TOAST_ICON[kind] || TOAST_ICON.info));
+  const body = el('div', 'toast-msg');
+  body.textContent = msg == null ? '' : String(msg);
+  card.appendChild(body);
+  const x = el('button', 'toast-x', '×');
+  x.type = 'button';
+  x.setAttribute('aria-label', '关闭通知');
+  card.appendChild(x);
+  host.appendChild(card);
+
+  // 上限 5 条：再多会把右上角糊住，而且旧的那几条已经没人在读。
+  while (host.children.length > 5) host.removeChild(host.firstChild);
+
+  const ttl = Number(opts.duration) || (kind === 'err' ? 6000 : 3200);
+  const bar = el('i', 'toast-bar');
+  card.appendChild(bar);
+  if (!opts.sticky) {
+    bar.style.animationDuration = ttl + 'ms';
+    // 悬停暂停：正在读的时候被抽走是最让人恼火的一件事。
+    let left = ttl, start = Date.now(), timer = null;
+    const stop = () => { clearTimeout(timer); left -= Date.now() - start; bar.style.animationPlayState = 'paused'; };
+    const go = () => { start = Date.now(); bar.style.animationPlayState = 'running'; timer = setTimeout(dismiss, Math.max(400, left)); };
+    const dismiss = () => {
+      clearTimeout(timer);
+      if (card._gone) return;
+      card._gone = true;
+      card.classList.add('out');
+      setTimeout(() => { if (card.parentNode) card.parentNode.removeChild(card); }, 220);
+    };
+    card.addEventListener('mouseenter', stop);
+    card.addEventListener('mouseleave', go);
+    x.onclick = dismiss;
+    go();
+  } else {
+    x.onclick = () => { if (card.parentNode) card.parentNode.removeChild(card); };
+  }
+  return card;
+}
+
+// ---------------------------------------------------------------- ② 确认对话框
+//
+// confirmDialog({...}) → Promise<boolean>。
+//
+// 为什么是 Promise 而不是回调：调用点几乎全是
+//   `if (!confirm(...)) return;`
+// 的形态，返回布尔判断最自然；Promise 让它保持"看起来一样"（只是多个 await）。
+//
+// ⚠️ 调用点必须位于 async 函数内（或 .then 里）。这由 jscheck 与回归用例兜住。
+function confirmDialog(opts) {
+  opts = opts || {};
+  // 测试通道：回归框架可置 window.__autoConfirm = true 让它直接通过，
+  // 这样既有的大量流程用例不必逐个去点确认键（专用用例会显式测真实交互）。
+  if (window.__autoConfirm) return Promise.resolve(true);
+
+  return new Promise((resolve) => {
+    const back = el('div', 'dlg-back');
+    back.setAttribute('role', 'presentation');
+    const dlg = el('div', 'dlg' + (opts.danger ? ' danger' : ''));
+    dlg.setAttribute('role', 'alertdialog');
+    dlg.setAttribute('aria-modal', 'true');
+    const titleId = 'dlgTitle_' + Date.now();
+    dlg.setAttribute('aria-labelledby', titleId);
+
+    const head = el('div', 'dlg-head');
+    const h = el('div', 'dlg-title', opts.title || '确认操作');
+    h.id = titleId;
+    head.appendChild(h);
+    if (opts.danger) head.appendChild(el('span', 'tag err', '不可撤销'));
+    dlg.appendChild(head);
+
+    if (opts.message) dlg.appendChild(el('div', 'dlg-msg', opts.message));
+    if (opts.detail) dlg.appendChild(el('div', 'dlg-detail', opts.detail));
+
+    const foot = el('div', 'dlg-foot');
+    const cancel = el('button', 'ghost', opts.cancelText || '取消');
+    cancel.type = 'button';
+    cancel.setAttribute('data-dlg-cancel', '1');
+    const ok = el('button', opts.danger ? 'danger' : '', opts.confirmText || '确认');
+    ok.type = 'button';
+    ok.setAttribute('data-dlg-ok', '1');
+    foot.appendChild(cancel);
+    foot.appendChild(ok);
+    dlg.appendChild(foot);
+    back.appendChild(dlg);
+
+    let done = false;
+    const close = (val) => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      if (back.parentNode) back.parentNode.removeChild(back);
+      resolve(val);
+    };
+    // Esc 关闭：必须用捕获阶段并在关闭时移除，否则页面上其它 Esc 监听（弹窗、
+    // 命令面板）会一起响应，出现"一次 Esc 关掉两层"。
+    const onKey = (ev) => {
+      if (ev.key === 'Escape') { ev.stopPropagation(); close(false); }
+      if (ev.key === 'Enter' && ev.target && ev.target.tagName !== 'TEXTAREA') {
+        ev.preventDefault();
+        ok.click();
+      }
+    };
+    cancel.onclick = () => close(false);
+    // 遮罩点击关闭：但**只**在点遮罩本身时（点对话框内部不该关）。
+    back.onclick = (ev) => { if (ev.target === back) close(false); };
+    ok.onclick = async () => {
+      if (opts.onConfirm) {
+        ok.disabled = true;
+        cancel.disabled = true;
+        ok.textContent = opts.busyText || '执行中…';
+        try {
+          await opts.onConfirm();
+        } catch (e) {
+          // 回调自己负责报错（用 toast）；这里只把按钮恢复可用，
+          // 让用户能再试一次或取消 —— 卡在 disabled 上是最糟的结局。
+          ok.disabled = false;
+          cancel.disabled = false;
+          ok.textContent = opts.confirmText || '确认';
+          toast(e && e.message ? e.message : String(e), 'err');
+          return;
+        }
+      }
+      close(true);
+    };
+
+    document.body.appendChild(back);
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => { try { ok.focus(); } catch (e) {} }, 0);
+  });
+}
+
+// confirmAsk 是 confirmDialog 的**语法糖**：直接把原来写给原生 confirm() 的那段
+// 中文提示塞进来即可 —— 首段当标题、其余当说明（既有文案本来就是这么写的：
+// 第一句是问题、空行后是代价与后果），于是替换时**一个字都不用改文案**。
+//
+// danger 只给真正不可逆的动作（删除 / 清空 / 封禁 / 打款）；"上架 / 分配 / 设为"
+// 这类可回退的操作不该被涂成红色 —— 到处都是红色等于没有红色。
+function confirmAsk(text, opts) {
+  opts = opts || {};
+  const parts = String(text == null ? '' : text).split(/\n{2,}/);
+  const title = (parts.shift() || '确认操作').trim();
+  return confirmDialog(Object.assign({
+    title: title,
+    message: parts.join('\n\n').trim(),
+  }, opts));
+}
+
+// ---------------------------------------------------------------- ③ 命令面板（⌘K）
+//
+// 只做「跳转」，不放任何破坏性动作 —— ⌘K 的用法是"敲几个字 + 回车"，而回车前
+// 那个词往往只打了一半；把「退出登录 / 删除账号」放进来等于把最容易误触的交互
+// 接到最危险的按钮上。
+//
+// 排序**不按使用历史**：同一句查询在不同机器上给出不同结果会让"第一项是什么"
+// 变得不可预测，方向键的肌肉记忆就废了。省下那一次输入不值得。
+
+// navCommands 从侧边栏实时派生页面清单（单一事实源：菜单即清单）。
+function navCommands() {
+  const out = [];
+  let group = '';
+  for (const node of document.querySelectorAll('.nav .nav-group, .nav .nav-item')) {
+    if (node.classList.contains('nav-group')) { group = node.textContent.trim(); continue; }
+    const label = (node.textContent || '').replace(/\s+/g, '').replace(/[0-9]+$/, '').trim();
+    const nav = node.dataset.nav;
+    if (!nav) continue;
+    out.push({
+      id: 'nav:' + nav, label: label, group: group || '页面',
+      hint: (node.dataset.title || '') + ' ' + (node.dataset.sub || ''),
+      run: () => { if (typeof window.navGo === 'function') window.navGo(nav); },
+    });
+  }
+  return out;
+}
+
+// paletteSources 允许页面注册**动态**数据源（账号 / 用户 / 密钥 …）。
+// 契约：{ name, search(q) -> Promise<[{id,label,group,hint,run}]> }
+// 只在查询非空时调用，且带最短长度门槛 —— 每敲一个字就打一次接口是很容易犯的错。
+window.paletteSources = window.paletteSources || [];
+
+function openCommandPalette() {
+  if ($('paletteBack')) return;
+  const back = el('div', 'pal-bk');
+  back.id = 'paletteBack';
+  const box = el('div', 'pal');
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  box.setAttribute('aria-label', '命令面板');
+
+  const row = el('div', 'pal-row');
+  row.appendChild(el('span', 'pal-ico', '⌕'));
+  const input = el('input', 'pal-input');
+  input.id = 'palInput'; // 便于自动化用例直接定位（也是"输入框要有 id"的常规要求）
+  input.type = 'text';
+  input.placeholder = '搜索页面、账号、用户…';
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-expanded', 'true');
+  input.setAttribute('aria-controls', 'palList');
+  input.setAttribute('autocomplete', 'off');
+  row.appendChild(input);
+  const kbd = el('kbd', 'pal-kbd', 'esc');
+  row.appendChild(kbd);
+  box.appendChild(row);
+
+  const list = el('div', 'pal-list');
+  list.id = 'palList';
+  list.setAttribute('role', 'listbox');
+  box.appendChild(list);
+
+  const foot = el('div', 'pal-foot');
+  foot.appendChild(el('span', '', '↑↓ 选择 · ↵ 打开 · esc 关闭'));
+  const count = el('span', 'pal-count', '');
+  foot.appendChild(count);
+  box.appendChild(foot);
+  back.appendChild(box);
+  document.body.appendChild(back);
+
+  let items = navCommands();
+  let active = 0;
+  const dynamic = [];      // 动态结果（来自 paletteSources）
+  let dynSeq = 0;
+
+  const render = () => {
+    const all = items.concat(dynamic);
+    list.textContent = '';
+    if (!all.length) {
+      const e = el('div', 'pal-empty');
+      e.appendChild(el('div', 'pal-empty-t', '没有匹配项'));
+      e.appendChild(el('div', 'pal-empty-d', '换一个关键词，或清空后按 ↵ 展开全部页面'));
+      list.appendChild(e);
+      count.textContent = '共 0 项';
+      return;
+    }
+    if (active >= all.length) active = all.length - 1;
+    all.forEach((it, i) => {
+      const n = el('div', 'pal-item' + (i === active ? ' on' : ''));
+      n.setAttribute('role', 'option');
+      n.setAttribute('aria-selected', i === active ? 'true' : 'false');
+      n.dataset.href = it.id;
+      n.appendChild(el('span', 'pal-lb', it.label));
+      n.appendChild(el('span', 'pal-gp', it.group || ''));
+      n.onclick = () => pick(all, i);
+      // 鼠标移过就跟着高亮：否则鼠标与键盘各指一处，回车打开的是"另一条"。
+      n.onmousemove = () => { if (active !== i) { active = i; paint(); } };
+      list.appendChild(n);
+    });
+    count.textContent = '共 ' + all.length + ' 项';
+    const cur = list.querySelector('.pal-item.on');
+    // block:'nearest' 而不是 center：一次只挪一格，居中会让整个列表跟着跳。
+    scrollIntoViewNearest(cur);
+  };
+
+  // paint 只切高亮类，不重建 DOM —— 键盘连续按 ↓ 时重建会让滚动条抖动。
+  const paint = () => {
+    const nodes = list.querySelectorAll('.pal-item');
+    nodes.forEach((n, i) => {
+      n.classList.toggle('on', i === active);
+      n.setAttribute('aria-selected', i === active ? 'true' : 'false');
+    });
+    scrollIntoViewNearest(nodes[active]);
+  };
+
+  const pick = (all, i) => {
+    const it = all[i];
+    if (!it) return;
+    close();
+    if (typeof it.run === 'function') it.run();
+  };
+
+  const close = () => {
+    document.removeEventListener('keydown', onKey, true);
+    if (back.parentNode) back.parentNode.removeChild(back);
+  };
+
+  const allNow = () => items.concat(dynamic);
+
+  const onKey = (ev) => {
+    // 中文/日文输入法：回车是"确认候选词"而不是"打开这一项"。
+    // 不拦掉的话，拼音打 zhanghao 再回车会直接跳走，跳到哪一条取决于当时高亮是谁。
+    if (ev.isComposing || ev.keyCode === 229) return;
+    const n = allNow().length;
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); close(); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); if (n) { active = (active + 1) % n; paint(); } }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); if (n) { active = (active - 1 + n) % n; paint(); } }
+    else if (ev.key === 'Home') { ev.preventDefault(); active = 0; paint(); }
+    else if (ev.key === 'End') { ev.preventDefault(); active = Math.max(0, n - 1); paint(); }
+    else if (ev.key === 'Enter') { ev.preventDefault(); pick(allNow(), active); }
+  };
+
+  // 输入：同步过滤页面；动态源异步追加（带序号防乱序覆盖）。
+  const onInput = async () => {
+    const q = input.value.trim().toLowerCase();
+    // ⚠️ 必须**按得分排序**，不能只拿 matchScore 当过滤器用。
+    // 踩过的坑：搜「代理」时，候选有「代理」（标签命中，80 分）与「账号池」
+    //（只有说明里出现过"代理"，10 分）；而菜单顺序里账号池在前 —— 只过滤不排序，
+    // 回车打开的就是**账号池**，用户看到的却是自己搜的词指向另一个页面。
+    // 同分时按菜单原序（稳定），避免键盘操作的目标在两次输入间跳来跳去。
+    items = q ? navCommands()
+      .map((it, idx) => ({ it: it, score: matchScore(it, q), idx: idx }))
+      .filter((x) => x.score >= 0)
+      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+      .map((x) => x.it)
+      : navCommands();
+    active = 0;
+    if (q.length < 2) { dynamic.length = 0; render(); return; }
+    const seq = ++dynSeq;
+    const results = await Promise.all(window.paletteSources.map((s) => {
+      try { return Promise.resolve(s.search(q)).catch(() => []); } catch (e) { return Promise.resolve([]); }
+    }));
+    if (seq !== dynSeq) return; // 已有更新的查询在跑，丢弃这次的迟到结果
+    dynamic.length = 0;
+    for (const arr of results) for (const it of (arr || [])) dynamic.push(it);
+    dynamic.splice(60); // 动态结果本身也要有上限
+    render();
+  };
+
+  input.addEventListener('input', onInput);
+  document.addEventListener('keydown', onKey, true);
+  back.onclick = (ev) => { if (ev.target === back) close(); };
+  render();
+  try { input.focus(); } catch (e) {}
+}
+
+// scrollIntoViewNearest 把元素滚进视野，并做**能力检测**。
+//
+// 为什么要检：jsdom 没有实现 scrollIntoView，直接调会抛
+// "cur.scrollIntoView is not a function"，而它出现在键盘移动高亮这种
+// **高频路径**上 —— 一抛就把整个渲染打断（表现为"打开面板打字没反应"）。
+// 真实浏览器都有这个方法，所以这是纯粹的防御，不影响正常功能。
+function scrollIntoViewNearest(node) {
+  if (!node || typeof node.scrollIntoView !== 'function') return;
+  try { node.scrollIntoView({ block: 'nearest' }); } catch (e) { /* 老浏览器忽略 */ }
+}
+
+// matchScore 命中得分（越大越靠前）；-1 = 不命中。
+// 只认"子串命中"，且**标签命中优先于提示命中** —— 搜"账"时「账号池」应当排在
+// 提示里恰好也有"账"字的其它页前面。
+function matchScore(it, q) {
+  const label = String(it.label || '').toLowerCase();
+  if (label === q) return 100;
+  if (label.indexOf(q) === 0) return 80;
+  if (label.indexOf(q) >= 0) return 60;
+  if (String(it.group || '').toLowerCase().indexOf(q) >= 0) return 20;
+  if (String(it.hint || '').toLowerCase().indexOf(q) >= 0) return 10;
+  return -1;
+}
+
+// mountPaletteTrigger 在顶栏插一个**可见的**入口。
+// 快捷键只对已经知道它的人有用；这一批的目标是"可发现性"，所以必须有个能点的按钮。
+function mountPaletteTrigger() {
+  const bar = document.querySelector('.topbar .actions');
+  if (!bar || $('btnPalette')) return;
+  const b = el('button', 'ghost sm pal-trigger');
+  b.id = 'btnPalette';
+  b.type = 'button';
+  b.title = '搜索页面与数据（Ctrl/⌘ + K）';
+  b.appendChild(el('span', 'pal-trigger-ico', '⌕'));
+  b.appendChild(el('span', 'pal-trigger-t', '搜索'));
+  const k = el('kbd', 'pal-kbd', isMac() ? '⌘K' : 'Ctrl K');
+  b.appendChild(k);
+  b.onclick = openCommandPalette;
+  bar.insertBefore(b, bar.firstChild);
+}
+
+function isMac() {
+  try { return /mac|iphone|ipad|ipod/i.test(navigator.userAgent); } catch (e) { return false; }
+}
+
+// mountShortcuts 全局快捷键。
+//
+// 刻意只装三条，且都避开输入态：
+//   Ctrl/⌘+K  命令面板（浏览器自带的 Ctrl+K 会去聚焦地址栏，必须拦掉默认行为）
+//   /         聚焦当前页的搜索框（不是输入框里时才生效）
+//   Esc       关掉最上层的浮层（命令面板 / 对话框各自处理，这里兜住"焦点在输入框"的情况）
+function mountShortcuts() {
+  document.addEventListener('keydown', (ev) => {
+    const t = ev.target || {};
+    const typing = t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable;
+    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && String(ev.key).toLowerCase() === 'k') {
+      ev.preventDefault();
+      openCommandPalette();
+      return;
+    }
+    if (typing) return;
+    if (ev.key === '/') {
+      const box = document.querySelector('.pane.active input[type="text"], .pane.active input:not([type])');
+      if (box) { ev.preventDefault(); box.focus(); box.select && box.select(); }
+    }
+  });
+}
+
+// ---------------------------------------------------------------- ④ 常驻失败横幅
+//
+// 失败**不能只弹 toast**：toast 几秒后消失，用户切回来时只看到"一切正常"的数字，
+// 根本不知道刚才刷新失败过 —— 那些数字可能已经不是最新的了。
+// 横幅常驻到下一次刷新成功为止。
+// key 是**必须**传的（本轮踩过的坑）：实时概览页里「实时态势」与「号池仪表盘」
+// 两块共用同一个 .pane 作为宿主，各自成功时都会清横幅 —— 用一个共享的 banner
+// 节点，就会出现"另一块失败刷出来的横幅被这一块的成功清掉"，用户什么也看不到。
+// 按 key 隔离后，谁的横幅归谁清。
+function loadBanner(host, msg, retry, key) {
+  if (!host) return null;
+  const k = key || 'default';
+  clearLoadBanner(host, k);
+  const bar = el('div', 'load-banner');
+  bar.dataset.banner = k;
+  bar.setAttribute('role', 'status');
+  bar.appendChild(el('span', 'load-banner-ico', '!'));
+  bar.appendChild(el('span', 'load-banner-msg', msg || '本次刷新未成功，页面显示的可能不是最新数据。'));
+  if (retry) {
+    const b = el('button', 'ghost sm', '重试');
+    b.type = 'button';
+    b.onclick = () => { clearLoadBanner(host); retry(); };
+    bar.appendChild(b);
+  }
+  const x = el('button', 'toast-x', '×');
+  x.type = 'button';
+  x.setAttribute('aria-label', '关闭提示');
+  x.onclick = () => clearLoadBanner(host);
+  bar.appendChild(x);
+  host.insertBefore(bar, host.firstChild);
+  return bar;
+}
+
+function clearLoadBanner(host, key) {
+  if (!host) return;
+  const k = key || 'default';
+  for (const old of Array.from(host.querySelectorAll('[data-banner="' + k + '"]'))) {
+    if (old.parentNode) old.parentNode.removeChild(old);
+  }
+}
+
+// ---------------------------------------------------------------- ⑤ 骨架屏
+//
+// 为什么值得做：首屏从"文字 加载中…"变成"形状先出现、内容后到位"，
+// 感知速度明显更快，而且不会在数据到达时整体跳动（布局抖动比慢更难受）。
+function skeletonRows(tbody, rows, cols) {
+  if (!tbody) return;
+  tbody.textContent = '';
+  for (let i = 0; i < (rows || 3); i++) {
+    const tr = el('tr', 'skel-row');
+    for (let c = 0; c < (cols || 3); c++) {
+      const td = el('td');
+      const s = el('i', 'skel');
+      s.style.width = (35 + ((i * 7 + c * 13) % 45)) + '%';
+      td.appendChild(s);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function skeletonCards(box, n, kind) {
+  if (!box) return;
+  box.textContent = '';
+  for (let i = 0; i < (n || 3); i++) {
+    const c = el('div', 'skel-card ' + (kind || ''));
+    c.appendChild(el('i', 'skel skel-line', ''));
+    c.appendChild(el('i', 'skel skel-line short', ''));
+    c.appendChild(el('i', 'skel skel-line', ''));
+    box.appendChild(c);
+  }
+}
+
+function skeletonBlock(box, lines) {
+  if (!box) return;
+  box.textContent = '';
+  for (let i = 0; i < (lines || 3); i++) {
+    const s = el('i', 'skel skel-line');
+    s.style.width = (40 + ((i * 17) % 50)) + '%';
+    box.appendChild(s);
+  }
+}
+
+// ---------------------------------------------------------------- ⑥ KPI 数字滚动
+//
+// 增强层：**不改各页已有的赋值逻辑**，只在渲染完成后扫一遍 KPI 数字节点，
+// 从"上一次的值"滚到"这一次的值"。这样接入成本接近零，也不会引入新的一致性问题
+// （每个数字该显示什么，仍然由原来那段代码决定）。
+function animateKpiNumbers(root) {
+  const scope = root || document;
+  const nodes = scope.querySelectorAll('.kpi-card .v, [data-count]');
+  nodes.forEach((node) => {
+    // 只取**直接文本节点**：`.v` 里可能还嵌着单位 <span class="u">点</span>，
+    // 读 textContent 会得到 "12.5点"，被当成非数字而静默跳过（那就白做了）。
+    let tn = null;
+    for (const n of node.childNodes) {
+      if (n.nodeType === 3 && String(n.textContent).trim() !== '') { tn = n; break; }
+    }
+    if (!tn) return;
+    const raw = String(tn.textContent).trim();
+    if (!/^-?[\d,]+(\.\d+)?$/.test(raw)) return;
+    const to = Number(raw.replace(/,/g, ''));
+    if (!isFinite(to)) return;
+    const prev = Number(node.dataset.countPrev);
+    node.dataset.countPrev = String(to);
+    if (!isFinite(prev) || prev === to || prefersReduced()) return;
+    const dec = (raw.split('.')[1] || '').length;
+    const t0 = performance.now();
+    const dur = 420;
+    const step = (t) => {
+      const p = Math.min(1, (t - t0) / dur);
+      const e = 1 - Math.pow(1 - p, 3); // easeOutCubic
+      const v = prev + (to - prev) * e;
+      tn.textContent = v.toLocaleString('zh-CN', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+      if (p < 1) requestAnimationFrame(step);
+      else tn.textContent = to.toLocaleString('zh-CN', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+// ---------------------------------------------------------------- ⑦ 侧边栏过滤
+//
+// 菜单涨到十几个之后，"用眼睛在列表里找"开始变慢。加一个过滤框把它变成"打两个字"。
+// 分组标题在整组被过滤空时一并隐藏 —— 留着空标题会让人以为下面还有内容。
+function mountNavFilter() {
+  const nav = document.querySelector('.sidebar .nav');
+  if (!nav || $('navFilter')) return;
+  const wrap = el('div', 'nav-filter-wrap');
+  const input = el('input', 'nav-filter');
+  input.id = 'navFilter';
+  input.type = 'text';
+  input.placeholder = '过滤页面…';
+  input.setAttribute('aria-label', '过滤侧边栏页面');
+  const clear = el('button', 'nav-filter-x', '×');
+  clear.type = 'button';
+  clear.setAttribute('aria-label', '清空过滤');
+  wrap.appendChild(el('span', 'nav-filter-ico', '⌕'));
+  wrap.appendChild(input);
+  wrap.appendChild(clear);
+  nav.parentNode.insertBefore(wrap, nav);
+
+  const apply = () => {
+    const q = input.value.trim().toLowerCase();
+    clear.style.display = q ? '' : 'none';
+    let shown = 0;
+    const groupNodes = Array.from(nav.querySelectorAll('.nav-group'));
+    for (const it of Array.from(nav.querySelectorAll('.nav-item'))) {
+      const hay = ((it.textContent || '') + ' ' + (it.dataset.title || '') + ' ' + (it.dataset.sub || '')).toLowerCase();
+      const hit = !q || hay.indexOf(q) >= 0;
+      it.style.display = hit ? '' : 'none';
+      if (hit) shown++;
+    }
+    // 分组标题：整组都被过滤掉就隐藏。
+    for (const g of groupNodes) {
+      let n = 0;
+      for (let s = g.nextElementSibling; s && s.classList.contains('nav-item'); s = s.nextElementSibling) {
+        if (s.style.display !== 'none') n++;
+      }
+      g.style.display = n ? '' : 'none';
+    }
+    let hint = nav.parentNode.querySelector('.nav-filter-empty');
+    if (!shown && q) {
+      if (!hint) { hint = el('div', 'nav-filter-empty', '没有匹配的页面'); nav.parentNode.insertBefore(hint, nav.nextSibling); }
+    } else if (hint) hint.parentNode.removeChild(hint);
+  };
+  input.addEventListener('input', apply);
+  clear.onclick = () => { input.value = ''; apply(); input.focus(); };
+  clear.style.display = 'none';
+}
+
+// ---------------------------------------------------------------- ⑧ 初始化
+//
+// 两个控制台共用：顶栏按钮 + 快捷键 + 侧边栏过滤。各页只需在 init 里调一次。
+function mountUiShell() {
+  mountPaletteTrigger();
+  mountShortcuts();
+  mountNavFilter();
+}

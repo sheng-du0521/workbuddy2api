@@ -577,6 +577,16 @@ const FX = {
 
 function fixtureFor(url) {
   const u = String(url);
+  // /api/admin/users?q=xxx 真接口会按用户名子串 / ID 精确过滤。桩必须照做：
+  // 一个"忽略 q、永远返回全部"的桩，会让"搜不到 → 空态"这类用例**必然失败**
+  //（或更糟：让它假通过，因为总有一条恰好命中）。
+  const mq = /\/api\/admin\/users\?q=([^&]*)/.exec(u);
+  if (mq) {
+    const q = decodeURIComponent(mq[1]).toLowerCase();
+    const all = (FX['/api/admin/users'] || {}).users || [];
+    return { users: all.filter((x) => String(x.username || '').toLowerCase().indexOf(q) >= 0
+      || String(x.id) === q) };
+  }
   if (/\/resources(\?|$)/.test(u)) return FX.__credit;
   if (/\/task-status(\?|$)/.test(u)) return FX.__taskstatus;
   const keys = Object.keys(FX).sort((a, b) => b.length - a.length);
@@ -607,11 +617,33 @@ function run(pageFile, meOverride, plan) {
       beforeParse(win) {
         if (meOverride) FX['/api/auth/me'] = { user: meOverride };
         win.onerror = (msg, src, line, col) => errors.push('window.onerror: ' + msg + ' @' + line + ':' + col);
-        win.fetch = (url) => Promise.resolve({
-          ok: true, status: 200,
-          text: () => Promise.resolve(JSON.stringify(fixtureFor(url))),
-          json: () => Promise.resolve(fixtureFor(url)),
-        });
+        // v0.26.6：fail 列表里的路径返回 500 —— 失败路径（常驻横幅 / 重试按钮）
+        // 此前完全测不到，因为桩恒成功。"能不能扛住失败"恰恰是这批改动的主题。
+        win.__failPaths = [];
+        win.fetch = (url) => {
+          const u = String(url);
+          if (win.__failPaths.some((f) => u.indexOf(f) >= 0)) {
+            return Promise.resolve({
+              ok: false, status: 500,
+              text: () => Promise.resolve('{"error":"桩：模拟服务端故障"}'),
+              json: () => Promise.resolve({ error: '桩：模拟服务端故障' }),
+            });
+          }
+          return Promise.resolve({
+            ok: true, status: 200,
+            text: () => Promise.resolve(JSON.stringify(fixtureFor(url))),
+            json: () => Promise.resolve(fixtureFor(url)),
+          });
+        };
+        // v0.26.6：原生 confirm() 已被自定义确认框取代。
+        // __autoConfirm 让**既有流程用例**不必逐个去点确认键（它们要测的是流程，
+        // 不是弹窗）；需要真实验证弹窗的用例会把 dialog 设为 cancel/manual 关掉它。
+        win.__autoConfirm = true;
+        // jsdom 未实现 scrollIntoView（浏览器里有）。补一个空实现，
+        // 让"把它滚进视野"这类正常代码在测试环境里也能跑通。
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
         win.confirm = () => true;
         win.prompt = () => '1';
         win.alert = () => {};
@@ -652,6 +684,18 @@ function run(pageFile, meOverride, plan) {
       // 其中一种，另一种只能靠人眼 —— 而人眼恰好最容易漏掉"未开启被画成 0 条"
       // 这类误报。
       for (const [fxPath, fxVal] of (stage.fx || [])) FX[fxPath] = fxVal;
+      // dialog: 'cancel' | 'manual' —— 关掉自动确认，让自定义确认框真实渲染。
+      //   cancel → 点「取消」（验证"取消后什么都不该发生"）
+      //   manual → 保持打开（后面的断言直接看弹窗内容）
+      if (stage.dialog) win.__autoConfirm = false;
+      // fail: [pathSubstring] —— 用例级让某些接口失败（可叠加，便于"先成功后失败"）。
+      if (stage.fail) win.__failPaths = (win.__failPaths || []).concat(stage.fail);
+      // run: ['js 源码'] —— 在页面作用域里执行一小段代码。
+      // 为什么需要：像 skeletonCards / countUp 这类**纯工具函数**没有用户可点的入口，
+      // 只能直接调用；再为它们专门造一个页面入口是本末倒置。
+      for (const code of (stage.run || [])) {
+        try { win.eval(code); } catch (e) { ok = false; lines.push('[FAIL] run 抛错: ' + e.message); }
+      }
       if (stage.nav) clickNav(stage.nav);
       // click: [selector] —— 点击元素（用于打开弹窗、勾选复选框等）。
       // 复选框特殊处理：jsdom 不保证合成 click 会触发它的「激活行为」（勾选态可能不变），
@@ -683,12 +727,32 @@ function run(pageFile, meOverride, plan) {
         }
         target.dispatchEvent(new win.Event('click', { bubbles: true }));
       }
+      // press: [[selectorOrNull, key, modifiers]] —— 派发 keydown。
+      // 用来验证键盘交互（⌘K 命令面板、↑↓ 选择、Enter 打开）。
+      // selector 为 null 时发到 body（事件照常冒泡/捕获到 document）。
+      for (const [sel, key, mods] of (stage.press || [])) {
+        const target = sel ? doc.querySelector(sel) : doc.body;
+        if (!target) { ok = false; lines.push(`[FAIL] press 目标 ${sel} 不存在`); continue; }
+        const m = String(mods || '');
+        target.dispatchEvent(new win.KeyboardEvent('keydown', {
+          key: key, bubbles: true, cancelable: true,
+          ctrlKey: m.indexOf('ctrl') >= 0, metaKey: m.indexOf('meta') >= 0,
+          shiftKey: m.indexOf('shift') >= 0,
+        }));
+      }
       // input: [[id, value]] —— 给输入框赋值并派发 input 事件（验证即时过滤等交互）。
       for (const [id, value] of (stage.input || [])) {
         const inp = doc.getElementById(id);
         if (!inp) { ok = false; lines.push(`[FAIL] 输入框 #${id} 不存在`); continue; }
         inp.value = value;
         inp.dispatchEvent(new win.Event('input', { bubbles: true }));
+      }
+      // 确认框：默认（dialog 未声明或声明为其他值）自动点「确认」，
+      // 让流程用例继续往下走；dialog:'cancel' 点取消；dialog:'manual' 留给断言。
+      if (stage.dialog !== 'manual') {
+        const sel = stage.dialog === 'cancel' ? '[data-dlg-cancel]' : '[data-dlg-ok]';
+        const b = doc.querySelector(sel);
+        if (b) b.dispatchEvent(new win.Event('click', { bubbles: true }));
       }
       setTimeout(() => {
         for (const [id, want] of (stage.counts || [])) {
@@ -1189,6 +1253,94 @@ function run(pageFile, meOverride, plan) {
         // 空表单下的默认提示
         ['#annWindowPreview', '长期有效']] },
     { nav: 'settings', texts: [['setProxyGroups', '反代'], ['hostShareHint', '推广返点'], ['withdrawHint', '最小提现']] },
+
+    // ================================================================
+    // v0.26.6 · 共享 UI 套件（对照 workbuddy-manager 的交互调研结论）
+    // ================================================================
+
+    // ① 顶栏有一个**可点的**搜索入口：快捷键只对已经知道它的人有用，
+    //    这一批的目标是"可发现性"，所以入口必须是可见控件。
+    { nav: 'overview',
+      has: [['#btnPalette', 1], ['#btnPalette .pal-kbd', 1], ['#navFilter', 1]],
+      textIn: [['#btnPalette', '搜索']] },
+
+    // ② ⌘K / Ctrl+K 打开命令面板；面板列出页面（单一事实源：菜单即清单）。
+    { nav: 'overview', press: [[null, 'k', 'ctrl']],
+      has: [['#paletteBack', 1], ['#palInput', 1], ['#palList', 1],
+        ['#palList .pal-item', 15],
+        // 每项右侧带归属分组：光看名字「用户」分不清是页面还是数据行。
+        ['#palList .pal-gp', 15]],
+      textIn: [['#palList', '账号池'], ['#palList', '运行'], ['#palList', '系统']] },
+
+    // ③ 输入关键词过滤 + ↑↓ 移动 + Enter 打开（键盘全程可用）。
+    //    搜「代理」应命中「代理」页，回车后跳到该页。
+    { input: [['palInput', '代理']],
+      has: [['#palList .pal-item', 1]],
+      textIn: [['#palList', '代理']] },
+    { press: [['#palInput', 'Enter']],
+      // 回车后：面板关闭 + 已经切到代理页
+      has: [['.pane[data-pane="egress"].active', 1]],
+      absent: ['#paletteBack'] },
+
+    // ④ Esc 关闭（不跳转）
+    { press: [[null, 'k', 'ctrl']], has: [['#paletteBack', 1]] },
+    { press: [['#palInput', 'Escape']], absent: ['#paletteBack'] },
+
+    // ⑤ 搜不到时给的是"空态"而不是一片空白（要能分清"打错了"与"确实没有"）
+    { press: [[null, 'k', 'ctrl']], has: [['#paletteBack', 1]] },
+    // 输入是**异步过滤**（动态源要打接口），所以过滤结果放在下一步断言 ——
+    // 同一步里断言会读到"还没过滤完"的 DOM（这个坑本轮踩过一次）。
+    { input: [['palInput', 'zzzz不存在zzzz']] },
+    { has: [['.pal-empty', 1]],
+      textIn: [['.pal-empty', '没有匹配项'], ['.pal-count', '共 0 项']] },
+    { press: [['#palInput', 'Escape']], absent: ['#paletteBack'] },
+
+    // ⑥ 侧边栏过滤：菜单涨到十几个之后，"用眼睛在列表里找"开始变慢。
+    { nav: 'overview', input: [['navFilter', '代理']],
+      has: [['#navFilter', 1], ['#navFilter[placeholder]', 1],
+        // 过滤后只剩「代理」一项（页面标签命中）
+        ['.nav .nav-item:not([style*="display: none"])', 1]] },
+    { input: [['navFilter', '']],
+      // 后台菜单共 15 项（清空过滤后必须**全部**回来，否则就是"过滤后回不去"）
+      has: [['.nav .nav-item:not([style*="display: none"])', 15]] },
+
+    // ⑦ 确认框：原生 confirm() 已全部替换。危险操作要一眼看出是破坏性的，
+    //    且必须是**可样式化、带忙碌态**的自定义弹窗。
+    { nav: 'pool', dialog: 'manual', click: ['#accCards .ecard .pick input'] },
+    { nav: 'pool', dialog: 'manual', click: ['#btnBulkDelete'],
+      has: [['.dlg', 1], ['.dlg.danger', 1], ['[data-dlg-ok]', 1], ['[data-dlg-cancel]', 1]],
+      textIn: [['.dlg', '永久删除'], ['.dlg', '不可撤销'], ['.dlg-title', '从号池']] },
+    // 取消 → 弹窗消失且**什么都没发生**（批量选择仍在，说明没有误删）
+    { dialog: 'cancel', click: ['[data-dlg-cancel]'],
+      absent: ['.dlg-back'],
+      textIn: [['#btnBulkGroup', '已选 1']] },
+
+    // ⑧ 通知：从"单元素 2.8 秒消失"改为**堆叠卡片**（图标 / 可关闭 / 倒计时线）。
+    //    错误提示切页就找不到，是旧实现最实际的毛病。
+    { run: ["toast('第一条','ok')", "toast('第二条','err')"],
+      has: [['.toast-host', 1], ['.toast-card', 2], ['.toast-card.err', 1],
+        ['.toast-card .toast-ico', 2], ['.toast-card .toast-bar', 2],
+        ['.toast-x', 2]],
+      textIn: [['.toast-host', '第一条'], ['.toast-host', '第二条']] },
+    { run: ["document.querySelector('.toast-x').click()"],
+      has: [['.toast-card', 1]] },
+
+    // ⑨ 骨架屏：首屏用它代替"加载中…"（形状先出现，内容后到位，不跳版）。
+    { nav: 'overview',
+      run: ["skeletonCards(document.getElementById('ovKpis'), 4)"],
+      has: [['#ovKpis .skel-card', 4], ['#ovKpis .skel', 12]] },
+    // 表格骨架：用一个真实存在的 tbody（不能拿 document.body 兜底 —— 那会把
+    // 整个页面清空，后面所有用例都会以"找不到元素"失败，根因却看不出来）。
+    { nav: 'codes', run: ["skeletonRows(document.querySelector('#codeRows') || document.querySelector('.pane.active tbody'), 2, 3)"] },
+
+    // ⑩ 常驻失败横幅 + 重试：失败**不能只弹 toast**（几秒后消失，页面上的旧数字
+    //    看起来仍然可信）。这是本批最实质的一处修正。
+    { nav: 'overview', fail: ['/api/admin/live'],
+      press: [[null, 'k', 'ctrl']],
+      has: [['.load-banner', 1], ['.load-banner button', 1]],
+      textIn: [['.load-banner', '实时态势已连续'], ['.load-banner', '重试']] },
+    { nav: 'overview', press: [[null, 'Escape']],
+      has: [['.load-banner', 1]] },
   ];
   const dashPlan = [
     { nav: 'overview', counts: [['ovChart', 1], ['ovToday', 4], ['ovFeed', 1], ['ovModels', 1]],
@@ -1258,6 +1410,7 @@ function run(pageFile, meOverride, plan) {
     { click: ['#btnTheme'], has: [['html[data-theme="dark"]', 1]], textIn: [['#btnTheme', '浅色']] },
     { click: ['#btnTheme'], has: [['html[data-theme="light"]', 1]], textIn: [['#btnTheme', '深色']] },
     { nav: 'docs', texts: [['baseUrl', '/v1']] },
+
   ];
   const a = await run('admin.html', { id: 1, username: 'admin', is_admin: true }, adminPlan);
   const b = await run('dashboard.html', { id: 2, username: 'tester', is_admin: false, daily_limit: 100, daily_used: 12.5, monthly_limit: 1000, monthly_used: 800 }, dashPlan);

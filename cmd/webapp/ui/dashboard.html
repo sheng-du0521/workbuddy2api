@@ -546,6 +546,9 @@ async function loadTop() {
     setTxt('monthUsed', me.monthly_limit > 0 ? `${fmtPoints(me.monthly_used)} / ${fmtPoints(me.monthly_limit)}` : fmtPoints(me.monthly_used || 0));
     setTxt('monthNote', me.monthly_limit > 0 ? '已用 / 月限额（点）' : '无消费闸（点数）');
   }
+  // KPI 数字滚动（v0.26.6）：读已经写好的最终文本、只补过渡，上面的赋值逻辑不用改。
+  // ★ 必须在 setTxt 之后 —— 放在函数开头滚的就是上一次的值。
+  animateKpiNumbers(document.querySelector('.pane[data-pane="overview"]') || document);
 }
 
 // ======================================================================
@@ -610,7 +613,18 @@ function dailyTable(container, rows) {
 // ======================================================================
 
 async function loadOverview() {
-  await loadTop();
+  const host = document.querySelector('.pane[data-pane="overview"]');
+  try {
+    await loadTop();
+    clearLoadBanner(host, 'overview');
+  } catch (e) {
+    // 余额/用量取不到时**不能只弹 toast**：几秒后它消失，页面上的旧数字
+    // 看起来仍然可信 —— 而"余额是多少"恰恰是最不能看错的一个数。
+    loadBanner(host,
+      '概览数据加载失败（' + e.message + '）。下面的余额与用量是上一次成功的结果。',
+      loadOverview, 'overview');
+    return;
+  }
   // 公告：概览卡片随页刷新；弹窗只对「本浏览器未读」的公告触发一次。
   maybeShowAnnouncements().then(() => {
     const s = $('annStamp');
@@ -1035,10 +1049,19 @@ async function loadKeyForm() {
 }
 
 async function loadKeys() {
-  await loadKeyForm();
-  const d = await api('/api/keys');
-  keyAll = d.keys || [];
-  renderKeyCards();
+  const host = document.querySelector('.pane[data-pane="keys"]');
+  try {
+    await loadKeyForm();
+    const d = await api('/api/keys');
+    keyAll = d.keys || [];
+    renderKeyCards();
+    clearLoadBanner(host, 'keys');
+  } catch (e) {
+    // 密钥列表为空最容易被读成"我还没建过 Key"，而真相可能是接口挂了 ——
+    // 两者的下一步动作完全不同，所以必须说出来。
+    if (!keyAll.length) skeletonCards($('keyCards'), 2, 'ecard');
+    loadBanner(host, '密钥列表加载失败（' + e.message + '）。', loadKeys, 'keys');
+  }
 }
 
 // openKeyBindModal 修改既有密钥的账号范围。
@@ -1085,6 +1108,9 @@ function renderKeyCards() {
     const active = k.status === 'active';
     const host = k.kind === 'host';
     const card = el('article', 'ecard' + (active ? '' : ' dim'));
+    // data-key-id 是命令面板的落点锚（v0.26.6）：搜到密钥后跳页并高亮这一张卡。
+    // 没有它就只能"跳到密钥页"，然后让用户自己在卡片里再找一遍 —— 那等于没搜。
+    card.setAttribute('data-key-id', String(k.id));
     const head = el('header');
     head.appendChild(el('div', 'avatar ' + avatarTone(k.name || k.prefix), (k.name || 'K').charAt(0).toUpperCase()));
     const who = el('div', 'who');
@@ -1167,7 +1193,7 @@ function renderKeyCards() {
     }, '启用 ' + (k.name || '')));
     const del = el('button', 'danger', '删除');
     del.onclick = async () => {
-      if (!confirm('删除后使用该密钥的客户端会立即失效，确认？')) return;
+      if (!(await confirmAsk('删除后使用该密钥的客户端会立即失效，确认？', {danger: true, confirmText: '删除'}))) return;
       try { await api(`/api/keys/${k.id}`, { method: 'DELETE' }); loadKeys(); }
       catch (e) { toast(e.message, 'err'); }
     };
@@ -1421,7 +1447,9 @@ function hostCard(h) {
   // 入池动作
   if (h.pool_state === 'in') {
     const out = el('button', 'ghost', '退出号池');
-    out.onclick = () => { if (confirm('退出后平台将不再用该账号反代，也不再产生收益。确认？')) hostPoolAction(h.uid, 'leave'); };
+    out.onclick = async () => {
+      if (await confirmAsk('退出号池？\n\n退出后平台将不再用该账号反代，也不再产生收益。')) hostPoolAction(h.uid, 'leave');
+    };
     foot.appendChild(out);
   } else if (h.pool_state === 'pending') {
     const cancel = el('button', 'ghost', '撤回申请');
@@ -1470,7 +1498,7 @@ function hostCard(h) {
 
   const del = el('button', 'danger', '删除');
   del.onclick = async () => {
-    if (!confirm('从平台移除该代挂账号？（不影响你上游账号本身）')) return;
+    if (!(await confirmAsk('从平台移除该代挂账号？（不影响你上游账号本身）'))) return;
     try { await api('/api/host/accounts/' + encodeURIComponent(h.uid), { method: 'DELETE' }); loadHostAccounts(); }
     catch (e) { toast(e.message, 'err'); }
   };
@@ -1575,9 +1603,9 @@ function onSaleCard(a, balance, rate) {
   const b = el('button', '', '买断（' + salePriceText(a, rate) + '）');
   b.title = '按卖家挂牌价成交，从你的余额扣除';
   b.onclick = async () => {
-    if (!confirm('确认买断该账号？\n\n账号：' + (a.nickname || a.uid.slice(0, 8)) +
+    if (!(await confirmAsk('确认买断该账号？\n\n账号：' + (a.nickname || a.uid.slice(0, 8)) +
       '\n成交价：' + salePriceText(a, rate) + '\n你的余额：' + fmtPointsU(balance) +
-      '\n\n成功后账号归你所有，并进入你的代挂序列。')) return;
+      '\n\n成功后账号归你所有，并进入你的代挂序列。'))) return;
     try {
       const r = await post('/api/sale/accounts/' + encodeURIComponent(a.uid) + '/buy', {});
       toast(r.message || '买断成功', 'ok');
@@ -1639,7 +1667,7 @@ function ownedAccountCard(a, rate) {
       if (Math.abs(yuan * 100 - Math.round(yuan * 100)) > 1e-6) {
         toast('挂牌价最多两位小数', 'err'); return;
       }
-      if (!confirm('确认以 ' + fmtMoney(yuan) + ' 上架该账号？')) return;
+      if (!(await confirmAsk('确认以 ' + fmtMoney(yuan) + ' 上架该账号？'))) return;
       try {
         await post('/api/sale/accounts/' + encodeURIComponent(a.uid) + '/list',
           { action: 'list', price: yuan });
@@ -1926,10 +1954,10 @@ function hostGrowthCard(r) {
 async function hgRun(uids, label) {
   if (!uids || !uids.length) { toast('请先勾选要执行成长任务的账号', 'err'); return; }
   const who = label ? `「${label}」` : `${uids.length} 个账号`;
-  if (!confirm(`对${who}执行成长任务？\n\n`
+  if (!(await confirmAsk(`对${who}执行成长任务？\n\n`
     + '· 会向账号发起真实请求（上报 / 领奖）\n'
     + '· 已完成的会自动跳过，不会重复扣积分\n'
-    + '· 后台逐个串行，账号之间随机等待，多个账号需要较长时间')) return;
+    + '· 后台逐个串行，账号之间随机等待，多个账号需要较长时间'))) return;
   try {
     const d = await post('/api/host/growth/run', { uids });
     toast(d.note || `已开始执行 ${uids.length} 个账号`, 'ok');
@@ -2341,6 +2369,52 @@ async function refreshActive() {
   else toast('已刷新', 'ok');
 }
 
+// ======================================================================
+// 命令面板的数据源（v0.26.6）
+//
+// 面板本体在 app.js（与后台共用）。这里只登记"本控制台有哪些数据可搜"。
+// 搜到密钥即跳页 + 高亮定位 —— 省掉"翻卡片找名字"那一步。
+// ======================================================================
+window.paletteSources = (window.paletteSources || []).concat([
+  {
+    name: '密钥',
+    search: async (q) => {
+      const d = await api('/api/keys').catch(() => null);
+      const list = (d && d.keys) || [];
+      return list.filter((k) => String(k.name || '').toLowerCase().indexOf(q) >= 0)
+        .slice(0, 10).map((k) => ({
+          id: 'key:' + k.id,
+          label: k.name || ('Key #' + k.id),
+          group: '我的密钥',
+          hint: k.prefix || '',
+          run: () => {
+            if (typeof window.navGo === 'function') window.navGo('keys');
+            const card = document.querySelector('#keyCards [data-key-id="' + k.id + '"]');
+            if (card) {
+              card.scrollIntoView({ block: 'center' });
+              card.classList.add('sel');
+              setTimeout(() => card.classList.remove('sel'), 1600);
+            }
+          },
+        }));
+    },
+  },
+  {
+    name: '主题',
+    search: async (q) => {
+      const dark = '深色'.indexOf(q) >= 0 || 'dark'.indexOf(q) >= 0;
+      const light = '浅色'.indexOf(q) >= 0 || 'light'.indexOf(q) >= 0;
+      if (!dark && !light) return [];
+      return [{
+        id: 'theme:' + (dark ? 'dark' : 'light'),
+        label: dark ? '切换到深色主题' : '切换到浅色主题',
+        group: '界面',
+        run: () => { if (typeof window.setTheme === 'function') window.setTheme(dark ? 'dark' : 'light'); },
+      }];
+    },
+  },
+]);
+
 (async function init() {
   me = await requireLogin();
   if (!me) return;
@@ -2364,6 +2438,7 @@ async function refreshActive() {
   mountAccountTools(); // 「改密码」入口
 
   loadWalletMethods();
+  mountUiShell(); // v0.26.6：命令面板（⌘K）+ 全局快捷键 + 侧边栏过滤
   setupNav(document.body); // 初始页的数据加载与轮询由 onNavChange 钩子按需启动
 })();
 </script>

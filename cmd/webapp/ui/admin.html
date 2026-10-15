@@ -1668,17 +1668,30 @@ function taskPanel(model, onApply) {
 // ======================================================================
 
 async function loadLive() {
+  // 实时接口失败**不能只 console.warn**（v0.26.6）：每 3 秒一个静默失败，页面上
+  // 的数字会一直停在旧值，看起来"一切正常"，而实际上数据早就断了。
+  // 改为常驻横幅：不刷屏、不自动消失，下一次成功自动清除。
+  const host = $('ovKpis') ? $('ovKpis').parentNode : null;
   try {
     const d = await api('/api/admin/live');
     renderLive(d);
+    liveFails = 0;
+    clearLoadBanner(host, 'live');
   } catch (e) {
-    // 实时接口失败不弹 toast（每 3 秒一次会刷屏），只在忙时静默。
-    console.warn('live:', e.message);
+    liveFails++;
+    // 第一次失败就提示，之后每 10 次（约 30 秒）刷新一次文案，避免误判成"一直没好"。
+    if (liveFails === 1 || liveFails % 10 === 0) {
+      loadBanner(host, '实时态势已连续 ' + liveFails + ' 次刷新失败（' + e.message + '）——'
+        + '下面的数字是最后一次成功的数据。', loadLive, 'live');
+    }
   }
   // 号池仪表盘与实时态势同频刷新（v0.17.3：从「账号池」页迁到本页）。
   // 两个请求互不阻塞：任一失败不影响另一块照常更新。
   loadPoolDash();
 }
+
+// liveFails 连续失败计数：用于"失败多久了"的文案，以及避免每 3 秒重写一次 DOM。
+let liveFails = 0;
 
 function renderLive(d) {
   const t = d.totals || {};
@@ -1690,6 +1703,8 @@ function renderLive(d) {
   const okRate = t.requests > 0 ? Math.round((t.ok / t.requests) * 100) : 0;
 
   // ---- 概览 KPI ----
+  // 末尾统一走 animateKpiNumbers：它读**已经写好的最终文本**，只把过渡补上，
+  // 所以这里的赋值逻辑一个字都不用改。
   setTxt('ovInflight', fmtNum(d.inflight));
   setTxt('ovReq60', fmtNum(t.requests));
   setTxt('ovReq60d', `成功 ${fmtNum(t.ok)} · 失败 ${fmtNum(t.fail)}`);
@@ -1783,7 +1798,7 @@ function renderLive(d) {
 // startLive 只负责挂定时器；首次加载由导航的 data-on="loadLive" 触发。
 function startLive() {
   if (stopLive) return;
-  stopLive = poll(3000, loadLive);
+  stopLive = poll(3000, loadLive, 'live');
 }
 function stopLivePoll() {
   if (stopLive) { stopLive(); stopLive = null; }
@@ -2038,7 +2053,7 @@ function reviveActionBtn(uid, name, isRevive, onDone) {
   const btn = el('button', 'ghost sm', label);
   btn.title = tip;
   btn.onclick = async () => {
-    if (!confirm('确认对「' + (name || uid.slice(0, 8)) + '」执行「' + label + '」？\n\n' + tip)) return;
+    if (!(await confirmAsk('确认对「' + (name || uid.slice(0, 8)) + '」执行「' + label + '」？\n\n' + tip))) return;
     btn.disabled = true;
     const old = btn.textContent;
     btn.textContent = label + '中…';
@@ -2221,14 +2236,14 @@ if ($('btnHealthDeleteFailed')) $('btnHealthDeleteFailed').onclick = async () =>
   const failed = healthFailedAccounts();
   if (!failed.length) { toast('最近一次检测里没有「对话探活失败」的账号', 'err'); return; }
   const sample = failed.slice(0, 8).map((r) => (r.nickname || String(r.uid || '').slice(0, 8))).join('、');
-  if (!confirm('删除 ' + failed.length + ' 个**对话探活失败**的账号？\n\n' +
+  if (!(await confirmAsk('删除 ' + failed.length + ' 个**对话探活失败**的账号？\n\n' +
     sample + (failed.length > 8 ? ' 等' : '') + '\n\n' +
     '· 这些号余额通道可能还通，但**对话通道已被上游风控拦住**（返回 11140），\n' +
     '  留在池里只会让用户请求拿到错误\n' +
     '· 删除后**不可恢复**，剩余积分一并消失\n' +
     '· 资金流水（代挂收益 / 卖号记录）保留为历史\n' +
     '· 上游标记有可能自行解除 —— 若想先观察，请去「账号池」页勾选后「停用」\n' +
-    '  （或把 kv `pool_delete_on_11140` 设为 0，关掉自动删除）')) return;
+    '  （或把 kv `pool_delete_on_11140` 设为 0，关掉自动删除）', {danger: true, confirmText: '删除'}))) return;
   try {
     const d = await post('/api/admin/accounts/batch-delete', { uids: failed.map((r) => r.uid) });
     toast('已删除 ' + d.deleted + ' 个账号' +
@@ -2497,7 +2512,7 @@ function accountCard(a) {
 
   const del = el('button', 'danger', '删除');
   del.onclick = async () => {
-    if (!confirm('确认从号池移除该账号？')) return;
+    if (!(await confirmAsk('确认从号池移除该账号？'))) return;
     try {
       await api('/api/admin/accounts/' + encodeURIComponent(a.uid), { method: 'DELETE' });
       loadAccounts();
@@ -2521,8 +2536,8 @@ function accountCard(a) {
     ? '从用户市场下架，并恢复上架前的消耗分组'
     : '上架到用户市场：挂牌期间归属「闲置」分组（不参与平台反代）；售出后转入买家代挂序列';
   saleBtn.onclick = async () => {
-    if (!listed && !confirm('确认上架该账号到用户市场？\n\n挂牌期间该账号归属「闲置」分组，不参与平台反代消耗；下架时会恢复原分组。')) return;
-    await doAccountSale(a.uid, listed, loadAccounts);
+    if (!listed && !(await confirmAsk('确认上架该账号到用户市场？\n\n挂牌期间该账号归属「闲置」分组，不参与平台反代消耗；下架时会恢复原分组。'))) return;
+    await doAccountSale(a.uid, listed, loadAccounts, 'accounts');
   };
   foot.appendChild(saleBtn);
 
@@ -2592,10 +2607,15 @@ function renderGroupBar() {
 // loadPoolDash 拉取聚合并渲染；失败只 warn（3 秒一次，弹 toast 会刷屏）。
 async function loadPoolDash() {
   if (!$('poolKpis')) return;
+  const host = $('poolKpis').parentNode;
   try {
     renderPoolDash(await api('/api/admin/pool-dashboard'));
+    clearLoadBanner(host, 'pool');
+    // KPI 数字滚动（v0.26.6）：从上一帧的值滚到新值。只动**显示**，
+    // 不参与任何计算 —— 数字该显示什么仍由 renderPoolDash 决定。
+    animateKpiNumbers($('poolKpis'));
   } catch (e) {
-    console.warn('pool-dashboard:', e.message);
+    loadBanner(host, '号池仪表盘刷新失败（' + e.message + '）。', loadPoolDash, 'pool');
   }
 }
 
@@ -2846,6 +2866,9 @@ function renderPoolDash(d) {
   } else {
     kpis.appendChild(poolKpi('指纹隔离', '正常', { d: '各账号设备标识互异' }));
   }
+
+  // 概览 6 个 KPI 的数字滚动（必须在上面 setTxt 之后）。
+  animateKpiNumbers($('ovKpis'));
 
   const stamp = $('poolDashStamp');
   if (stamp) {
@@ -3125,6 +3148,12 @@ function renderSelectionBar() {
 }
 
 async function loadAccounts() {
+  // 首屏骨架（v0.26.6）：只在**第一次**加载时放，之后的刷新保持旧卡片 ——
+  // 每次轮询都把内容换成骨架屏，会让人误以为"数据一直没加载出来"。
+  if (!allAccounts.length && $('accCards') && !$('accCards').children.length) {
+    skeletonCards($('accCards'), 6, 'ecard');
+  }
+  const host = $('accCards') ? $('accCards').parentNode : null;
   try {
     // 账号列表与账号市场状态并行拉取：卡片上的「上架 / 下架」按钮需要知道谁在售。
     const [d, sales] = await Promise.all([
@@ -3149,10 +3178,16 @@ async function loadAccounts() {
       if (s.egress_proxy_default) parts.push('默认代理已配');
       $('selSummary').textContent = parts.length ? ('反代选号：' + parts.join(' · ')) : '反代选号：全部账号';
     } catch (_) { /* 设置读取失败不影响账号列表 */ }
+    clearLoadBanner(host, 'accounts');
     // 健康检测结果已迁到独立的「健康检测」页（v0.23.2）：本页不再拉取，
     // 该页由导航的 data-on="loadHealthLast" 驱动（与「号池仪表盘迁到实时概览」同一原则：
     // 每页只管自己那一件事，切页即取数）。
-  } catch (e) { toast(e.message, 'err'); }
+  } catch (e) {
+    // 账号列表是这一页的全部内容：失败必须常驻可见 + 可重试（toast 会飘走，
+    // 而"这页空了"很像"号池真的空了"，两者处置完全不同）。
+    loadBanner(host, '账号列表加载失败（' + e.message + '）。下面的内容可能不是最新的。', loadAccounts, 'accounts');
+    toast(e.message, 'err');
+  }
 }
 
 async function syncAccounts() {
@@ -3576,7 +3611,7 @@ function userCard(u) {
   const ban = el('button', banned ? 'ghost' : 'danger', banned ? '解封' : '封禁');
   ban.onclick = async () => {
     const next = banned ? 'active' : 'banned';
-    if (next === 'banned' && !confirm(`封禁「${u.username}」后其所有 Key 立即失效，确认？`)) return;
+    if (next === 'banned' && !(await confirmAsk(`封禁「${u.username}」后其所有 Key 立即失效，确认？`, {danger: true, confirmText: '封禁'}))) return;
     try { await post(`/api/admin/users/${u.id}/status`, { status: next }); loadUsers(); }
     catch (e) { toast(e.message, 'err'); }
   };
@@ -3768,7 +3803,7 @@ async function loadMarket() {
           const yuan = Number(String(input).trim());
           if (!Number.isFinite(yuan) || yuan <= 0) { toast('挂牌价必须大于 0', 'err'); return; }
           if (Math.abs(yuan * 100 - Math.round(yuan * 100)) > 1e-6) { toast('挂牌价最多两位小数', 'err'); return; }
-          if (!confirm('确认以 ' + fmtMoney(yuan) + ' 上架该账号？\n\n挂牌期间该账号归属「闲置」分组，不参与平台反代消耗；下架时会恢复原分组。')) return;
+          if (!(await confirmAsk('确认以 ' + fmtMoney(yuan) + ' 上架该账号？\n\n挂牌期间该账号归属「闲置」分组，不参与平台反代消耗；下架时会恢复原分组。'))) return;
           try {
             await post('/api/admin/accounts/' + encodeURIComponent(a.uid) + '/sale', { action: 'list', price: yuan });
             toast('已上架（归属闲置分组）', 'ok');
@@ -3809,11 +3844,18 @@ async function loadMarket() {
 }
 
 async function loadUsers() {
+  if (!allUsers.length && $('userCards') && !$('userCards').children.length) {
+    skeletonCards($('userCards'), 4, 'ecard');
+  }
+  const host = $('userCards') ? $('userCards').parentNode : null;
   try {
     const d = await api('/api/admin/users');
     allUsers = d.users || [];
     renderUsers();
-  } catch (e) { toast(e.message, 'err'); }
+    clearLoadBanner(host, 'users');
+  } catch (e) {
+    loadBanner(host, '用户列表加载失败（' + e.message + '）。', loadUsers, 'users');
+  }
 }
 
 // 搜索框：输入即时过滤（前端过滤，无网络往返）。
@@ -4662,8 +4704,8 @@ if ($('btnSaveDevice')) $('btnSaveDevice').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 if ($('btnClearDeviceToken')) $('btnClearDeviceToken').onclick = async () => {
-  if (!confirm('清除全局设备凭证？\n\n清除后，没有自带 device_token 的账号出站将不再注入 X-Device-Token。\n' +
-    '（若凭证由环境变量提供，清除无效。）')) return;
+  if (!(await confirmAsk('清除全局设备凭证？\n\n清除后，没有自带 device_token 的账号出站将不再注入 X-Device-Token。\n' +
+    '（若凭证由环境变量提供，清除无效。）'))) return;
   try {
     await post('/api/admin/settings', { device_token: '' });
     toast('全局设备凭证已清除', 'ok');
@@ -5028,7 +5070,7 @@ function renderWdFilter() {
 async function reviewWithdraw(id, approve) {
   let note = '';
   if (approve) {
-    if (!confirm('确认通过并打款？将即时扣减该用户余额。')) return;
+    if (!(await confirmAsk('确认通过并打款？将即时扣减该用户余额。', {danger: true, confirmText: '确认打款'}))) return;
     note = prompt('打款备注（可留空，如流水号）', '') || '';
   } else {
     note = prompt('驳回原因（可留空）', '') || '';
@@ -5354,8 +5396,8 @@ function openImportDialog() {
         const force = el('button', 'danger', '仍要导入（跳过防关联门禁）');
         force.style.marginTop = '8px';
         force.onclick = async () => {
-          if (!confirm('跳过门禁会让这批新号与上一批共用同一个出口 IP ——\n' +
-            '正是「批量导入」这一类最容易被上游聚类的形态。\n\n确定要继续吗？（会记 WARN 日志）')) return;
+          if (!(await confirmAsk('跳过门禁会让这批新号与上一批共用同一个出口 IP ——\n' +
+            '正是「批量导入」这一类最容易被上游聚类的形态。\n\n确定要继续吗？（会记 WARN 日志）'))) return;
           force.disabled = true;
           try {
             const d2 = await post('/api/admin/accounts/import-desktop', { json: v, force: true });
@@ -5489,7 +5531,7 @@ $('btnBulkGroup').onclick = async () => {
   const scope = usingSel ? sel : visibleAccounts();
   if (!scope.length) { toast('当前筛选下没有账号', 'err'); return; }
   const scopeText = usingSel ? ('已勾选的 ' + scope.length + ' 个账号') : ('当前筛选出的 ' + scope.length + ' 个账号');
-  if (!confirm('把' + scopeText + '的消耗分组设为「' + label + '」？')) return;
+  if (!(await confirmAsk('把' + scopeText + '的消耗分组设为「' + label + '」？'))) return;
   try {
     const d = await post('/api/admin/accounts/consume-group/batch', { uids: scope.map((a) => a.uid), group: g });
     toast('已更新 ' + d.updated + ' 个账号 → ' + (d.group_label || label), 'ok');
@@ -5507,12 +5549,12 @@ $('btnBulkDelete').onclick = async () => {
   const sel = allAccounts.filter((a) => selectedUIDs.has(a.uid));
   if (!sel.length) { toast('请先勾选要删除的账号（本操作只作用于勾选项）', 'err'); return; }
   const names = sel.slice(0, 8).map((a) => (a.nickname || String(a.uid || '').slice(0, 8))).join('、');
-  if (!confirm('从号池**永久删除**以下 ' + sel.length + ' 个账号？\n\n' +
+  if (!(await confirmAsk('从号池**永久删除**以下 ' + sel.length + ' 个账号？\n\n' +
     names + (sel.length > 8 ? (' 等 ' + sel.length + ' 个') : '') + '\n\n' +
     '· 删除后**不可恢复**（没有回收站）\n' +
     '· 账号的剩余积分一并消失\n' +
     '· 资金流水（代挂收益 / 卖号记录）会保留为历史，便于对账\n' +
-    '· 若只是暂时不能用（冷却 / 被风控），请改用「停用」而不是删除')) return;
+    '· 若只是暂时不能用（冷却 / 被风控），请改用「停用」而不是删除', {danger: true, confirmText: '删除'}))) return;
   try {
     const d = await post('/api/admin/accounts/batch-delete', { uids: sel.map((a) => a.uid) });
     toast('已删除 ' + d.deleted + ' 个账号' +
@@ -5529,10 +5571,10 @@ $('btnBulkDelete').onclick = async () => {
 async function runGrowth(uids, label) {
   if (!uids || !uids.length) { toast('请先勾选要执行成长任务的账号', 'err'); return; }
   const who = label ? ('「' + label + '」') : (uids.length + ' 个账号');
-  if (!confirm('对' + who + '执行成长任务？\n\n' +
+  if (!(await confirmAsk('对' + who + '执行成长任务？\n\n' +
     '· 会向账号发起真实上报 / 领奖请求（幂等：已完成的自动跳过，不会重复扣资源）\n' +
     '· 后台逐个串行执行，账号之间随机等待，多个账号需要较长时间\n' +
-    '· 进度与结果见「执行台账」里的成长任务记录')) return;
+    '· 进度与结果见「执行台账」里的成长任务记录'))) return;
   try {
     const d = await post('/api/admin/growth/run', { uids });
     toast(d.note || ('已开始执行 ' + uids.length + ' 个账号'), 'ok');
@@ -5871,7 +5913,7 @@ if ($('btnFpSampleRefresh')) $('btnFpSampleRefresh').onclick = async () => {
 if ($('btnFpSampleClear')) {
   $('btnFpSampleClear').onclick = async () => {
     const m = $('fpSampleMsg');
-    if (!confirm('确认清空样本文件？\n\n这是本程序唯一会落盘的请求内容片段，清掉后不可恢复。')) return;
+    if (!(await confirmAsk('确认清空样本文件？\n\n这是本程序唯一会落盘的请求内容片段，清掉后不可恢复。', {danger: true, confirmText: '清空'}))) return;
     try {
       const r = await api('/api/admin/fingerprint-samples', { method: 'DELETE' });
       if (m) { m.textContent = '已清空（释放 ' + fmtBytes(r.removed_bytes || 0) + '）'; m.style.color = 'var(--ok)'; }
@@ -6623,7 +6665,7 @@ function egrCard(p) {
 
   const del = el('button', 'danger', '删除');
   del.onclick = async () => {
-    if (!confirm('确认从线路池移除「' + (p.name || p.url) + '」？\n已绑定该出口的账号不会被改动（仍继续用这条线路）；如需解绑请另行分配。')) return;
+    if (!(await confirmAsk('确认从线路池移除「' + (p.name || p.url) + '」？\n已绑定该出口的账号不会被改动（仍继续用这条线路）；如需解绑请另行分配。'))) return;
     try {
       await api('/api/admin/egress/proxies?id=' + encodeURIComponent(p.id), { method: 'DELETE' });
       toast('已移除', 'ok');
@@ -6780,7 +6822,7 @@ $('btnEgrApply').onclick = async () => {
   try {
     const body = await egrAssignBody(false);
     if (!body) return;
-    if (!confirm('确认执行分配？将改写 ' + (body.all ? '全部' : '所选范围') + '账号的出口，并立即重同步号池。')) return;
+    if (!(await confirmAsk('确认执行分配？将改写 ' + (body.all ? '全部' : '所选范围') + '账号的出口，并立即重同步号池。'))) return;
     const d = await post('/api/admin/egress/pool/assign', body);
     renderEgressPlan(d, false);
     toast('已分配 ' + d.assigned + ' 个账号到 ' + d.proxies_used + ' 条线路', 'ok');
@@ -6805,7 +6847,7 @@ async function egrSetDirect(mode) {
       body.consume_group = v.slice(5);
     }
     const label = mode === 'clear' ? '清空出口（跟随全局默认）' : '设为直连（不走任何代理）';
-    if (!confirm('确认把所选范围内账号' + label + '？')) return;
+    if (!(await confirmAsk('确认把所选范围内账号' + label + '？'))) return;
     const d = await post('/api/admin/egress/assign', body);
     renderEgressPlan(d, false);
     toast('已' + label + '：' + d.assigned + ' 个账号', 'ok');
@@ -7019,7 +7061,7 @@ function renderAnnounceCards() {
     foot.appendChild(edit);
     const del = el('button', 'danger', '删除');
     del.onclick = async () => {
-      if (!confirm('删除后该公告立即从用户侧消失，且不可恢复。确认删除？')) return;
+      if (!(await confirmAsk('删除后该公告立即从用户侧消失，且不可恢复。确认删除？', {danger: true, confirmText: '删除'}))) return;
       try {
         await api(`/api/admin/announcements/${a.id}`, { method: 'DELETE' });
         if (annEditingID === a.id) cancelAnnEdit();
@@ -7133,11 +7175,11 @@ if ($('btnWarmCredit')) $('btnWarmCredit').onclick = async () => {
   const picked = Array.from(selectedUIDs);
   const scope = picked.length ? ('勾选的 ' + picked.length + ' 个账号') : '全部账号';
   if (picked.length) {
-    if (!confirm('将对' + scope + '逐个（串行）查询积分明细并缓存，\n' +
-      '约需 ' + (picked.length * 0.8).toFixed(0) + ' 秒。不改账号状态、不消耗积分。继续？')) return;
+    if (!(await confirmAsk('将对' + scope + '逐个（串行）查询积分明细并缓存，\n' +
+      '约需 ' + (picked.length * 0.8).toFixed(0) + ' 秒。不改账号状态、不消耗积分。继续？'))) return;
   } else {
-    if (!confirm('将对' + scope + '逐个（串行）查询积分明细并缓存。\n' +
-      '账号多时需要一两分钟，期间不要反复点击。不改账号状态、不消耗积分。继续？')) return;
+    if (!(await confirmAsk('将对' + scope + '逐个（串行）查询积分明细并缓存。\n' +
+      '账号多时需要一两分钟，期间不要反复点击。不改账号状态、不消耗积分。继续？'))) return;
   }
   const btn = $('btnWarmCredit');
   const old = btn.textContent;
@@ -7175,6 +7217,72 @@ if ($('annDuration')) $('annDuration').addEventListener('change', annWindowHintP
 annWindowHintPreview();
 
 // ======================================================================
+// 命令面板的数据源（v0.26.6）
+//
+// 面板本身在 app.js 里（两个控制台共用）；这里只登记"本控制台有哪些数据可搜"。
+// 契约：{ name, search(q) -> Promise<[{id,label,group,hint,run}]> }
+//
+// 跳转后**把关键词写进目标页的搜索框**：只跳页不填词的话，用户还得到几十张卡里
+// 再找一遍 —— 那就白搜了。
+// ======================================================================
+window.paletteSources = (window.paletteSources || []).concat([
+  {
+    name: '账号',
+    search: async (q) => {
+      const d = await api('/api/admin/accounts').catch(() => null);
+      const list = (d && d.accounts) || [];
+      return list.filter((a) => {
+        const hay = ((a.nickname || '') + ' ' + (a.uid || '') + ' ' + (a.host_note || '')).toLowerCase();
+        return hay.indexOf(q) >= 0;
+      }).slice(0, 12).map((a) => ({
+        id: 'acc:' + a.uid,
+        label: (a.nickname || a.uid.slice(0, 8)),
+        group: '账号池',
+        hint: a.uid,
+        run: () => {
+          if (typeof window.navGo === 'function') window.navGo('pool');
+          const box = $('accQuery');
+          if (box) { box.value = a.uid.slice(0, 8); box.dispatchEvent(new Event('input', { bubbles: true })); }
+        },
+      }));
+    },
+  },
+  {
+    name: '用户',
+    search: async (q) => {
+      const d = await api('/api/admin/users?q=' + encodeURIComponent(q)).catch(() => null);
+      const list = (d && d.users) || [];
+      return list.slice(0, 12).map((u) => ({
+        id: 'user:' + u.id,
+        label: u.username,
+        group: '用户',
+        hint: 'ID ' + u.id,
+        run: () => {
+          if (typeof window.navGo === 'function') window.navGo('users');
+          const box = $('userSearch');
+          if (box) { box.value = u.username; box.dispatchEvent(new Event('input', { bubbles: true })); }
+        },
+      }));
+    },
+  },
+  // 主题切换做成命令：⌘K 里打 "深色 / 浅色" 就能切，省掉一次"去设置页找开关"。
+  {
+    name: '主题',
+    search: async (q) => {
+      const dark = '深色'.indexOf(q) >= 0 || 'dark'.indexOf(q) >= 0;
+      const light = '浅色'.indexOf(q) >= 0 || 'light'.indexOf(q) >= 0;
+      if (!dark && !light) return [];
+      return [{
+        id: 'theme:' + (dark ? 'dark' : 'light'),
+        label: dark ? '切换到深色主题' : '切换到浅色主题',
+        group: '界面',
+        run: () => { if (typeof window.setTheme === 'function') window.setTheme(dark ? 'dark' : 'light'); },
+      }];
+    },
+  },
+]);
+
+// ======================================================================
 // 启动
 // ======================================================================
 
@@ -7197,6 +7305,7 @@ annWindowHintPreview();
   mountAccountTools(); // 「改密码」入口
   mountEgrTabs();      // 代理页子区（出口代理 / 账号代理 / 去哪弄代理）
 
+  mountUiShell(); // v0.26.6：命令面板（⌘K）+ 全局快捷键 + 侧边栏过滤
   setupNav(document.body); // 初始页的实时轮询由 onNavChange 钩子按需启动
 
   // 版本更新提醒（v0.26.5 恢复）：进后台就查一次，让「设置」上的徽标立即可见 ——
