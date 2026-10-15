@@ -33,15 +33,44 @@ package pool
 
 import "time"
 
-// clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
-// reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// clearCoolingLocked 清**全部**冷却域：账号级（until/coolKind/reason/softStreak）
+// 与模型级（modelCooldowns）一起归零。熔断器不属冷却域，不动。
+//
+// 只用于「账号退出选号」的终态迁移（disableLocked）与**人工**启用
+// （ReviveDisabled）——这两种场景下"这个号完全不用了 / 运维宣布它可用"是明确的，
+// 残留的模型级冷却只会造成"点了启用却没反应"。
+//
+// ⚠️ **签到的余额解冻（reviveCoolingLocked）不要走这里**，用
+// clearAccountCoolingLocked —— 理由见其注释（v0.31.0 修正）。
 // 调用方必须已持有 p.mu。
 func (e *entry) clearCoolingLocked() {
+	e.clearAccountCoolingLocked()
+	e.modelCooldowns = nil // 账号退出选号 / 人工启用：模型级独立冷却一并作废
+}
+
+// clearAccountCoolingLocked 只清**账号级**冷却域（until/coolKind/reason/softStreak），
+// **保留** modelCooldowns（6004/11102 的 (账号, 模型) 独立冷却）。
+//
+// 为什么必须拆出这一层（v0.31.0 实测缺陷）：reviveCoolingLocked 此前调
+// clearCoolingLocked，而它的唯一生产调用者是 ReenableIfCredits —— 该函数被
+// 「每日签到（每个在池账号、含冷却中的号）」「健康检测探测成功」「代挂刷新余额」
+// **无条件**调用。于是任何一次余额刷新都会把整个模型的 6004 冷却表清空：
+//
+//	09:00 签到 → 清空 → 10:00 请求同一模型 → 重新调度到该号 → 又撞 6004
+//
+// 后果有两层：① 上游明说的重置墙钟被无视，冷却实际被截断到"距下次签到/探活的
+// 间隔"（v0.26.5 把模型级上限提到 24h 的意义被抵消）；② 每次清空都放行一批
+// 必然失败的请求（用户侧多一次失败、上游多一条风控痕迹）。
+//
+// 语义依据：签到只证明**余额通道**通了，既没有证明 chat 通道可用，更没有证明
+// 「这个模型没被限流」。而连 NoteSuccess（强得多的证据：该号刚刚真的服务成功，
+// 且**就是**在 chat 通道上）都刻意不碰 modelCooldowns —— 见其注释
+// 「其他模型成功不得抹掉本模型的冷却截止」。更弱的证据没有理由清得更狠。
+func (e *entry) clearAccountCoolingLocked() {
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
 }
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
@@ -60,16 +89,18 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	p.dirty.Store(true)
 }
 
-// reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
-// 并更新 credits，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。
+// reviveCoolingLocked 清**账号级**冷却域（until/coolKind/reason/softStreak）并更新
+// credits，不动熔断器（fails/retryCount/breakerUntil），也不动 modelCooldowns（v0.31.0）。
+// 签到解冻走这里：签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，
+// 熔断（连续 5xx 信号）不应被签到覆盖；同理，它也不构成「这个模型没被限流」的证据 ——
+// 模型级冷却有上游给的重置墙钟，由自身 Until 到期（或人工启用）回收，见
+// clearAccountCoolingLocked 的注释。
 // softStreak 属冷却域（与 until/coolKind 同域），随冷却一并清零——与「解冻只清冷却
 // 不清熔断」的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
 // 历史软冷却累积。调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.credits = credits
-	e.clearCoolingLocked()
+	e.clearAccountCoolingLocked()
 }
 
 // setManualDisabledLocked 手动停用迁移（运维入口）：只置 manualDisabled + 原因，

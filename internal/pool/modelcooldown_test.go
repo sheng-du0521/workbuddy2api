@@ -208,17 +208,37 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
-func TestModelCooldownsClearedByRevive(t *testing.T) {
+// TestModelCooldownsPreservedByRevive 签到解冻（reviveCoolingLocked）**不得**清模型级
+// 6004 冷却。
+//
+// v0.31.0 语义修正（原断言为 "revive 后 modelCooldowns 必须为 0"，已证伪）：
+// reviveCoolingLocked 的唯一生产调用者是 ReenableIfCredits，而它被「每日签到
+// （遍历全部在池账号，含冷却中的号）」「健康检测探测成功」「代挂刷新余额」三处
+// **无条件**调用。原语义下任何一次余额刷新都会把整张模型冷却表清空，于是上游明说的
+// 重置墙钟被无视（冷却实际被截断到"距下次签到的间隔"），并且每次清空都放行一批
+// 必然失败的请求。详见 transition.go clearAccountCoolingLocked 的注释。
+//
+// 断言同时覆盖"账号级冷却仍应被解冻"（签到解冻的本职不能被这次修正带走）。
+func TestModelCooldownsPreservedByRevive(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
+	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")
+	resetAt := time.Now().Add(time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, resetAt, "glm-5.3", "6004")
 	p.ReenableIfCredits("u1", 500)
+
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Errorf("账号级冷却应被签到解冻（until=%v kind=%v）", st.Until, st.CoolKind)
+	}
 	p.mu.RLock()
-	n := len(p.byUID["u1"].modelCooldowns)
+	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("revive 后 modelCooldowns=%d want 0", n)
+	if !ok {
+		t.Fatal("签到解冻不得清除模型级 6004 冷却（冷却会被截断到下次签到，期间必然失败）")
+	}
+	if d := mc.Until.Sub(resetAt); d < -time.Second || d > time.Second {
+		t.Errorf("模型级 Until=%v 应对齐上游重置墙钟 %v", mc.Until, resetAt)
 	}
 }
 

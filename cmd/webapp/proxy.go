@@ -623,6 +623,27 @@ func (p *Proxy) recentlyHit(uid string) bool {
 	return last > 0 && time.Since(time.Unix(last, 0)) < gap
 }
 
+// noteChatSuccess 一次「账号真的服务成功」的统一记账（v0.31.0）。
+//
+// 两件事必须同进同出，故收在一个入口里：
+//   - NoteSuccess：清失败/熔断等运行态阻塞位；
+//   - BlockModelClear：清该 (账号, 模型) 的 11102「该后端无此模型」负缓存 ——
+//     **这一步此前只在旧网关有**（internal/server/handler.go），webapp 侧一直缺，
+//     于是 webapp 记下的 11102 条目只能等 TTL（6h 起、封顶 24h）自然到期。
+//     过去它被"签到解冻会清空整张模型冷却表"这个副作用掩盖着；v0.31.0 修掉那个
+//     副作用之后，这条**设计好的**恢复路径必须真的存在（否则 11102 条目再没有
+//     提前解除的手段 —— 见 transition.go clearAccountCoolingLocked）。
+//
+// 只清 11102 条目（按 reason 前缀识别），6004 的独立冷却不受影响：6004 有上游给的
+// 重置墙钟，一次成功不该把它抹掉（见 pool.NoteSuccess 注释）。
+//
+// 触发场景是**并发窗口**：11102 条目可能由另一个请求在本次选号之后写入，而本次
+// 请求其实成功了 —— 不清的话一个陈旧的"后端无此模型"会把该模型挡满整个 TTL。
+func (p *Proxy) noteChatSuccess(uid, model string) {
+	p.pool.NoteSuccess(uid)
+	p.pool.BlockModelClear(uid, model)
+}
+
 // noteHit 记账「该账号刚被用于一次请求」，供节流判定。
 func (p *Proxy) noteHit(uid string) {
 	p.hitMu.Lock()
@@ -1334,7 +1355,7 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		p.pool.NoteSuccess(au.UID)
+		p.noteChatSuccess(au.UID, model)
 		p.noteHit(au.UID) // 记账复用时刻，供最小复用间隔节流
 		// 响应头透出实际服务的账号（对齐 cmd/server，v0.17.5 补齐）：
 		//   - 排障时直接看到「这次是谁在答」；

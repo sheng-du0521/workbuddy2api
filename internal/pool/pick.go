@@ -37,8 +37,10 @@ func (p *Pool) Pick(model string) *auth.Auth {
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效；PickExcluding 传 ""）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域；PickExcluding 传 ""）。
-// 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
-// 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
+// 注意：模型豁免进 normal 选号（候选 healthyForModel 判定），兜底则**排除**对该模型
+// 正在冷却的账号（v0.31.0）—— 兜底是"全池都不可用"时的降级，它探测的是**账号级**
+// 冷却能否放开；把请求发给一个"对该模型正处于 6004 冷却"的号，探测的维度是错的，
+// 结果只有一种：必然失败的那一次请求 + 又一条上游风控痕迹。宁可提前 503。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -69,8 +71,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底；
+		// 对**本请求模型**正在模型级冷却的账号同样排除（v0.31.0，见函数注释）。
+		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
@@ -279,11 +282,21 @@ func (p *Pool) pickRoundRobinLocked(cands []*entry, now time.Time) *entry {
 	return cands[0] // 全部在防撞号窗口内：取最久未用者
 }
 
-// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
+// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个，
+// 并排除对该 reqModel 正在模型级冷却（6004/11102）的账号（v0.31.0）。
+//
+// 为什么排除：本函数选出来的号**一定**在账号级冷却中，发给它本身就是一次半开探测
+// （期望"冷却已过期/上游已放开"）。但模型级冷却与账号级是**两个正交维度** —— 一个
+// 号完全可能"账号级冷却刚到期"、"该模型却还有 8 小时才重置"。此时把它选出来，等于
+// 用一个注定失败的请求去探测一个已经知道答案的问题（我们把答案就记在
+// modelCooldowns 里）。返回 nil（→ 上层 503）比发一次必然失败的请求更诚实：
+// 前者客户端立刻知道要等，后者要等一个完整的上游往返 + 换号退避。
+//
+// 注意它并不减少"可服务账号"：对**其他**模型正在冷却的号照常参与兜底。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -291,6 +304,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if realm != "" && e.a.Realm() != realm {
 			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
+		}
+		if e.modelCooled(now, reqModel) {
+			continue // 该模型仍在模型级冷却：探测维度不对，见函数注释（v0.31.0）
 		}
 		if e.disabled || e.manualDisabled {
 			continue // 禁用/手动停用的账号永不参与兜底

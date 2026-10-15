@@ -186,11 +186,17 @@ func (p *Pool) ManualDisabledState(uid string) (disabled bool, reason string, ok
 	return e.manualDisabled, e.manualReason, true
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却域（余额恢复）。
-// 迁移经 transition.reviveCoolingLocked：只清冷却域（until/coolKind/softStreak/
-// modelCooldowns）并更新 credits，不动熔断器（fails/retryCount/breakerUntil）——
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。remain==0 或禁用时只更新 credits（不动冷却/禁用）。
+// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清**账号级**冷却域
+// （余额恢复）。迁移经 transition.reviveCoolingLocked：清 until/coolKind/softStreak/
+// reason 并更新 credits，**不动** modelCooldowns（v0.31.0 修正），不动熔断器
+// （fails/retryCount/breakerUntil）—— 签到成功只证明余额恢复与 billing 通道健康，
+// 不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖；同理它也不构成
+// 「这个模型没被限流」的证据，模型级冷却由自身 Until 或人工启用回收。
+// remain==0 或禁用时只更新 credits（不动冷却/禁用）。
+//
+// ⚠️ 本函数被三处**无条件**调用（定时签到遍历全部在池账号 / 健康检测探测成功 /
+// 代挂刷新余额），所以它对冷却域的每一次"多清一点"都会被放大成周期性行为 ——
+// 加字段前先想清楚"余额通了"能否证明该字段可以放行。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

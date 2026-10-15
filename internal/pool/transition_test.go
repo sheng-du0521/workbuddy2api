@@ -132,11 +132,16 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	}
 }
 
-// TestTransitionReviveClearsCoolingKeepsBreaker reviveCoolingLocked（签到解冻）语义：
-// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 更新 credits，不动熔断。
-// 既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例一次性断言完整
-// 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
-func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+// TestTransitionReviveClearsAccountCoolingKeepsModelAndBreaker reviveCoolingLocked
+// （签到解冻）语义：清**账号级**冷却域（until/coolKind/reason/softStreak）+ 更新 credits，
+// 不动熔断器，也**不**动模型级冷却（modelCooldowns）。
+//
+// v0.31.0 语义修正：原用例断言"modelCooldowns 也必须清 0"。该断言把一个真实缺陷
+// 规格化了 —— ReenableIfCredits 是**无条件**周期调用（签到遍历全部在池账号 / 探活 /
+// 代挂刷新余额），所以"清模型冷却"等于"每次余额同步都把上游给的模型重置墙钟抹掉"。
+// 模型级冷却由自身 Until 到期或**人工**启用来回收（见 modelcooldown_dispatch_test.go
+// 的两条用例）；签到解冻只负责账号级。
+func TestTransitionReviveClearsAccountCoolingKeepsModelAndBreaker(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	// 冷却域：软冷却 + 6004 模型级冷却（softStreak 累计）。
@@ -153,9 +158,13 @@ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
 		t.Errorf("revive 后 credits=%d want 700", st.Credits)
 	}
 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
-	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
-		t.Errorf("revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
-			until, kind, reason, streak, mc)
+	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 {
+		t.Errorf("revive 应清账号级冷却域：until=%v kind=%v reason=%q streak=%d",
+			until, kind, reason, streak)
+	}
+	if mc != 1 {
+		t.Errorf("revive 不得清模型级独立冷却：modelCooldowns=%d want 1"+
+			"（它只由自身 Until 到期或人工启用来回收）", mc)
 	}
 	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {
 		t.Fatal("revive 不得清熔断（chat 通道健康未证明）")
