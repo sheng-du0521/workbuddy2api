@@ -662,6 +662,15 @@ func frameGatewayHint(hintFn func(string) string, payload string) string {
 	return strings.TrimSpace(hintFn(payload))
 }
 
+// AttachHintToErrorFrame 在 error 帧 payload 的 error 对象上附加 gateway_hint 字段并返回
+// 新 payload（v0.31.5 导出：webapp 自己的流实现也要附加同一字段，不能让第二个产品
+// 各写一份"往 error 对象里塞键"的逻辑）。原文不动：message/code/requestId 等键原样保留。
+//
+// 非 JSON / 无 error 对象 → **原样返回**（调用方据此判定"没改写"，宁可不加 hint 也不破坏原文）。
+func AttachHintToErrorFrame(payload, hint string) string {
+	return attachHintToErrorFrame(payload, hint)
+}
+
 // attachHintToErrorFrame 在 error 帧的 error 对象上附加 gateway_hint 字段。
 // message/code/requestId 等既有键原样保留（只加不改）；非 JSON / 无 error 对象 →
 // payload 原样返回（宁可不加 hint 也不破坏原文透传）。

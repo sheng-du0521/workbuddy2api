@@ -23,9 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create config.json for build
-        run: cp config.example.json config.json
-
       # setup-qemu 必须在 setup-buildx 之前：buildx 多架构依赖 QEMU 跨平台模拟。
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -61,12 +58,12 @@ jobs:
       - name: Export offline tarball (amd64)
         run: |
           docker buildx build --platform linux/amd64 --file Dockerfile \
-            --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar .
-          gzip -f wb2api-amd64.tar
+            --tag workbuddy2api:offline --output type=docker,dest=workbuddy2api-amd64.tar .
+          gzip -f workbuddy2api-amd64.tar
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wb2api-amd64
-          path: wb2api-amd64.tar.gz
+          name: workbuddy2api-amd64
+          path: workbuddy2api-amd64.tar.gz
           if-no-files-found: error

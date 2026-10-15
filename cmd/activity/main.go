@@ -20,7 +20,7 @@
 // 加载 auths 后构建 pool + upstream，调用 scheduler.RunActivityNow 立即执行一次。
 //
 // schedule 段复用 internal/config 的同一份 Schedule 结构 + 默认值（issue #49）：
-// 与 cmd/server 共用，缺省 activity_report_count=5 不再各自复制漂移。
+// 与旧网关（cmd/server，已于 v0.31.5 删除）共用过同一份默认值，避免各自复制漂移。
 package main
 
 import (
@@ -38,7 +38,7 @@ import (
 )
 
 // cfgFile 只取本工具需要的字段；Schedule 段直接用 internal/config.Schedule
-// （与 cmd/server 同源），其余段保持精简内联。
+// （与旧网关同源的缺省处理），其余段保持精简内联。
 type cfgFile struct {
 	AuthDir   string          `json:"auth_dir"`
 	StateFile string          `json:"state_file"`
@@ -60,7 +60,7 @@ func main() {
 		log.Fatalf("read config: %v", err)
 	}
 	// 先置默认值再 Unmarshal：键缺席（或为 null）时字段原样保留默认，
-	// 与 cmd/server 的 Load 同路——缺省 activity_report_count=5 而非 Go 零值 0。
+	// 与旧网关的 Load 同路（历史口径）——缺省 activity_report_count=5 而非 Go 零值 0。
 	c := cfgFile{Schedule: config.DefaultSchedule()}
 	if err := json.Unmarshal(raw, &c); err != nil {
 		log.Fatalf("parse config: %v", err)

@@ -156,15 +156,16 @@ SQLite 以 **WAL** 模式打开（默认 rollback journal 下每条 SQL 各 fsyn
 ### 上游协议口径（单点）
 
 **上游 `usage` 的解析只有一份实现**：`internal/upstream/usage.go`
-（`ParseUsageLine` / `ParseUsageObject` / `StripSSEDataPrefix`）。两条转发链路
-（站点 `cmd/webapp` 与旧网关 `cmd/server`）都调用它 —— 此前各写一份，已经漂移出两处真实差异
-（站点漏采前缀缓存三计数；旧网关只认带空格的 `data: ` 前缀，会**整帧丢掉 usage 与计费依据 `credit`**）。
+（`ParseUsageLine` / `ParseUsageObject` / `StripSSEDataPrefix`）。此前有**两条**转发链路各写一份，
+已经漂移出两处真实差异（站点漏采前缀缓存三计数；旧网关只认带空格的 `data: ` 前缀，会**整帧丢掉
+usage 与计费依据 `credit`**）—— 旧网关已于 v0.31.5 随合并删除，**现在只有一份实现**。
 新增上游字段只改一处。
 
 ### 口径单点（同一个东西只有一份实现）
 
-两条转发链路（`cmd/webapp` 与 `cmd/server`）共用下列口径，**同一件事不在两处各写一份**
-（2026-10-13 三十号误杀的成因就是同一个错误码在两套实现里有两套纪律）：
+v0.31.5 起本仓**只有一个产品**（`cmd/webapp`）。下列口径当年是为两条转发链路收敛的
+（2026-10-13 三十号误杀的成因就是同一个错误码在两套实现里有两套纪律），
+合并后它们仍是**唯一的实现** —— 改转发相关代码时按这份清单走：
 
 - **上游 `usage` 解析** —— `internal/upstream/usage.go`（见上）；
 - **模型名写法归一**（v0.31.3）—— `internal/modelname`：去首尾空白/零宽字符 → 剥 realm 前缀
@@ -246,8 +247,10 @@ SQLite 以 **WAL** 模式打开（默认 rollback journal 下每条 SQL 各 fsyn
 > 3. **老命令与老脚本不用改**：`/status`、`/admin/accounts/{uid}/{disable,enable,revive}`、
 >    `/admin/tasks/{name}/run` 这些旧网关接口在 webapp 上**同名同形状**实现（见 `cmd/webapp/compat.go`），
 >    把 `cmd/acct` / `checkin.sh` 的地址指向 8780 即可；
-> 4. 旧网关的 `cmd/server`、`internal/server`、`config.json` 属**待删除**部分（合并第二步），
->    迁移期两者可并存。
+> 4. **旧网关已经删掉了**（v0.31.5 完成合并第二步）：`cmd/server`、`internal/server`、
+>    `config.example.json`、`dist/wb2api.exe` 都不再存在；它的**对外契约**（`/status`、`/admin/*`、
+>    任务触发）以兼容层形式保留在 webapp 里，所以老脚本/老命令照旧可用。Dockerfile / CI /
+>    各构建脚本 / issue 模板也已全部切到单产品形态。
 
 **方式一：下载发布包（推荐，Web 版）**
 
@@ -278,7 +281,7 @@ docker compose up -d        # 8780 端口（v0.31.4 起容器入口就是 webapp
 
 > 容器入口 = `webapp`（网站 + 管理后台 + 网关），数据在 `./data` 卷（SQLite + 管理密钥）。
 > 迁移期沿用了 `./auths` 卷：把旧网关的账号目录挂进来，用 `docker-compose.yml` 里的导入命令
-> 一次性搬进 SQLite，搬完即可删掉该挂载。
+> 一次性搬进 SQLite，搬完即可删掉该挂载（`config.json` 已不再挂载：webapp 用参数 + 环境变量）。
 > 国内构建建议 `--build-arg GOPROXY=https://goproxy.cn,direct`（官方 proxy 在大陆不可达，
 > 构建第一步 `go mod download` 会卡住）。
 

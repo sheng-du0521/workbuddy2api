@@ -170,7 +170,10 @@ func (a *app) alertView() map[string]any {
 	}
 }
 
-// alertPayload webhook 请求体（对齐 internal/alert 的 Payload 结构，便于同一接收端解析）。
+// alertPayload webhook 请求体。
+//
+// 字段形状**冻结**：与旧网关（internal/alert，v0.31.5 随旧网关一并删除）的告警载荷兼容，
+// 既有接收端不必改解析。改这里的键名等于让用户的告警通道静默失效。
 type alertPayload struct {
 	Version  int    `json:"version"`
 	Event    string `json:"event"`

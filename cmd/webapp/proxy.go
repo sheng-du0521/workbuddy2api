@@ -1433,9 +1433,21 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		var ui usageInfo
 		var streamErr error
 		var se streamModelErr
+		// 流内 error 帧透传时附加 gateway_hint（v0.31.5，与旧网关 StreamHint 同口径）：
+		// hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才判一次。
+		hintFn := func(payload string) string {
+			if payload == "" || payload == "[DONE]" {
+				return ""
+			}
+			return upstream.GatewayHint(upstream.FrameKind(payload), payload,
+				upstream.HintContext{Model: model})
+		}
 		if wantStream {
-			ui, se, streamErr = streamSSE(w, resp)
+			ui, se, streamErr = streamSSEHint(w, resp, hintFn)
 		} else {
+			// 非流式聚合路径不加 hint：聚合后回给客户端的是**合成**的响应体（不是上游帧），
+			// 而旧网关那条路径同样不带 hint（它用 upstream.Aggregate）—— 保持一致，
+			// 不为"看起来更完整"而偏离原口径。
 			ui, se, streamErr = aggregateSSE(w, resp)
 		}
 		resp.Body.Close()
@@ -1530,7 +1542,15 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	if lastRetryAfter != "" {
 		w.Header().Set("Retry-After", lastRetryAfter)
 	}
-	writeOpenAIError(w, finalStatus, "upstream unavailable: "+lastErr)
+	// gateway_hint（v0.31.5，从旧网关移植；此前 webapp 的错误响应没有这个字段）：
+	// 失败原因的高层分类（finalKind）已经算好，这里只把它翻成一句"网关视角的补充说明"——
+	// message 仍是原文，hint 是**并列**字段，绝不替换 message。
+	// 没有 kind 可判（如池里压根没号）时退用本地调度事实的固定 hint（同为旧网关口径）。
+	hint := upstream.GatewayHint(finalKind, lastErr, upstream.HintContext{Model: model})
+	if hint == "" && finalKind == upstream.ErrNone {
+		hint = upstream.NoHealthyAccountHint()
+	}
+	writeOpenAIErrorHint(w, finalStatus, "upstream unavailable: "+lastErr, hint)
 }
 
 // isClientFaultKind 该错误是否由**请求本身**引起（换任何账号结果相同）。
@@ -2053,6 +2073,16 @@ func (p *Proxy) reportInStreamModelError(uid, model string, body, reqBody []byte
 // 表现为「会话中断 / 一直转圈」。这里无条件兜底补一个，与 internal/upstream 的
 // StreamHint 同口径（那条成熟链路一直有，本链路此前缺失）。
 func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, streamModelErr, error) {
+	return streamSSEHint(w, resp, nil)
+}
+
+// streamSSEHint 同 streamSSE，但在透传**上游 error 帧**前把 hintFn(payload) 附加为
+// error.gateway_hint（v0.31.5）。hintFn 为 nil/返回空串 → 帧逐字节原样透传。
+//
+// 与 upstream.StreamHint 的分工：上游包那份是"库"（旧网关删除后已无产品调用方），
+// 这份是 webapp 自己的流实现（额外带 usage 采集与模型级错误帧提取），两者共用
+// 同一张判据表（upstream.GatewayHint / FrameKind），不存在两套口径。
+func streamSSEHint(w http.ResponseWriter, resp *http.Response, hintFn func(string) string) (usageInfo, streamModelErr, error) {
 	var ui usageInfo
 	var me streamModelErr // 首个模型级错误帧（若有）：供调用方补做 (账号,模型) 冷却
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -2075,7 +2105,19 @@ func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, streamMod
 		if isSSEDone(line) {
 			sawDone = true
 		}
-		fmt.Fprintf(w, "%s\n", line)
+		out := line
+		if hintFn != nil {
+			// 上游 error 帧：附加 error.gateway_hint 后透传（message 原文不动）。
+			// 只在真的带 error 键时才尝试改写，正常数据帧零开销。
+			if payload, ok := upstream.StripSSEDataPrefix(line); ok && strings.Contains(payload, "error") {
+				if hint := hintFn(payload); hint != "" {
+					if rewritten := upstream.AttachHintToErrorFrame(payload, hint); rewritten != payload {
+						out = "data: " + rewritten
+					}
+				}
+			}
+		}
+		fmt.Fprintf(w, "%s\n", out)
 		if line == "" && flusher != nil {
 			flusher.Flush()
 		}
@@ -2615,14 +2657,28 @@ func (p *Proxy) estimateCredit(upstreamUID, model string, tokens int) float64 {
 }
 
 // writeOpenAIError 输出 OpenAI 兼容的错误响应。
+// writeOpenAIError 不带 gateway_hint 的错误响应（hint 未覆盖形态时走这里）。
 func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
+	writeOpenAIErrorHint(w, status, msg, "")
+}
+
+// writeOpenAIErrorHint 带 gateway_hint 的错误响应（v0.31.5）。
+//
+// hint 为空串 → 字段**缺席**（与 writeOpenAIError 逐字节一致）：hint 表未覆盖的形态
+// 宁可不写，也不编造一句"看起来像结论"的话。
+//
+// 为什么只**新增**一个键而不改既有形状：webapp 既有客户端（前端 api()、下游 OpenAI
+// 兼容客户端）读的是 error.message / error.code，动它们就是破坏兼容；hint 是纯增量。
+func writeOpenAIErrorHint(w http.ResponseWriter, status int, msg, hint string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"message": msg,
-			"type":    "upstream_error",
-			"code":    status,
-		},
-	})
+	e := map[string]any{
+		"message": msg,
+		"type":    "upstream_error",
+		"code":    status,
+	}
+	if hint != "" {
+		e["gateway_hint"] = hint
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": e})
 }

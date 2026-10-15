@@ -7,7 +7,7 @@
 // 两个子命令，由 login.sh 顺序驱动：
 //
 //	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
-//	                                  state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
+//	                                  state 落 /tmp/workbuddy2api-login-state.json，stdout 打印授权 URL
 //	login [--realm=cn|global] poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
 //	                                  成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
 //	                                  stdout 打印完整 token+account JSON（含 realm 键）
@@ -50,7 +50,7 @@ const (
 // 登录 state 落盘路径（var 便于测试替换临时文件）。
 // 跨平台：os.TempDir() 在 Linux 解析为 /tmp（容器内行为不变），Windows 解析为
 // 系统临时目录，避免硬编码 /tmp 在 Windows 上 "The system cannot find the path"。
-var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
+var stateFile = filepath.Join(os.TempDir(), "workbuddy2api-login-state.json")
 
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
 var exitFunc = os.Exit

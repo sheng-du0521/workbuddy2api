@@ -116,15 +116,12 @@ body:
     id: config
     attributes:
       label: 有效配置
-      description: 贴出实际生效的配置（`config.json` 或环境变量覆盖）。`api_key`、`upstash.token` 必须打码；未改动的字段可省略，但要说明省略。
+      description: 贴出实际生效的**启动参数与环境变量**（v0.31.5 起本仓只有 webapp 一个产品，配置走 `-addr/-db/...` 与 `WB2API_*`，不再有 `config.json`）。管理密钥等敏感值必须打码。
       render: json
       placeholder: |
-        {
-          "listen": ":7863",
-          "server": { "max_body_mb": 8 },
-          "prompt": { "mode": "custom" },
-          "features": { "sanitize_blacklist_fingerprints": true }
-        }
+        ./webapp -addr 127.0.0.1:8780 -db ./data/webapp.db
+        # 或环境变量：
+        WB2API_ADMINKEY=***            # 管理密钥（也可用 data/admin.key）
     validations:
       required: true
 
@@ -135,7 +132,7 @@ body:
       description: 可直接执行的 curl（URL 与 key 打码即可），或客户端实际发出的完整请求体 JSON。必须包含 `model`、`messages`、`stream`，涉及工具调用时须含 `tools` / `tool_choice`。
       render: shell
       placeholder: |
-        curl -sS -N http://127.0.0.1:7863/v1/chat/completions \
+        curl -sS -N http://127.0.0.1:8780/v1/chat/completions \
           -H "Authorization: Bearer $API_KEY" \
           -H "Content-Type: application/json" \
           -d '{"model":"...","messages":[...],"stream":true}'

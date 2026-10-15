@@ -5,7 +5,8 @@
 // Command webapp 把 workbuddy2api 的多账号网关做成单进程 Web 应用：
 // 自带管理 UI + OpenAI 兼容接口，账号存 SQLite（替换 auths/ 目录与 state.json）。
 //
-// 与 cmd/server 的差异（Web 化必改项）：
+// 历史沿革（Web 化时与旧网关 cmd/server 的差异清单；**旧网关已于 v0.31.5 整体删除**，
+// 本仓现在只有这一个产品）：
 //  1. 存储：auths/*.json → SQLite；state.json → pool_state.json（由 pool 包自己落盘）
 //  2. OAuth：临时 state 文件 → 进程内会话表（多并发不互相覆盖）
 //  3. 定时任务：四类纯 Go 任务（签到/旅行/活跃/保活）直接复用 internal/scheduler；
@@ -70,7 +71,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.4"
+const version = "0.31.5"
 
 type app struct {
 	store  *Store
@@ -1520,7 +1521,7 @@ func (a *app) routes() *http.ServeMux {
 	// （鉴权失败 / 密钥停用 / 账号封禁 / 余额不足 / 配额超限 / 限流 / 请求体非法）
 	// 也补记进实时面板 —— 否则曲线与事件流只反映走到上游的请求，
 	// 呈现"只有成功、没有失败"的假象（详见 live.go 的说明）。
-	// ── 旧网关（cmd/server，7863）对外面的兼容层（v0.31.4）────────────────────────
+	// ── 旧网关对外面的兼容层（v0.31.4 落地；旧网关实现已于 v0.31.5 删除，契约保留）──
 	// 两个产品合并的第一步：让老命令与老脚本**一行不改**也能打 webapp。
 	// 形状、键名、状态码一律照旧网关（见 compat.go 文件头），鉴权用同一个管理密钥。
 	mux.HandleFunc("GET /status", a.compatGuard(a.handleCompatStatus))

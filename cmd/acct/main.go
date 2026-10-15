@@ -15,7 +15,7 @@
 // 配置:
 //
 //	-config 配置路径（默认 config.json），从中读 listen 与 api_key
-//	-server 直接指定网关地址（覆盖 config 的 listen），如 http://127.0.0.1:7863
+//	-server 直接指定网关地址（覆盖 config 的 listen），如 http://127.0.0.1:8780
 //
 // 为什么走 HTTP 而不是直接改 state.json：手动停用是**运行中进程的内存状态**，
 // 由池的定时 flush 落盘（5s 周期）。外部直接改文件会在下一次 flush 被覆盖——
@@ -166,17 +166,20 @@ func resolveTarget(cfgPath, serverOverride string) (string, string, error) {
 	return strings.TrimRight(base, "/"), cfg.APIKey, nil
 }
 
-// normalizeListen 把配置里的 listen（":7863" / "0.0.0.0:7863" / "127.0.0.1:7863"）
+// acctDefaultPort 缺省端口 = webapp 的监听端口（v0.31.5 起本仓只有这一个产品）。
+const acctDefaultPort = "8780"
+
+// normalizeListen 把配置里的 listen（":8780" / "0.0.0.0:8780" / "127.0.0.1:8780"）
 // 归一成本机可访问的 http 基址。监听通配地址时收敛到回环——本工具总是和网关同机运行，
 // 往 0.0.0.0 / :: 发请求在部分平台会直接失败。
 //
-// 用 net.SplitHostPort 而非手工切冒号：IPv6 字面量（"::" / "[::]:7863"）本身含冒号，
+// 用 net.SplitHostPort 而非手工切冒号：IPv6 字面量（"::" / "[::]:8780"）本身含冒号，
 // `strings.LastIndex(listen, ":")` 会把 "::" 切成 host=":" port=""，拼出
-// "http://::7863" 这种非法基址（测试 TestNormalizeListen 抓到过）。
+// "http://::8780" 这种非法基址（测试 TestNormalizeListen 抓到过）。
 func normalizeListen(listen string) string {
 	listen = strings.TrimSpace(listen)
 	if listen == "" {
-		return "http://127.0.0.1:7863"
+		return "http://127.0.0.1:" + acctDefaultPort
 	}
 	host, port := "", ""
 	if h, p, err := net.SplitHostPort(listen); err == nil {
@@ -191,7 +194,7 @@ func normalizeListen(listen string) string {
 		}
 	}
 	if port == "" {
-		port = "7863"
+		port = acctDefaultPort
 	}
 	switch host {
 	// ":" 是裸 "::" 经 SplitHostPort 的产物（Go 把 "::" 解析为 host=":"）；

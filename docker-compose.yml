@@ -33,6 +33,6 @@ services:
       #        -d "{\"json\": $(cat $f), \"force\": true}"; done'
       # （expiresAt 是"秒"还是"毫秒"都能吃：见 cmd/webapp/import_desktop.go 的 normalizeExpiresSec）
       - ./auths:/app/auths
-      # config.json 不再需要（webapp 用命令行参数 + WB2API_* 环境变量）。
-      # 保留挂载仅为了让 login.sh 之类的旧脚本还能读到端口/密钥，可按需删掉。
-      - ./config.json:/app/config.json:ro
+      # config.json 不再需要也不挂在镜像里：webapp 用命令行参数 + WB2API_* 环境变量。
+      # 若你仍在用 login.sh / checkin.sh 这类旧脚本（它们会读工作目录的 config.json），
+      # 按需自行加回一条挂载即可。

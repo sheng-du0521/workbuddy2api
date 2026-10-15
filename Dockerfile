@@ -11,11 +11,8 @@ RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
 #
-# 说明（v0.31.4 合并第一步）：`cmd/server`（旧网关）仍会编译，但**不再是本镜像的入口**
-# —— 入口改为 webapp（网站 + 管理后台 + 网关一体）。旧网关按计划在合并第二步删除，
-# 届时这一行与 /app/wb2api 一起去掉。
+# v0.31.5：旧网关（cmd/server）已随合并删除，镜像里只有 webapp + 各 CLI 工具。
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/webapp ./cmd/webapp \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
@@ -32,7 +29,6 @@ WORKDIR /app
 # 脚本置入 + 去 CRLF（Windows 检出可能性）在切到 app 之前以 root 完成——
 # app 对 root 所有文件无写权限，sed -i 需要写权限。
 COPY --from=build /out/webapp /app/webapp
-COPY --from=build /out/wb2api /app/wb2api
 COPY --from=build /out/signin_bin /app/signin_bin
 COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
@@ -46,8 +42,6 @@ COPY scripts/task_runner.py /app/scripts/task_runner.py
 COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
 RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
-# 镜像不带真实配置：落 example 作为旧网关的默认（webapp 不用它，见下）。
-COPY config.example.json /app/config.json
 USER app
 # webapp 的唯一外部端口（网站 / 管理后台 / OpenAI 兼容网关共用）。
 EXPOSE 8780

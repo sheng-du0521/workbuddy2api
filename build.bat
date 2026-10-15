@@ -22,8 +22,8 @@ echo === building workbuddy2api binaries ===
 
 rem webapp = 主产品（Web 应用中转站，8780）。v0.24.0 补入：此前它**不在任何
 rem 脚本化构建路径里**，是个手工产物 —— 于是"改了源码忘了重建 exe"极易发生。
+rem v0.31.5 起旧网关（cmd/server → wb2api.exe）已随合并删除，不再构建。
 call :build webapp webapp.exe
-call :build server wb2api.exe
 call :build login login.exe
 call :build signin signin_bin.exe
 call :build credit credit.exe

@@ -47,7 +47,7 @@ body:
       description: 与模型 / 网关相关的配置片段（含 base_url、model、是否开启工具调用 / 附件 / 流式）。密钥打码。截图请同时附文字。
       render: text
       placeholder: |
-        base_url: http://127.0.0.1:7863/v1
+        base_url: http://127.0.0.1:8780/v1
         model: ...
         tools: enabled
         stream: true
