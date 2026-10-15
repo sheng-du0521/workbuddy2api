@@ -1929,39 +1929,24 @@ func isSSEDone(line string) bool {
 	return strings.TrimSpace(strings.TrimPrefix(t, "data:")) == "[DONE]"
 }
 
-// parseUsageLine 从一行 SSE 里抽取 usage（兼容 "data: " 与 "data:" 两种前缀）。
+// parseUsageLine 从一行 SSE 里抽取 usage。
+//
+// 解析口径**统一在 upstream.ParseUsageLine**（v0.26.7）—— 这里只负责"写进 ui"。
+// 收敛前本函数与旧网关（internal/server/logging.go）各写一份，已经漂移出两处
+// 真实差异（webapp 漏采缓存三字段、旧网关只认一种 data 前缀），
+// 详见 internal/upstream/usage.go 顶部注释。
 func parseUsageLine(line string, ui *usageInfo) {
-	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "data:") {
+	f, ok := upstream.ParseUsageLine(line)
+	if !ok {
 		return
 	}
-	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-	if payload == "" || payload == "[DONE]" {
-		return
-	}
-	var chunk struct {
-		Usage *struct {
-			CompletionTokens int      `json:"completion_tokens"`
-			PromptTokens     int      `json:"prompt_tokens"`
-			Credit           *float64 `json:"credit"`
-			// 前缀缓存三计数（v0.26.7）：旧网关一直在采，webapp 此前漏了。
-			// 字段名与 internal/server/logging.go 保持一字不差 —— 两套转发实现的
-			// 观测口径必须是同一份，否则两个面板的"命中率"不可比。
-			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
-			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
-		} `json:"usage"`
-	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		return
-	}
-	ui.PromptTokens = chunk.Usage.PromptTokens
-	ui.CompletionTokens = chunk.Usage.CompletionTokens
-	ui.CacheHitTokens = chunk.Usage.PromptCacheHitTokens
-	ui.CacheMissTokens = chunk.Usage.PromptCacheMissTokens
-	ui.CacheWriteTokens = chunk.Usage.PromptCacheWriteTokens
-	if chunk.Usage.Credit != nil {
-		ui.Credit = *chunk.Usage.Credit
+	ui.PromptTokens = f.PromptTokens
+	ui.CompletionTokens = f.CompletionTokens
+	ui.CacheHitTokens = f.CacheHitTokens
+	ui.CacheMissTokens = f.CacheMissTokens
+	ui.CacheWriteTokens = f.CacheWriteTokens
+	if f.HasCredit {
+		ui.Credit = f.Credit
 		ui.HasCredit = true
 	}
 }
@@ -2117,30 +2102,22 @@ func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error)
 }
 
 // parseUsageJSON 从 usage 原始 JSON 抽取计费字段。
+//
+// 与流式路径**同一口径**（upstream.ParseUsageObject）：非流式是另一种客户端形态，
+// 口径分叉会让"某类客户端的观测凭空消失"。
 func parseUsageJSON(raw json.RawMessage) usageInfo {
 	var ui usageInfo
-	if len(raw) == 0 {
+	f, ok := upstream.ParseUsageObject(raw)
+	if !ok {
 		return ui
 	}
-	var u struct {
-		CompletionTokens int      `json:"completion_tokens"`
-		PromptTokens     int      `json:"prompt_tokens"`
-		Credit           *float64 `json:"credit"`
-		// 缓存三计数：与流式路径（parseUsageLine）逐字段对齐，两条链路口径必须一致。
-		PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
-		PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
-	}
-	if json.Unmarshal(raw, &u) != nil {
-		return ui
-	}
-	ui.PromptTokens = u.PromptTokens
-	ui.CompletionTokens = u.CompletionTokens
-	ui.CacheHitTokens = u.PromptCacheHitTokens
-	ui.CacheMissTokens = u.PromptCacheMissTokens
-	ui.CacheWriteTokens = u.PromptCacheWriteTokens
-	if u.Credit != nil {
-		ui.Credit = *u.Credit
+	ui.PromptTokens = f.PromptTokens
+	ui.CompletionTokens = f.CompletionTokens
+	ui.CacheHitTokens = f.CacheHitTokens
+	ui.CacheMissTokens = f.CacheMissTokens
+	ui.CacheWriteTokens = f.CacheWriteTokens
+	if f.HasCredit {
+		ui.Credit = f.Credit
 		ui.HasCredit = true
 	}
 	return ui

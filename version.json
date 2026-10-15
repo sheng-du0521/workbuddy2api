@@ -1,14 +1,9 @@
 {
-  "version": "0.26.7",
+  "version": "0.26.8",
   "min_supported": "0.24.0",
-  "notes": "v0.26.7：补齐「又慢又贵」的观测缺口。① 端到端耗时落库（此前只存在于 90 分钟的内存态面板，重启即丢）；② 采集上游明确回报的前缀缓存三计数（prompt_cache_hit/miss/write tokens）——旧网关一直在采，只有 webapp 这条链路把它丢了，导致「缓存到底有没有生效」无从判断；③ 报表页新增「性能与前缀缓存」（平均/P50/P95 耗时 + token 加权命中率，无观测时显式说明而不是画 0）。排查结论：缓存机制正常（同前缀第二次命中 3584/3607，费用降 9.3 倍），延迟来自超长上下文（实测单请求 48 万 tokens、92~129 秒）的上游前向计算。",
-  "released_at": 1792047811,
+  "notes": "v0.26.8：① 网关口径收敛 —— 上游 usage 解析（含缓存三计数、credit 缺失语义、data 前缀两种形态）统一到 internal/upstream，两条转发链路共用一份；顺带修掉旧网关「只认带空格的 data: 前缀、会整帧丢掉 usage 与计费依据 credit」；并新增示例配置的双向完整性测试（当场抓到 schedule.activity_report_count 遗漏）。② 账号已挂载天数可视化：管理后台账号卡与控制台代挂卡均显示「已挂载 N 天（起算日）」，口径为从入库时刻起算的自然日数，未知时刻显示「—」而非 0 天。③ 更新检测升级：发现新版本自动下载产物（sha256 必校验、只落盘 .new、不动运行中的程序），面板展示逐行渲染的版本说明与产物状态，并提供「应用更新」生成替换脚本（不自动替换、不自动重启）。",
+  "released_at": 1792050941,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
-  "assets": [
-    {
-      "os": "windows",
-      "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases"
-    }
-  ]
+  "assets": [],
+  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。"
 }

@@ -11,11 +11,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -127,43 +127,37 @@ func (s *chatStatsReader) CacheTokens() (hit, miss, write int) {
 	return s.cacheHit, s.cacheMiss, s.cacheWr
 }
 
-// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确用量。
+//
+// usage 的解析口径**统一在 upstream.ParseUsageLine**（v0.26.7）—— 本函数只负责
+// TTFB 计时与"写进自身字段"。收敛前这里与 cmd/webapp 各写一份，漂移出一处
+// 真实差异：本函数只认 `"data: "`（带空格），上游若发 `data:{...}` 会**整帧漏掉
+// usage**（含计费依据 credit），表现为"这次请求没有成本观测"。
+// 详见 internal/upstream/usage.go 顶部注释。
 func (s *chatStatsReader) parseSSELine(line string) {
-	line = strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(line, "data: ") {
-		return
-	}
-	payload := strings.TrimPrefix(line, "data: ")
-	if payload == "[DONE]" {
+	// 首帧判定用统一前缀剥离：原来只认带空格的前缀，会让无空格形态的首帧
+	// 漏计 TTFB（表现为 TTFT 偏大）。
+	payload, isData := upstream.StripSSEDataPrefix(line)
+	if !isData || payload == "[DONE]" {
 		return
 	}
 	if !s.seen {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
-	var chunk struct {
-		Usage *struct {
-			CompletionTokens int      `json:"completion_tokens"`
-			PromptTokens     int      `json:"prompt_tokens"`
-			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
-			// 缓存三段（上游实测字段名，见 /v1/stats 的 cache_* 口径）。
-			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
-			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
-		} `json:"usage"`
-	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	f, ok := upstream.ParseUsageLine(line)
+	if !ok {
 		return
 	}
 	s.hasUsage = true
-	s.tokens = chunk.Usage.CompletionTokens
-	s.prompt = chunk.Usage.PromptTokens
-	s.cacheHit = chunk.Usage.PromptCacheHitTokens
-	s.cacheMiss = chunk.Usage.PromptCacheMissTokens
-	s.cacheWr = chunk.Usage.PromptCacheWriteTokens
-	if chunk.Usage.Credit != nil {
+	s.tokens = f.CompletionTokens
+	s.prompt = f.PromptTokens
+	s.cacheHit = f.CacheHitTokens
+	s.cacheMiss = f.CacheMissTokens
+	s.cacheWr = f.CacheWriteTokens
+	if f.HasCredit {
 		s.hasCredit = true
-		s.credit = *chunk.Usage.Credit
+		s.credit = f.Credit
 	}
 }
 

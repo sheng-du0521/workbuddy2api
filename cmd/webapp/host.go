@@ -46,6 +46,14 @@ type hostAccountView struct {
 	ExpiresAt    int64   `json:"expires_at"`
 	Earned       float64 `json:"earned"`
 	CreatedAt    int64   `json:"created_at"`
+	// ---- 已挂载时长（v0.26.7）----
+	// 与管理后台同口径（mounted.go）：从入库时刻起算的自然日数。
+	// 号主最关心的就是"我这个号挂了多久"，而 CreatedAt 是原始时间戳，
+	// 让前端各自算天数必然与管理侧漂移（跨零点差一天）。
+	MountedAt    int64  `json:"mounted_at"`
+	MountedDays  int    `json:"mounted_days"`
+	MountedText  string `json:"mounted_text"`
+	MountedKnown bool   `json:"mounted_known"`
 	// Task 该账号的定时任务开关（v0.11.0）。
 	Task accountTaskState `json:"task"`
 	// 归属（管理侧展示号主；用户侧留空）。
@@ -115,6 +123,9 @@ func (a *app) hostViewP(acc *Account, cp cachedCreditPacks) hostAccountView {
 		EgressError: a.proxy.EgressErrorForUID(acc.UID),
 	}
 	v.EarnedCNY = pointsToCNY(v.Earned, a.moneyRate())
+	// 已挂载时长：与管理后台同口径（mounted.go）。
+	mi := mountedOf(acc.CreatedAt, time.Now())
+	v.MountedAt, v.MountedDays, v.MountedText, v.MountedKnown = mi.At, mi.Days, mi.Text, mi.Known
 	if st, ok := a.proxy.pool.Status(acc.UID); ok {
 		v.Credits = st.Credits
 		v.CreditsKnown = st.CreditsSeenAt > 0

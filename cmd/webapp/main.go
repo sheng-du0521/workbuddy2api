@@ -69,7 +69,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.26.7"
+const version = "0.26.8"
 
 type app struct {
 	store  *Store
@@ -620,6 +620,14 @@ type accountView struct {
 	// 收益属「返点」→ 界面一律以金额为主展示，点数进 title 说明。
 	Earned    float64 `json:"earned"`
 	EarnedCNY float64 `json:"earned_cny"`
+	// ---- 已挂载时长（v0.26.7）----
+	// 从账号**首次接入本系统**（入库时刻）起算的自然日数，口径见 mounted.go。
+	// MountedKnown=false 表示没有可信的挂载时刻（历史行/异常导入），
+	// 前端应显示"—"而不是 0 天 —— "不知道挂了多久"与"刚挂上"是两件事。
+	MountedAt    int64  `json:"mounted_at"`
+	MountedDays  int    `json:"mounted_days"`
+	MountedText  string `json:"mounted_text"`
+	MountedKnown bool   `json:"mounted_known"`
 	// Task 该账号的定时任务开关（v0.11.0）。
 	Task accountTaskState `json:"task"`
 	// ---- 计费口径（v0.12.0，需求 7）----
@@ -755,6 +763,9 @@ func (a *app) toViewP(st pool.Status, acc *Account, cp cachedCreditPacks) accoun
 		v.ConsumeGroupNote = acc.ConsumeGroupNote
 		// 成长任务：0 = 尚未跑过首次（待办）；>0 = 已跑过（时间戳）。
 		v.GrowthDoneAt = acc.GrowthDoneAt
+		// 已挂载时长：口径集中在 mounted.go，此处只取值。
+		mi := mountedOf(acc.CreatedAt, time.Now())
+		v.MountedAt, v.MountedDays, v.MountedText, v.MountedKnown = mi.At, mi.Days, mi.Text, mi.Known
 		if acc.OwnerUserID == 0 {
 			v.PoolState = "in" // 平台自持账号隐含在池
 		}
@@ -1373,6 +1384,10 @@ func (a *app) routes() *http.ServeMux {
 	// 版本更新提醒（v0.26.0）：读状态 + 跳过某版本。**只提醒，不自动更新**。
 	mux.HandleFunc("GET /api/admin/update-status", a.adminGuard(a.handleAdminUpdateStatus))
 	mux.HandleFunc("POST /api/admin/update-skip", a.adminGuard(a.handleAdminUpdateSkip))
+	// 「应用更新」（v0.26.7）：生成替换脚本并回操作指引。**不自动替换、不自动重启**
+	// —— 正在运行的 exe 无法被覆盖，任何自动替换都要靠外部进程在退出后动手，
+	// 等于一次无人值守的重启；且清单与二进制同源、无法自证，最后一步必须由人确认。
+	mux.HandleFunc("POST /api/admin/update-apply", a.adminGuard(a.handleAdminUpdateApply))
 
 	// 站内公告管理（v0.17.8）：创建 / 编辑 / 启停 / 删除。
 	mux.HandleFunc("GET /api/admin/announcements", a.adminGuard(a.handleAdminListAnnouncements))

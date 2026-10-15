@@ -1433,6 +1433,15 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
             <div class="hint">内网 / 私有化部署应当<b>关掉</b>：隔离网络里这个请求既无用又多一个外联点。</div>
           </div>
           <div class="setting-card">
+            <label>自动下载新版本产物</label>
+            <label class="muted" style="display:flex;gap:6px;align-items:center;margin-top:6px;">
+              <input type="checkbox" id="setUpdateAuto"> <span>发现新版本时自动下载到本地并校验</span>
+            </label>
+            <div class="hint">下载的产物只<b>落盘为 <code>*.new</code> 并校验 SHA-256</b>，
+              <b>不会自动替换正在运行的程序</b>—— 替换要停服务，交由人在维护窗口执行
+              （卡片会给出一条命令）。关掉则只在面板里显示下载链接。</div>
+          </div>
+          <div class="setting-card">
             <label>更新清单地址（version.json）</label>
             <input type="text" id="setUpdateManifest" placeholder="https://raw.githubusercontent.com/用户/仓库/main/version.json">
             <div class="hint">静态 JSON，字段：<code>version</code> / <code>min_supported</code> /
@@ -1442,6 +1451,8 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
         <div class="row" style="margin-top:14px;">
           <button id="btnSaveUpdate">保存</button>
           <button class="ghost" id="btnCheckUpdate">立即检查</button>
+          <button class="ghost" id="btnApplyUpdate" style="display:none;"
+            title="生成替换脚本并给出操作步骤（不会自动替换、不会自动重启）">应用更新</button>
           <button class="ghost" id="btnSkipUpdate" style="display:none;">跳过此版本</button>
           <span id="updateCfgHint" class="muted"></span>
         </div>
@@ -2428,6 +2439,13 @@ function accountCard(a) {
     line('异常归档', a.consume_group_note + (a.consume_group_auto ? '（冷却到期自动回归原组）' : '（需重登后人工改回）'), 'err');
   }
   if (a.egress_error) line('出口代理', a.egress_error + '　→ 已暂停参与平台消耗，请到「代理 → 账号代理」修好或清空该账号的出口', 'err');
+  // 已挂载时长（v0.26.7）：从账号**首次接入本系统**起算，口径由后端
+  // mounted.go 统一计算（两个界面同源，避免跨零点差一天）。
+  // mounted_known=false 时**整行不显示** —— 历史行没有可信时刻，
+  // 写「0 天」会被读成"刚挂上"，与"不知道挂了多久"是两件事。
+  if (a.mounted_known) {
+    line('已挂载', a.mounted_text + '（' + fmtDate(a.mounted_at) + ' 起）');
+  }
   if (a.expires_at) line('Token 到期', fmtTime(a.expires_at));
   const notes = [];
   if (a.reason) notes.push(a.reason);
@@ -4786,16 +4804,57 @@ function renderUpdateStatus(d) {
       box.appendChild(el('div', 'credit-err',
         '当前版本低于清单声明的最低支持版本 ' + (d.min_supported || '') + '，建议尽快升级。'));
     }
-    if (d.notes) box.appendChild(el('div', 'muted', d.notes));
+    // 版本说明（更新日志）：按行拆开渲染，而不是把整段塞进一个 muted div。
+    // 清单里的 notes 是多行条目（"① … ② …"或逐条换行），整段渲染会变成
+    // 一大坨、看不出有几条改动。逐行渲染才能被"扫读"。
+    if (d.notes) {
+      const nb = el('div', 'upd-notes');
+      for (const line of String(d.notes).split(/\r?\n/)) {
+        const tx = line.trim();
+        if (!tx) continue;
+        nb.appendChild(el('div', 'upd-line', tx));
+      }
+      box.appendChild(nb);
+    }
+    // 产物状态（v0.26.7）：none / downloading / done / failed 四态各有明确文案。
+    // 刻意不用"准备中"这类模糊措辞：运维需要知道"还差什么才能更新"。
+    const dl = d.download;
+    if (dl && dl.state && dl.state !== 'none') {
+      const dbox = el('div', 'upd-dl');
+      if (dl.state === 'downloading') {
+        dbox.appendChild(el('span', 'muted',
+          '正在下载 ' + (dl.version || d.latest || '') + ' 的产物…'
+          + (dl.size ? '（约 ' + fmtBytes(dl.size) + '）' : '')));
+      } else if (dl.state === 'done') {
+        const t = el('span', 'tag ok', '产物已就绪 ' + (dl.version || ''));
+        t.title = '已下载并校验通过（' + (dl.file || '') + '）';
+        dbox.appendChild(t);
+        dbox.appendChild(el('span', 'muted',
+          fmtBytes(dl.got_size || dl.size || 0) + ' · SHA-256 校验通过'));
+      } else if (dl.state === 'failed') {
+        dbox.appendChild(el('span', 'credit-err', '产物下载失败：' + (dl.error || '未知原因')));
+      }
+      if (dl.state === 'done' && dl.apply_hint) {
+        // 操作指引**原样展示**而不是做成按钮自动执行 —— 最后一步必须由人确认
+        // （正在运行的 exe 无法被覆盖，且清单与二进制同源、无法自证）。
+        dbox.appendChild(el('div', 'upd-hint', dl.apply_hint));
+      }
+      box.appendChild(dbox);
+    }
     const links = el('div', 'row');
     links.style.gap = '10px';
     if (d.release_url) links.appendChild(extLink(d.release_url, '打开发布页'));
     if (d.asset && d.asset.url) links.appendChild(extLink(d.asset.url, '下载本平台产物'));
     if (links.childNodes.length) box.appendChild(links);
     if (d.asset && d.asset.sha256) box.appendChild(el('div', 'muted', 'SHA-256 ' + d.asset.sha256));
+    // 「应用更新」只在下好产物时出现。
+    const ap = $('btnApplyUpdate');
+    if (ap) ap.style.display = (dl && dl.state === 'done') ? '' : 'none';
     if (skip) { skip.style.display = ''; skip.textContent = '跳过 ' + d.latest; }
   } else {
     box.appendChild(el('div', 'muted', '已是最新版本。'));
+    const ap = $('btnApplyUpdate');
+    if (ap) ap.style.display = 'none';
   }
   if (d.stale) box.appendChild(el('div', 'muted', '离线：显示的是上次成功检查的结果。'));
   if (d.error && d.latest) box.appendChild(el('div', 'muted', '本次检查未成功：' + d.error));
@@ -4820,10 +4879,25 @@ function extLink(href, text) {
 }
 
 if ($('btnCheckUpdate')) $('btnCheckUpdate').onclick = () => loadUpdateStatus(true);
+// 「应用更新」：只生成替换脚本 + 回操作指引，**不自动替换、不自动重启**。
+// 打开一个可复制的对话框而不是直接执行 —— 执行意味着停服务，必须由人决定时机。
+if ($('btnApplyUpdate')) $('btnApplyUpdate').onclick = async () => {
+  try {
+    const d = await post('/api/admin/update-apply', {});
+    await confirmDialog({
+      title: '更新产物已就绪',
+      message: '请按以下步骤应用（程序不会自动替换自己）：' + String.fromCharCode(10, 10)
+        + (d.apply_hint || ''),
+      confirmText: '知道了',
+      hideCancel: true,
+    });
+  } catch (e) { toast('应用更新失败：' + e.message, 'err'); }
+};
 if ($('btnSaveUpdate')) $('btnSaveUpdate').onclick = async () => {
   try {
     await post('/api/admin/settings', {
       update_check_enabled: !!($('setUpdateCheck') && $('setUpdateCheck').checked),
+      update_auto_download: !!($('setUpdateAuto') && $('setUpdateAuto').checked),
       update_manifest_url: $('setUpdateManifest').value.trim(),
     });
     toast('版本更新设置已保存', 'ok');

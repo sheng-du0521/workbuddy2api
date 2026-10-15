@@ -35,6 +35,7 @@
     "keepalive_enabled": true,
     "school_enabled": true,
     "cat_enabled": true,
+    "activity_report_count": 5,
     "jitter_minutes": 0,
     "ledger_file": "",
     "retry_delay_minutes": 0,

@@ -1291,6 +1291,8 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		// UpdateCheckEnabled 是否开启版本检查。内网/私有化部署应当关掉 ——
 		// 它会主动向外部地址出站，这在隔离网络里既无用又多余。
 		UpdateCheckEnabled *bool `json:"update_check_enabled"`
+		// UpdateAutoDownload 自动下载开关（v0.26.7）。
+		UpdateAutoDownload *bool `json:"update_auto_download"`
 		// UpdateManifestURL 更新清单（version.json）地址。原样回显：它是配置不是密钥。
 		UpdateManifestURL *string `json:"update_manifest_url"`
 	}
@@ -1658,6 +1660,16 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.UpdateAutoDownload != nil {
+		v := "0"
+		if *req.UpdateAutoDownload {
+			v = "1"
+		}
+		if err := a.store.SetKV(kvUpdateAutoDownload, v); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
 	if req.UpdateManifestURL != nil {
 		v := strings.TrimSpace(*req.UpdateManifestURL)
 		// **只接受 http(s)**：这是程序会主动出站请求的地址。放开 scheme 等于
@@ -1786,6 +1798,9 @@ func (a *app) settingsView() map[string]any {
 	// 版本更新提醒（v0.26.0）：清单地址原样回显（配置项，不是密钥）；
 	// 被跳过的版本也回显，否则管理员会以为"检查坏了"。
 	out["update_check_enabled"] = a.updateCheckEnabled()
+	// 自动下载开关（v0.26.7）：默认开 —— 产物只落盘不替换，风险极低，
+	// 而"发现新版本时本地已经备好"是它全部的价值。
+	out["update_auto_download"] = a.updateAutoDownloadEnabled()
 	out["update_manifest_url"] = a.updateManifestURL()
 	out["update_skip_version"] = a.updateSkipVersion()
 	return out

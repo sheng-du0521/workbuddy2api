@@ -84,6 +84,10 @@ const FX = {
         egress: 'socks5://1.2.3.4:1080', fail_count: 0, expires_at: now + 86400,
         // v0.17.2 仪表盘用：号池消耗与出口字段（生产接口一直有这两个字段）。
         served_requests: 13, consumed_credit: 0.05, charged_points: 0.05, owner_id: 0,
+        // v0.26.7：已挂载时长（后端 mounted.go 统一算）。给 14 天，好让断言能看出
+        // 「天数」与「起始日期」两段都渲染了。
+        mounted_known: true, mounted_at: now - 14 * 86400, mounted_days: 14,
+        mounted_text: '已挂载 14 天',
         task: { enabled: true, disabled: ['travel'], kinds: [] },
         // v0.13.0 消耗分组
         consume_group: 'proxy', consume_group_effective: 'proxy', consume_group_text: '反代',
@@ -94,6 +98,9 @@ const FX = {
         credits_known: true,
         device_token_state: 'none',
         disabled: true, manual_off: false, cooling: false, cooling_for: 0, group: '',
+        // v0.26.7：**没有**可信挂载时刻（历史行）。必须整行不显示，
+        // 而不是显示「已挂载 0 天」—— 那会被读成"刚挂上"。
+        mounted_known: false, mounted_at: 0, mounted_days: 0, mounted_text: '',
         egress: '', fail_count: 3, expires_at: now + 3600,
         task: { enabled: true, disabled: [], kinds: [] },
         consume_group: 'abnormal', consume_group_effective: 'abnormal', consume_group_text: '异常',
@@ -378,6 +385,24 @@ const FX = {
     purchases: [{ uid: 'acc-buy0000001', amount: 300, created_at: now - 7200 }],
     balance: 500, rate: 0.01, min_trade_credits: 4000,
   },
+  // v0.26.7：更新检测 + 自动下载 + 更新简介。刻意给**多行 notes**（验证逐行渲染）
+  // 与 **done 的下载状态**（验证产物徽标、体积、应用按钮三处都出现）。
+  '/api/admin/update-status': {
+    current: '0.26.6', latest: '0.26.7', has_update: true, severity: 'minor',
+    notes: 'v0.26.7：\n① 补齐耗时与缓存观测；\n② 修报表日界缺陷。',
+    release_url: 'https://example.com/releases',
+    asset: { os: 'windows', arch: 'amd64', url: 'https://example.com/a.exe',
+      sha256: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+    manifest_url: 'https://example.com/version.json',
+    manifest_used: 'https://example.com/version.json',
+    checked_at: now, enabled: true, auto_download: true,
+    download: { state: 'done', version: '0.26.7', size: 15728640, got_size: 15728640,
+      sha256: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      file: 'webapp.exe.new', at: now,
+      apply_hint: '1) 停止本程序；2) 运行 apply-update.bat' },
+  },
+  '/api/admin/update-apply': { ok: true, script: 'apply-update.bat',
+    apply_hint: '1) 停止本程序；2) 运行 apply-update.bat' },
   '/api/admin/usage': {
     days: 14, totals: { requests: 120, tokens: 12345, charged: 1.23 },
     daily: [{ day: '2026-10-09', requests: 10, tokens: 1000, charged: 0.1 }],
@@ -558,6 +583,9 @@ const FX = {
       uid: 'host-1', nickname: '代挂号A', realm: 'cn', host_group: '主力', pool_state: 'in',
       disabled: false, cooling: false, cooling_for: 0, credits: 800,
       expires_at: now + 86400, earned: 12.5, created_at: now, owner_id: 2,
+      // v0.26.7：已挂载时长（与管理后台同口径）。
+      mounted_known: true, mounted_at: now - 30 * 86400, mounted_days: 30,
+      mounted_text: '已挂载 30 天',
       task: { enabled: true, disabled: ['travel'], kinds: [] },
     }],
     groups: { '主力': 1 },
@@ -916,7 +944,11 @@ function run(pageFile, meOverride, plan) {
         // v0.23.2：本页只留两个健康检测入口（检测勾选 / 健康检测 →），检测动作与结果都在
         // 独立的「健康检测」页 —— 本页不再为全量检测结果留版面。
         ['#btnHealthSelPool', 1], ['#btnGoHealth', 1]],
-      lacks: [['#accCards', '反代组'], ['#accCards', '未分组']],
+      lacks: [['#accCards', '反代组'], ['#accCards', '未分组'],
+        // v0.26.7：「被封号」那张卡没有可信挂载时刻，**整行不该出现** ——
+        // 显示「已挂载 0 天」会被读成"刚挂上"，与"不知道挂了多久"相反。
+        // 用 xxx 断言该账号卡的「已挂载」计数为 1（即只有第一张卡有）。
+        ['#accCards', '已挂载 0 天']],
       textIn: [['#btnImportDesktop', '批量导入 JSON'], ['#accCards', '未指定'], ['#accCards', 'SOCKS'],
         // v0.15.4：每张卡有勾选框；工具栏有全选/清除/已选计数。
         ['#accCards', '未指定'],
@@ -924,7 +956,9 @@ function run(pageFile, meOverride, plan) {
         // 用户口径是「6004 只挡对应模型，其他模型正常接」，界面必须能验证这一点。
         ['#accCards', '模型级限额'], ['#accCards', 'glm-5.3'], ['#accCards', '其它模型正常可用'],
         // 上游没给时间的那条要标出「本地估」（区分"上游说的"与"我们猜的"）
-        ['#accCards', '本地估']],
+        ['#accCards', '本地估'],
+        // v0.26.7：已挂载时长（天数 + 起始日期两段都要渲染）。
+        ['#accCards', '已挂载'], ['#accCards', '已挂载 14 天']],
       has: [['#accCards .ecard .pick input', 2], ['#chkAll', 1], ['#btnClearSel', 1], ['#selCount', 1],
         ['#bulkConsumeGroup option', 4]],
       texts: [['selSummary', '反代选号']] },
@@ -1051,6 +1085,7 @@ function run(pageFile, meOverride, plan) {
       has: [['.modal .import-ta', 1], ['.modal .import-adv', 1],
         ['.modal input[type=file][multiple]', 1], ['.modal button', 2]],
       textIn: [['.modal', '批量导入账号'], ['.modal', '服务端本地路径']] },
+    // v0.26.7：代挂卡片的「已挂载 N 天」标签（号主最常问的问题）。
     { nav: 'host', counts: [['hostPending', 1], ['hostCards', 1], ['hostGroupBar', 2]], texts: [['hostSummary', '代挂账号']],
       // v0.24.2（P3-13）：hostStateTag 已下沉 app.js —— 共享实现仍要能渲染出状态标签，
       // 「删掉了」与「还能用」两件事必须都验（只验其一会漏掉「删过头」）。
@@ -1285,6 +1320,24 @@ function run(pageFile, meOverride, plan) {
         ['#annWindowPreview', '长期有效']] },
     { nav: 'settings', texts: [['setProxyGroups', '反代'], ['hostShareHint', '推广返点'], ['withdrawHint', '最小提现']] },
 
+    // v0.26.7：更新检测与自动下载面板。
+    { nav: 'settings',
+      has: [['#setUpdateAuto', 1], ['#btnApplyUpdate', 1],
+        ['#updateStatus .upd-notes', 1],
+        // 简介按行渲染：给的是 3 行 notes，就必须渲染成 3 个 .upd-line
+        // （整段塞一个 div 会让"有几条改动"看不出来）。
+        ['#updateStatus .upd-line', 3],
+        // 产物已就绪：徽标 + 应用按钮可见
+        ['#updateStatus .tag', 1], ['#updateStatus .upd-dl', 1],
+        ['#updateStatus .upd-hint', 1]],
+      textIn: [['#updateStatus', '功能更新'], ['#updateStatus', '0.26.7'],
+        ['#updateStatus', '① 补齐耗时与缓存观测'],
+        ['#updateStatus', '产物已就绪'],
+        ['#updateStatus', 'SHA-256 校验通过'],
+        ['#updateStatus', 'apply-update.bat']],
+      // 已就绪时应用按钮应可见（display 不为 none —— 由 display 断言覆盖）
+      display: [['#btnApplyUpdate', true]] },
+
     // ================================================================
     // v0.26.6 · 共享 UI 套件（对照 workbuddy-manager 的交互调研结论）
     // ================================================================
@@ -1421,6 +1474,9 @@ function run(pageFile, meOverride, plan) {
         ['#marketBalance', '4000']] },
     { nav: 'host', counts: [['hostCards', 1], ['hostEarnCards', 1], ['hostUnifiedList', 6]],
       has: [['#hostOauthBtns .oauth-btns button', 2], ['#hostCards .ecard .tstatus', 1]],
+      // v0.26.7：代挂卡片的「已挂载 N 天」标签（号主最常问的问题）。
+      // 断言放在这里而不是独立用例：host 数据是异步加载的，独立用例可能先于数据到达。
+      textIn: [['#hostCards', '已挂载 30 天']],
       lacks: [['#hostCards', '分组：']],
       texts: [['hostSummary', '累计收益']],
       // v0.24.2（P3-13）：共享 hostStateTag 仍然生效（与管理后台同一份实现）。

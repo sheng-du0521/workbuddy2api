@@ -1368,6 +1368,14 @@ function hostCard(h) {
     chips.appendChild(el('span', 'tag ' + cgTone, '消耗组：' + h.consume_group_text));
   }
   chips.appendChild(el('span', 'tag ' + (model.enabled ? 'ok' : ''), '自动任务：' + (model.enabled ? '开' : '关')));
+  // 已挂载时长（v0.26.7）：与管理后台**同口径**（后端 mounted.go 统一算）。
+  // 号主最常问的就是"我这个号挂了多久"，而 created_at 是原始时间戳 ——
+  // 让前端各自算天数，跨零点时两个界面会差一天。
+  if (h.mounted_known) {
+    const mt = el('span', 'tag', h.mounted_text);
+    mt.title = '自 ' + fmtDate(h.mounted_at) + ' 接入本平台';
+    chips.appendChild(mt);
+  }
   // 收益＝返点 → 以「钱」为主展示（v0.17.7），点数进 title。
   if (h.earned > 0) {
     const t = el('span', 'tag ok', '累计收益 ' + fmtMoney(h.earned_cny));

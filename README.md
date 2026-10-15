@@ -77,6 +77,10 @@ OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时积�
 - **运行态九态** —— `online` / `cooling` / `rate_limited` / `risk_cooling` / `exhausted` / `relogin` / `egress_error` / `disabled` / `manual_disabled`
 - **两个独立停用位** —— 运维手动停用与系统判定禁用各自独立，恢复时各清各的
 - **存量自愈** —— 启动时纠正两类历史脏状态：6004 被误写成账号级冷却、模型级冷却被账号级上限截断
+- **已挂载天数** —— 账号卡与代挂卡显示「已挂载 N 天（起算日）」，口径为入库时刻起算的自然日数；
+  时刻缺失时**不显示**该行（`0 天` 会被读成"刚挂上"，与"不知道挂了多久"相反）
+- **更新检测与自动下载** —— 发现新版本自动下载产物（**sha256 必校验**、只落盘 `*.new`、
+  **不动运行中的程序**），面板展示逐行版本说明与产物三态，并提供「应用更新」生成替换脚本
   （**只放长不缩短**，且只在字段自相矛盾时动手）
 
 ### 防风控
@@ -91,6 +95,14 @@ OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时积�
   （body 文案 / 结构化字段 / 响应头三级解析）；拿不到时间信息时回落该模型的有界退避。
   账号卡列出「哪几个模型被限、何时恢复」，仪表盘单列一块**模型级冷却明细**，账号池可按「限模」筛
 - **5xx 降档重试**（可选，默认关）—— 上游 5xx 时下沉到下一成本层继续救；因为会花更贵的额度，留给站长自己开
+
+### 上游协议口径（单点）
+
+**上游 `usage` 的解析只有一份实现**：`internal/upstream/usage.go`
+（`ParseUsageLine` / `ParseUsageObject` / `StripSSEDataPrefix`）。两条转发链路
+（站点 `cmd/webapp` 与旧网关 `cmd/server`）都调用它 —— 此前各写一份，已经漂移出两处真实差异
+（站点漏采前缀缓存三计数；旧网关只认带空格的 `data: ` 前缀，会**整帧丢掉 usage 与计费依据 `credit`**）。
+新增上游字段只改一处。
 
 ### 控制台交互
 
@@ -227,6 +239,7 @@ curl http://127.0.0.1:8780/v1/chat/completions \
 | `GET` | `/api/admin/consume-failures` | 消耗失败台账：统计 + 明细 + **错误码处置策略表**（`limit` / `code` / `stage` / `hours`） |
 | `GET` | `/api/admin/update-status` | 版本更新状态（`?force=1` 忽略缓存；多候选回退，回显实际命中地址） |
 | `POST` | `/api/admin/update-skip` | 跳过某个版本（与「关闭检查」是两个不同动作） |
+| `POST` | `/api/admin/update-apply` | 生成更新替换脚本并回操作指引（**不自动替换、不自动重启**） |
 | `GET` | `/api/admin/settings` | 全部设置（含 `egress_on_line_down` / 各开关等） |
 
 > 命令行工具（`login` / `signin` / `credit` / `trial` / `activity` / `stats` / `acct`）

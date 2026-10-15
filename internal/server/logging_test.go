@@ -410,3 +410,58 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
 	}
 }
+
+// ======================================================================
+// v0.26.7 · usage 解析口径收敛到 internal/upstream 后的回归护栏
+//
+// 收敛前本包只认 `"data: "`（带空格）前缀，cmd/webapp 两种都认 —— 同一份上游
+// 协议两套解析，已经漂移。下面两条钉住本包在收敛后**不丢**任何一种形态。
+// ======================================================================
+
+// TestChatStatsReaderAcceptsBothDataPrefixes 无空格的 `data:{...}` 也必须解析出 usage。
+//
+// 这条是**真实缺陷的复现**：此前只认带空格前缀，上游若发无空格形态，
+// 整帧 usage（含计费依据 credit）被静默丢弃，表现为"这次请求没有成本观测"。
+func TestChatStatsReaderAcceptsBothDataPrefixes(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":900,"completion_tokens":12,"credit":0.31,` +
+		`"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":100,"prompt_cache_write_tokens":780}}`
+
+	for _, line := range []string{"data: " + body, "data:" + body} {
+		r := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+		r.parseSSELine(line)
+
+		if tok, ok := r.Tokens(); !ok || tok != 12 {
+			t.Errorf("前缀 %q：completion 应解析为 12，得 %d（ok=%v）", line[:6], tok, ok)
+		}
+		if got := r.PromptTokens(); got != 900 {
+			t.Errorf("前缀 %q：prompt 应为 900，得 %d", line[:6], got)
+		}
+		if c, ok := r.Credit(); !ok || c != 0.31 {
+			t.Errorf("前缀 %q：credit 应为 0.31（ok），得 %v（ok=%v）—— 丢 credit 等于丢计费依据", line[:6], c, ok)
+		}
+		hit, miss, wr := r.CacheTokens()
+		if hit != 800 || miss != 100 || wr != 780 {
+			t.Errorf("前缀 %q：缓存三计数不符 hit=%d miss=%d write=%d", line[:6], hit, miss, wr)
+		}
+	}
+}
+
+// TestChatStatsReaderTTFBOnNoSpaceFrame 无空格的数据帧同样是"首帧"，
+// 必须计入 TTFB —— 否则 TTFT 会从第二个帧才开始算，表现为偏大。
+func TestChatStatsReaderTTFBOnNoSpaceFrame(t *testing.T) {
+	r := newChatStatsReaderSince(strings.NewReader(""), time.Now().Add(-5*time.Millisecond))
+	if r.TTFB() != 0 {
+		t.Fatal("初始 TTFB 应为 0")
+	}
+	r.parseSSELine(`data:{"choices":[{"delta":{"content":"x"}}]}`)
+	if r.TTFB() <= 0 {
+		t.Error("无空格数据帧应被认作首帧并记录 TTFB")
+	}
+	// 注释帧与 [DONE] 都不是首帧。
+	r2 := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+	r2.parseSSELine(": keep-alive")
+	r2.parseSSELine("data: [DONE]")
+	if r2.TTFB() != 0 {
+		t.Error("注释帧与 [DONE] 不该被当作首帧")
+	}
+}

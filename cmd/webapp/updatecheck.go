@@ -283,6 +283,13 @@ type updateStatus struct {
 	Asset       *updateAsset `json:"asset,omitempty"`         // 匹配当前平台+架构的产物
 	Error       string       `json:"error,omitempty"`         // 上次检查的失败原因（空=成功）
 	Stale       bool         `json:"stale"`                   // 结果来自过期缓存（离线时）
+
+	// ---- 自动下载（v0.26.7）----
+	// AutoDownload 自动下载开关的当前值（面板据此显示"自动/手动"）。
+	AutoDownload bool `json:"auto_download"`
+	// Download 产物下载状态。**始终非 nil**（未下载时 State="none"）——
+	// 让前端无需判空就能渲染"未提供产物 / 正在下载 / 已就绪"三态。
+	Download *updateDownload `json:"download,omitempty"`
 }
 
 // decideUpdate **纯函数**：给定当前版本、清单与用户偏好，算出要展示什么。
@@ -618,10 +625,12 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 	}
 	if !st.Enabled {
 		// 关闭时也要把本机版本显示出来 —— "已关闭检查"不等于"没有版本信息"。
+		a.attachDownload(&st)
 		return st
 	}
 	if st.ManifestURL == "" {
 		st.Error = "未配置更新清单地址（设置 → 关于 / 版本更新 可填）"
+		a.attachDownload(&st)
 		return st
 	}
 	if !force && a.updateCacheFresh(now) {
@@ -629,6 +638,7 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 			out := decideUpdate(version, m, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL = true, st.ManifestURL
 			out.ManifestUse = a.updateManifestUsed()
+			a.attachDownload(&out)
 			return out
 		}
 	}
@@ -641,6 +651,7 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 			out := decideUpdate(version, m, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL = true, st.ManifestURL
 			out.ManifestUse = a.updateManifestUsed()
+			a.attachDownload(&out)
 			return out
 		}
 	}
@@ -655,8 +666,10 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 			out.Enabled, out.ManifestURL, out.Error = true, st.ManifestURL, st.Error
 			out.ManifestUse = a.updateManifestUsed()
 			out.Stale = true
+			a.attachDownload(&out)
 			return out
 		}
+		a.attachDownload(&st)
 		return st
 	}
 
@@ -669,7 +682,59 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 	out := decideUpdate(version, m, st.Skipped, now.Unix())
 	out.Enabled, out.ManifestURL = true, st.ManifestURL
 	out.ManifestUse = used
+	// 自动下载（v0.26.7）：发现新版本且清单给了本机平台的产物时**异步**下载。
+	// 必须异步 —— 这里处在 HTTP 请求路径上，而一次 20MB 的下载远超本次请求
+	// 的预算（候选数 × 8s）。状态通过 Download 字段随每次刷新回报。
+	a.attachDownload(&out)
 	return out
+}
+
+// attachDownload 把下载状态挂到更新状态上，并在需要时**触发一次**异步下载。
+//
+// 触发条件（全部满足才下）：
+//   - 有更新、且清单提供了本机平台的产物（没有产物就没什么可下）；
+//   - 自动下载开关打开（关掉时只展示已有结果，不发起新的下载）；
+//   - 该版本尚未下好、也没有正在下的（避免每次页面刷新都起一个 goroutine）。
+func (a *app) attachDownload(st *updateStatus) {
+	st.AutoDownload = a.updateAutoDownloadEnabled()
+	d := a.loadUpdateDownload()
+
+	if !st.AutoDownload || !st.HasUpdate || st.Asset == nil {
+		st.Download = &d
+		return
+	}
+	// 已下好同一版本且文件仍在 → 直接展示。
+	if d.State == "done" && d.Version == st.Latest && updateNewFileExists() {
+		st.Download = &d
+		return
+	}
+	// 已在下载同一版本 → 只回报状态。
+	updateTriggerMu.Lock()
+	if updateTriggeringFor == st.Latest {
+		updateTriggerMu.Unlock()
+		d.State, d.Version = "downloading", st.Latest
+		st.Download = &d
+		return
+	}
+	updateTriggeringFor = st.Latest
+	updateTriggerMu.Unlock()
+
+	snapshot := *st
+	go func() {
+		defer func() {
+			updateTriggerMu.Lock()
+			updateTriggeringFor = ""
+			updateTriggerMu.Unlock()
+		}()
+		// 用 Background 而不是请求的 ctx：响应一结束请求 ctx 就会被取消，
+		// 那样下载永远走不完（表现为状态卡在 downloading）。
+		ctx, cancel := context.WithTimeout(context.Background(), updateDownloadTimeout)
+		defer cancel()
+		a.downloadUpdate(ctx, snapshot)
+	}()
+
+	d.State, d.Version = "downloading", st.Latest
+	st.Download = &d
 }
 
 // cachedManifest 读出上次成功拉到的清单（兼作离线缓存）。解析失败视为无缓存。

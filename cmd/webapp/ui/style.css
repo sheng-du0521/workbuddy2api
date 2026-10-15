@@ -872,3 +872,44 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
   .skel { animation: none; background: var(--border); }
   .toast-bar { animation: none; opacity: 0; }
 }
+
+/* ---------- 更新简介与产物状态（v0.26.7） ---------- */
+/* 版本说明按行渲染的容器：左侧竖线让"这是引用的清单内容"一眼可辨 ——
+   清单是外部文件，与页面上我们自己写死的文案应当有视觉区分。 */
+.upd-notes {
+  margin: 8px 0 4px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--tint);
+  border-radius: 0 8px 8px 0;
+}
+.upd-line {
+  font-size: 12.5px;
+  line-height: 1.8;
+  color: var(--text);
+}
+.upd-line + .upd-line { margin-top: 3px; }
+
+/* 产物状态行：徽标 + 体积 + 校验信息横排，窄屏自动换行 */
+.upd-dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
+/* 应用指引：需要被完整读、且要能复制，所以给独立区块 + 允许断行。
+   用虚线边而不是实线：它是"待执行的操作"，与已完成的结论区分开。 */
+.upd-hint {
+  flex-basis: 100%;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  word-break: break-all;
+  user-select: text;
+}

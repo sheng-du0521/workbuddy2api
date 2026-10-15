@@ -1577,13 +1577,19 @@ function confirmDialog(opts) {
     if (opts.detail) dlg.appendChild(el('div', 'dlg-detail', opts.detail));
 
     const foot = el('div', 'dlg-foot');
-    const cancel = el('button', 'ghost', opts.cancelText || '取消');
-    cancel.type = 'button';
-    cancel.setAttribute('data-dlg-cancel', '1');
+    // hideCancel：纯提示型对话框（如"更新产物已就绪，请按此操作"）只需要一个
+    // 关闭键。给两个语义相同的按钮会让人以为"取消"会撤销什么 —— 而它什么都不做。
+    // 注意不能靠 cancelText:'' 来隐藏：那时 `|| '取消'` 会把它回落成"取消"。
+    let cancel = null;
+    if (!opts.hideCancel) {
+      cancel = el('button', 'ghost', opts.cancelText || '取消');
+      cancel.type = 'button';
+      cancel.setAttribute('data-dlg-cancel', '1');
+      foot.appendChild(cancel);
+    }
     const ok = el('button', opts.danger ? 'danger' : '', opts.confirmText || '确认');
     ok.type = 'button';
     ok.setAttribute('data-dlg-ok', '1');
-    foot.appendChild(cancel);
     foot.appendChild(ok);
     dlg.appendChild(foot);
     back.appendChild(dlg);
@@ -1605,13 +1611,13 @@ function confirmDialog(opts) {
         ok.click();
       }
     };
-    cancel.onclick = () => close(false);
+    if (cancel) cancel.onclick = () => close(false);
     // 遮罩点击关闭：但**只**在点遮罩本身时（点对话框内部不该关）。
     back.onclick = (ev) => { if (ev.target === back) close(false); };
     ok.onclick = async () => {
       if (opts.onConfirm) {
         ok.disabled = true;
-        cancel.disabled = true;
+        if (cancel) cancel.disabled = true;
         ok.textContent = opts.busyText || '执行中…';
         try {
           await opts.onConfirm();
@@ -1619,7 +1625,7 @@ function confirmDialog(opts) {
           // 回调自己负责报错（用 toast）；这里只把按钮恢复可用，
           // 让用户能再试一次或取消 —— 卡在 disabled 上是最糟的结局。
           ok.disabled = false;
-          cancel.disabled = false;
+          if (cancel) cancel.disabled = false;
           ok.textContent = opts.confirmText || '确认';
           toast(e && e.message ? e.message : String(e), 'err');
           return;
