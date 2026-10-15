@@ -1847,7 +1847,11 @@ function renderLive(d) {
     setTxt('ovAxisL', series[0].label);
     setTxt('ovAxisR', series[series.length - 1].label);
   }
-  setTxt('liveStamp', '更新于 ' + fmtClock(d.now));
+  // 提示词降级（v0.31.4）：进程级状态，降级期内所有请求的 system 都被换成中性提示词
+  // —— 直接在时间戳旁标出来，避免"回答风格变了却查不到原因"。
+  const prm = d.prompt || {};
+  setTxt('liveStamp', '更新于 ' + fmtClock(d.now)
+    + (prm.degraded ? ' · ⚠️ 提示词降级中（至 ' + fmtClock(prm.until) + '，累计 ' + fmtNum(prm.triggers || 0) + ' 次）' : ''));
   const dot = $('liveDot');
   if (dot) dot.className = 'live-dot on';
 

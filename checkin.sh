@@ -4,7 +4,8 @@
 # 不调 HTTP 签到接口：cmd/signin 已自带表格输出（uid/nick/status/remain/detail
 # + total=N ok=N already=N fail=N 汇总行）与 token 预刷新（NeedsRefresh(2h)），
 # 比包一层 HTTP 更完善。本脚本：
-#   1. 读 config.json 的端口与 api_key，调 GET /status 判网关活不死活
+#   1. 调 GET /status 判网关活不死活（v0.31.4 起默认打 webapp 的 8780；
+#      config.json 仍被识别，方便迁到一半的老部署）
 #      （活着只是提示"定时签到已在网关侧运行"）；
 #   2. 核心动作 = 构建并执行 ./signin_bin auths，透传其已表格化的输出；
 #   3. -v 模式从表格里过滤出 fail 明细（FAIL/LOAD_ERR/AUTH_INVALID，已签到不计）。
@@ -18,7 +19,8 @@
 #
 # 环境变量:
 #   WB2A_CONFIG  配置文件路径（默认 ./config.json，读取端口与 api_key）
-#   WB2A_URL     直接指定服务地址（如 http://1.2.3.4:7863），设置后忽略配置文件
+#   WB2A_URL     直接指定服务地址（如 http://1.2.3.4:8780），设置后忽略端口探测
+#   WB2A_KEY     直接指定密钥（默认自动解析：config.json 的 api_key > data/admin.key）
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -43,16 +45,26 @@ fi
 HAS_JQ=1
 command -v jq >/dev/null 2>&1 || HAS_JQ=0
 
-# ─── 解析服务地址与密钥：优先 WB2A_URL，其次 config.json ──────────────────────
+# ─── 解析服务地址与密钥 ───────────────────────────────────────────────────────
+# v0.31.4 起默认目标是 webapp（8780）：端口 8780、密钥取 data/admin.key。
+# 同时保留旧网关的识别路径（config.json 的 listen/api_key），因为合并分两步走，
+# 迁移期两种部署都会存在。优先级：环境变量 > 旧网关 config.json > webapp admin.key。
 CFG=${WB2A_CONFIG:-config.json}
-PORT=7863
-KEY=""
+PORT=8780
+KEY="${WB2A_KEY:-}"
 if [[ -f "$CFG" ]] && [[ "$HAS_JQ" == "1" ]]; then
-    LISTEN=$(jq -r '.listen // ":7863"' "$CFG")
-    PORT=${LISTEN##*:}
-    KEY=$(jq -r '.api_key // ""' "$CFG")
+    # 旧网关配置在就用它（listen 缺省仍是 8780 —— 合并后的默认产品）。
+    LISTEN=$(jq -r '.listen // ""' "$CFG")
+    [[ -n "$LISTEN" && "$LISTEN" != "null" ]] && PORT=${LISTEN##*:}
+    [[ -z "$KEY" ]] && KEY=$(jq -r '.api_key // ""' "$CFG")
 fi
-PORT=${PORT:-7863}
+if [[ -z "$KEY" ]]; then
+    # webapp 的管理密钥（首次启动随机生成并落盘）；dist 下的部署也认。
+    for f in data/admin.key dist/data/admin.key; do
+        if [[ -z "$KEY" && -f "$f" ]]; then KEY=$(tr -d '\r\n' < "$f"); fi
+    done
+fi
+PORT=${PORT:-8780}
 BASE=${WB2A_URL:-http://localhost:$PORT}
 
 AUTH=()
@@ -75,7 +87,7 @@ if [[ -n "$RESP" ]]; then
         [[ -z "$GATEWAY_INFO" ]] && GATEWAY_INFO="网关在线（/status 200）"
     else
         case "$CODE" in
-            401) GATEWAY_INFO="网关鉴权失败（401）：api_key 与 config.json 不一致" ;;
+            401) GATEWAY_INFO="网关鉴权失败（401）：密钥不对（webapp 用 data/admin.key；可用 WB2A_KEY 指定）" ;;
             000) GATEWAY_INFO="连不上 $BASE：服务未启动或端口不对" ;;
             *)   GATEWAY_INFO="网关 /status 异常（HTTP $CODE）" ;;
         esac

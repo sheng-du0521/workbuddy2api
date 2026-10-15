@@ -83,6 +83,19 @@ func newLiveStats() *liveStats {
 	return &liveStats{buckets: map[int64]*liveBucket{}, maxEv: 40}
 }
 
+// reset 清空进程内累计（分钟桶 + 事件流 + 三个请求计数），供 /v1/stats/reset
+// 的兼容语义使用（旧网关同名端点 = 清空累计便于观察增量）。
+//
+// **在途计数不清**：那是在飞请求的真实数量，清掉等于撒谎。
+// 三个请求计数一起清零，保证「total == ok + fail」这条不变量继续成立
+// （只清其中一个会让面板显示"失败比总数还多"）。
+func (l *liveStats) reset() {
+	l.mu.Lock()
+	l.buckets = map[int64]*liveBucket{}
+	l.events = nil
+	l.mu.Unlock()
+}
+
 // begin / done 维护在途请求计数（请求进入 +1，离开 -1）。
 func (l *liveStats) begin() {
 	l.mu.Lock()
@@ -452,8 +465,12 @@ func (a *app) handleLive(w http.ResponseWriter, r *http.Request) {
 			"blocked": a.limiter.blocked.Load(),
 			"rpm":     a.rateLimitRPM(),
 		},
-		"pool":            pool,
-		"alerts":          a.alertView(),
+		"pool":   pool,
+		"alerts": a.alertView(),
+		// 提示词降级（v0.31.4）：**进程级**状态 —— 降级期内**所有**请求的 system 都被
+		// 换成中性提示词。这种"悄悄影响全站"的状态必须在运维能看到的地方出现，
+		// 否则"为什么日志里 system 变了 / 为什么回答风格变了"只能靠翻代码回答。
+		"prompt":          a.proxy.promptDegradeView(),
 		"events":          events,
 		"observed_models": a.proxy.observedModelCount(),
 	})

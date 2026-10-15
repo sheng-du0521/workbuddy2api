@@ -5,55 +5,21 @@
 package server
 
 import (
-	"sync"
 	"time"
+
+	"workbuddy2api/internal/prompt"
 )
 
-// degradeGate 降级状态机：passthrough 模式下请求被上游内容策略拦截时，
-// 切换到 Degraded 中性提示词直到次日 00:00 CST 重置。
+// degradeGate 降级状态机 —— **实现已下沉到 internal/prompt**（v0.31.4）。
 //
-// 定位：误报处理（与 internal/upstream/sanitize.go 同哲学）——内容拦截多为
-// system 来源的指纹误报，换最小中性提示词即可绕开；不是对抗框架。
+// 为什么下沉：主产品（cmd/webapp）此前完全没有这条能力，而「合并两个产品」的前提是
+// 能力等值；状态机本身与"用哪段降级提示词"是同一件事的两半，放在 prompt 包里
+// 两个入口共用一份实现。这里保留别名，是为了让旧网关的调用点与既有测试零改动
+// （旧网关按计划在合并第二步删除）。
 //
-// 状态机：进程内存、重启清零（可接受：重启极少触发，且 custom 模式根本
-// 不进降级路径）。降级期内的请求直达 Degraded，不再先撞 400。
-type degradeGate struct {
-	mu    sync.Mutex
-	until time.Time
-}
+// 语义见 prompt.Gate 的注释：passthrough 请求被上游内容策略拦截（400 审核文案 /
+// 11128 渠道拒绝）时，换 Degraded 中性提示词重试一次，并降级到次日 00:00 CST 重置。
+type degradeGate = prompt.Gate
 
-// Active 当前是否处于降级期（now < until）。
-func (g *degradeGate) Active() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return time.Now().Before(g.until)
-}
-
-// Trigger 触发降级，直到次日 00:00 CST（Asia/Shanghai）。
-// 已在降级期内则不续期（保持最早触发点的 00:00 重置语义）。
-func (g *degradeGate) Trigger() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if !time.Now().Before(g.until) {
-		// 已过期/未触发 → 设新的 until；未过期则保持原 until（不续期）。
-		g.until = nextMidnightCST(time.Now())
-	}
-}
-
-// nextMidnightCST 返回 now 之后最近的 Asia/Shanghai 00:00 时刻（纯函数，方便单测）。
-//
-// 边界语义：
-//   - 23:59 → 次日 00:00（几秒后）
-//   - 00:00 → 次日 00:00（刚过 00:00，下个零点是次日）
-//
-// 用固定 +08:00 偏移计算，避免依赖系统时区配置（容器/宿主机时区不确定）。
-func nextMidnightCST(now time.Time) time.Time {
-	cst := time.FixedZone("CST", 8*60*60)
-	// 把 now 转到 CST 视角取当天 00:00，再加一天；若该 00:00 <= now 则再加一天。
-	y, m, d := now.In(cst).Date()
-	midnight := time.Date(y, m, d, 0, 0, 0, 0, cst)
-	for !midnight.After(now) {
-		midnight = midnight.Add(24 * time.Hour)
-	}
-	return midnight
-}
+// nextMidnightCST 旧名保留（既有单测按这个名字写）。
+func nextMidnightCST(now time.Time) time.Time { return prompt.NextMidnightCST(now) }

@@ -46,8 +46,8 @@ func TestModelLevelErrorCodeOnlyModelCodes(t *testing.T) {
 		}
 	}
 	for _, code := range []int{
-		0,    // 解析不出
-		400,  // HTTP 状态码本身
+		0,   // 解析不出
+		400, // HTTP 状态码本身
 		401, 403, 404, 429, 500, 502, 503,
 		11115, // prompt too long（请求的问题）
 		11128, // 渠道拒绝（指纹/渠道级）

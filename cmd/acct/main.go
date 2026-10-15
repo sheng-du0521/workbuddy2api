@@ -131,11 +131,12 @@ func usage() {
 任务名（acct task 用）:
   checkin    签到（每日 9/21 点）        activity   活跃地图（10 点）
   keepalive  token 保活（22 点）          travel     猫猫旅行（9/21 点）
-  school     开学季任务（12 点）          cat        夜猫子任务（1 点）
+  cat        夜猫子任务（1 点）
 
 选项:
   -config <path>  配置路径（默认 config.json，读 listen 与 api_key）
-  -server <url>   直接指定网关地址，如 http://127.0.0.1:7863
+  -server <url>   直接指定网关地址，如 http://127.0.0.1:8780
+                  （webapp 与旧网关都可用：兼容端点同名同形状。）
 
 注意：enable 只解手动位。若账号同时被系统自动禁用（disabled），
 需要额外执行 revive 才能回到选号池。
@@ -329,7 +330,7 @@ func doAdmin(base, apiKey, op, uid, reason string) error {
 
 // adminTaskNames 可手动触发的任务名。与 server 侧白名单（admin_tasks.go）一致；
 // 这里只用于用法提示与参数校验，真正的准入以网关的 404 为准（单一真源在服务端）。
-var adminTaskNames = []string{"checkin", "activity", "keepalive", "travel", "school", "cat"}
+var adminTaskNames = []string{"checkin", "activity", "keepalive", "travel", "cat"}
 
 // runTask 手动触发一个排程任务：POST /admin/tasks/{name}/run。
 //

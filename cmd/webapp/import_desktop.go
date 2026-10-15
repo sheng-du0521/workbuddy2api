@@ -316,11 +316,32 @@ func desktopGroup(g string) string {
 	}
 }
 
+// normalizeExpiresSec 把 expiresAt 归一成 **Unix 秒**，同时容忍"秒"与"毫秒"两种写法。
+//
+// 为什么必须容忍（v0.31.4，合并两个产品的迁移通道发现的真陷阱）：
+// 桌面端导出文件写的是**毫秒**（`createdAt`/`refreshedAt` 也在同一量纲），而旧网关的
+// `auths/*.json` 写的是**秒**（`auth.ExpiresAt // Unix 秒`）。两者的键名完全一样，
+// 于是"把 auths 目录直接导进 webapp"这条迁移路径会把秒当毫秒 → 除 1000 后得到 1970 年
+// → 每个账号一落库就"已过期"，被立刻刷新 —— 一个百号部署会在几秒内打出一百次 refresh。
+//
+// 判据是量纲而不是年份：秒（~1.8e9）与毫秒（~1.8e12）相差三个数量级，
+// 用 1e11 作分界在未来数千年内都不会误判。
+func normalizeExpiresSec(v int64) int64 {
+	const msCutoff = 1e11 // 秒 → 毫秒分界：秒值约 1.8e9，毫秒值约 1.8e12
+	if v <= 0 {
+		return 0
+	}
+	if v < msCutoff {
+		return v // 已经是秒（auths/*.json、手写扁平文件）
+	}
+	return v / 1000 // 毫秒（桌面端导出）
+}
+
 // toAccount 把一条桌面端记录映射为库内 Account。
 // 优先用 auth_raw（含最新 accessToken/refreshToken/domain），缺失时回落到顶层字段。
 func (d desktopAccount) toAccount() *Account {
 	access, refresh, domain := d.AccessToken, d.RefreshToken, d.Domain
-	expiresAt := d.ExpiresAt / 1000 // 毫秒 → 秒
+	expiresAt := normalizeExpiresSec(d.ExpiresAt)
 	// 设备凭证：顶层 device_token 优先；空的再从 auth_raw 里捞（v0.25.1）。
 	deviceToken := d.DeviceToken
 	if len(d.AuthRaw) > 0 {

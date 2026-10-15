@@ -1,5 +1,5 @@
 services:
-  wb2api:
+  webapp:
     build:
       context: .
       args:
@@ -12,20 +12,27 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
+      # 管理密钥：留空则用 ./data/admin.key（首次启动随机生成并落盘），
+      # 也可在这里显式指定（优先级高于文件）：
+      #   WB2API_ADMINKEY: "换成你自己的长随机串"
     ports:
-      - "7863:7863"
+      # v0.31.4 起容器入口是 webapp：网站 / 管理后台 / OpenAI 兼容网关共用 8780。
+      # 旧网关（wb2api，7863）仍编译进镜像但不再作为入口，按计划在合并第二步删除。
+      - "8780:8780"
     volumes:
-      # auths 凭证卷：login.sh 在宿主机落盘 workbuddy-<uid>.json（0600），容器网关以
-      # app(uid 10001) 读 + 回写（refresh / realm backfill 走 tmp+rename，需目录写权限）。
-      # 跨 uid 部署（非 root 宿主落盘 / rootful 下宿主 uid≠10001）读不到 → 账号数为 0
-      # （issue #108）。登录后把目录属主交给 10001（与 ./data 卷同口径）：
-      #   chown -R 10001:10001 ./auths
-      # 之后新增账号建议进容器登录（app 自身落盘，属主即 10001，免反复 chown；容器内无
-      # docker CLI，完成后回宿主机重启）：
-      #   docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
-      - ./auths:/app/auths
-      # data 保持 bind mount（本地映射，与旧版本一致）。
-      # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
+      # data 卷 = SQLite（webapp.db + -wal/-shm）+ 管理密钥 + 池状态。
+      # ⚠️ 备份要么先停容器，要么三个 db 文件一起复制（见 README「数据库」一节）。
+      # 若容器内 app(uid 10001) 报 permission denied，宿主机执行：
       #   chown -R 10001:10001 ./data
       - ./data:/app/data
+      # auths 卷仅为**迁移期**保留：把旧网关的账号目录挂进来，用下面的导入命令
+      # 一次性搬进 webapp 的 SQLite；搬完即可从本文件删掉这一行。
+      #   docker compose exec -it webapp bash -c \
+      #     'for f in /app/auths/*.json; do curl -s -X POST http://127.0.0.1:8780/api/admin/accounts/import-desktop \
+      #        -H "X-Admin-Key: $(cat /app/data/admin.key)" -H "Content-Type: application/json" \
+      #        -d "{\"json\": $(cat $f), \"force\": true}"; done'
+      # （expiresAt 是"秒"还是"毫秒"都能吃：见 cmd/webapp/import_desktop.go 的 normalizeExpiresSec）
+      - ./auths:/app/auths
+      # config.json 不再需要（webapp 用命令行参数 + WB2API_* 环境变量）。
+      # 保留挂载仅为了让 login.sh 之类的旧脚本还能读到端口/密钥，可按需删掉。
       - ./config.json:/app/config.json:ro

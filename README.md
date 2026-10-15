@@ -227,12 +227,27 @@ SQLite 以 **WAL** 模式打开（默认 rollback journal 下每条 SQL 各 fsyn
 
 ## 快速开始
 
-> ⚠️ **先确认你要跑哪个产品** —— 本仓有**两个可执行文件**，形态完全不同：
+**一个产品：`webapp`** —— 网站 + 管理后台 + OpenAI 兼容网关，一个可执行文件。
 
-| 产品 | 端口 | 形态 | 入口 |
-|---|---|---|---|
-| **`webapp`（主产品）** | 8780 | 网站 + 管理后台 + OpenAI 网关，**有 Web 界面** | `./webapp -addr 127.0.0.1:8780 -db ./data/webapp.db` |
-| `wb2api`（旧版） | 7863 | 纯命令行网关，**无 Web 界面**，读 `config.json` | `./wb2api -config ./config.json` |
+| 项 | 值 |
+|---|---|
+| 端口 | 8780（网站 / 管理后台 / `/v1` 网关共用） |
+| 入口 | `./webapp -addr 127.0.0.1:8780 -db ./data/webapp.db` |
+| 账号存储 | SQLite（`data/webapp.db`），支持桌面端 / 旧网关 `auths/*.json` 批量导入 |
+| 配置 | 命令行参数 + `WB2API_*` 环境变量（不再需要 `config.json`） |
+
+> 🔀 **从旧网关 `wb2api`（7863）迁移**：
+> 1. 起 `webapp`，用管理密钥登录；
+> 2. 把 `auths/*.json` 逐个导入（页面「账号管理 → 导入」或接口）：
+>    `curl -X POST http://127.0.0.1:8780/api/admin/accounts/import-desktop \
+>      -H "X-Admin-Key: $(cat data/admin.key)" -H 'Content-Type: application/json' \
+>      -d "{\"json\": $(cat auths/xxx.json), \"force\": true}"`
+>    （`expiresAt` 写秒或毫秒都能吃，见 `cmd/webapp/import_desktop.go`）；
+> 3. **老命令与老脚本不用改**：`/status`、`/admin/accounts/{uid}/{disable,enable,revive}`、
+>    `/admin/tasks/{name}/run` 这些旧网关接口在 webapp 上**同名同形状**实现（见 `cmd/webapp/compat.go`），
+>    把 `cmd/acct` / `checkin.sh` 的地址指向 8780 即可；
+> 4. 旧网关的 `cmd/server`、`internal/server`、`config.json` 属**待删除**部分（合并第二步），
+>    迁移期两者可并存。
 
 **方式一：下载发布包（推荐，Web 版）**
 
@@ -258,11 +273,12 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o webapp ./cmd/webapp
 **方式三：Docker**
 
 ```bash
-docker compose up -d        # 7863 端口
+docker compose up -d        # 8780 端口（v0.31.4 起容器入口就是 webapp）
 ```
 
-> ⚠️ 当前 `docker-compose.yml` / `Dockerfile` 起的是**旧版 `wb2api`（7863，无 Web 界面）** ——
-> 镜像里虽然也编译了 `webapp`，但默认 `ENTRYPOINT` 不是它。要用 **Web 版**请走方式一或方式二。
+> 容器入口 = `webapp`（网站 + 管理后台 + 网关），数据在 `./data` 卷（SQLite + 管理密钥）。
+> 迁移期沿用了 `./auths` 卷：把旧网关的账号目录挂进来，用 `docker-compose.yml` 里的导入命令
+> 一次性搬进 SQLite，搬完即可删掉该挂载。
 > 国内构建建议 `--build-arg GOPROXY=https://goproxy.cn,direct`（官方 proxy 在大陆不可达，
 > 构建第一步 `go mod download` 会卡住）。
 

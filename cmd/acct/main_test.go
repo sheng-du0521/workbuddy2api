@@ -110,11 +110,16 @@ func TestRunTask(t *testing.T) {
 	}
 }
 
-// TestAdminTaskNamesMatchServerWhitelist acct 侧任务名与 server 侧白名单必须一致。
-// 两处各写一份是有意的（cmd 不该 import internal/server 的运行时表），但一旦漂移
+// TestAdminTaskNamesMatchServerWhitelist acct 侧任务名与网关侧白名单必须一致。
+// 两处各写一份是有意的（cmd 不该 import 网关的运行时表），但一旦漂移
 // 就会变成「命令提示的名字网关不认」，所以用一条哨兵测试钉住。
+//
+// v0.31.4 修正：清单里此前还留着 `school`（开学季已于 v0.27.0 移除），
+// 于是帮助文案让用户去点一个**网关必然回 404** 的任务名。
+// 现在的对齐目标是「webapp 的 compatTaskNames ∪ runnableKinds」——
+// 合并后 webapp 才是默认产品，旧网关的 internal/server 表按计划删除。
 func TestAdminTaskNamesMatchServerWhitelist(t *testing.T) {
-	want := []string{"checkin", "activity", "keepalive", "travel", "school", "cat"}
+	want := []string{"checkin", "activity", "keepalive", "travel", "cat"}
 	if strings.Join(adminTaskNames, ",") != strings.Join(want, ",") {
 		t.Fatalf("acct 任务名 = %v, want %v（与 internal/server/admin_tasks.go 的 adminTaskNames 对齐）",
 			adminTaskNames, want)

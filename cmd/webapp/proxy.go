@@ -27,6 +27,7 @@ import (
 	"workbuddy2api/internal/egress"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/rotateguard"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -126,6 +127,14 @@ type Proxy struct {
 	// 激活期内轮转遇 WAF 403 直接终止，不把一次客户端请求放大 N 倍打同一出口 IP。
 	// 进程内状态、重启清零（窗 60s，重建成本极低）。语义见 internal/rotateguard。
 	wafGate rotateguard.WAFGate
+	// degrade 降级提示词状态机（v0.31.4，从旧网关移植）。
+	//
+	// 请求被上游内容策略拦截（400 审核文案 / 11128 渠道拒绝）时，判定多为 system 来源的
+	// 指纹误报 → 换极简中性提示词 prompt.Degraded **同请求内重试一次**，并把降级状态
+	// 保持到次日 00:00 CST（否则后续同一客户端的每个请求都要先撞一次 400）。
+	// 第二次仍被拦 → 说明是用户内容本身触发审核，回内容防火墙错误、不再重试。
+	// 进程内状态、重启清零；语义见 internal/prompt.Gate。
+	degrade prompt.Gate
 	// onCreditChanged 号池积分发生**实时扣减**后的回调（v0.20.0）。
 	//
 	// 用回调而非反向持有 *app：Proxy 是底层转发组件，反向依赖 app 会形成环，
@@ -1135,6 +1144,18 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 降级期内的请求**直达** Degraded 中性提示词（v0.31.4，从旧网关移植）：
+	// 降级是"这个客户端的 system 模板正在被上游误杀"的状态，同一窗口内每个请求都先撞
+	// 一次 400 再降级纯属浪费（且每次失败都会给上游多打一次必然失败的请求）。
+	// 起点作用在 outBody 上：PrepareOutbound 每轮从它重算，故改写一次即对全部轮次生效。
+	degradedApplied := false
+	if p.degrade.Active() {
+		outBody = prompt.Rewrite(outBody, prompt.Degraded)
+		degradedApplied = true
+		log.Printf("INFO: [proxy] 提示词降级生效中（直到 %s）：本次请求直接使用中性 system",
+			p.degrade.Until().Format(time.RFC3339))
+	}
+
 	// 会话粘性键：优先客户端会话 ID，退化为首条 user 消息派生。
 	stickyKey := session.ExtractKey(raw)
 	if stickyKey == "" {
@@ -1360,6 +1381,24 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			lastKind = kind
 			if retryAfter != "" {
 				lastRetryAfter = retryAfter
+			}
+			// 内容拦截 / 渠道拒绝的**降级重试**（v0.31.4，从旧网关移植；此前 webapp
+			// 完全没有这条能力，是合并两个产品时唯一的能力差集）。
+			//
+			// 判定依据：这类 4xx 多由客户端 system 模板的**逐字指纹**触发（issue #36/PR39），
+			// 换中性提示词即大概率通过 —— 而换账号毫无帮助（全池 UA/身份声明一致）。
+			// 只重试**一次**（degradedApplied 闸）：第二次仍被拦说明是用户内容本身触发审核，
+			// 继续重试只是把同一份被拒内容反复打上游。
+			// 该分支不改账号状态：内容问题不是账号问题（reportUpstreamError 已按此分类）。
+			if (kind == upstream.ErrContentBlocked || kind == upstream.ErrChannelDenied) && !degradedApplied {
+				p.degrade.Trigger()
+				outBody = prompt.Rewrite(outBody, prompt.Degraded)
+				degradedApplied = true
+				// 单账号池也要能拿到重试机会：本次已试过的号重新可用（降级重试只占一次名额）。
+				delete(tried, au.UID)
+				log.Printf("WARN: [proxy] 内容拦截（%s，多为 system 指纹误报）→ 已触发提示词降级并同请求重试一次",
+					kind)
+				continue
 			}
 			// 客户端可修的错（请求本身的问题）单独记一份：即使后续账号报出别的
 			// 错误，最终也该回 4xx —— 根因是请求，不是账号。
@@ -1721,6 +1760,23 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 	// 分类已经算好，各 case 各写一遍必然漏一份。默认关闭时这里是零成本返回。
 	p.maybeSampleFingerprint(kind, uid, model, reqBody, body)
 	return kind
+}
+
+// promptDegradeView 提示词降级的可观测面（v0.31.4）。
+//
+// 用 map 而不是结构体：这是**对外下发**的视图，字段名必须显式（v0.29.0 的
+// 「提现审核按钮点不动」就是内嵌无 json tag 结构体导致键名变成 Go 字段名）。
+func (p *Proxy) promptDegradeView() map[string]any {
+	until := p.degrade.Until()
+	out := map[string]any{
+		"degraded": !until.IsZero(),
+		"triggers": p.degrade.Triggers(),
+		"until":    int64(0),
+	}
+	if !until.IsZero() {
+		out["until"] = until.Unix()
+	}
+	return out
 }
 
 // handleSessionDead 12153（会话失效）的**统一处置**（v0.24.8）。

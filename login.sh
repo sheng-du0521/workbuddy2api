@@ -26,7 +26,7 @@ mkdir -p "$AUTH_DIR" 2>/dev/null || true
 if ! [[ -w "$AUTH_DIR" ]]; then
     echo "❌ 无法写入 $AUTH_DIR（auths/ 已归属容器 uid 10001？）" >&2
     echo "    请在容器内登录（无需 chown 回滚，属主自动正确）：" >&2
-    echo "    docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api" >&2
+    echo "    docker compose exec -it webapp bash -c './login.sh' && docker compose restart webapp" >&2
     exit 1
 fi
 
@@ -213,7 +213,7 @@ try:
     if st.st_uid != CONTAINER_UID:
         print(f"\n⚠️  权限警告：{auth_file} 属主 uid={st.st_uid}，容器内 app(uid={CONTAINER_UID}) 可能读不到")
         print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths")
-        print(f"    或在容器内登录（属主自动正确）：docker compose exec -it wb2api bash -c './login.sh'\n")
+        print(f"    或在容器内登录（属主自动正确）：docker compose exec -it webapp bash -c './login.sh'\n")
 except Exception:
     if tmp_file is not None:
         try:
@@ -225,7 +225,7 @@ except Exception:
     if not os.access(auth_dir, os.W_OK):
         print(f"\n❌ 写入失败：目录 {auth_dir} 不可写（权限不足）", file=sys.stderr)
         print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths", file=sys.stderr)
-        print(f"    或在容器内登录：docker compose exec -it wb2api bash -c './login.sh'\n", file=sys.stderr)
+        print(f"    或在容器内登录：docker compose exec -it webapp bash -c './login.sh'\n", file=sys.stderr)
     raise
 print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_file}")
 PYEOF
@@ -371,9 +371,23 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
     sleep 2
-    # API_KEY 从 config.json 读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
-    API_KEY=$(python3 -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
-    COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
+    # 密钥解析（v0.31.4）：WB2A_KEY > 旧网关 config.json 的 api_key > webapp 的 data/admin.key
+    API_KEY="${WB2A_KEY:-}"
+    if [[ -z "$API_KEY" && -f config.json ]]; then
+        API_KEY=$(python3 -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
+    fi
+    if [[ -z "$API_KEY" ]]; then
+        for f in data/admin.key dist/data/admin.key; do
+            [[ -z "$API_KEY" && -f "$f" ]] && API_KEY=$(tr -d '\r\n' < "$f")
+        done
+    fi
+    # 端口同理：默认 webapp 的 8780；config.json 里写了 listen 就用它（老部署）。
+    PORT=8780
+    if [[ -f config.json ]]; then
+        _L=$(python3 -c "import json; print(json.load(open('config.json')).get('listen',''))" 2>/dev/null)
+        [[ -n "$_L" ]] && PORT=${_L##*:}
+    fi
+    COUNT=$(curl -s "http://127.0.0.1:$PORT/status" -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
     echo "服务已重启，当前账号数: $COUNT"
 else
     echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"

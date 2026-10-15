@@ -2,8 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-set "WB2API_EXE=%CD%\wb2api.exe"
-set "WB2API_PID_FILE=%CD%\wb2api.pid"
+set "WB2API_EXE=%CD%\webapp.exe"
+set "WB2API_PID_FILE=%CD%\webapp.pid"
 if not exist "%WB2API_PID_FILE%" (
   echo WorkBuddy2API is not running: no PID file.
   exit /b 0

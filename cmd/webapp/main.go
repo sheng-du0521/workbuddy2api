@@ -70,7 +70,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.3"
+const version = "0.31.4"
 
 type app struct {
 	store  *Store
@@ -1520,6 +1520,15 @@ func (a *app) routes() *http.ServeMux {
 	// （鉴权失败 / 密钥停用 / 账号封禁 / 余额不足 / 配额超限 / 限流 / 请求体非法）
 	// 也补记进实时面板 —— 否则曲线与事件流只反映走到上游的请求，
 	// 呈现"只有成功、没有失败"的假象（详见 live.go 的说明）。
+	// ── 旧网关（cmd/server，7863）对外面的兼容层（v0.31.4）────────────────────────
+	// 两个产品合并的第一步：让老命令与老脚本**一行不改**也能打 webapp。
+	// 形状、键名、状态码一律照旧网关（见 compat.go 文件头），鉴权用同一个管理密钥。
+	mux.HandleFunc("GET /status", a.compatGuard(a.handleCompatStatus))
+	mux.HandleFunc("POST /v1/stats/reset", a.compatGuard(a.handleCompatStatsReset))
+	mux.HandleFunc("POST /admin/accounts/{uid}/disable", a.compatGuard(a.handleCompatAccountDisable))
+	mux.HandleFunc("POST /admin/accounts/{uid}/enable", a.compatGuard(a.handleCompatAccountEnable))
+	mux.HandleFunc("POST /admin/accounts/{uid}/revive", a.compatGuard(a.handleCompatAccountRevive))
+	mux.HandleFunc("POST /admin/tasks/{name}/run", a.compatGuard(a.handleCompatTaskRun))
 	mux.HandleFunc("POST /v1/chat/completions", a.liveCapture(a.apiKeyGuard(a.proxy.ServeChat)))
 	// /v1/models 是客户端接入时的第一个探测请求，且不产生消费 —— 故豁免余额校验，
 	// 否则余额为 0 的用户在客户端里只会看到「连接失败」（详见 apiKeyGuardNoBalance）。

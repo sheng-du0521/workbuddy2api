@@ -2,8 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-set "WB2API_EXE=%CD%\wb2api.exe"
-set "WB2API_PID_FILE=%CD%\wb2api.pid"
+set "WB2API_EXE=%CD%\webapp.exe"
+set "WB2API_PID_FILE=%CD%\webapp.pid"
 if not exist "%WB2API_PID_FILE%" (
   echo WorkBuddy2API is not running: no PID file.
   exit /b 1
@@ -17,7 +17,7 @@ if errorlevel 1 (
 )
 
 echo WorkBuddy2API is running. PID=%WB2API_PID%
-if "%WB2API_HEALTH_URL%"=="" set "WB2API_HEALTH_URL=http://127.0.0.1:7863/healthz"
+if "%WB2API_HEALTH_URL%"=="" set "WB2API_HEALTH_URL=http://127.0.0.1:8780/healthz"
 curl.exe --fail-with-body --silent --show-error --max-time 5 "%WB2API_HEALTH_URL%"
 set "WB2API_STATUS=%ERRORLEVEL%"
 echo.

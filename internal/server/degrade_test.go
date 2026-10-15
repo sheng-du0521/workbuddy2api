@@ -64,18 +64,12 @@ func TestDegradeGateActiveTriggered(t *testing.T) {
 func TestDegradeGateTriggerNoRenewal(t *testing.T) {
 	var g degradeGate
 	g.Trigger()
-	first := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
-	}()
+	// 用导出方法 Until() 读截止时刻（v0.31.4 起实现下沉到 internal/prompt，
+	// 内部字段不再可触及 —— 这本身是好事：测试只能靠公开契约断言）。
+	first := g.Until()
 	// 再次 Trigger：仍在降级期内，until 不应改变。
 	g.Trigger()
-	second := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
-	}()
+	second := g.Until()
 	if !first.Equal(second) {
 		t.Errorf("Trigger during active should not renew: first=%v second=%v", first, second)
 	}
