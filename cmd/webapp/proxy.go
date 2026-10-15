@@ -986,13 +986,13 @@ func (p *Proxy) SelectionSummary() map[string]any {
 	return out
 }
 
-// chatBaseFor 按 realm 返回上游 chat base。
-func chatBaseFor(realm string) string {
-	if realm == "global" {
-		return "https://www.workbuddy.ai"
-	}
-	return "https://copilot.tencent.com"
-}
+// 上游 chat base 一律走 upstream.Client.ChatBaseFor（v0.28.0）。
+//
+// 此前这里有一个本地的 `chatBaseFor(realm)`，把两个官方域名**硬编码**在本文件里 ——
+// 于是 upstream 的 `ChatBaseCN` / `ChatBaseGlobal`（可配置）只对包内出站
+// （签到 / 查余额 / 模型列表）生效，而**占比最大的转发链路**永远走硬编码域名：
+// 运维把 base 指向自建镜像时会看到"配了没用"，且没有任何报错可查。
+// 现在删掉本地副本，转发链路与包内出站共用同一个判定（realm 路由 + 可配置覆盖）。
 
 // authFromAccount 把库里的账号记录转成 upstream 需要的 *auth.Auth。
 // realm 字段在包内未导出，唯一可靠的构造途径是走 auth.Parse 解析嵌套 JSON。
@@ -1236,7 +1236,7 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		url := chatBaseFor(au.Realm()) + chatPath
+		url := p.uc.ChatBaseFor(au) + chatPath
 		// 出站改写（v0.24.0 P1-1）：复用 upstream 的同一套管线和 webapp 之前**完全绕过**它，
 		// 导致指纹脱敏 / 角色归一 / efforts 降级 / prompt_cache_key 全部失效
 		// （而 p.uc.SanitizeFingerprints 明明设了 true —— 静默缺陷）。

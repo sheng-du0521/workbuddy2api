@@ -90,12 +90,29 @@ var sanitizeRewrites = [][2]string{
 }
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+//
+// 自定义规则集由全局指针提供（见 fingerprint_rules.go）。抽成 _With 形态是为了让
+// 「保存前自检」能拿一个**尚未安装**的候选规则集跑同一条管线 —— 若先装再评估，
+// 评估期间生产流量已经在用一条没验证过的规则了。
 func sanitizeText(text string) string {
-	if !hasFingerprint(text) {
+	return sanitizeTextWith(activeFingerprintRules.Load(), text)
+}
+
+// sanitizeTextWith 用给定的自定义规则集净化（cr 为 nil = 只有内置规则）。
+func sanitizeTextWith(cr *compiledFingerprintRules, text string) string {
+	if !hasFingerprintWith(cr, text) {
 		return text
 	}
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
+	}
+	// 自定义规则（v0.28.0，R4）：literal 在前、regex 在后的顺序由编译期排定
+	// （见 compiledFingerprintRules.ordered 的说明）。cr 为 nil 时整段被跳过，
+	// 热路径上只是一次 nil 判断。
+	if cr != nil {
+		for _, c := range cr.ordered {
+			text = c.apply(text)
+		}
 	}
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
@@ -118,12 +135,31 @@ func sanitizeText(text string) string {
 // 必须再用不要求冒号的 (?i) 正则兜底（sanitizeBareHdrRe），否则整条净化被跳过。
 // sanitizeBareHdrRe 不要求冒号，是 sanitizeHdrRe 的超集，故无需再单独匹配后者。
 func hasFingerprint(text string) bool {
+	return hasFingerprintWith(activeFingerprintRules.Load(), text)
+}
+
+// hasFingerprintWith 带自定义规则集的预检。
+//
+// ⚠️ 自定义规则必须进预检：预检不中就**整条净化被跳过**，于是"装了规则却不生效"
+// 会表现为"规则列表里明明有它，却没有效果"——最难查的一类不一致。规则少而短，
+// 这里的额外成本可忽略；匹配逻辑与 apply 共用同一个 compiledFpRule（不会分叉）。
+func hasFingerprintWith(cr *compiledFingerprintRules, text string) bool {
 	for _, f := range sanitizeFeatures {
 		if strings.Contains(text, f) {
 			return true
 		}
 	}
-	return sanitizeBareHdrRe.MatchString(text)
+	if sanitizeBareHdrRe.MatchString(text) {
+		return true
+	}
+	if cr != nil {
+		for _, c := range cr.ordered {
+			if c.match(text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。

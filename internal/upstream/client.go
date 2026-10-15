@@ -974,6 +974,17 @@ func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
+// ChatBaseFor 按账号 realm 返回 chat base（导出形态，v0.28.0）。
+//
+// 存在的理由：webapp 的转发链路此前**自己**复制了一份 base 判定
+// （cmd/webapp/proxy.go 的 chatBaseFor）—— 于是 `ChatBaseCN` / `ChatBaseGlobal`
+// 这两个可配置字段只对**本包内部**的出站生效（签到 / 查余额 / 模型列表），
+// 而**占比最大的 chat 转发**永远走硬编码的官方域名。运维把 base 指向自建镜像时，
+// 表现就是"配了没用"（一部分请求走了镜像、最主要的那部分没有）。
+//
+// 现在收敛到这一个函数：任何调用方都不该再自己拼 base。
+func (c *Client) ChatBaseFor(a *auth.Auth) string { return c.chatBase(a) }
+
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；

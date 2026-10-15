@@ -157,6 +157,20 @@ const FX = {
     enabled: false, file: 'data/fingerprint_samples.jsonl', count: 0, full: false,
     kinds: {}, samples: [],
   },
+  // v0.28.0：出站指纹规则（R4）。桩必须**按真接口形状**给（内置是只读视图、
+  // 自定义可增删、max 是条数上限）—— 否则测的是桩的懒惰而不是界面的行为。
+  '/api/admin/fingerprint-rules': {
+    max: 200,
+    builtin: [
+      { id: 'fp-builtin-ident', kind: 'literal',
+        match: "You are Claude Code, Anthropic's official CLI for Claude",
+        replace: "You are Claude Code, Anthropic's official CLI tool for Claude",
+        note: '内置（编译期常量，只读）', source: 'builtin', builtin: true },
+      { id: 'fp-builtin-hdr', kind: 'regex', match: 'x-anthropic-billing-header:[^;\\n]*;?\\s*',
+        replace: '', note: '内置：整段删除', source: 'builtin', builtin: true },
+    ],
+    custom: [],
+  },
   // v0.26.3：消耗失败台账（统计 + 明细 + 处置策略表）。
   '/api/admin/consume-failures': {
     window_hours: 24, since: 0, limit: 100, retention: 5000, total: 12,
@@ -1200,8 +1214,19 @@ function run(pageFile, meOverride, plan) {
     { clickText: [['#egrTabs .seg', '设备与选号诊断']],
       has: [['[data-egr-sub="device"]', 1], ['#devTokSummary', 1], ['#devTokRows', 1],
         ['#devTokText', 1], ['#btnDevTokImport', 1], ['#selBalance', 1], ['#selCands', 1], ['#fpSamples', 1],
-        // 三张表：凭证逐号、均衡度 Top、候选队列
-        ['[data-egr-sub="device"] .egr-help-table', 3]],
+        // v0.28.0：指纹规则面板（自定义可增删 / 内置只读 / 试跑 / 样本回放）。
+        ['#fpRulesCustom', 1], ['#fpRulesBuiltin', 1], ['#fpRuleKpis', 1],
+        ['#fpRuleKind', 1], ['#fpRuleMatch', 1], ['#fpRuleReplace', 1], ['#fpRuleNote', 1],
+        ['#btnFpRuleSave', 1], ['#btnFpRuleTest', 1], ['#btnFpRuleReplay', 1],
+        ['#fpRuleTestText', 1], ['#fpRuleTestOut', 1], ['#fpRuleReplayOut', 1],
+        ['#fpRuleKind option', 2], ['#fpRuleKpis .stat-card', 3],
+        // 四张表：凭证逐号、均衡度 Top、候选队列、内置规则（自定义为空时是空态块）
+        ['[data-egr-sub="device"] .egr-help-table', 4],
+        // 自定义为空：必须是「空态提示」而不是一张空表（后者看着像加载失败）
+        ['#fpRulesCustom .feed-empty', 1]],
+      // 内置规则**不给**删除按钮（它来自代码，删不掉）—— 给了按钮才是缺陷，
+      // 所以这条必须用 absent（「必须为 0 个」）而不是 has（`>=0` 永远成立）。
+      absent: ['#fpRulesBuiltin [data-fp-del]'],
       display: [['[data-egr-sub="device"]', 'shown'], ['[data-egr-sub="pool"]', 'none']],
       textIn: [['#devTokSummary', '真凭证 1'], ['#devTokSummary', '无凭证 1'],
         // v0.26.3：五态必须分别可见（stale 与 derived 的处置方向相反，
@@ -1214,7 +1239,13 @@ function run(pageFile, meOverride, plan) {
         ['#selCands', '#1'], ['#selCands', 'Top5'], ['#selCands', '账号级冷却中'],
         ['#selCands', '落选'],
         // 样本开关关着时必须明说"未开启"：显示"0 条"会让人误以为"没被拦过"
-        ['#fpSamples', '未开启']],
+        ['#fpSamples', '未开启'],
+        // v0.28.0：指纹规则面板 —— 内置只读要能看见、自定义为空要有引导、
+        // 条数上限要显示（否则运维不知道"还能加多少"）。
+        ['#fpRuleKpis', '自定义规则'], ['#fpRuleKpis', '0 / 200'], ['#fpRuleKpis', '内置规则'],
+        ['#fpRulesBuiltin', '内置'], ['#fpRulesBuiltin', 'regex'],
+        ['#fpRulesCustom', '还没有自定义规则'],
+        ['#fpRuleKind', '正则替换'], ['#fpRuleKind', '逐字替换']],
       // 凭证原文绝不出现（接口只回指纹与长度）
       lacks: [['[data-egr-sub="device"]', 'AUTHTOKEN']] },
     // v0.26.5：样本面板的**启用态** —— 关着时测的是"必须明说未开启"，
@@ -1243,7 +1274,38 @@ function run(pageFile, meOverride, plan) {
         ['#fpSampleDist', '按拦截类型'], ['#fpSampleDist', 'content_blocked'],
         ['#fpSampleDist', '按模型'], ['#fpSampleDist', 'glm-5.3'],
         ['#fpSamples', 'You are Claude Code'], ['#fpSamples', '复制全文'],
+        // v0.28.0：样本行必须能"采纳为规则"（采集 → 处置的闭环入口）。
+        ['#fpSamples', '采纳为规则'],
       ] },
+    // v0.28.0：规则面板的**有自定义规则**态 —— 关着时测"空态引导"，
+    // 这里测真的把表 / 命中列 / 删除按钮画出来了（两态都要钉，缺一即为漏测）。
+    { fx: [['/api/admin/fingerprint-rules', {
+        max: 200,
+        builtin: [
+          { id: 'fp-builtin-ident', kind: 'literal', match: 'You are Claude Code, Anthropic official CLI',
+            replace: 'You are Claude Code, Anthropic official CLI tool',
+            note: '内置（编译期常量，只读）', source: 'builtin', builtin: true },
+        ],
+        custom: [
+          { id: 'fp-aaaabbbbcccc', kind: 'literal', match: 'CUSTOM-TOKEN-HERE',
+            replace: 'CUSTOM TOKEN HERE', note: '来自 10-15 样本', source: 'sample', added_at: 1791972000 },
+          { id: 'fp-ddddeeeeffff', kind: 'regex', match: 'trace_[0-9a-f]+;?',
+            replace: '', note: '整段删除', source: 'manual', added_at: 1791972001 },
+        ],
+      }]],
+      clickText: [['#egrTabs .seg', '设备与选号诊断']],
+      has: [['#fpRulesCustom .egr-help-table', 1], ['#fpRulesBuiltin .egr-help-table', 1],
+        ['#fpRulesCustom [data-fp-del]', 2], ['#fpRulesCustom [data-fp-hits]', 2]],
+      // 内置表**不得**有删除按钮（两态都要验，否则"只在内置为空时才隐藏"这种
+      // 假实现会漏过）。
+      absent: ['#fpRulesBuiltin [data-fp-del]', '#fpRulesCustom .feed-empty'],
+      textIn: [['#fpRuleKpis', '2 / 200'], ['#fpRulesCustom', 'CUSTOM-TOKEN-HERE'],
+        ['#fpRuleKpis', '逐字 → 正则'],
+        // 正则规则替换串为空时必须显示「（删除）」而不是空白格 ——
+        // 空白会让人以为"没填"，而它的语义恰好相反。
+        ['#fpRulesCustom', '（删除）'],
+        // 命中数占位：回放前显示「—」而不是 0（"没评估"≠"一条没命中"）。
+        ['#fpRulesCustom', '—']] },
     // R1：线路失效处置策略 = 面板可读可改（默认「不静默换出口」）
     { nav: 'egress',
       has: [['#egrOnLineDown', 1], ['#btnEgrOnLineDown', 1], ['#egrOnLineDown option', 2]],

@@ -663,6 +663,60 @@
           </div>
           <div id="fpSamples" style="margin-top:12px;"></div>
         </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="section-head">
+            <h2>出站指纹规则</h2>
+            <span class="muted" style="font-size:12px;">上面的样本 → 这里的规则，<b>改完立即生效，无需发版</b></span>
+          </div>
+          <div class="sub" style="margin:0 0 10px;">
+            出站请求体会按下面的规则脱敏（剥离上游内容审核的黑名单指纹）。<b>内置规则来自代码，只读</b>；
+            自定义规则存在数据库里、随时可增删 —— 新发现的触发词不必再等下一个版本。
+            两种形态：<b>逐字</b>（把某个句子里的一个词换掉，最安全，优先用它）与<b>正则</b>（处理长度不定的键值段，留空替换串即整段删除）。<br>
+            ⚠️ 规则会作用于<b>所有</b>出站请求，副作用是"模型开始答非所问"这种极难归因的现象 ——
+            所以保存前请务必<b>试跑</b>，并用<b>样本回放</b>确认它真的命中被拦样本。
+          </div>
+          <div id="fpRuleKpis" class="kpis"></div>
+
+          <div class="row" style="margin-top:14px;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+            <label class="field" style="min-width:120px;"><span>形态</span>
+              <select id="fpRuleKind">
+                <option value="literal">逐字替换（推荐）</option>
+                <option value="regex">正则替换</option>
+              </select>
+            </label>
+            <label class="field" style="flex:1;min-width:240px;"><span>匹配串</span>
+              <input id="fpRuleMatch" placeholder="逐字：整句 / 整段原文；正则：如 cc_[a-z]+=[^;\n]*;?">
+            </label>
+            <label class="field" style="flex:1;min-width:200px;"><span>替换为（留空 = 删除）</span>
+              <input id="fpRuleReplace" placeholder="逐字：只改一个词；正则：可留空">
+            </label>
+            <label class="field" style="min-width:160px;"><span>备注（为什么加它）</span>
+              <input id="fpRuleNote" placeholder="如：来自 10-15 的 11128 样本">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="ghost sm" id="btnFpRuleSave">保存规则</button>
+            <button class="ghost sm" id="btnFpRuleTest">用下面的文本试跑</button>
+            <button class="ghost sm" id="btnFpRuleReplay">对已采集样本回放</button>
+            <span id="fpRuleMsg" class="muted" style="font-size:12px;"></span>
+          </div>
+          <label class="field" style="margin-top:10px;display:block;">
+            <span>试跑文本（不会真的发出去）</span>
+            <textarea id="fpRuleTestText" rows="3" placeholder="把 system 提示词或可疑片段粘进来，点「用下面的文本试跑」看净化前后的差异"></textarea>
+          </label>
+          <div id="fpRuleTestOut" style="margin-top:10px;"></div>
+          <div id="fpRuleReplayOut" style="margin-top:10px;"></div>
+
+          <div style="margin-top:14px;">
+            <div class="muted" style="margin-bottom:6px;">自定义规则（可增删，存储在数据库）</div>
+            <div id="fpRulesCustom"></div>
+          </div>
+          <div style="margin-top:14px;">
+            <div class="muted" style="margin-bottom:6px;">内置规则（编译期常量，只读）</div>
+            <div id="fpRulesBuiltin"></div>
+          </div>
+        </div>
       </div>
 
       <!-- ========== 子区 ②：账号代理（绑定层） ========== -->
@@ -6238,16 +6292,18 @@ async function saveEgrOnLineDown() {
 async function loadDeviceDiag() {
   const box = $('devTokSummary');
   if (box) box.textContent = '加载中…';
-  const [dt, bal, cand, fps] = await Promise.all([
+  const [dt, bal, cand, fps, fpr] = await Promise.all([
     api('/api/admin/device-tokens').catch((e) => ({ error: String(e.message || e) })),
     api('/api/admin/selection-balance?hours=24').catch((e) => ({ error: String(e.message || e) })),
     api('/api/admin/selection-candidates').catch((e) => ({ error: String(e.message || e) })),
     api('/api/admin/fingerprint-samples').catch((e) => ({ error: String(e.message || e) })),
+    api('/api/admin/fingerprint-rules').catch((e) => ({ error: String(e.message || e) })),
   ]);
   renderDeviceTok(dt);
   renderSelBalance(bal);
   renderSelCands(cand);
   renderFpSamples(fps);
+  renderFpRules(fpr);
 }
 
 // 样本面板的两个按钮（在子区里，故用条件挂载）。
@@ -6365,7 +6421,10 @@ function renderFpSamples(d) {
       + '<td class="mono">' + escapeHTML(s.model || '—') + '</td>'
       + '<td style="font-size:12px;">' + escapeHTML((s.system || '').slice(0, 120)) + '</td>'
       + '<td style="font-size:12px;">' + escapeHTML((s.tools || []).slice(0, 6).join(', ') || '—') + '</td>'
-      + '<td><button class="ghost sm" data-fp-copy="' + escapeHTML(s.key || '') + '">复制全文</button></td></tr>').join('')
+      + '<td style="white-space:nowrap;">'
+      + '<button class="ghost sm" data-fp-copy="' + escapeHTML(s.key || '') + '">复制全文</button> '
+      + '<button class="ghost sm" data-fp-adopt="' + escapeHTML(s.key || '') + '">采纳为规则</button>'
+      + '</td></tr>').join('')
     + '</tbody></table>';
   // 复制全文：黑名单要的是 system 原文（表里只截了 120 字，截断处可能正好是指纹词）。
   for (const b of Array.from(box.querySelectorAll('[data-fp-copy]'))) {
@@ -6377,6 +6436,250 @@ function renderFpSamples(d) {
         + ((s2.tools || []).join(', ') || '—'));
     };
   }
+  // 采纳为规则：把样本原文灌进下面的规则表单与试跑框。
+  //
+  // 刻意**不**自动猜一条匹配串：指纹是 system 里的哪一句，只有看过内容的人知道
+  // （从 300 字里自动切一段，切错的表现是"规则存了但没命中"，比不填更难查）。
+  // 这里做的是把"证据"搬到"编辑器"旁边，并预置一次试跑输入 —— 让人写规则时
+  // 眼前就有真实的被拦原文，写完立刻能验证。
+  for (const b of Array.from(box.querySelectorAll('[data-fp-adopt]'))) {
+    b.onclick = () => {
+      const s2 = rows.find((x) => (x.key || '') === b.dataset.fpAdopt);
+      if (!s2) return;
+      const t = $('fpRuleTestText');
+      if (t) t.value = s2.system || '';
+      const note = $('fpRuleNote');
+      if (note && !note.value) {
+        note.value = '来自 ' + fmtTime(s2.at) + ' 的 ' + (s2.kind || '') + ' 样本';
+      }
+      const m = $('fpRuleMatch');
+      if (m) { m.value = ''; m.focus(); }
+      setFpRuleMsg('已把样本原文填入下面的试跑框 —— 从里面挑出真正触发拦截的那一句，填进「匹配串」，再点试跑。', 'ok');
+    };
+  }
+}
+
+// ======================================================================
+// 出站指纹规则面板（R4，v0.28.0）
+//
+// 三条设计取舍：
+//   1. **内置规则单独一块、不给删除**：它来自代码。混在一张表里会让运维以为
+//      "删除内置规则"是个可用操作，然后反复点击却没反应；
+//   2. **试跑与样本回放都必须在保存前可用**：规则的作用面是全部出站请求，
+//      而坏规则的表现为"模型开始答非所问"—— 事后归因的成本远高于事前验证；
+//   3. **命中数为 0 的规则也要显示**："没用"和"没评估"是两件事，只显示命中的
+//      会让后者看起来像前者（运维会据此删掉一条其实有用的规则）。
+// ======================================================================
+
+function setFpRuleMsg(t, tone) {
+  const m = $('fpRuleMsg');
+  if (!m) return;
+  m.textContent = t || '';
+  m.style.color = tone === 'err' ? 'var(--err)' : (tone === 'ok' ? 'var(--ok)' : '');
+}
+
+function renderFpRules(d) {
+  const cust = $('fpRulesCustom'), built = $('fpRulesBuiltin'), kbox = $('fpRuleKpis');
+  if (!cust || !built) return;
+  if (!d || d.error) {
+    if (kbox) kbox.textContent = '';
+    cust.textContent = '读取失败：' + ((d && d.error) || '未知错误');
+    built.textContent = '';
+    return;
+  }
+  const custom = d.custom || [], builtin = d.builtin || [];
+  if (kbox) {
+    kbox.textContent = '';
+    kbox.appendChild(statCard('自定义规则', fmtNum(custom.length) + ' / ' + fmtNum(d.max || 0)));
+    kbox.appendChild(statCard('内置规则', fmtNum(builtin.length)));
+    kbox.appendChild(statCard('生效顺序', '逐字 → 正则', { hint: '内置与自定义叠加，不可覆盖内置' }));
+  }
+
+  const table = (list, withDel) => '<table class="egr-help-table"><thead><tr><th>形态</th><th>匹配串</th>'
+    + '<th>替换为</th><th>备注</th>'
+    + (withDel ? '<th>命中样本</th><th></th>' : '')
+    + '</tr></thead><tbody>'
+    + list.map((r) => '<tr>'
+      + '<td><span class="tag ' + (r.kind === 'regex' ? 'accent' : '') + '">' + escapeHTML(r.kind) + '</span></td>'
+      + '<td class="mono" style="font-size:12px;word-break:break-all;">' + escapeHTML(r.match || '') + '</td>'
+      + '<td class="mono" style="font-size:12px;word-break:break-all;">'
+      + (r.replace ? escapeHTML(r.replace) : '<span class="muted">（删除）</span>') + '</td>'
+      + '<td style="font-size:12px;">' + escapeHTML(r.note || '—') + '</td>'
+      + (withDel
+        ? '<td class="mono" data-fp-hits="' + escapeHTML(r.id) + '">—</td>'
+          + '<td><button class="ghost sm" data-fp-del="' + escapeHTML(r.id) + '">删除</button></td>'
+        : '')
+      + '</tr>').join('')
+    + '</tbody></table>';
+
+  if (!custom.length) {
+    emptyBlock(cust, '还没有自定义规则。内置规则已在生效；新发现触发词时在这里加一条即可，'
+      + '不必等下一个版本。');
+  } else {
+    cust.innerHTML = table(custom, true);
+    for (const b of Array.from(cust.querySelectorAll('[data-fp-del]'))) {
+      b.onclick = async () => {
+        const id = b.dataset.fpDel;
+        if (!(await confirmAsk('删除这条指纹规则？\n\n删除后立即生效，出站请求不再按它脱敏。', { confirmText: '删除' }))) return;
+        try {
+          const r = await api('/api/admin/fingerprint-rules?id=' + encodeURIComponent(id), { method: 'DELETE' });
+          renderFpRules({ builtin, custom: r.custom || [], max: d.max });
+          setFpRuleMsg(r.changed ? '已删除' : '该规则不存在（可能已被删除）', r.changed ? 'ok' : '');
+        } catch (e) { setFpRuleMsg('删除失败：' + e.message, 'err'); }
+      };
+    }
+  }
+  built.innerHTML = table(builtin, false);
+  // 命中数是**懒加载**的：回放要读样本文件，不该在每次进页面时都跑一遍。
+  markFpHitsPending(custom);
+}
+
+// markFpHitsPending 命中数占位（回放之后才会被填上）。
+function markFpHitsPending(custom) {
+  for (const r of custom) {
+    const cell = document.querySelector('[data-fp-hits="' + r.id + '"]');
+    if (cell) cell.textContent = '—';
+  }
+}
+
+// fpCollectForm 读表单里的规则（用于试跑 / 保存）。
+function fpCollectForm() {
+  const kind = ($('fpRuleKind') || {}).value || 'literal';
+  const match = ($('fpRuleMatch') || {}).value || '';
+  const replace = ($('fpRuleReplace') || {}).value || '';
+  const note = ($('fpRuleNote') || {}).value || '';
+  return { kind, match, replace, note };
+}
+
+// ---- 面板按钮（条件挂载：规则面板只在「出口代理 → 设备」子区里） ----
+if ($('btnFpRuleSave')) {
+  $('btnFpRuleSave').onclick = async () => {
+    const form = fpCollectForm();
+    if (!form.match) { setFpRuleMsg('请先填「匹配串」', 'err'); return; }
+    setFpRuleMsg('保存中…');
+    try {
+      const r = await api('/api/admin/fingerprint-rules', { method: 'POST', body: JSON.stringify(form) });
+      // 保存成功后把表单清掉（匹配串保留会让人以为"还有一条待保存"）。
+      if ($('fpRuleMatch')) $('fpRuleMatch').value = '';
+      if ($('fpRuleReplace')) $('fpRuleReplace').value = '';
+      if ($('fpRuleNote')) $('fpRuleNote').value = '';
+      await refreshFpRules();
+      setFpRuleMsg('已保存并生效（自定义规则 ' + ((r.custom || []).length) + ' 条）', 'ok');
+      toast('指纹规则已保存并生效');
+    } catch (e) {
+      // 校验失败的错误文案就是"为什么存不进去"的答案，原样显示，不要套一层通用话术。
+      setFpRuleMsg('保存失败：' + e.message, 'err');
+    }
+  };
+}
+if ($('btnFpRuleTest')) {
+  $('btnFpRuleTest').onclick = async () => {
+    const text = ($('fpRuleTestText') || {}).value || '';
+    if (!text) { setFpRuleMsg('请先在下面的框里粘一段文本', 'err'); return; }
+    try {
+      // 表单里填了匹配串 → 用「当前规则 + 这条候选」预演（保存前先看效果）。
+      // 没填 → 用已保存的规则集试跑。
+      const form = fpCollectForm();
+      const payload = { text };
+      if (form.match) {
+        const cur = (await api('/api/admin/fingerprint-rules')).custom || [];
+        payload.rules = cur.concat([form]);
+      }
+      const r = await api('/api/admin/fingerprint-rules/test', { method: 'POST', body: JSON.stringify(payload) });
+      renderFpTestOut(r, !!form.match);
+      setFpRuleMsg(r.changed ? '净化已生效（见下方对照）' : '这段文本不会被改写', r.changed ? 'ok' : '');
+    } catch (e) { setFpRuleMsg('试跑失败：' + e.message, 'err'); }
+  };
+}
+if ($('btnFpRuleReplay')) {
+  $('btnFpRuleReplay').onclick = async () => {
+    const out = $('fpRuleReplayOut');
+    if (out) out.textContent = '回放中…';
+    try {
+      const form = fpCollectForm();
+      const payload = {};
+      if (form.match) {
+        const cur = (await api('/api/admin/fingerprint-rules')).custom || [];
+        payload.rules = cur.concat([form]);
+      }
+      const r = await api('/api/admin/fingerprint-rules/replay', { method: 'POST', body: JSON.stringify(payload) });
+      renderFpReplayOut(r);
+      // 命中数写回自定义规则表（回放的价值就是"这条规则到底有没有用"）。
+      for (const id of Object.keys(r.hits || {})) {
+        const cell = document.querySelector('[data-fp-hits="' + id + '"]');
+        if (cell) cell.textContent = String(r.hits[id]);
+      }
+    } catch (e) {
+      if (out) out.textContent = '回放失败：' + e.message;
+    }
+  };
+}
+
+// renderFpTestOut 试跑对照（前后逐字并列）。
+function renderFpTestOut(r, isCandidate) {
+  const out = $('fpRuleTestOut');
+  if (!out) return;
+  out.textContent = '';
+  const head = el('div', 'muted');
+  head.textContent = '试跑结果' + (isCandidate ? '（含未保存的候选规则）' : '（当前已保存的规则）')
+    + ' · 命中规则 ' + ((r.hit_rules || []).length) + ' 条'
+    + (r.builtin_changed ? ' · 内置规则也改写了这段文本' : '');
+  out.appendChild(head);
+  const pair = (title, text, cls) => {
+    const wrap = el('div');
+    wrap.style.marginTop = '6px';
+    wrap.appendChild(el('div', 'muted', title));
+    const pre = el('pre', 'mono ' + cls);
+    pre.style.cssText = 'white-space:pre-wrap;word-break:break-all;font-size:12px;'
+      + 'max-height:180px;overflow:auto;margin:4px 0 0;padding:8px;border-radius:8px;background:var(--tint);';
+    pre.textContent = text;
+    wrap.appendChild(pre);
+    return wrap;
+  };
+  out.appendChild(pair('原文', r.before || ''));
+  out.appendChild(pair('净化后', r.after || ''));
+  if (r.hit_rules && r.hit_rules.length) {
+    const ids = r.hit_rules.join(', ');
+    out.appendChild(el('div', 'muted', '命中：' + ids));
+  }
+}
+
+// renderFpReplayOut 回放结果：用真实被拦样本验证规则有效性。
+function renderFpReplayOut(r) {
+  const out = $('fpRuleReplayOut');
+  if (!out) return;
+  out.textContent = '';
+  const n = Number(r.sample_count || 0);
+  if (!n) {
+    emptyBlock(out, '还没有样本可回放 —— 要么没被拦过，要么「被拦样本回流」开关没打开'
+      + '（见上方面板的说明）。');
+    return;
+  }
+  const kinds = r.sample_kinds || {};
+  const dist = Object.keys(kinds).map((k) => k + ' ' + kinds[k]).join(' / ');
+  out.appendChild(el('div', 'muted', '对 ' + n + ' 条去重样本回放（' + dist + '）'));
+  const rules = r.rules || [];
+  const hits = r.hits || {};
+  const rows = rules.map((x) => ({ id: x.id, match: x.match, kind: x.kind, n: Number(hits[x.id] || 0) }))
+    .sort((a, b) => b.n - a.n);
+  const total = rows.reduce((s, x) => s + x.n, 0);
+  out.appendChild(el('div', 'sub', total > 0
+    ? ('命中合计 ' + total + ' 次 —— 说明这些规则确实覆盖到被拦样本。')
+    : '⚠️ 一条都没命中：规则可能写偏了（匹配串与样本里的实际文字不一致），建议对照样本原文修改。'));
+  const tb = el('table', 'egr-help-table');
+  tb.innerHTML = '<thead><tr><th>形态</th><th>匹配串</th><th>命中样本</th></tr></thead><tbody>'
+    + rows.map((x) => '<tr><td>' + escapeHTML(x.kind) + '</td>'
+      + '<td class="mono" style="font-size:12px;word-break:break-all;">' + escapeHTML(x.match) + '</td>'
+      + '<td class="mono">' + x.n + '</td></tr>').join('')
+    + '</tbody></table>';
+  out.appendChild(tb);
+}
+
+// refreshFpRules 只刷规则面板（保存 / 删除后回显）。
+async function refreshFpRules() {
+  const d = await api('/api/admin/fingerprint-rules').catch((e) => ({ error: String(e.message || e) }));
+  renderFpRules(d);
+  return d;
 }
 
 // fmtBytes 人类可读的体积（KB / MB）。样本文件的上限是 2MB 量级，

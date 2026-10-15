@@ -69,7 +69,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.27.0"
+const version = "0.28.0"
 
 type app struct {
 	store  *Store
@@ -314,6 +314,18 @@ func main() {
 		loginLimiter:    newRateLimiter(30, 15*time.Minute),
 		limiter:         newClientLimiter(),
 		alerts:          newAlertState(),
+	}
+
+	// 自定义出站指纹规则（R4，v0.28.0）：从 kv 读回并安装到 upstream 的全局规则集上。
+	// **必须在服务开始接流量之前**（否则最初一段文本走的是无规则路径，而且没有任何
+	// 痕迹能看出"前 N 个请求没脱敏"）。
+	//
+	// 失败**不阻断启动**（详见 loadFingerprintRules 的注释：规则是增强，不是前置条件），
+	// 但一定会留一条 WARN 日志，避免运维"以为规则还在生效"。
+	if n, err := a.loadFingerprintRules(); err != nil {
+		log.Printf("WARN: [fprules] 启动加载自定义指纹规则失败（已按无自定义规则运行）：%v", err)
+	} else if n > 0 {
+		log.Printf("INFO: [fprules] 已加载 %d 条自定义出站指纹规则", n)
 	}
 
 	// -check-update：只跑一次版本检查就退出，不启动 HTTP 服务与定时任务。
@@ -1438,6 +1450,15 @@ func (a *app) routes() *http.ServeMux {
 	// 指纹被拦样本回流（R4 / v0.26.1）：默认关闭，开启后落 system 原文前 300 字 + 工具清单。
 	mux.HandleFunc("GET /api/admin/fingerprint-samples", a.adminGuard(a.handleFingerprintSamples))
 	mux.HandleFunc("DELETE /api/admin/fingerprint-samples", a.adminGuard(a.handleFingerprintSamplesClear))
+
+	// 出站指纹规则（R4，v0.28.0）：把"被拦样本"变成"可上线规则"，无需发版。
+	// 与上面采样面板配套 —— 采集（样本）+ 处置（规则）合起来才是闭环。
+	mux.HandleFunc("GET /api/admin/fingerprint-rules", a.adminGuard(a.handleAdminFingerprintRules))
+	mux.HandleFunc("POST /api/admin/fingerprint-rules", a.adminGuard(a.handleAdminFingerprintRuleUpsert))
+	mux.HandleFunc("DELETE /api/admin/fingerprint-rules", a.adminGuard(a.handleAdminFingerprintRuleDelete))
+	// 试跑（保存前预演，不动全局规则）与样本回放（用真实被拦样本验证规则有效性）。
+	mux.HandleFunc("POST /api/admin/fingerprint-rules/test", a.adminGuard(a.handleAdminFingerprintRuleTest))
+	mux.HandleFunc("POST /api/admin/fingerprint-rules/replay", a.adminGuard(a.handleAdminFingerprintRuleReplay))
 
 	// 消耗失败台账（v0.26.3，见 failures.go）：统计 + 明细 + 错误码处置策略表。
 	mux.HandleFunc("GET /api/admin/consume-failures", a.adminGuard(a.handleConsumeFailures))
