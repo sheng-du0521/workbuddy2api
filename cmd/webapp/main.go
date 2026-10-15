@@ -47,6 +47,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"workbuddy2api/internal/api/fingerprint"
+	"workbuddy2api/internal/httpx"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/modelname"
@@ -71,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.11"
+const version = "0.31.12"
 
 type app struct {
 	store  *Store
@@ -1309,11 +1311,13 @@ var fallbackModels = modelname.FallbackModels
 // 为什么在这里脱敏而不是改 150+ 个调用点：见 errsafe.go 的说明 ——
 // 单点收敛、可单测、与业务判断（状态码）解耦。业务文案不受影响，
 // 只有「看起来像 SQLite/栈信息」的文本会被替换，且原文仍进日志。
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(scrubErrBody(v))
-}
+// writeJSON 统一的 JSON 响应出口 —— **实现已下沉 `internal/httpx.WriteJSON`**
+// （v0.31.12，P2-7 第四刀起手：脱敏 + 写出是所有 handler 的横切关注点，不该由
+// 每个 `internal/api/*` 包各复制一份）。
+//
+// 保留本包同名薄包装：它的调用点有 **552 处**，改引用点不会带来任何理解收益，
+// 只会让这一刀的面积虚增（与前三刀的接线纪律一致）。
+func writeJSON(w http.ResponseWriter, status int, v any) { httpx.WriteJSON(w, status, v) }
 
 // routes 注册全部 HTTP 路由（v0.24.0 从 main() 抽出）。
 //
@@ -1489,12 +1493,17 @@ func (a *app) routes() *http.ServeMux {
 
 	// 出站指纹规则（R4，v0.28.0）：把"被拦样本"变成"可上线规则"，无需发版。
 	// 与上面采样面板配套 —— 采集（样本）+ 处置（规则）合起来才是闭环。
-	mux.HandleFunc("GET /api/admin/fingerprint-rules", a.adminGuard(a.handleAdminFingerprintRules))
-	mux.HandleFunc("POST /api/admin/fingerprint-rules", a.adminGuard(a.handleAdminFingerprintRuleUpsert))
-	mux.HandleFunc("DELETE /api/admin/fingerprint-rules", a.adminGuard(a.handleAdminFingerprintRuleDelete))
+	//
+	// 实现已于 v0.31.12 下沉 `internal/api/fingerprint`（P2-7 第四刀第一刀）：
+	// 路由**注册**留在这里（应用级装配），handler 的**实现**在新包。
+	// 样本读取（文件 IO、路径可被 flag 改）作为依赖注入 —— 新包不认识文件系统。
+	fpRules := fingerprint.New(a.store, fingerprintSampleTexts)
+	mux.HandleFunc("GET /api/admin/fingerprint-rules", a.adminGuard(fpRules.HandleRules))
+	mux.HandleFunc("POST /api/admin/fingerprint-rules", a.adminGuard(fpRules.HandleRuleUpsert))
+	mux.HandleFunc("DELETE /api/admin/fingerprint-rules", a.adminGuard(fpRules.HandleRuleDelete))
 	// 试跑（保存前预演，不动全局规则）与样本回放（用真实被拦样本验证规则有效性）。
-	mux.HandleFunc("POST /api/admin/fingerprint-rules/test", a.adminGuard(a.handleAdminFingerprintRuleTest))
-	mux.HandleFunc("POST /api/admin/fingerprint-rules/replay", a.adminGuard(a.handleAdminFingerprintRuleReplay))
+	mux.HandleFunc("POST /api/admin/fingerprint-rules/test", a.adminGuard(fpRules.HandleRuleTest))
+	mux.HandleFunc("POST /api/admin/fingerprint-rules/replay", a.adminGuard(fpRules.HandleRuleReplay))
 
 	// 消耗失败台账（v0.26.3，见 failures.go）：统计 + 明细 + 错误码处置策略表。
 	mux.HandleFunc("GET /api/admin/consume-failures", a.adminGuard(a.handleConsumeFailures))

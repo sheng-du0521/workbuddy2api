@@ -78,6 +78,10 @@ OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时积�
   同一模型不会再被当成两个模型（写错写法此前是"上游 400 → 客户端 404"的必然失败）
 - **失败台账区分「上游 HTTP」与「回客户端」** —— 上游对「模型不存在」固定回 400，
   而我们回 404；两列并列后不会再把它读成"网关整站 400"
+- **admin HTTP 面的共享层**（v0.31.12）—— `internal/httpx`：`WriteJSON` + **内部错误文本脱敏**
+  （原 `cmd/webapp/errsafe.go`）。它们是每个 handler 的横切关注点（552 处调用），
+  `internal/api/*` 各自复制一份就会让脱敏策略出现多个版本。
+  **本包只放"对所有 handler 都一样"的东西** —— 带业务判断的写出留在业务域，否则它会变成第二个上帝对象；
 - **结算编排单点**（v0.31.11）—— "什么时候记账、按什么顺序记"在 `internal/billing/settle.go`：
   预扣对账 → 扣费/退还 → 写流水；所有 IO 走**窄接口** `billing.Ledger`（5 个方法，由
   `cmd/webapp/billingledger.go` 用 Store 适配，**只转发不判断**）。分成/返点仍由 `cmd/webapp` 执行
@@ -211,7 +215,7 @@ v0.31.5 起本仓**只有一个产品**（`cmd/webapp`）。下列口径当年�
 | 2 | `Store` 只读查询面 | ⬜ |
 | 3 | 计费纯算术 → `internal/billing`（单位/估算/预扣/单价观测/分成返点公式） | ✅ v0.31.10 |
 | 3b | 结算编排 → `internal/billing/settle.go`（预扣对账/扣费/写流水；IO 走 `Ledger` 窄接口） | ✅ v0.31.11 |
-| 4 | `app` 的 admin HTTP 面 → `internal/api/*` | ⬜ |
+| 4 | admin HTTP 面 → `internal/httpx`（共享层）+ `internal/api/*`（按域） | 🟡 v0.31.12 |
 
 细节与每刀流程见 `docs/P2-7-拆包方案.md`。
 

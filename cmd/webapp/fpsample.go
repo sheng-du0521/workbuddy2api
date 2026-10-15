@@ -395,3 +395,39 @@ func (a *app) handleFingerprintSamples(w http.ResponseWriter, r *http.Request) {
 	v.Count = len(order)
 	writeJSON(w, http.StatusOK, v)
 }
+
+// fingerprintSampleTexts 读出样本文件里全部去重后的 system 原文。
+//
+// 与 handleFingerprintSamples 用同一套解析（同文件、同去重键），但**不做条数截断**：
+// 界面只展示最近 50 条是展示取舍，而回放要的是全集 —— 截断会让"没命中"变成假象。
+func fingerprintSampleTexts() ([]string, map[string]int, error) {
+	perKind := map[string]int{}
+	raw, err := os.ReadFile(fpSampleFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, perKind, nil // 还没采样过 = 空集，不是错误
+		}
+		return nil, perKind, err
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var s fingerprintSample
+		if err := json.Unmarshal([]byte(line), &s); err != nil {
+			continue // 半行 / 坏行跳过（文件是追加写的）
+		}
+		if seen[s.Key] {
+			continue
+		}
+		seen[s.Key] = true
+		perKind[s.Kind]++
+		if strings.TrimSpace(s.System) != "" {
+			out = append(out, s.System)
+		}
+	}
+	return out, perKind, nil
+}
