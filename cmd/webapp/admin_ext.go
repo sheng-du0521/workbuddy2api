@@ -20,8 +20,7 @@ func (a *app) handleTaskConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodGet {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"config":           a.tasks.Config(),
-			"school_available": a.tasks.schoolOK,
+			"config": a.tasks.Config(),
 			// 成长任务：只透出脚本可用性（是否能在前端给出「跑成长任务」入口）。
 			// 它不排程、无待跑队列，故没有「待跑数量」这类排程态信息。
 			"growth_available": a.tasks.growthOK,

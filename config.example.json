@@ -23,9 +23,6 @@
     "keepalive_hours": [
       22
     ],
-    "school_hours": [
-      12
-    ],
     "cat_hours": [
       1
     ],
@@ -33,7 +30,6 @@
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
-    "school_enabled": true,
     "cat_enabled": true,
     "activity_report_count": 5,
     "jitter_minutes": 0,

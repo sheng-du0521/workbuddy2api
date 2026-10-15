@@ -141,8 +141,26 @@ func (s *Store) decField(v string) string {
 }
 
 // OpenStore 打开（必要时创建）数据库并执行迁移。
+//
+// ## 为什么用 WAL（v0.27.0，由一次真实超时逼出来的）
+//
+// 默认的 rollback journal 模式下**每条语句都要单独 fsync**；而迁移有近百条
+// DDL，于是每次 OpenStore 要花约 1 秒。测试包里几乎每个用例都建一个库，
+// 累计把 `cmd/webapp` 整个包推到 **10 分钟超时**（实测 602s 失败）。
+// 实测切到 WAL 后：建库 1080ms → **88ms**，单次写入 14ms → **0.5ms**。
+// 对生产同样有益（启动与每次结算写库都变快）。
+//
+// ## 取舍（必须知道，别当成纯优化）
+//
+//   - 库旁边会多出 `webapp.db-wal` 与 `webapp.db-shm` 两个文件。
+//     **备份/搬迁要么先停服**（Close 会 checkpoint 并删掉它们），**要么三个文件
+//     一起复制** —— 只拷 .db 会丢掉尚未 checkpoint 的最近写入。
+//   - **不要在网络盘 / 云同步目录（SMB、OneDrive、坚果云等）上运行**：WAL 依赖
+//     共享内存，网络文件系统上不可靠。本应用是单机本地盘部署，符合前提。
+//   - 可回退：`PRAGMA journal_mode=DELETE` 即切回（SQLite 会自动 checkpoint），
+//     **无需任何数据迁移**。
 func OpenStore(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -171,6 +189,23 @@ func OpenStore(path string) (*Store, error) {
 	// 余额分桶一次性回填（v0.21.0）：按历史返点/收益/卖号流水还原可提现额度。
 	// 放在所有建表（尤其 rebates / host_earnings / account_purchases）之后。
 	if err := s.backfillBalanceBuckets(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// 计费倍率变更历史（v0.27.0）：见 multiplier.go。
+	if err := s.EnsureMultiplierHistory(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// 余额变动审计表（v0.27.0）：见 balanceaudit.go。
+	if err := s.EnsureBalanceAudits(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// 提现冻结回填（v0.27.0）：必须排在 backfillBalanceBuckets **之后** ——
+	// 后者把老库的 withdrawable 从历史流水还原出来（有 kv 守卫，只跑一次），
+	// 本函数再从还原后的额度里划走冻结额。顺序反了会"先划后还原"，等于没冻。
+	if err := s.backfillWithdrawFreeze(); err != nil {
 		db.Close()
 		return nil, err
 	}

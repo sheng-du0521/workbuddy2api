@@ -229,6 +229,9 @@ const FX = {
         host_count: 2, host_groups: [{ group: '主力', count: 1 }, { group: '备用', count: 1 }], host_earned: 12.5 },
     ],
   },
+  // v0.27.0：人工余额调整的返回。必须回显 before/after —— 界面靠它显示
+  // "已从 X 调整为 Y"（只提示"已调整"无法让人确认到底改成了多少）。
+  '/api/admin/users/1/balance': { id: 1, balance: 300, before: 100, after: 300, delta: 200 },
   '/api/admin/codes': {
     codes: [
       { code: 'WB-AAAA-BBBB-CCCC', points: 100, used: false, used_by: 0, used_at: 0 },
@@ -403,6 +406,43 @@ const FX = {
   },
   '/api/admin/update-apply': { ok: true, script: 'apply-update.bat',
     apply_hint: '1) 停止本程序；2) 运行 apply-update.bat' },
+  // v0.27.0：用户侧计费倍率（当前 + 变更历史）。刻意给一条"降价"记录：
+  // 涨/降两种方向的颜色与文案都要能渲染出来。
+  '/api/multiplier': {
+    current: 1.2,
+    history: [
+      { old_value: 1.5, new_value: 1.2, note: '算力成本回落', created_at: now - 86400,
+        change_percent: -20, direction: 'down' },
+      { old_value: 1.0, new_value: 1.5, note: '', created_at: now - 10 * 86400,
+        change_percent: 50, direction: 'up' },
+    ],
+  },
+  // 后台：调价历史（含调整人）。第二条刻意 announced=false —— 管理端必须看得见
+  // "这次没发出公告"，否则用户收不到通知而没人知道。
+  '/api/admin/multiplier-history': {
+    current: 1.2,
+    announce_ttl_hours: 168,
+    history: [
+      { id: 2, old_value: 1.5, new_value: 1.2, admin_id: 1, admin_name: 'admin',
+        note: '算力成本回落', announced: true, announce_id: 7,
+        created_at: now - 86400, change_percent: -20, direction: 'down' },
+      { id: 1, old_value: 1.0, new_value: 1.5, admin_id: 1, admin_name: 'admin',
+        note: '', announced: false, announce_id: 0,
+        created_at: now - 10 * 86400, change_percent: 50, direction: 'up' },
+    ],
+  },
+  // 后台：余额变动记录（含一条失败记录）。
+  '/api/admin/balance-audits': {
+    rate: 0.01,
+    audits: [
+      { id: 2, user_id: 2, username: 'tester', admin_id: 1, admin_name: 'admin',
+        delta_micro: 50000, before_micro: 100000, after_micro: 150000,
+        reason: '客服补偿', result: 'ok', created_at: now - 3600 },
+      { id: 1, user_id: 2, username: 'tester', admin_id: 1, admin_name: 'admin',
+        delta_micro: 10000, before_micro: 0, after_micro: 0,
+        reason: '', result: 'rejected', error: '用户不存在', created_at: now - 7200 },
+    ],
+  },
   '/api/admin/usage': {
     days: 14, totals: { requests: 120, tokens: 12345, charged: 1.23 },
     daily: [{ day: '2026-10-09', requests: 10, tokens: 1000, charged: 0.1 }],
@@ -675,6 +715,9 @@ function run(pageFile, meOverride, plan) {
         // __autoConfirm 让**既有流程用例**不必逐个去点确认键（它们要测的是流程，
         // 不是弹窗）；需要真实验证弹窗的用例会把 dialog 设为 cancel/manual 关掉它。
         win.__autoConfirm = true;
+        // v0.27.0：原生 prompt() 已被 promptDialog 取代。默认设 null = "用户取消"
+        // —— 保证用例不会因为一个弹窗卡住；需要走通的用例用 prompt 字段显式给值。
+        win.__autoPrompt = null;
         // jsdom 未实现 scrollIntoView（浏览器里有）。补一个空实现，
         // 让"把它滚进视野"这类正常代码在测试环境里也能跑通。
         if (win.Element && !win.Element.prototype.scrollIntoView) {
@@ -724,6 +767,11 @@ function run(pageFile, meOverride, plan) {
       //   cancel → 点「取消」（验证"取消后什么都不该发生"）
       //   manual → 保持打开（后面的断言直接看弹窗内容）
       if (stage.dialog) win.__autoConfirm = false;
+      // prompt: {字段: 值} —— 让 promptDialog 直接返回该对象（等价于"用户填了这个"）。
+      // 传 'cancel' 表示用户取消了那个对话框。
+      if (stage.prompt === 'cancel') win.__autoPrompt = null;
+      else if (stage.prompt) win.__autoPrompt = stage.prompt;
+      else win.__autoPrompt = null;
       // fail: [pathSubstring] —— 用例级让某些接口失败（可叠加，便于"先成功后失败"）。
       if (stage.fail) win.__failPaths = (win.__failPaths || []).concat(stage.fail);
       // run: ['js 源码'] —— 在页面作用域里执行一小段代码。
@@ -1221,13 +1269,16 @@ function run(pageFile, meOverride, plan) {
     // v0.17.1：新增独立「成长任务」侧边栏。
     // v0.17.4：调度状态条 + 运行中徽标 + 下次触发时刻 + 自动刷新开关。
     // 这些断言锁死「定时有效可见」与「任务跑完会自己出现」两件事。
-    { nav: 'tasks', counts: [['taskGrid', 6], ['taskKinds', 2], ['runCards', 2], ['schedBar', 4]],
+    // v0.27.0：开学季任务整体移除 → 任务卡从 6 张降为 5 张。
+    { nav: 'tasks', counts: [['taskGrid', 5], ['taskKinds', 2], ['runCards', 2], ['schedBar', 4]],
       has: [['#tasksAuto', 1], ['#schedStamp', 1],
         // checkin 在 fixture 里是 running → 其按钮被禁用并显示「执行中：」。
         ['#taskKinds .action-card.running', 1], ['#runCards .run-card.running', 1],
         ['#runCards .tag.pulse', 1]],
       // 成长任务已移出排程：既不该有它的任务卡/时段/开关，也不该有每批上限输入。
-      absent: ['#tcGrowthBatch', '#tc_growth_hours', '#tc_growth_off', '#taskcard_growth'],
+      absent: ['#tcGrowthBatch', '#tc_growth_hours', '#tc_growth_off', '#taskcard_growth',
+        // v0.27.0：开学季（活动已结束）已整体移除，不留任何入口。
+        '#taskcard_school', '#tc_school_hours', '#tc_school_off'],
       // v0.17.2：台账卡片分两个维度显示 —— 「自动排程 · 9/21 点」（任务性质）
       // 与「本轮 · 人工」（fixture 里 checkin 是 manual 触发）。
       // lacks 断言旧标签「手动」已消失：签到明明是自动任务，之前只挂一个孤立
@@ -1320,6 +1371,18 @@ function run(pageFile, meOverride, plan) {
         ['#annWindowPreview', '长期有效']] },
     { nav: 'settings', texts: [['setProxyGroups', '反代'], ['hostShareHint', '推广返点'], ['withdrawHint', '最小提现']] },
 
+    // ================================================================
+    // v0.27.0 · 后台：调价历史（含调整人）+ 调价说明输入
+    // ================================================================
+    { nav: 'settings',
+      has: [['#setMultNote', 1], ['#multHistBox', 1], ['#setMultOld', 1],
+        ['#multHistBox .feed .ev', 2]],
+      textIn: [['#multHistBox', 'admin'], ['#multHistBox', '1.5 → 1.2'],
+        ['#multHistBox', '1 → 1.5'], ['#multHistBox', '算力成本回落'],
+        // ⚠ 未发出公告的那条必须显式标出来：用户收不到通知，管理端看不见就没人知道。
+        ['#multHistBox', '未发出公告'],
+        ['#multHistBox', '建议手工在「公告」页补一条']] },
+
     // v0.26.7：更新检测与自动下载面板。
     { nav: 'settings',
       has: [['#setUpdateAuto', 1], ['#btnApplyUpdate', 1],
@@ -1390,6 +1453,37 @@ function run(pageFile, meOverride, plan) {
 
     // ⑦ 确认框：原生 confirm() 已全部替换。危险操作要一眼看出是破坏性的，
     //    且必须是**可样式化、带忙碌态**的自定义弹窗。
+    // ================================================================
+    // v0.27.0 · 后台：余额变动记录（可追溯：谁、什么时候、改了多少、结果）
+    // ================================================================
+    // 找到「测试账号」那张卡的「记录」按钮并点开。
+    { nav: 'users', clickText: [['#userCards .ecard footer button', '记录']],
+      has: [['.modal', 1], ['.modal .feed .ev', 2]],
+      textIn: [['.modal', '余额变动记录'], ['.modal', 'admin'],
+        ['.modal', '客服补偿'],
+        // 失败记录也要展示原因 —— "我点了却没生效"的答案往往就在这里。
+        ['.modal', '失败：用户不存在'],
+        // 变动前后余额必须显示（只给"改了多少"无法对账）。
+        ['.modal', '100 → 150']] },
+
+    // 余额调整必须真的走通（v0.27.0）。旧实现依赖原生 prompt：被浏览器弹窗策略
+    // 拦截时它**不显示界面且返回 null**，调用方按"取消"处理 —— 用户看到的就是
+    // "点了没反应、没有任何报错"。这条用例钉住"填了值就一定发得出去"。
+    { nav: 'users', prompt: { delta: '200', reason: '回归验证' },
+      clickText: [['#userCards .ecard footer button', '加余额']] },
+    { has: [['.toast-card', 1]],
+      textIn: [['.toast-host', '余额已从'], ['.toast-host', '300']] },
+
+    // 取消则什么都不做（**不能**按空值继续执行 —— 旧代码 `prompt() || ''` 在
+    // "取消"与"留空"之间不做区分，会把取消当成空备注继续打款/继续改余额）。
+    { nav: 'users',
+      // 先清掉上一条用例留下的提示卡：toast 有 2.8 秒生命期，不清的话这里断言
+      // "没有新提示"会读到旧内容而假失败。
+      run: ["Array.from(document.querySelectorAll('.toast-card')).forEach(function(n){n.remove()})"],
+      prompt: 'cancel',
+      clickText: [['#userCards .ecard footer button', '加余额']] },
+    { lacks: [['.toast-host', '余额已从']], has: [['.toast-card', 0]] },
+
     { nav: 'pool', dialog: 'manual', click: ['#accCards .ecard .pick input'] },
     { nav: 'pool', dialog: 'manual', click: ['#btnBulkDelete'],
       has: [['.dlg', 1], ['.dlg.danger', 1], ['[data-dlg-ok]', 1], ['[data-dlg-cancel]', 1]],
@@ -1460,7 +1554,33 @@ function run(pageFile, meOverride, plan) {
       textIn: [['#keyCards', 'sk-wb-abcdefghijklmnop']] },
     { nav: 'test', counts: [['testKey', 2], ['modelOpts', 2]] },
     { nav: 'usage', counts: [['bkCards', 3], ['usKpis', 6], ['usChart', 1], ['usModels', 1], ['myDailyTable', 1], ['usFeed', 1]] },
-    { nav: 'wallet', counts: [['wdKpis', 8], ['wdCards', 2], ['rcCards', 1]], texts: [['wdHint', '最小']] },
+
+    // ================================================================
+    // v0.27.0 · 计费倍率可视化（用户侧）
+    // ================================================================
+    // 三个信息缺一不可：当前倍率（算成本要用）、趋势（"最近变贵了吗"）、
+    // 逐条记录（几次、什么时候、从多少到多少、为什么）。
+    { nav: 'usage',
+      has: [['#multKpis', 1], ['#multTrend', 1], ['#multHistory', 1],
+        // miniGrid 的单元是 .mk（不是 .kpi-card —— 那是 .kpis 用的另一套）。
+        ['#multKpis .mk', 4],
+        // 调价记录用事件流（不是表格）：时间 + 变化 + 方向 + 说明四段都要有。
+        ['#multHistory .feed .ev', 2],
+        // 趋势线必须画出来（有历史记录时不能只剩空态提示）。
+        ['#multTrend svg', 1]],
+      textIn: [['#multKpis', '当前倍率'], ['#multKpis', '1.2'],
+        ['#multKpis', '最近调整'], ['#multKpis', '下调'],
+        // 涨/降两种方向都要能看出：-20% 与 +50% 各一条
+        ['#multHistory', '1.5 → 1.2'], ['#multHistory', '1 → 1.5'],
+        ['#multHistory', '-20.0%'], ['#multHistory', '+50.0%'],
+        ['#multHistory', '算力成本回落'],
+        // 无说明时要给中性文案，不能是空白（空白看起来像渲染出错）
+        ['#multHistory', '倍率上调']],
+      // 用户侧**不得**出现调整人（后端已剔除）：调价是平台行为，不是某个人的行为。
+      lacks: [['#multKpis', 'admin'], ['#multHistory', 'admin']] },
+    // v0.27.0：钱包 KPI 增加「审核中（已冻结）」一项 → 9 个。
+    { nav: 'wallet', counts: [['wdKpis', 9], ['wdCards', 2], ['rcCards', 1]],
+      textIn: [['#wdKpis', '审核中（已冻结）']] },
     // v0.12.0：代挂页顶部两个扫码按钮（国内版 / 国际版）。
     // v0.13.1：卡片新增任务完成情况（已签到 / 旅行状态）。
     // v0.19.0：账号市场（用户控制台）——在售卡片 + 买断记录 + 余额。

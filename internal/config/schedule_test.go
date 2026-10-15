@@ -25,15 +25,13 @@ func TestDefaultScheduleActivityCount(t *testing.T) {
 	if len(s.ActivityHours) != 1 || s.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", s.ActivityHours)
 	}
-	if len(s.SchoolHours) != 1 || s.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", s.SchoolHours)
-	}
 	if len(s.CatHours) != 1 || s.CatHours[0] != 1 {
 		t.Errorf("cat_hours=%v want [1]", s.CatHours)
 	}
-	if !s.SchoolEnabled || !s.CatEnabled {
-		t.Errorf("school/cat switches must default true: %+v", s)
+	if !s.CatEnabled {
+		t.Errorf("cat switch must default true: %+v", s)
 	}
+	// 开学季已于 v0.27.0 移除：字段不存在即不会再被"默认值"悄悄打开。
 }
 
 // TestNormalizeScheduleThreeStates 缺省/显式 0/显式 N 三态默认值：
@@ -82,9 +80,6 @@ func TestNormalizeScheduleEmptyHoursFallback(t *testing.T) {
 	if len(s.ActivityHours) != 1 || s.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", s.ActivityHours)
 	}
-	if len(s.SchoolHours) != 1 || s.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", s.SchoolHours)
-	}
 	if len(s.CatHours) != 1 || s.CatHours[0] != 1 {
 		t.Errorf("cat_hours=%v want [1]", s.CatHours)
 	}
@@ -101,8 +96,6 @@ func TestNormalizeScheduleInvalidHour(t *testing.T) {
 		{Schedule{KeepaliveHours: []int{24}}, "keepalive_enabled"},
 		{Schedule{TravelHours: []int{-1}}, "travel_enabled"},
 		{Schedule{ActivityHours: []int{24}}, "activity_enabled"},
-		{Schedule{SchoolHours: []int{25}}, "school_enabled"},
-		{Schedule{SchoolHours: []int{-1}}, "school_enabled"},
 		{Schedule{CatHours: []int{24}}, "cat_enabled"},
 		{Schedule{CatHours: []int{-1}}, "cat_enabled"},
 	}

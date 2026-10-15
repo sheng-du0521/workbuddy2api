@@ -56,12 +56,12 @@ func TestRunNowUnknownKind(t *testing.T) {
 	}
 }
 
-// TestRunNowSchoolUnavailable school 脚本链路不可用时拒绝（不静默受理）。
-func TestRunNowSchoolUnavailable(t *testing.T) {
+// TestRunNowRejectsRemovedSchoolKind 开学季已于 v0.27.0 移除：任务类不再存在，
+// 手动入口必须按"未知任务类"拒绝，而不是静默受理后什么都不发生。
+func TestRunNowRejectsRemovedSchoolKind(t *testing.T) {
 	tr := newAsyncRunner(t)
-	tr.schoolOK = false
 	if _, err := tr.RunNow("school"); err == nil {
-		t.Fatal("school 链路不可用时应报错")
+		t.Fatal("已移除的 school 任务类应报错")
 	}
 }
 
@@ -79,9 +79,14 @@ func TestLedgerExposesRunningAndNextRuns(t *testing.T) {
 	if !ok {
 		t.Fatalf("Ledger 应含 next_runs（map[string]nextRunView），得 %T", out["next_runs"])
 	}
-	// 默认配置下六类自动任务都启用 → 都应有下次时刻。
-	if len(nx) != 6 {
-		t.Fatalf("默认应给出 6 类任务的下次时刻，得 %d：%v", len(nx), nx)
+	// 默认配置下**五类**自动任务都启用 → 都应有下次时刻。
+	// （v0.27.0：开学季任务整体移除，由 6 类降为 5 类。）
+	if len(nx) != 5 {
+		t.Fatalf("默认应给出 5 类任务的下次时刻，得 %d：%v", len(nx), nx)
+	}
+	// 已移除的任务类**不得**再出现（否则前端会渲染一个永远不触发的时刻）。
+	if _, ok := nx["school"]; ok {
+		t.Fatal("开学季已移除，不应有下次时刻")
 	}
 	if _, ok := nx["growth"]; ok {
 		t.Fatal("成长任务不排程，不应有下次时刻")

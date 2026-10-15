@@ -105,8 +105,6 @@ func kindByName(name string) (taskKind, bool) {
 		return taskActivity, true
 	case "keepalive":
 		return taskKeepalive, true
-	case "school":
-		return taskSchool, true
 	case "cat":
 		return taskCat, true
 	}
@@ -124,8 +122,6 @@ func (s *Scheduler) kindDisabled(k taskKind) bool {
 		return s.cfg.ActivityDisabled
 	case taskKeepalive:
 		return s.cfg.KeepaliveDisabled
-	case taskSchool:
-		return s.cfg.SchoolDisabled
 	case taskCat:
 		return s.cfg.CatDisabled
 	}

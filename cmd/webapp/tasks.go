@@ -40,7 +40,6 @@ type taskRunner struct {
 	dataDir   string
 	cancel    context.CancelFunc
 	started   time.Time
-	schoolOK  bool
 	// growthOK 成长任务脚本链路是否可用（python + scripts/growth_run.py）；
 	// 不可用时调度器侧强制禁用该类任务（见 schedulerConfig）。
 	growthOK bool
@@ -70,25 +69,23 @@ func installCredentialHook(store *Store) {
 
 // newTaskRunner 装配调度器。
 //
-// 自动排程的任务里五类是纯 Go HTTP 实现（签到 / 猫猫旅行 / 活跃上报 / token 保活 /
-// 夜猫子），直接接管；开学季依赖 exec.Command 拉起外部 python 脚本
-// （internal/scheduler/school.go），本程序不打包那些脚本，启动时探测可用性，
-// 不可用则显式禁用——否则每轮到点只会稳定刷一条失败日志，反而掩盖真实故障。
+// 自动排程的五类任务都是纯 Go HTTP 实现（签到 / 猫猫旅行 / 活跃上报 / token 保活 /
+// 夜猫子），直接接管。
+//
+// 开学季排程已于 v0.27.0 **整体移除**：活动已结束，且它依赖外部 python 脚本、
+// 配置项散在两处、长期是需要盯的故障源。脚本文件保留供人工执行，程序不再排程。
 //
 // 成长任务（internal/scheduler/growth.go）不进排程：它由管理员在账号池里选号
 // 手动执行，这里只负责探测脚本链路可用性（growthOK），供 UI 决定是否给出入口。
 //
 // 触发时刻/开关等来自 kv 里的 TaskConfig（管理端可改，见 Reconfigure）。
 func newTaskRunner(px *Proxy, store *Store, dataDir string) *taskRunner {
-	schoolOK := scheduler.SchoolAvailable()
 	growthOK := scheduler.GrowthScriptAvailable()
 	tc := store.LoadTaskConfig()
-	r := &taskRunner{proxy: px, store: store, dataDir: dataDir, schoolOK: schoolOK,
+	r := &taskRunner{proxy: px, store: store, dataDir: dataDir,
 		growthOK: growthOK, growth: growthProvider{store: store}, cfg: tc,
 		taskCfg: loadAccountTaskCfg(store)}
-	// r.growth 同时实现 GrowthProvider（按 uid 取）与 SchoolProvider（取全部）——
-	// 两个接口形状不同但数据源相同，拆成两个对象只会多一处需要同步的构造。
-	r.sch = scheduler.New(tc.schedulerConfig(px, dataDir, schoolOK, growthOK, r.growth, r.growth, r.accountTaskFilter))
+	r.sch = scheduler.New(tc.schedulerConfig(px, dataDir, growthOK, r.growth, r.accountTaskFilter))
 	return r
 }
 
@@ -109,16 +106,15 @@ func (t *taskRunner) Start() {
 	t.mu.Unlock()
 	go t.flushLoop(ctx)
 	log.Printf("定时任务已启用：%s", t.cfgSummary())
-	// 脚本任务链路的**诊断行**（v0.26.9）：解释器探测过程 + 脚本根 + 两个脚本任务的
-	// 可用性，一次说清。
+	// 脚本任务链路的**诊断行**（v0.26.9）：解释器探测过程 + 脚本根 + 成长任务可用性，
+	// 一次说清。（开学季排程已于 v0.27.0 移除，不再出现在这里。）
 	//
 	// 此前这里只有一句"未探测到可用解释器/脚本，已禁用" —— 既不说试了哪个解释器、
 	// 也不说去哪找脚本，运维拿着这句话无从下手。而本机实际原因很具体：
 	// PATH 上的 `python3` 是 Microsoft Store 的存根（跑不起来），真解释器叫 `python`。
 	// 现在解释器是**自动探测**的（见 scheduler.probePython），本行只负责把结论与过程摊开。
-	log.Printf("脚本任务链路：%s；脚本根 %s；开学季 %s；成长任务 %s",
-		scheduler.PythonDiagnosis(), scheduler.ScriptRoot(),
-		availText(t.schoolOK), availText(t.growthOK))
+	log.Printf("脚本任务链路：%s；脚本根 %s；成长任务 %s",
+		scheduler.PythonDiagnosis(), scheduler.ScriptRoot(), availText(t.growthOK))
 }
 
 // availText 可用性的人话文案（避免在日志里出现裸 true/false —— 那需要读者自己回忆极性）。
@@ -151,7 +147,7 @@ func (t *taskRunner) Reconfigure(tc TaskConfig) {
 		t.schCancel() // 停掉旧循环；Run(ctx) 收到取消后退出
 	}
 	t.cfg = tc
-	t.sch = scheduler.New(tc.schedulerConfig(t.proxy, t.dataDir, t.schoolOK, t.growthOK, t.growth, t.growth, t.accountTaskFilter))
+	t.sch = scheduler.New(tc.schedulerConfig(t.proxy, t.dataDir, t.growthOK, t.growth, t.accountTaskFilter))
 	t.startScheduler()
 	log.Printf("定时任务已重配置：%s", t.cfgSummary())
 }
@@ -182,7 +178,6 @@ func (t *taskRunner) cfgSummary() string {
 		sched("活跃", tc.ActivityHours, tc.ActivityDisabled),
 		sched("保活", tc.KeepaliveHours, tc.KeepaliveDisabled),
 		sched("夜猫子", tc.CatHours, tc.CatDisabled),
-		sched("开学季", tc.SchoolHours, tc.SchoolDisabled),
 	}, "、") + "；成长任务：手动选号执行"
 }
 
@@ -244,7 +239,7 @@ func (t *taskRunner) flushTokens() {
 // 手动触发
 // ---------------------------------------------------------------------------
 
-// runnableKinds 可手动触发的任务（school 仅在脚本链路可用时列出）。
+// runnableKinds 可手动触发的任务。
 var runnableKinds = map[string]string{
 	"checkin":   "每日签到（含余额查询与冷却解冻）",
 	"travel":    "猫猫旅行（派出 + 领奖一趟闭环）",
@@ -330,20 +325,12 @@ func (t *taskRunner) RunNow(kind string) (map[string]any, error) {
 	// 而这三类各自在**更内层**已经有界：
 	//   · keepalive —— 逐账号调 RefreshToken，走 HTTP 客户端（Timeout 120s），
 	//     整体上界 = 账号数 × 120s，不会无限挂；
-	//   · cat      —— 同上，走 growth 域的上游调用；
-	//   · school   —— 跑 python 脚本，本轮已在 `internal/scheduler` 的
-	//     newScriptCmd 里换成 exec.CommandContext + scriptTimeout（此前是
-	//     exec.Command，**那才是真正会永久挂住的那一处**）。
+	//   · cat      —— 同上，走 growth 域的上游调用。
 	// 在这些入口再套一层只会让日志出现两种互相矛盾的超时来源，故不加。
 	case "keepalive":
 		runAsync(kind, t.sch.RunKeepaliveNow)
 	case "cat":
 		runAsync(kind, t.sch.RunCatNow)
-	case "school":
-		if !t.schoolOK {
-			return nil, fmt.Errorf("school 脚本链路不可用（缺少 python 或 scripts/）")
-		}
-		runAsync(kind, t.sch.RunSchoolNow)
 	default:
 		return nil, fmt.Errorf("unknown task %q", kind)
 	}
@@ -723,9 +710,6 @@ func (a *app) handleTasks(w http.ResponseWriter, r *http.Request) {
 	for k, desc := range runnableKinds {
 		kinds = append(kinds, map[string]string{"kind": k, "desc": desc})
 	}
-	if a.tasks.schoolOK {
-		kinds = append(kinds, map[string]string{"kind": "school", "desc": "开学季（脚本链路，可用时启用）"})
-	}
 	out := a.tasks.Ledger()
 	out["enabled"] = true
 	out["kinds"] = kinds
@@ -784,18 +768,12 @@ func (a *app) handleTaskRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := r.PathValue("kind")
-	// 白名单：runnableKinds 是 Go 原生实现的类别；school 是脚本链路，
-	// 需额外确认脚本可用（否则会「点了没反应」或报更晦涩的错）。
+	// 白名单：只允许 runnableKinds 里的类别。
 	// 成长任务不在此列：它需要带 uid 列表，走 POST /api/admin/growth/run。
+	// 开学季已于 v0.27.0 移除，不再有对应入口。
 	if _, ok := runnableKinds[kind]; !ok {
-		if kind != "school" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown task kind: " + kind})
-			return
-		}
-		if !a.tasks.schoolOK {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "school 脚本链路不可用（缺 python 或 scripts/）"})
-			return
-		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown task kind: " + kind})
+		return
 	}
 	res, err := a.tasks.RunNow(kind)
 	switch {

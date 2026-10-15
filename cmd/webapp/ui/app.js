@@ -1656,6 +1656,138 @@ function confirmAsk(text, opts) {
   }, opts));
 }
 
+// promptDialog(opts) —— 自定义输入对话框，**替代原生 prompt()**。
+//
+// 为什么必须替换（v0.27.0，用户报「管理后台用户余额增减功能失效」）：
+// 原生 prompt() 在若干环境里（内嵌 WebView、被浏览器弹窗策略拦截、页面失焦时）
+// 会**直接返回 null 且不显示任何界面** —— 调用方一律按"用户取消"处理，用户看到的
+// 就是"点了按钮没反应"。旧的余额调整正是这样：`const v = prompt(...);
+// if (v === null) return;` 一旦 prompt 不出界面，整条链路静默中止，且没有任何错误。
+//
+// 另外原生 prompt 还有两个绕不开的问题：同步阻塞（与我们的异步 UI 体系冲突）、
+// 一次只能收一个字段（而"加余额"天然要"数值 + 原因"两个），以及完全不可样式化。
+//
+// opts:
+//   title       标题
+//   message     说明段
+//   fields      [{name, label, value, placeholder, type, required, multiline, hint}]
+//   confirmText 确认按钮文案
+//   danger      确认键用危险色
+//   successMsg  提交成功后的提示（可选，由本函数负责 toast）
+//
+// 返回 Promise<Record<string,string> | null>：null = 用户取消。
+// 取消与"提交失败"必须可区分 —— 前者什么都不做，后者要报错。
+function promptDialog(opts) {
+  opts = opts || {};
+  const fields = (opts.fields || []).slice();
+  // 测试通道：回归框架把 window.__autoPrompt 设成 {字段: 值} 即直接返回该对象，
+  // 设成 null 即视为"取消"。默认（未设置）走真实渲染 —— 这样专用用例能测真交互，
+  // 而其余流程用例也不会因为一个弹窗卡住。
+  if (window.__autoPrompt !== undefined) return Promise.resolve(window.__autoPrompt);
+
+  return new Promise((resolve) => {
+    const back = el('div', 'dlg-back');
+    const dlg = el('div', 'dlg' + (opts.danger ? ' danger' : ''));
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+
+    const head = el('div', 'dlg-head');
+    head.appendChild(el('div', 'dlg-title', opts.title || '请输入'));
+    dlg.appendChild(head);
+    if (opts.message) dlg.appendChild(el('div', 'dlg-msg', opts.message));
+
+    const body = el('div', 'dlg-body');
+    const inputs = {};
+    for (const f of fields) {
+      const row = el('div', 'dlg-field');
+      if (f.label) {
+        const lab = el('label', 'dlg-label', f.label);
+        lab.setAttribute('for', 'dlgIn_' + f.name);
+        row.appendChild(lab);
+      }
+      let inp;
+      if (f.multiline) {
+        inp = document.createElement('textarea');
+        inp.rows = f.rows || 3;
+      } else {
+        inp = document.createElement('input');
+        inp.type = f.type || 'text';
+      }
+      inp.className = 'dlg-input';
+      inp.id = 'dlgIn_' + f.name;
+      // data-dlg-field 供自动化用例直接定位（也便于将来做表单重置）。
+      inp.setAttribute('data-dlg-field', f.name);
+      if (f.placeholder) inp.placeholder = f.placeholder;
+      if (f.value !== undefined && f.value !== null) inp.value = String(f.value);
+      row.appendChild(inp);
+      if (f.hint) row.appendChild(el('div', 'dlg-hint', f.hint));
+      inputs[f.name] = inp;
+      body.appendChild(row);
+    }
+    dlg.appendChild(body);
+
+    const foot = el('div', 'dlg-foot');
+    const cancel = el('button', 'ghost', '取消');
+    cancel.type = 'button';
+    cancel.setAttribute('data-dlg-cancel', '1');
+    const ok = el('button', opts.danger ? 'danger' : '', opts.confirmText || '确定');
+    ok.type = 'button';
+    ok.setAttribute('data-dlg-ok', '1');
+    foot.append(cancel, ok);
+    dlg.appendChild(foot);
+    back.appendChild(dlg);
+
+    let done = false;
+    const close = (val) => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      if (back.parentNode) back.parentNode.removeChild(back);
+      resolve(val);
+    };
+    const collect = () => {
+      const out = {};
+      for (const f of fields) out[f.name] = String(inputs[f.name].value);
+      return out;
+    };
+    const submit = () => {
+      const vals = collect();
+      // 必填校验：**在这里拦**，而不是让接口回一个 400 让用户重新填一遍
+      //（重填时前面已输入的内容就丢了）。
+      for (const f of fields) {
+        if (f.required && !vals[f.name].trim()) {
+          toast('请填写「' + (f.label || f.name) + '」', 'err');
+          try { inputs[f.name].focus(); } catch (e) {}
+          return;
+        }
+      }
+      close(vals);
+    };
+    // Esc 关闭（捕获阶段，关闭时移除 —— 否则会和页面其它 Esc 监听叠加，
+    // 出现"一次 Esc 关掉两层"）。
+    const onKey = (ev) => {
+      if (ev.key === 'Escape') { ev.stopPropagation(); close(null); }
+      // Enter 提交；多行文本框里的 Enter 是换行，不提交（用户是在写备注）。
+      if (ev.key === 'Enter' && !ev.shiftKey) {
+        const t = ev.target;
+        if (t && t.tagName === 'TEXTAREA') return;
+        ev.preventDefault();
+        submit();
+      }
+    };
+    cancel.onclick = () => close(null);
+    back.onclick = (ev) => { if (ev.target === back) close(null); };
+    ok.onclick = submit;
+
+    document.body.appendChild(back);
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      const first = fields.length ? inputs[fields[0].name] : ok;
+      try { first.focus(); if (first.select) first.select(); } catch (e) {}
+    }, 0);
+  });
+}
+
 // ---------------------------------------------------------------- ③ 命令面板（⌘K）
 //
 // 只做「跳转」，不放任何破坏性动作 —— ⌘K 的用法是"敲几个字 + 回车"，而回车前

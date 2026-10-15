@@ -35,7 +35,6 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
-	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// JitterMinutes 触发时刻抖动窗口（分钟）：每类任务的触发时刻在该窗口内取一个
 	// **确定性**偏移，把「所有部署都在整点同一秒打上游」摊开，对 WAF 友好。
@@ -59,15 +58,6 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
-	// SchoolDisabled 显式关闭开学季任务排程（schedule.school_enabled=false）。
-	SchoolDisabled bool
-	// School 开学季任务的凭证提供方（nil = 功能不可用，按"无凭证"跳过）。
-	//
-	// 与 Growth 分开是因为**需要的形状不同**：成长任务是"管理员选的这几个号"，
-	// 开学季任务一次跑全部账号（脚本本身按 ALL 执行）。
-	// 不把它并进 GrowthProvider：那是"按 uid 取"的接口，为 school 硬加一个
-	// "取全部"的方法会逼所有实现者都实现一个自己用不到的能力。
-	School SchoolProvider
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
 
@@ -208,9 +198,6 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
 	}
-	if len(cfg.SchoolHours) == 0 {
-		cfg.SchoolHours = []int{12}
-	}
 	if len(cfg.CatHours) == 0 {
 		cfg.CatHours = []int{1}
 	}
@@ -347,7 +334,7 @@ func (s *Scheduler) LastAutoRuns() map[string]taskledger.Run {
 func (s *Scheduler) NextRuns() map[string]time.Time {
 	now := s.now()
 	jit := s.cfg.JitterMinutes
-	out := make(map[string]time.Time, 6)
+	out := make(map[string]time.Time, 5)
 	add := func(k taskKind, hours []int, disabled bool) {
 		if disabled {
 			return
@@ -360,7 +347,6 @@ func (s *Scheduler) NextRuns() map[string]time.Time {
 	add(taskTravel, s.cfg.TravelHours, s.cfg.TravelDisabled)
 	add(taskActivity, s.cfg.ActivityHours, s.cfg.ActivityDisabled)
 	add(taskKeepalive, s.cfg.KeepaliveHours, s.cfg.KeepaliveDisabled)
-	add(taskSchool, s.cfg.SchoolHours, s.cfg.SchoolDisabled)
 	add(taskCat, s.cfg.CatHours, s.cfg.CatDisabled)
 	return out
 }
@@ -435,7 +421,6 @@ const (
 	taskTravel
 	taskActivity
 	taskKeepalive
-	taskSchool
 	taskCat
 	taskGrowth
 )
@@ -452,8 +437,6 @@ func (k taskKind) String() string {
 		return "activity"
 	case taskKeepalive:
 		return "keepalive"
-	case taskSchool:
-		return "school"
 	case taskCat:
 		return "cat"
 	case taskGrowth:
@@ -483,9 +466,6 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.KeepaliveDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours, jit), taskKeepalive})
-	}
-	if !s.cfg.SchoolDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours, jit), taskSchool})
 	}
 	if !s.cfg.CatDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.CatHours, jit), taskCat})
@@ -677,7 +657,7 @@ func (s *Scheduler) batchStaggerMax() int {
 	return 0
 }
 
-// dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
+// dispatch 按任务类型分发到对应执行函数。脚本类（cat）失败只记 WARN、
 // 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
 // ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
 //
@@ -697,8 +677,6 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.runActivity(ctx, trigger)
 	case taskKeepalive:
 		s.runKeepalive(trigger)
-	case taskSchool:
-		s.runSchool(trigger)
 	case taskCat:
 		s.runCat(trigger)
 	case taskGrowth:

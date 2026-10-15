@@ -71,16 +71,35 @@ func TestWithdrawApplyApproveDeductsBalance(t *testing.T) {
 	}
 }
 
-// TestWithdrawRejectNoDeduct 校验驳回不扣余额。
-func TestWithdrawRejectNoDeduct(t *testing.T) {
+// TestWithdrawRejectReturnsFrozen 校验驳回：**冻结额原路退回**可提现额度，余额不变。
+//
+// v0.27.0：驳回不再只是"改个状态" —— 申请时划走的钱必须还回去，否则用户的钱
+// 会永久卡在冻结额里（余额看着没少，却永远提不出来）。
+func TestWithdrawRejectReturnsFrozen(t *testing.T) {
 	store := newWalletStore(t, "wd2.db")
 	defer store.Close()
 	u, _ := store.CreateUser("bob", "x")
-	_ = store.AddUserBalance(u.ID, 100*MicroPerPoint)
-	w := &Withdrawal{UserID: u.ID, AmountMicro: 50 * MicroPerPoint, Method: "微信", AccountInfo: "bob_wx"}
+	// 入账走**可提现额度**：提现只允许动返点/卖号所得（AddUserBalance 是充值桶，
+	// 不可提现，用它会让这条用例在额度校验处就失败）。
+	if err := store.CreditWithdrawable(u.ID, 100*MicroPerPoint); err != nil {
+		t.Fatalf("CreditWithdrawable: %v", err)
+	}
+	w := &Withdrawal{UserID: u.ID, AmountMicro: 50 * MicroPerPoint, Method: "alipay", AlipayAccount: "bob@x.com", RealName: "鲍勃"}
 	if err := store.CreateWithdrawal(w); err != nil {
 		t.Fatalf("CreateWithdrawal: %v", err)
 	}
+	// 申请后：额度已扣、冻结已加，余额**不变**（钱还在账上，只是不可动用）。
+	before, _ := store.GetUserByID(u.ID)
+	if before.FrozenMicro != 50*MicroPerPoint {
+		t.Fatalf("申请后冻结额应为 50 点，得 %d", before.FrozenMicro)
+	}
+	if before.WithdrawableMicro != 50*MicroPerPoint {
+		t.Fatalf("申请后可提现额度应剩 50 点，得 %d", before.WithdrawableMicro)
+	}
+	if before.BalanceMicro != 100*MicroPerPoint {
+		t.Fatalf("申请阶段不动余额，应仍为 100 点，得 %d", before.BalanceMicro)
+	}
+
 	row, err := store.ReviewWithdrawal(w.ID, false, "信息不符", 1)
 	if err != nil {
 		t.Fatalf("ReviewWithdrawal reject: %v", err)
@@ -92,26 +111,85 @@ func TestWithdrawRejectNoDeduct(t *testing.T) {
 	if fresh.BalanceMicro != 100*MicroPerPoint {
 		t.Fatalf("驳回不应扣余额，应为 100 点，得 %d 微点", fresh.BalanceMicro)
 	}
+	if fresh.FrozenMicro != 0 {
+		t.Fatalf("驳回后冻结额应清零，得 %d", fresh.FrozenMicro)
+	}
+	if fresh.WithdrawableMicro != 100*MicroPerPoint {
+		t.Fatalf("驳回后额度应原路退回为 100 点，得 %d", fresh.WithdrawableMicro)
+	}
 }
 
-// TestWithdrawApproveInsufficientBalance 校验审核通过时余额不足会拒绝（不产生负数）。
-func TestWithdrawApproveInsufficientBalance(t *testing.T) {
+// TestWithdrawApproveSucceedsDespiteSpending 冻结的核心承诺：**申请之后用户怎么消费，
+// 都不影响审核通过**。
+//
+// 这正是用户报的「审核操作无法执行」的回归护栏。旧实现只在查询时减待审额，用户
+// 一等审核期间消费就把余额打到低于待审额，审核必然失败（管理员只能驳回）。
+func TestWithdrawApproveSucceedsDespiteSpending(t *testing.T) {
 	store := newWalletStore(t, "wd3.db")
 	defer store.Close()
 	u, _ := store.CreateUser("carol", "x")
-	// 先入金后提现，再把余额花掉，制造「申请时够、审核时不够」。
-	_ = store.AddUserBalance(u.ID, 100*MicroPerPoint)
-	w := &Withdrawal{UserID: u.ID, AmountMicro: 100 * MicroPerPoint, Method: "银行卡", AccountInfo: "6222"}
+	// 100 点可提现 + 100 点充值（后者用于制造"消费"的空间）。
+	if err := store.CreditWithdrawable(u.ID, 100*MicroPerPoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddUserBalance(u.ID, 100*MicroPerPoint); err != nil {
+		t.Fatal(err)
+	}
+	w := &Withdrawal{UserID: u.ID, AmountMicro: 100 * MicroPerPoint, Method: "alipay", AlipayAccount: "c@x.com", RealName: "卡罗"}
 	if err := store.CreateWithdrawal(w); err != nil {
 		t.Fatalf("CreateWithdrawal: %v", err)
 	}
-	_ = store.AddUserBalance(u.ID, -100*MicroPerPoint)
-	if _, err := store.ReviewWithdrawal(w.ID, true, "", 1); err == nil {
-		t.Fatal("余额不足时审核通过应报错")
+	// 等待审核期间把余额花到只剩 100 点（刚好等于冻结额）——旧实现下这一步之后
+	// 审核就会失败（balance 100 < ... 实际旧判据是 wd < amount）。
+	if _, err := store.ChargeUser(u.ID, 100*MicroPerPoint); err != nil {
+		t.Fatal(err)
+	}
+	row, err := store.ReviewWithdrawal(w.ID, true, "已打款", 999)
+	if err != nil {
+		t.Fatalf("冻结后审核应必然成功，却报错：%v", err)
+	}
+	if row.Status != WithdrawApproved {
+		t.Fatalf("状态应为 approved，得 %q", row.Status)
 	}
 	fresh, _ := store.GetUserByID(u.ID)
 	if fresh.BalanceMicro != 0 {
-		t.Fatalf("拒绝打款后余额应保持 0，得 %d", fresh.BalanceMicro)
+		t.Fatalf("打款后余额应为 0（200 - 100 消费 - 100 打款），得 %d", fresh.BalanceMicro)
+	}
+	if fresh.FrozenMicro != 0 {
+		t.Fatalf("打款后冻结额应清零，得 %d", fresh.FrozenMicro)
+	}
+}
+
+// TestWithdrawApproveFailsWhenFreezeMissing 冻结额对不上时报错而不是把余额扣成负数。
+//
+// 这是"数据异常"分支：老版本提交且未回填的 pending 记录，或有人直接改过库。
+// 必须明确失败 —— 静默通过会让 balance 变负、账目无法对账。
+func TestWithdrawApproveFailsWhenFreezeMissing(t *testing.T) {
+	store := newWalletStore(t, "wd3b.db")
+	defer store.Close()
+	u, _ := store.CreateUser("carol2", "x")
+	if err := store.CreditWithdrawable(u.ID, 100*MicroPerPoint); err != nil {
+		t.Fatal(err)
+	}
+	w := &Withdrawal{UserID: u.ID, AmountMicro: 100 * MicroPerPoint, Method: "alipay", AlipayAccount: "c@x.com", RealName: "卡"}
+	if err := store.CreateWithdrawal(w); err != nil {
+		t.Fatal(err)
+	}
+	// 手工把冻结额清零（模拟"提交于旧版本、未回填"）。
+	if _, err := store.db.Exec(`UPDATE users SET frozen_micro = 0 WHERE id = ?`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReviewWithdrawal(w.ID, true, "", 1); err == nil {
+		t.Fatal("冻结额不足时审核通过必须报错（否则余额会被扣成负数）")
+	}
+	fresh, _ := store.GetUserByID(u.ID)
+	if fresh.BalanceMicro != 100*MicroPerPoint {
+		t.Fatalf("失败后余额应保持 100 点，得 %d", fresh.BalanceMicro)
+	}
+	// 该申请仍是 pending，可被驳回（这也是给运维的补救路径）。
+	rows, _ := store.ListWithdrawals(WithdrawPending, 10)
+	if len(rows) != 1 {
+		t.Fatalf("申请应仍处于待审状态以便驳回，得 %d 条", len(rows))
 	}
 }
 

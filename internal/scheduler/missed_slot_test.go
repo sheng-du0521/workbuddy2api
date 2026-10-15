@@ -28,7 +28,9 @@ func onlyCheckinActivity() *Scheduler {
 		ActivityHours:  []int{10},
 		JitterMinutes:  0, // 关抖动：本文件测的是补跑语义，不是抖动派生
 		TravelDisabled: true, KeepaliveDisabled: true,
-		SchoolDisabled: true, CatDisabled: true,
+		// 本 helper 的语义是"只有签到与活跃两类"。cat（01:00）必须一并禁用 ——
+		// 它排在 09:00 之前，会抢走"首个槽位"从而让整组断言测到别的东西。
+		CatDisabled: true,
 	})
 }
 
@@ -112,7 +114,9 @@ func TestNextWakeBaseAdvancesWithoutDuplicate(t *testing.T) {
 		CheckinHours: []int{9}, TravelHours: []int{9}, // 同配 9 点：必须同批
 		JitterMinutes:    0,
 		ActivityDisabled: true, KeepaliveDisabled: true,
-		SchoolDisabled: true, CatDisabled: true,
+		// cat（01:00）必须一并禁用：否则它会插在 9/25 09:00 之前成为首个槽位，
+		// 这条用例的断言（"先命中 09:00"）就会测到别的东西。
+		CatDisabled: true,
 	})
 	slot := time.Date(2026, 9, 25, 9, 0, 0, 0, time.Local)
 

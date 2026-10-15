@@ -913,3 +913,37 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
   word-break: break-all;
   user-select: text;
 }
+
+/* ---------- 输入对话框字段（v0.27.0，promptDialog） ---------- */
+/* 每个字段独立成块（标签在输入框上方）：这些表单往往有 2 个字段
+   （数值 + 原因 / 日限额 + 月限额），横排会在窄屏挤成一团。 */
+.dlg-body { margin-top: 10px; }
+.dlg-field + .dlg-field { margin-top: 10px; }
+.dlg-label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.dlg-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.dlg-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+textarea.dlg-input { resize: vertical; line-height: 1.6; }
+.dlg-hint {
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}

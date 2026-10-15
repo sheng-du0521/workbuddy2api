@@ -1221,6 +1221,12 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
               1.0 = 1 积分扣 1 点，1.5 = 加价 50%。运行概览 / 账号池也会显示各账号的积分消耗与收取点数。</div>
           </div>
           <div class="setting-card">
+            <label>调价说明（可选）</label>
+            <input type="text" id="setMultNote" maxlength="200" placeholder="例如：算力成本上涨">
+            <div class="hint">倍率一旦变化，这段话会<b>原样出现在自动发布的用户公告里</b>，
+              并记录到调价历史。涨价不说明理由是最容易失去信任的一件事。</div>
+          </div>
+          <div class="setting-card">
             <div class="inline">
               <label>开放注册</label>
               <span class="switch"><input type="checkbox" id="setRegister"><i></i></span>
@@ -1232,6 +1238,19 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
           <button id="btnSaveSettings">保存</button>
           <span id="settHint" class="muted"></span>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>计费倍率调整历史</h2>
+          <span class="slot-refresh" data-refresh="loadMultiplierHistory" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          每次调整都留痕：<b>时间 / 调整前后 / 调整人</b>。倍率一旦变化，系统会
+          <b>自动向用户控制台发布临时公告</b>（默认 7 天）—— 涨价不通知是最伤信任的做法，
+          所以这件事不靠人记得做。
+        </div>
+        <div id="multHistBox"></div>
       </div>
 
       <div class="card">
@@ -1633,11 +1652,10 @@ const TASK_META = [
   { kind: 'activity',  name: '活跃上报', hours: true },
   { kind: 'keepalive', name: 'token 保活', hours: true },
   { kind: 'cat',       name: '夜猫子',   hours: true, note: '夜间对话点亮，窗口 23-08 CST' },
-  { kind: 'school',    name: '开学季',   hours: true, note: '依赖脚本链路，可用时才执行' },
 ];
 // 说明：成长任务**不在**上面这张表里 —— 它不参与自动排程，由管理员在「号池账号」
 // 里勾选账号后手动执行（见 runGrowthSelected）。放到这里只会让人以为它也有触发时刻。
-const TASK_LABELS = { checkin: '签到', travel: '猫猫旅行', activity: '活跃上报', keepalive: 'token 保活', cat: '夜猫子', school: '开学季', growth: '成长任务' };
+const TASK_LABELS = { checkin: '签到', travel: '猫猫旅行', activity: '活跃上报', keepalive: 'token 保活', cat: '夜猫子', growth: '成长任务' };
 
 // 账号级自动任务（与后端 accountTaskKinds 对齐）。
 const ACCOUNT_TASKS = [
@@ -3240,7 +3258,17 @@ let hostGroupFilter = '__all__';
 
 async function reviewHost(uid, action) {
   let reason = '';
-  if (action === 'reject') reason = prompt('移出号池 / 驳回原因（可留空）', '') || '';
+  if (action === 'reject') {
+    const r = await promptDialog({
+      title: '移出号池 / 驳回',
+      message: '该操作会把账号从号池移出。可留一句原因，便于以后追溯。',
+      fields: [{ name: 'reason', label: '原因（可留空）', multiline: true,
+        placeholder: '例如：令牌失效 / 分组不符' }],
+      confirmText: '确认移出',
+    });
+    if (r === null) return; // 取消 = 什么都不做
+    reason = r.reason;
+  }
   try {
     await post('/api/admin/host/accounts/' + encodeURIComponent(uid) + '/review', { action, reason });
     toast(action === 'approve' ? '已批准入池' : '已移出 / 驳回', 'ok');
@@ -3398,11 +3426,20 @@ function ratioTag(label, view, userID, field) {
   t.style.cursor = 'pointer';
   t.onclick = async () => {
     const cur = v.is_custom ? String(v.override) : '';
-    const input = prompt(
-      '「' + label + '」比例（0 ~ 1 之间的小数）' +
-      '\n留空 = 恢复跟随全局（当前全局 ' + pct(v.global) + '）',
-      cur);
-    if (input === null) return; // 取消
+    // 原生 prompt 在被浏览器拦截时不显示界面且返回 null，整条链路静默中止 ——
+    // 这就是"点了没反应"的典型来源，故一律换成自定义对话框（v0.27.0）。
+    const r = await promptDialog({
+      title: '「' + label + '」比例',
+      message: '留空 = 恢复跟随全局（当前全局 ' + pct(v.global) + '）。',
+      fields: [{
+        name: 'value', label: '比例（0 ~ 1 之间的小数）',
+        value: cur, placeholder: '例如 0.3',
+        hint: '只影响之后的入账，不会追溯重算历史流水与已入账余额。',
+      }],
+      confirmText: '保存',
+    });
+    if (r === null) return; // 取消
+    const input = r.value;
     const body = {};
     const trimmed = String(input).trim();
     if (trimmed === '') {
@@ -3618,21 +3655,46 @@ function userCard(u) {
 
   const add = el('button', 'ghost', '加余额');
   add.onclick = async () => {
-    const v = prompt(`给「${u.username}」增加多少点？（可填负数扣减）`, '100');
-    if (v === null) return;
-    const delta = Number(v);
-    if (!delta) { toast('请输入非零数值', 'err'); return; }
-    try { await post(`/api/admin/users/${u.id}/balance`, { delta }); toast('已调整', 'ok'); loadUsers(); }
-    catch (e) { toast(e.message, 'err'); }
+    const r = await promptDialog({
+      title: '调整「' + u.username + '」的余额',
+      message: '当前余额 ' + fmtPoints(u.balance) + ' 点。填负数即扣减。',
+      fields: [
+        { name: 'delta', label: '变动值（点）', value: '100', type: 'number',
+          placeholder: '可填负数扣减', required: true },
+        // 原因会写进「余额变动记录」（含操作人与时间），便于事后对账 ——
+        // 钱的操作没有凭据是最容易被质疑、也最说不清的一件事。
+        { name: 'reason', label: '原因（可留空）', placeholder: '例如：客服补偿 / 活动奖励',
+          hint: '会记录到余额变动记录里，含操作人与时间。' },
+      ],
+      confirmText: '确认调整',
+    });
+    if (r === null) return;
+    const delta = Number(String(r.delta).trim());
+    if (!delta || !Number.isFinite(delta)) { toast('请输入非零数值', 'err'); return; }
+    try {
+      const d = await post(`/api/admin/users/${u.id}/balance`, { delta, reason: r.reason || '' });
+      // 回显"从 X 到 Y"：只提示"已调整"无法让人确认到底改成了多少。
+      toast(`余额已从 ${fmtPoints(d.before)} 点调整为 ${fmtPoints(d.after)} 点`, 'ok');
+      loadUsers();
+    } catch (e) { toast(e.message, 'err'); }
   };
   const lim = el('button', 'ghost', '限额');
   lim.onclick = async () => {
-    const d = prompt(`「${u.username}」每日限额（点，0=不限）`, String(u.daily_limit || 0));
-    if (d === null) return;
-    const m = prompt(`「${u.username}」每月限额（点，0=不限）`, String(u.monthly_limit || 0));
-    if (m === null) return;
+    // 两个字段一次收完：原来弹两次原生 prompt，只要第二次被取消，第一次的输入
+    // 就白填了（而且第一个弹窗里没有任何地方能告诉用户"还有第二个"）。
+    const r = await promptDialog({
+      title: '「' + u.username + '」消费闸',
+      message: '超过限额的请求会被拒绝。0 = 不限。',
+      fields: [
+        { name: 'daily', label: '每日限额（点）', value: String(u.daily_limit || 0), type: 'number' },
+        { name: 'monthly', label: '每月限额（点）', value: String(u.monthly_limit || 0), type: 'number' },
+      ],
+      confirmText: '保存',
+    });
+    if (r === null) return;
     try {
-      await post(`/api/admin/users/${u.id}/limits`, { daily: Number(d), monthly: Number(m) });
+      await post(`/api/admin/users/${u.id}/limits`,
+        { daily: Number(r.daily), monthly: Number(r.monthly) });
       toast('限额已更新', 'ok'); loadUsers();
     } catch (e) { toast(e.message, 'err'); }
   };
@@ -3643,7 +3705,10 @@ function userCard(u) {
     try { await post(`/api/admin/users/${u.id}/status`, { status: next }); loadUsers(); }
     catch (e) { toast(e.message, 'err'); }
   };
-  foot.append(add, lim, ban);
+  const rec = el('button', 'ghost', '记录');
+  rec.title = '余额变动记录：谁在什么时候改了多少、结果如何';
+  rec.onclick = () => openBalanceAudits(u);
+  foot.append(add, lim, ban, rec);
   card.appendChild(foot);
   return card;
 }
@@ -3826,8 +3891,16 @@ async function loadMarket() {
         b.title = '设置挂牌价（元）后上架';
         b.onclick = async () => {
           // 需求 2：上架时设置金额（元），前端校验 + 后端复核。
-          const input = prompt('请设置挂牌价（元，最多两位小数）：\n账号：' + (a.nickname || a.uid.slice(0, 8)));
-          if (input === null) return;
+          const r = await promptDialog({
+            title: '上架挂牌',
+            message: '账号：' + (a.nickname || a.uid.slice(0, 8)) +
+              '\n挂牌期间该账号归属「闲置」分组，不参与平台反代消耗；下架时恢复原分组。',
+            fields: [{ name: 'price', label: '挂牌价（元，最多两位小数）', type: 'number',
+              placeholder: '例如 88.00', required: true }],
+            confirmText: '下一步',
+          });
+          if (r === null) return;
+          const input = r.price;
           const yuan = Number(String(input).trim());
           if (!Number.isFinite(yuan) || yuan <= 0) { toast('挂牌价必须大于 0', 'err'); return; }
           if (Math.abs(yuan * 100 - Math.round(yuan * 100)) > 1e-6) { toast('挂牌价最多两位小数', 'err'); return; }
@@ -3945,6 +4018,14 @@ async function loadSettings() {
   try {
     const d = await api('/api/admin/settings');
     $('setMult').value = d.multiplier;
+    // 记下"进来时的倍率"：保存后据此判断这次到底有没有真的调价 ——
+    // 只有真的变了才提示"已自动发布公告"（否则会谎报通知）。
+    if (!$('setMultOld')) {
+      const hid = document.createElement('input');
+      hid.type = 'hidden'; hid.id = 'setMultOld';
+      document.body.appendChild(hid);
+    }
+    $('setMultOld').value = String(d.multiplier);
     $('setRegister').checked = !!d.register_enabled;
     $('setReserveRate').value = d.reserve_rate || 0;
     $('setReserveMax').value = d.reserve_max || 0;
@@ -3977,6 +4058,8 @@ async function loadSettings() {
     if ($('setUpdateCheck')) $('setUpdateCheck').checked = d.update_check_enabled !== false;
     if ($('setUpdateManifest')) $('setUpdateManifest').value = d.update_manifest_url || '';
     loadUpdateStatus(false);
+    // 调价历史（v0.27.0）：与倍率输入框同屏，改完保存能立刻看到"刚刚这一次"进去了。
+    loadMultiplierHistory();
     if ($('deviceTokenHint')) {
       if (d.device_token_from_env) {
         $('deviceTokenHint').textContent = '已由环境变量 WB2API_DEVICE_TOKEN 提供（在此处修改不会生效）';
@@ -4096,9 +4179,11 @@ async function loadTaskConfig() {
       const card = $('taskcard_' + t.kind);
       if (card) card.className = 'task-card' + (c[t.kind + '_disabled'] || !c.enabled ? ' off' : '');
     }
-    $('tcHint').textContent = d.school_available
-      ? '开学季脚本链路可用。'
-      : '开学季脚本链路不可用（缺 python 或 scripts/），保存后仍会保持禁用。';
+    // 开学季任务已于 v0.27.0 移除（活动结束），此处不再有相关提示；
+    // 脚本链路的状态改由「成长任务」那一行统一说明（它是当前唯一在用脚本的任务）。
+    $('tcHint').textContent = d.growth_available === false
+      ? '脚本链路不可用（缺 python 或 scripts/）：成长任务无法执行。'
+      : '脚本链路可用。';
     // 成长任务提示：它**不排程**（手动选号执行），所以这里只讲清楚「怎么跑」和
     // 「脚本链路是否可用」——不再是「开关开没开、还差几个号没跑」那套排程态信息。
     const gbox = $('growthNoteBox');
@@ -4662,17 +4747,116 @@ $('gBtnRun').onclick = () => {
   runGrowth(uids, '');
 };
 
+// loadMultiplierHistory 计费倍率调整历史（v0.27.0）。
+//
+// 与用户侧的区别：这里**必须**显示调整人（协作与追责都靠它），并显示"这次是否
+// 发出了公告" —— 公告失败时用户是收不到通知的，管理端看不见就等于没人知道。
+async function loadMultiplierHistory() {
+  const box = $('multHistBox');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/admin/multiplier-history');
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'hintbar', '加载失败：' + e.message));
+    return;
+  }
+  const hist = d.history || [];
+  box.textContent = '';
+  if (!hist.length) {
+    box.appendChild(el('div', 'hintbar',
+      '还没有调价记录（当前倍率 ' + d.current + '，自上线以来未调整过）。'));
+    return;
+  }
+  const wrap = el('div', 'feed');
+  for (const h of hist) {
+    const up = h.direction === 'up';
+    const down = h.direction === 'down';
+    const ev = el('div', 'ev' + (up ? ' bad' : ''));
+    ev.appendChild(el('span', 'dot'));  // 默认绿点；涨价时 .bad 转红
+    ev.appendChild(el('span', 't', fmtTime(h.created_at)));
+    ev.appendChild(el('span', 'who', h.old_value + ' → ' + h.new_value));
+    ev.appendChild(el('span', 'msg',
+      (h.admin_name || '未知操作人') +
+      (h.note ? (' · ' + h.note) : '') +
+      (h.announced ? '' : ' · ⚠ 未发出公告')));
+    ev.appendChild(el('span', 'amt',
+      (h.change_percent > 0 ? '+' : '') + Number(h.change_percent || 0).toFixed(1) + '%'));
+    wrap.appendChild(ev);
+  }
+  box.appendChild(wrap);
+  if (hist.some((h) => !h.announced)) {
+    box.appendChild(el('div', 'hintbar',
+      '有调价未能发出公告（见上「⚠ 未发出公告」）：受影响的用户不会收到通知，建议手工在「公告」页补一条。'));
+  }
+}
+
+// openBalanceAudits 某用户的余额变动记录（v0.27.0）。
+//
+// 为什么单独开弹窗而不是塞进「用户详情」：这条链路是**追责场景**使用的
+//（"这笔钱是谁改的"），需要能被直接调出来对照，混在几十个字段里反而难找。
+async function openBalanceAudits(u) {
+  const m = openModal('余额变动记录 · ' + (u.username || ('#' + u.id)), '加载中…');
+  let d;
+  try {
+    d = await api('/api/admin/balance-audits?user_id=' + encodeURIComponent(u.id));
+  } catch (e) {
+    m.body.appendChild(el('div', 'muted', '加载失败：' + e.message));
+    return;
+  }
+  m.body.textContent = '';
+  const rows = d.audits || [];
+  if (!rows.length) {
+    m.body.appendChild(el('div', 'hintbar', '该用户还没有人工余额调整记录。'));
+    return;
+  }
+  const rate = Number(d.rate || 0);
+  const wrap = el('div', 'feed');
+  for (const a of rows) {
+    const ok = a.result === 'ok';
+    const up = a.delta_micro > 0;
+    const ev = el('div', 'ev' + (ok ? '' : ' bad'));
+    ev.appendChild(el('span', 'dot'));
+    ev.appendChild(el('span', 't', fmtTime(a.created_at)));
+    ev.appendChild(el('span', 'who', a.admin_name || ('#' + a.admin_id)));
+    ev.appendChild(el('span', 'msg',
+      (up ? '+' : '') + fmtPoints(a.delta_micro / 1000) + ' 点' +
+      '（' + fmtPoints(a.before_micro / 1000) + ' → ' + fmtPoints(a.after_micro / 1000) + '）' +
+      (a.reason ? (' · ' + a.reason) : '') +
+      (ok ? '' : (' · 失败：' + (a.error || '未知原因')))));
+    ev.appendChild(el('span', 'amt',
+      rate > 0 ? ('≈ ' + fmtMoney((a.delta_micro / 1000) * rate)) : ''));
+    wrap.appendChild(ev);
+  }
+  m.body.appendChild(wrap);
+  m.body.appendChild(el('div', 'hintbar',
+    '记录含操作人、时间、变动值与改动前后余额；失败的操作同样留痕（"我点了却没生效"的答案往往就在这里）。'));
+}
+
 // ======================================================================
 // 保存按钮
 // ======================================================================
 
 $('btnSaveSettings').onclick = async () => {
+  const before = Number($('setMultOld').value || 0);
   try {
     const d = await post('/api/admin/settings', {
       multiplier: Number($('setMult').value),
+      multiplier_note: $('setMultNote').value || '',
       register_enabled: $('setRegister').checked,
     });
-    toast('已保存', 'ok');
+    // 倍率变了就说清楚"变成多少、已自动公告"：只说"已保存"无法让人确认
+    // 价格到底改没改、用户会不会收到通知。
+    const changed = before > 0 && Math.abs(Number(d.multiplier) - before) > 1e-9;
+    if (changed) {
+      toast(`计费倍率已由 ${before} 调整为 ${d.multiplier}，已自动发布用户公告`, 'ok');
+      // 说明栏清空：它是"这一次调整的理由"，留在框里会让下一次调整误带上旧理由。
+      $('setMultNote').value = '';
+      loadMultiplierHistory();
+    } else {
+      toast('已保存', 'ok');
+    }
     $('settHint').textContent = `当前倍率 ${d.multiplier}×`;
   } catch (e) { toast(e.message, 'err'); }
 };
@@ -5214,10 +5398,26 @@ function renderWdFilter() {
 async function reviewWithdraw(id, approve) {
   let note = '';
   if (approve) {
-    if (!(await confirmAsk('确认通过并打款？将即时扣减该用户余额。', {danger: true, confirmText: '确认打款'}))) return;
-    note = prompt('打款备注（可留空，如流水号）', '') || '';
+    if (!(await confirmAsk('确认通过并打款？金额已在用户提交申请时冻结，本次将从冻结额出账。',
+      {danger: true, confirmText: '确认打款'}))) return;
+    const r = await promptDialog({
+      title: '打款备注',
+      message: '该笔金额已在申请时冻结，打款会从冻结额出账并扣减用户余额。',
+      fields: [{ name: 'note', label: '备注（可留空，如流水号）', placeholder: '例如：支付宝 2026xxxx' }],
+      confirmText: '确认打款',
+    });
+    if (r === null) return; // 取消 = 不打款（不能默认按空备注继续执行）
+    note = r.note;
   } else {
-    note = prompt('驳回原因（可留空）', '') || '';
+    const r = await promptDialog({
+      title: '驳回答疑',
+      message: '驳回后冻结金额会原路退回到用户的可提现额度。',
+      fields: [{ name: 'note', label: '驳回原因（可留空）', multiline: true }],
+      danger: true,
+      confirmText: '确认驳回',
+    });
+    if (r === null) return;
+    note = r.note;
   }
   try {
     await post(`/api/admin/withdrawals/${id}/review`, { approve, note });
@@ -5244,7 +5444,8 @@ async function loadWithdrawals() {
   kb.appendChild(kpiCard('待审笔数', fmtNum(pend.length)));
   // 提现是钱的业务 → 主值用金额，点数进副行（v0.17.7）。
   kb.appendChild(kpiCard('待审金额', fmtMoney(sum(pend, (x) => x.cny)), '元',
-    '折合 ' + fmtPointsU(sum(pend, (x) => x.amount))));
+    // v0.27.0：这些钱在用户提交申请时就已冻结，审核**不会**因用户余额变动而失败。
+    '折合 ' + fmtPointsU(sum(pend, (x) => x.amount)) + '（已冻结）'));
   kb.appendChild(kpiCard('已打款金额', fmtMoney(sum(appr, (x) => x.cny)), '元',
     '折合 ' + fmtPointsU(sum(appr, (x) => x.amount))));
   kb.appendChild(kpiCard('已打款金额', fmtCNY(sum(appr, (x) => x.cny))));

@@ -48,7 +48,6 @@ func (f *fakeTaskRunner) RunCheckinNow()   { f.note("checkin") }
 func (f *fakeTaskRunner) RunActivityNow()  { f.note("activity") }
 func (f *fakeTaskRunner) RunKeepaliveNow() { f.note("keepalive") }
 func (f *fakeTaskRunner) RunTravelNow()    { f.note("travel") }
-func (f *fakeTaskRunner) RunSchoolNow()    { f.note("school") }
 func (f *fakeTaskRunner) RunCatNow()       { f.note("cat") }
 
 func (f *fakeTaskRunner) snapshot() []string {
@@ -131,9 +130,9 @@ func TestAdminTaskRequiresSameAPIKey(t *testing.T) {
 	fake.waitCalls(t, 1)
 }
 
-// TestAdminTaskDispatchesEveryWhitelistedName 六个任务名各自派发到**对应**的方法。
-// 表里写死「名字 → 期望被调用的方法名」，所以把 school 错接成 RunCatNow 这类
-// 复制粘贴错误会被直接抓住。
+// TestAdminTaskDispatchesEveryWhitelistedName 每个任务名各自派发到**对应**的方法。
+// 表里写死「名字 → 期望被调用的方法名」，所以把某个任务错接成另一个的 Run*Now
+// 这类复制粘贴错误会被直接抓住。
 func TestAdminTaskDispatchesEveryWhitelistedName(t *testing.T) {
 	for _, name := range adminTaskNames {
 		t.Run(name, func(t *testing.T) {

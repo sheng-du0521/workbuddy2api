@@ -23,7 +23,7 @@ func onlyCheckin(hours []int, jitter int) *Scheduler {
 	return New(Config{
 		CheckinHours: hours, JitterMinutes: jitter,
 		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
-		SchoolDisabled: true, CatDisabled: true,
+		CatDisabled: true,
 	})
 }
 
@@ -154,7 +154,7 @@ func TestJitterSameSlotSameOffsetForAllKinds(t *testing.T) {
 		JitterMinutes: 30,
 		// 其余任务关掉：它们的默认小时（如夜猫子 1 点）会更近，
 		// 让 nextWake 返回别的时点，干扰本用例对「同小时同批」的断言。
-		KeepaliveDisabled: true, SchoolDisabled: true, CatDisabled: true,
+		KeepaliveDisabled: true, CatDisabled: true,
 	})
 	now := time.Date(2026, 9, 25, 0, 0, 0, 0, time.Local)
 

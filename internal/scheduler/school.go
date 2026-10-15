@@ -2,12 +2,19 @@
 // 允许：个人学习 / 研究 / 自用部署 / 非营利分享与二次开发。
 // 禁止：以本源码或其衍生版本为标的的商业转售、倒卖、付费分发。
 
-// school.go 开学季任务与夜猫子任务的脚本类排程：从系统 crontab 迁入 Go scheduler。
+// school.go 脚本类任务的执行基础设施。
 //
-// 背景：school（12:00）与 cat（01:00 夜猫窗口）原由系统 crontab 调
-// scripts/school_open_day_cron.sh 执行——依赖外部系统 cron、容器重建可能丢失、
-// 不在 config 里配置。迁入后成为第五、第六类任务，时点由 schedule.school_hours /
-// schedule.cat_hours 配置，school_open_day_cron.sh 保留为手动触发入口。
+// ⚠️ 命名沿革（v0.27.0）：本文件最初同时承载「开学季」与「夜猫子」两个脚本类任务。
+// **开学季排程已整体移除**（活动已结束，且它依赖外部 python 脚本、长期是故障源）——
+// 相关任务类、配置项、手动入口、凭证提供方全部删除；`scripts/school_open_day_2026.py`
+// 文件本身保留在仓库里，供人工手动执行，但程序不再排程、不再调用它。
+//
+// 现在本文件只提供脚本类任务共用的执行面：
+//   - 解释器探测（pythonCmd / probePython）与脚本根定位（repoRoot）；
+//   - 子进程执行封装（scriptRunner / scriptCmd / runScript / runScriptTask）；
+//   - 输出捕获与结论行提取。
+//
+// 唯一的在册使用者是**成长任务**（growth.go）。
 package scheduler
 
 import (
@@ -22,7 +29,6 @@ import (
 	"time"
 
 	"bytes"
-	"encoding/json"
 	"io"
 	"sync"
 	"workbuddy2api/internal/auth"
@@ -32,8 +38,11 @@ import (
 // scriptRootMarkers 判定"这里就是脚本根"的标志（**任一存在**即可）。
 //
 // 为什么是一组而不是一个：此前只认 `school_open_day_2026.py` 一个文件 ——
-// 于是**开学季脚本一旦改名/缺失，成长任务会连带失效**（两者共用 repoRoot）。
+// 于是**那个脚本一旦改名/缺失，成长任务会连带失效**（两者共用 repoRoot）。
 // 两个功能共用的定位函数，不该把其中一个的文件当成硬依赖。
+//
+// 开学季排程虽已移除（v0.27.0），这条标志**仍保留**：老部署里 scripts/ 可能
+// 恰好只剩这一个文件，去掉它会让原本能用的成长任务突然找不到脚本根。
 var scriptRootMarkers = []string{
 	filepath.Join("scripts", "school_open_day_2026.py"),
 	filepath.Join("scripts", "growth_run.py"),
@@ -367,94 +376,6 @@ func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands 
 	s.recordRun(kind, trigger, started, runTally{
 		total: okN + failN, ok: okN, fail: failN, note: note,
 	})
-}
-
-// RunSchoolNow 立即执行开学季任务（人工入口）。
-func (s *Scheduler) RunSchoolNow() { s.runSchool(triggerManual) }
-
-// SchoolAvailable 报告开学季脚本链路当前是否可用。
-//
-// 两个条件缺一不可：
-//  1. scripts/school_open_day_2026.py 存在（发行目录不一定带 scripts/）；
-//  2. python 解释器能真正执行（Windows 上 PATH 常存在 Microsoft Store 的
-//     python3.exe 存根——LookPath 能找到却跑不了，故必须实跑一次 --version）。
-//
-// 装配方据此决定 SchoolDisabled，把「装了但缺依赖」从「每轮刷失败日志」变成
-// 「启动时一句明确说明」，故障不再被掩护。
-func SchoolAvailable() bool {
-	root := repoRoot()
-	if _, err := os.Stat(filepath.Join(root, "scripts", "school_open_day_2026.py")); err != nil {
-		return false
-	}
-	c := newScriptCmd(pythonCmd(), "--version")
-	c.SetDir(root)
-	return c.Run() == nil
-}
-
-// SchoolProvider 开学季任务的凭证提供方（Web 侧实现；nil = 按"无凭证"跳过）。
-//
-// 只要求一个能力：**取全部账号的凭证**。脚本按 ALL 跑，调度器不筛号。
-type SchoolProvider interface {
-	// AllCreds 返回全部可用的账号凭证（无 access token 的应被实现方滤掉）。
-	AllCreds() ([]GrowthCred, error)
-}
-
-// runSchool 执行开学季任务：school_open_day_2026.py ALL --run --yes。
-// 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
-// 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
-func (s *Scheduler) runSchool(trigger string) {
-	// 凭证经 stdin（v0.26.9）：Web 版账号存库且加密，既没有 auths/ 目录，
-	// 脚本原先也只认 auths/ 或单个 --token —— 于是本任务在 Web 版**从未成功过**
-	// （台账里那条 exit status 1 就是"无可用账号"）。
-	// 现在与成长任务用同一套传递方式：解密后经 stdin，不落盘。
-	stdin := s.schoolCredsPayload()
-	if len(stdin) == 0 {
-		s.recordRun(taskSchool, trigger, time.Now(), runTally{
-			skipped: 1, note: "无可用凭证（全部账号缺 access token 或账号为空）",
-		})
-		return
-	}
-	s.runScriptTask(taskSchool, trigger, "school", [][]string{
-		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes", "--creds-stdin"},
-	}, stdin)
-}
-
-// schoolCredsPayload 把全部账号凭证序列化成 JSON 数组（脚本经 stdin 读）。
-//
-// 为什么序列化在这里而不是让脚本自己查库：脚本不该知道库结构，也不该持有密钥。
-// 与 growth 的差别只是"全部"而不是"指定的几个" —— 开学季脚本本身就按 ALL 跑。
-func (s *Scheduler) schoolCredsPayload() []byte {
-	if s.cfg.School == nil {
-		return nil
-	}
-	creds, err := s.cfg.School.AllCreds()
-	if err != nil {
-		log.Printf("WARN: [school] 取凭证失败：%v", err)
-		return nil
-	}
-	if len(creds) == 0 {
-		return nil
-	}
-	type wireCred struct {
-		UID      string `json:"uid"`
-		Nickname string `json:"nickname"`
-		Realm    string `json:"realm"`
-		Domain   string `json:"domain"`
-		Token    string `json:"token"`
-	}
-	out := make([]wireCred, 0, len(creds))
-	for _, c := range creds {
-		out = append(out, wireCred{
-			UID: c.UID, Nickname: c.Nickname, Realm: c.Realm,
-			Domain: c.Domain, Token: c.AccessToken,
-		})
-	}
-	blob, err := json.Marshal(out)
-	if err != nil {
-		log.Printf("WARN: [school] 序列化凭证失败：%v", err)
-		return nil
-	}
-	return blob
 }
 
 // RunCatNow 立即执行夜猫子任务（人工入口）。

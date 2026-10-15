@@ -169,8 +169,9 @@ func (a *app) handleWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pendingApply, _ := a.store.PendingWithdrawMicro(u.ID)
-	// 可提现额度 = min(额度桶, 余额) − 待审申请（v0.21.0，见 store.WithdrawableQuota）。
-	quota, rawQuota, _ := a.store.WithdrawableQuota(u.ID)
+	// 可提现额度与冻结额（v0.27.0）：额度桶里的钱在申请提交那一刻就被划进冻结额，
+	// 所以两者是**互斥的两堆钱**，不是"额度减去待审"的关系。
+	quota, rawQuota, frozen, _ := a.store.WithdrawableState(u.ID)
 	// 汇总各口径的金额形态（v0.17.7）：提现页是「点 / 钱」并存的主要界面，
 	// 每处点数都必须带上金额，避免用户在两套口径间自己心算。
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -197,11 +198,16 @@ func (a *app) handleWallet(w http.ResponseWriter, r *http.Request) {
 			"count":             count,
 			"pending_apply":     MicroToPoint(pendingApply),
 			"pending_apply_cny": microToCNY(pendingApply, rate),
-			// 可提现额度（v0.21.0）：仅返点收益 + 账号买卖所得；已扣待审申请。
+			// 可提现额度（v0.27.0）：仅返点收益 + 账号买卖所得；在途申请已冻结划走。
 			"withdrawable":     MicroToPoint(quota),
 			"withdrawable_cny": microToCNY(quota, rate),
-			// 额度原值（未扣待审），供界面解释「为什么可提比额度小」。
+			// 额度桶原值。正常情况与 quota 相等；不相等只可能是 withdrawable > balance
+			// 的历史脏数据被钳制，界面据此提示"额度受余额上限约束"。
 			"withdrawable_raw": MicroToPoint(rawQuota),
+			// 冻结额（v0.27.0）：审核中的申请金额。钱的总额没变，只是不可动用。
+			// 界面必须单独显示它 —— 否则用户会觉得"我明明有这笔钱，可提现里却没有"。
+			"frozen":     MicroToPoint(frozen),
+			"frozen_cny": microToCNY(frozen, rate),
 		},
 	})
 }
@@ -262,19 +268,27 @@ func (a *app) handleWithdrawApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	amountMicro := PointToMicro(req.Amount)
-	// 可提现额度 = min(可提现额度桶, 余额) − 待审申请（v0.21.0）。
+	// 可提现额度（v0.27.0）= min(withdrawable_micro, balance_micro)：**在途待审
+	// 申请早已在提交时被冻结划走**，故这里不需要（也不能）再减一次待审额 ——
+	// 再减一次等于把同一笔钱扣两遍，用户会看到"明明还有额度却提不出来"。
 	// 只有返点收益与账号买卖所得进入该额度，体验点 / 充值点不可提现。
-	quota, rawQuota, err := a.store.WithdrawableQuota(u.ID)
+	quota, _, frozen, err := a.store.WithdrawableState(u.ID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	if quota < amountMicro {
+		msg := fmt.Sprintf("可提现额度不足：可提 %.2f 点（仅返点收益与账号买卖所得可提现），当前申请 %.2f 点",
+			MicroToPoint(quota), req.Amount)
+		if frozen > 0 {
+			// 已有在途申请时，必须说明"额度里有 X 点正被冻结" —— 否则用户会以为
+			// 自己的额度凭空消失了（这是旧版最容易引起追问的一处）。
+			msg += fmt.Sprintf("；另有 %.2f 点正在审核中（已冻结）", MicroToPoint(frozen))
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": fmt.Sprintf("可提现额度不足：可提 %.2f 点（仅返点收益与账号买卖所得可提现），当前申请 %.2f 点",
-				MicroToPoint(quota), req.Amount),
+			"error":        msg,
 			"withdrawable": MicroToPoint(quota),
-			"raw":          MicroToPoint(rawQuota),
+			"frozen":       MicroToPoint(frozen),
 		})
 		return
 	}
@@ -286,13 +300,30 @@ func (a *app) handleWithdrawApply(w http.ResponseWriter, r *http.Request) {
 		RealName:      name,
 		AccountInfo:   acct + " / " + name, // 兼容字段：保留可读组合串
 	}
+	// 真正生效的是这一句：额度校验与冻结在 store 层的**同一条条件 UPDATE** 里完成，
+	// 上面的 quota 检查只是为了让"额度不足"能带上友好文案（也不能省 —— 没有它，
+	// 并发场景下用户拿到的会是干巴巴的"额度不足"而没有数字）。
 	if err := a.store.CreateWithdrawal(row); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		switch {
+		case errors.Is(err, ErrInsufficientWithdrawable):
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "可提现额度不足（可能刚有另一笔申请占用了额度），请刷新后重试",
+			})
+		case errors.Is(err, ErrNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "用户不存在"})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
 		return
 	}
+	// 冻结后的账目快照：提交成功时把"现在还剩多少可提 / 冻结了多少"一并回给前端，
+	// 免得它再拉一次接口才知道（少一次往返就少一处不一致的可能）。
+	quota2, _, frozen2, _ := a.store.WithdrawableState(u.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"withdrawal": withdrawView(row, rate),
-		"message":    "提现申请已提交，等待管理员审核",
+		"withdrawal":   withdrawView(row, rate),
+		"message":      "提现申请已提交并已冻结对应金额，等待管理员审核",
+		"withdrawable": MicroToPoint(quota2),
+		"frozen":       MicroToPoint(frozen2),
 	})
 }
 
@@ -366,7 +397,12 @@ func (a *app) handleAdminWithdrawReview(w http.ResponseWriter, r *http.Request) 
 		case errors.Is(err, ErrNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "提现申请不存在"})
 		case errors.Is(err, ErrInsufficientWithdraw):
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "用户余额不足，无法打款（可先驳回）"})
+			// v0.27.0：这不再意味着"用户余额不够"（那件事已被冻结机制消除），
+			// 而是该申请的冻结额对不上 —— 老数据未回填，或有人直接改过库。
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": "该申请的冻结额异常（可能提交于旧版本且未回填，或余额被外部改动）。" +
+					"请驳回该申请后让用户重新提交，或核对冻结数据后再打款。",
+			})
 		default:
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		}

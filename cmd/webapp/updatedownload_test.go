@@ -397,3 +397,63 @@ func TestLoadUpdateDownloadDefaultsNone(t *testing.T) {
 		t.Errorf("脏数据应回落 none，得 %+v", d)
 	}
 }
+
+// TestUpdateHelperCarriesStartupArgs 替换脚本必须带上**当前进程的启动参数**。
+//
+// 这是 v0.27.0 修的一个真缺陷：脚本原先只写 `start "" "webapp.exe" %*`，而 %*
+// 是**脚本自己**收到的参数（双击时为空）→ 重启后程序用默认参数启动，监听地址与
+// 数据库路径都变了。表现是"替换成功但服务起不来/数据不对"，极难往这边想。
+func TestUpdateHelperCarriesStartupArgs(t *testing.T) {
+	exe := withTempExe(t) // 已把 updateExecutable 指向 t.TempDir 里的假 exe
+	if err := os.WriteFile(exe+updateNewSuffix, []byte("new-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟生产启动方式：带 -addr 与 -db 两个参数（其中一个含空格，验证引号处理）。
+	oldArgs := updateArgs
+	updateArgs = func() []string {
+		return []string{"-addr", "127.0.0.1:8780", "-db", "./data/my db.sqlite"}
+	}
+	defer func() { updateArgs = oldArgs }()
+
+	a := &app{store: newTestStore(t)}
+	helper, err := a.writeUpdateHelper()
+	if err != nil {
+		t.Fatalf("writeUpdateHelper: %v", err)
+	}
+	raw, err := os.ReadFile(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	for _, want := range []string{
+		"-addr", "127.0.0.1:8780", "-db",
+		// 含空格的参数必须被引号包住，否则重启后会被拆成两个参数。
+		`"./data/my db.sqlite"`,
+		// 手工追加参数的能力要保留。
+		"%*",
+		// 备份 / 失败回滚这两步不能丢（脚本存在的全部意义）。
+		".bak", "move /y",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("替换脚本缺少 %q：\n%s", want, body)
+		}
+	}
+}
+
+// TestQuoteBatArg 参数转义：含空白与元字符的要用引号包住；空串给一对空引号。
+func TestQuoteBatArg(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"-addr", "-addr"},
+		{"127.0.0.1:8780", "127.0.0.1:8780"},
+		{"./data/my db.sqlite", `"./data/my db.sqlite"`},
+		{"a&b", `"a&b"`},
+		{"", `""`},
+		// 内部双引号无法在 bat 里可靠转义 → 去掉（宁可少一个引号也不要坏掉整行）。
+		{`a"b`, `"ab"`},
+	}
+	for _, c := range cases {
+		if got := quoteBatArg(c.in); got != c.want {
+			t.Errorf("quoteBatArg(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}

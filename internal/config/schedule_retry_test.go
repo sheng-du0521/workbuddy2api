@@ -144,7 +144,7 @@ func TestScheduleRetryKeysDoNotDisturbExisting(t *testing.T) {
 		t.Errorf("jitter_minutes 默认被改动：%d", s.JitterMinutes)
 	}
 	if !s.CheckinEnabled || !s.TravelEnabled || !s.ActivityEnabled ||
-		!s.KeepaliveEnabled || !s.SchoolEnabled || !s.CatEnabled {
+		!s.KeepaliveEnabled || !s.CatEnabled {
 		t.Error("任务开关默认应全为 true")
 	}
 }

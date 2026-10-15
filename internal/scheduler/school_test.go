@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,20 +36,6 @@ type fakeScriptExec struct {
 	// out Run 时写进 output 的内容（模拟脚本的 stdout）。
 	out    string
 	output io.Writer
-}
-
-// fakeSchoolProvider 开学季凭证提供方（v0.26.9 起 runSchool 必须先拿到凭证，
-// 否则不会启动子进程 —— 那是刻意的：无凭证时跑起来必然报"无可用账号"，
-// 白白多一个子进程与一条失败台账）。
-type fakeSchoolProvider struct{ creds []GrowthCred }
-
-func (f fakeSchoolProvider) AllCreds() ([]GrowthCred, error) { return f.creds, nil }
-
-// schoolCredsFor 造一份最小可用凭证（探针用，token 是假的但足以走完链路）。
-func schoolCredsFor(uid string) fakeSchoolProvider {
-	return fakeSchoolProvider{creds: []GrowthCred{
-		{UID: uid, Nickname: "探针", Realm: "cn", AccessToken: "tok-" + uid},
-	}}
 }
 
 func (f *fakeScriptExec) SetDir(dir string) { f.lastDir = dir }
@@ -96,24 +81,6 @@ func equalArgs(a, b []string) bool {
 	return true
 }
 
-// TestNextWakeSchoolSlot 开学季任务在 school_hours（默认 12 点）处有独立时点。
-func TestNextWakeSchoolSlot(t *testing.T) {
-	s := New(Config{
-		CheckinHours:      []int{9},
-		TravelDisabled:    true,
-		ActivityDisabled:  true,
-		KeepaliveDisabled: true,
-		SchoolHours:       []int{12},
-	})
-	at, kinds := s.nextWake(time.Date(2026, 9, 14, 11, 0, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 14, 12, 0, 0, 0, time.Local); !at.Equal(want) {
-		t.Errorf("next=%v want %v（school 12:00 独立时点）", at, want)
-	}
-	if len(kinds) != 1 || kinds[0] != taskSchool {
-		t.Errorf("kinds=%v want [school]", kinds)
-	}
-}
-
 // TestNextWakeCatSlot 夜猫子任务在 cat_hours（默认 1 点）处有独立时点。
 func TestNextWakeCatSlot(t *testing.T) {
 	s := New(Config{
@@ -132,81 +99,22 @@ func TestNextWakeCatSlot(t *testing.T) {
 	}
 }
 
-// TestNextWakeSchoolCatDisabled 显式禁用 school/cat 后排程只剩签到时点（互不影响）。
-func TestNextWakeSchoolCatDisabled(t *testing.T) {
+// TestNextWakeCatDisabled 显式禁用夜猫子后排程只剩签到时点（互不影响）。
+func TestNextWakeCatDisabled(t *testing.T) {
 	s := New(Config{
 		CheckinHours:      []int{21},
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolHours:       []int{12},
 		CatHours:          []int{1},
-		SchoolDisabled:    true,
 		CatDisabled:       true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 14, 21, 0, 0, 0, time.Local); !at.Equal(want) {
-		t.Errorf("next=%v want %v（school/cat 禁用 → 只有签到 21:00）", at, want)
+		t.Errorf("next=%v want %v（cat 禁用 → 只有签到 21:00）", at, want)
 	}
 	if len(kinds) != 1 || kinds[0] != taskCheckin {
 		t.Errorf("kinds=%v want [checkin]", kinds)
-	}
-}
-
-// TestRunSchoolNowBuildsCommand RunSchoolNow 构造
-// `<python> scripts/school_open_day_2026.py ALL --run --yes --creds-stdin`，
-// 工作目录设为脚本根，**凭证经 stdin**（v0.26.9）。
-//
-// 解释器断言用 pythonCmd() 而不是字面量 "python3"：v0.26.9 起解释器是**自动探测**的
-// （见 probePython），在本机探测结果是 python —— 写死 "python3" 会让这条断言
-// 在"功能其实正常"的情况下失败。
-func TestRunSchoolNowBuildsCommand(t *testing.T) {
-	// 防环境泄漏：WB2A_PYTHON 若在测试机已设置会改写 pythonCmd()。
-	t.Setenv("WB2A_PYTHON", "")
-	f := installFakeExec(t)
-	s := New(Config{School: schoolCredsFor("acct-1")})
-	s.RunSchoolNow()
-	if f.lastName != pythonCmd() {
-		t.Errorf("name=%q want %q", f.lastName, pythonCmd())
-	}
-	want := []string{"scripts/school_open_day_2026.py", "ALL", "--run", "--yes", "--creds-stdin"}
-	if !equalArgs(f.lastArgs, want) {
-		t.Errorf("args=%v want %v", f.lastArgs, want)
-	}
-	if f.lastDir != repoRoot() {
-		t.Errorf("dir=%q want 脚本根 %q", f.lastDir, repoRoot())
-	}
-	if _, err := os.Stat(filepath.Join(f.lastDir, "scripts", "school_open_day_2026.py")); err != nil {
-		t.Errorf("脚本根 %q 内应有 scripts/school_open_day_2026.py: %v", f.lastDir, err)
-	}
-	// **凭证必须真的经 stdin 传出**：这是本次修复的核心（此前脚本只认 auths/，
-	// Web 版没有那个目录 → 必然失败）。
-	if !strings.Contains(f.lastStdin, "tok-acct-1") {
-		t.Errorf("凭证未经 stdin 传出，得 %q", f.lastStdin)
-	}
-	if !strings.Contains(f.lastStdin, "acct-1") {
-		t.Errorf("stdin 里应含 uid，得 %q", f.lastStdin)
-	}
-}
-
-// TestRunSchoolSkipsWithoutCreds 没有凭证时**不启动子进程**。
-//
-// 为什么这是对的：脚本在没有凭证时必然打印"无可用账号"并以非零退出 ——
-// 启动一个注定失败的子进程只会多一条误导性的失败台账（本机历史上那条
-// `exit status 1` 正是它），却让人以为"脚本坏了"。
-func TestRunSchoolSkipsWithoutCreds(t *testing.T) {
-	t.Setenv("WB2A_PYTHON", "")
-	f := installFakeExec(t)
-	s := New(Config{}) // School 为 nil
-	s.RunSchoolNow()
-	if f.runN != 0 {
-		t.Errorf("无凭证不该启动脚本，runN=%d", f.runN)
-	}
-	// 空凭证列表同样不启动。
-	s2 := New(Config{School: fakeSchoolProvider{}})
-	s2.RunSchoolNow()
-	if f.runN != 0 {
-		t.Errorf("凭证列表为空时不该启动脚本，runN=%d", f.runN)
 	}
 }
 
@@ -393,13 +301,15 @@ func TestRunCatNowAlreadyClaimed(t *testing.T) {
 	s.RunCatNow() // 不应 panic / 不应打任何写接口（打错会由 stub 500 暴露为日志）
 }
 
-// TestDispatchSchoolCatAndFailureWarnsOnly dispatch 把 school 分发给脚本链路；
-// 脚本失败只记 WARN（不 panic/不向上抛）。cat 已 Go 化，不再分发到脚本。
-func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
+// TestScriptTaskFailureWarnsOnly 脚本链路失败只记 WARN（不 panic、不向上抛）。
+//
+// v0.27.0 起不再用 dispatch 驱动脚本任务（开学季移除后已无排程内的脚本类任务），
+// 改为直接调用 runScriptTask —— 被验证的是"脚本失败怎么记账"这件事本身。
+func TestScriptTaskFailureWarnsOnly(t *testing.T) {
 	t.Setenv("WB2A_PYTHON", "")
 	f := installFakeExec(t)
 	f.err = errors.New("boom boom")
-	s := New(Config{School: schoolCredsFor("acct-9")})
+	s := New(Config{})
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -409,21 +319,30 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 		log.SetFlags(log.LstdFlags)
 	})
 
-	s.dispatch(context.Background(), taskSchool)
-	if f.runN != 1 || f.lastArgs[0] != "scripts/school_open_day_2026.py" {
-		t.Errorf("dispatch(school) 未执行: runN=%d last=%v", f.runN, f.lastArgs)
+	s.runScriptTask(taskGrowth, triggerManual, "growth", [][]string{
+		{"python", "scripts/growth_run.py", "--phase", "zero"},
+	}, []byte("[]"))
+	if f.runN != 1 || f.lastArgs[0] != "scripts/growth_run.py" {
+		t.Errorf("脚本未执行: runN=%d last=%v", f.runN, f.lastArgs)
 	}
-	// cat 已 Go 原生：窗口外应直接跳过，不产生子进程。
+	out := buf.String()
+	if !strings.Contains(out, "WARN") || !strings.Contains(out, "scripts/growth_run.py") {
+		t.Errorf("脚本失败未按 WARN 记录:\n%s", out)
+	}
+}
+
+// TestDispatchCatNeverSpawnsScript cat 已 Go 原生实现：dispatch 它**不得**拉起任何
+// 子进程（窗口外应直接跳过）。这条守的是"Go 化"这个决定本身。
+func TestDispatchCatNeverSpawnsScript(t *testing.T) {
+	t.Setenv("WB2A_PYTHON", "")
+	f := installFakeExec(t)
+	s := New(Config{})
 	s.nowFn = func() time.Time {
 		return time.Date(2026, 10, 9, 12, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	}
 	s.dispatch(context.Background(), taskCat)
-	if f.runN != 1 {
-		t.Errorf("cat 已 Go 化，不应再拉起脚本；runN=%d last=%v", f.runN, f.lastArgs)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "WARN") || !strings.Contains(out, "scripts/school_open_day_2026.py") {
-		t.Errorf("school 失败未按 WARN 记录:\n%s", out)
+	if f.runN != 0 {
+		t.Errorf("cat 已 Go 化，不应拉起脚本；runN=%d last=%v", f.runN, f.lastArgs)
 	}
 }
 
@@ -431,7 +350,7 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 //
 // ⚠️ 行为变更（v0.26.9）：缺省**不再恒定返回 "python3"**，而是自动探测
 // （`python3` → `python`，取首个能真正跑起来的）。旧断言把"Windows 上要用 python"
-// 推给运维去设 `WB2A_PYTHON`，结果是没人设 → 成长任务与开学季双双静默禁用
+// 推给运维去设 `WB2A_PYTHON`，结果是没人设 → 脚本类任务静默禁用
 // （本机的 `python3` 是 Microsoft Store 存根，跑不起来）。详见 scriptchain_test.go。
 //
 // 显式指定与 trim 的语义**不变**，原样保留。
@@ -489,8 +408,10 @@ func TestRunScriptLogsSummaryLineOnSuccess(t *testing.T) {
 	log.SetFlags(0)
 	t.Cleanup(func() { log.SetOutput(os.Stderr); log.SetFlags(log.LstdFlags) })
 
-	s := New(Config{School: schoolCredsFor("acct-1")})
-	s.RunSchoolNow()
+	s := New(Config{})
+	s.runScriptTask(taskGrowth, triggerManual, "growth", [][]string{
+		{"python", "scripts/growth_run.py", "--phase", "zero"},
+	}, []byte("[]"))
 
 	if !strings.Contains(buf.String(), "school2026 done") {
 		t.Errorf("日志应包含脚本汇总行，得：\n%s", buf.String())
@@ -512,8 +433,10 @@ func TestRunScriptLogsScriptOutputOnFailure(t *testing.T) {
 	log.SetFlags(0)
 	t.Cleanup(func() { log.SetOutput(os.Stderr); log.SetFlags(log.LstdFlags) })
 
-	s := New(Config{School: schoolCredsFor("acct-1")})
-	s.RunSchoolNow()
+	s := New(Config{})
+	s.runScriptTask(taskGrowth, triggerManual, "growth", [][]string{
+		{"python", "scripts/growth_run.py", "--phase", "zero"},
+	}, []byte("[]"))
 
 	out := buf.String()
 	if !strings.Contains(out, "无可用账号") {

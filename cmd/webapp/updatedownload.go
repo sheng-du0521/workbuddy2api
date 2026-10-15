@@ -118,6 +118,10 @@ func updateAssetFor(assets []updateAsset) *updateAsset {
 	return nil
 }
 
+// updateArgs 返回当前进程的启动参数（不含 argv[0]）。抽成变量以便测试注入：
+// 用例无法真的重启 go test 进程，但必须能验证"参数被写进了脚本"。
+var updateArgs = func() []string { return os.Args[1:] }
+
 // updateExecutable 返回当前可执行文件路径。抽成变量以便测试注入 ——
 // 否则每个用例都会把 `.new` 写到 `go test` 的临时二进制旁边（跑完留一地垃圾，
 // 且用例之间互相干扰）。与 updateHTTPClient 同一套路。
@@ -417,10 +421,32 @@ func (a *app) writeUpdateHelper() (string, error) {
 		return "", err
 	}
 	base := filepath.Base(exe)
+	// **把当前进程的启动参数原样写进重启行**（v0.27.0 修的真缺陷）。
+	//
+	// 此前这里只有 `start "" "webapp.exe" %*`，而 `%*` 是**脚本自己**收到的参数
+	// ——双击运行时它是空的。于是重启后程序用默认参数启动：监听地址变回默认、
+	// 数据库指向默认路径，表现是"替换成功、服务却起不来/数据不对"，
+	// 极易被误判成端口占用或防火墙。
+	//
+	// 注意 updateApplyHint 早就写着"按原参数重新启动" —— 文案与实现不一致本身
+	// 就是最难发现的一类缺陷：它把排查方向直接引偏。
+	restart := "start \"\" \"" + base + "\""
+	if args := updateArgs(); len(args) > 0 {
+		quoted := make([]string, 0, len(args))
+		for _, a := range args {
+			quoted = append(quoted, quoteBatArg(a))
+		}
+		restart += " " + strings.Join(quoted, " ")
+	}
+	// 末尾保留 %*：手工在命令行追加参数（如临时换端口）时仍然生效。
+	restart += " %*"
+
 	content := "@echo off\r\n" +
+		// chcp 必须在**任何中文输出之前**：否则默认代码页（GBK）下中文注释会被
+		// 显示成乱码 —— 运维打开脚本第一眼就是一团乱码，会直接怀疑脚本坏了。
+		"chcp 65001 >nul\r\n" +
 		"rem WorkBuddy2API 更新替换脚本（由程序生成，可自行修改）\r\n" +
 		"rem 用法：先停止本程序，再运行本脚本。\r\n" +
-		"chcp 65001 >nul\r\n" +
 		"cd /d \"%~dp0\"\r\n" +
 		"if not exist \"" + base + updateNewSuffix + "\" (\r\n" +
 		"  echo [错误] 未找到 " + base + updateNewSuffix + "，请先在后台\"检测更新\"触发下载。\r\n" +
@@ -437,10 +463,34 @@ func (a *app) writeUpdateHelper() (string, error) {
 		"  pause & exit /b 1\r\n" +
 		")\r\n" +
 		"echo 替换完成，正在启动...\r\n" +
-		"start \"\" \"" + base + "\" %*\r\n" +
-		"timeout /t 2 >nul\r\n"
+		"rem 下面这行由程序按**当前启动参数**生成，重启后监听地址与数据库路径与更新前一致。\r\n" +
+		restart + "\r\n" +
+		// **刻意不写 `timeout /t 2`**（v0.27.0 实测发现）：它在非交互环境里
+		//（任务计划程序、CI、脚本被其它程序调用）会等待输入而**永久挂住**，
+		// 脚本永远不退出、调用方一直等。start 本身是异步的，脚本退出不影响
+		// 新进程 —— 那段等待纯属多余。
+		"\r\n"
 	if err := os.WriteFile(helper, []byte(content), 0o644); err != nil {
 		return "", err
 	}
 	return helper, nil
+}
+
+// quoteBatArg 把单个启动参数转成 bat 里安全的形态。
+//
+// 规则（够用且不过度）：含空白或 cmd 元字符时用双引号包裹；内部的双引号本身
+// 无法在 bat 中可靠转义，改为**去掉**并在日志里留痕 —— 静默改写参数会让"重启后
+// 行为不一致"变成一桩无头案，所以宁可少一个引号也不要坏掉整行。
+func quoteBatArg(a string) string {
+	if a == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(a, " \t\"&|<>^()%!") {
+		return a
+	}
+	if strings.Contains(a, `"`) {
+		log.Printf("WARN: [update] 启动参数含双引号，已在替换脚本中移除：%s", a)
+		a = strings.ReplaceAll(a, `"`, "")
+	}
+	return `"` + a + `"`
 }

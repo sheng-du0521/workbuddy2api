@@ -22,9 +22,8 @@ type Schedule struct {
 	TravelHours    []int `json:"travel_hours"`    // [9,21]
 	ActivityHours  []int `json:"activity_hours"`  // [10]
 	KeepaliveHours []int `json:"keepalive_hours"` // [22]
-	SchoolHours    []int `json:"school_hours"`    // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
 	CatHours       []int `json:"cat_hours"`       // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
-	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
+	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/CatEnabled
 	// 显式禁用开关（缺省 true）。
 	//
 	// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -37,7 +36,6 @@ type Schedule struct {
 	TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
 	ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
-	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
 	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
@@ -95,13 +93,11 @@ func DefaultSchedule() Schedule {
 		TravelHours:         []int{9, 21},
 		ActivityHours:       []int{10},
 		KeepaliveHours:      []int{22},
-		SchoolHours:         []int{12},
 		CatHours:            []int{1},
 		CheckinEnabled:      true,
 		TravelEnabled:       true,
 		ActivityEnabled:     true,
 		KeepaliveEnabled:    true,
-		SchoolEnabled:       true,
 		CatEnabled:          true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
 		RetryMaxPerDay:      1, // 只写了 retry_delay_minutes 时的保守默认：每天补跑一次
@@ -134,9 +130,6 @@ func (s *Schedule) Normalize() error {
 	}
 	if len(s.KeepaliveHours) == 0 {
 		s.KeepaliveHours = []int{22}
-	}
-	if len(s.SchoolHours) == 0 {
-		s.SchoolHours = []int{12}
 	}
 	if len(s.CatHours) == 0 {
 		s.CatHours = []int{1}
@@ -190,9 +183,6 @@ func (s *Schedule) validateHours() error {
 		return err
 	}
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", s.KeepaliveHours); err != nil {
-		return err
-	}
-	if err := checkHourRange("schedule.school_hours", "school_enabled", s.SchoolHours); err != nil {
 		return err
 	}
 	return checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours)

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -1051,6 +1052,14 @@ func (a *app) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAdminSetBalance 调整某用户余额（正负均可，单位：点）。
+// handleAdminSetBalance 人工调整某用户余额（delta 可正可负，单位：点）。
+//
+// v0.27.0 起**每一次调用都落审计**（含被拒绝的）：操作人、时间、变动值、
+// 改动前后余额、原因、结果。钱的事没有凭据，事后对不上账就只能互相猜 ——
+// 而这类调整恰恰是最容易产生争议的操作。
+//
+// 审计写失败**不影响**返回：钱已经动了，却告诉管理员"操作失败"会让他在不知情
+// 的情况下重试（重复入账）。代价是可能丢一条审计，所以失败会打 WARN 日志。
 func (a *app) handleAdminSetBalance(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -1059,17 +1068,78 @@ func (a *app) handleAdminSetBalance(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Delta float64 `json:"delta"`
+		// Reason 变动原因（v0.27.0）。刻意做成可选而不是必填：强制填写只会得到
+		// 一堆"调整""测试"这类无信息量的字，反而不如让诚实留空。
+		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Delta == 0 {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	// NaN/Inf 必须先挡：它们能通过 `!= 0` 判断，却会把 PointToMicro 的结果变成
+	// 一个荒谬的整数，直接污染余额。
+	if req.Delta == 0 || math.IsNaN(req.Delta) || math.IsInf(req.Delta, 0) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请提供 non-zero delta（单位：点）"})
 		return
 	}
-	if err := a.store.AddUserBalance(id, PointToMicro(req.Delta)); err != nil {
+	if len([]rune(req.Reason)) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "原因过长（最多 200 字）"})
+		return
+	}
+
+	admin := userFrom(r)
+	audit := &BalanceAudit{
+		UserID:     id,
+		DeltaMicro: PointToMicro(req.Delta),
+		Reason:     strings.TrimSpace(req.Reason),
+	}
+	if admin != nil {
+		audit.AdminID, audit.AdminName = admin.ID, admin.Username
+	} else {
+		// **密钥通道没有登录身份**（`X-Admin-Key` 走的是头鉴权，不是某人登录）。
+		// 留空会让审计里只剩一个空操作人 —— 而"用管理密钥的脚本改的"与"管理员在
+		// 后台点的"是性质完全不同的两类操作，必须能区分（追责与排查都靠这个）。
+		audit.AdminName = "（管理密钥通道）"
+	}
+
+	// 先取用户（拿 before 快照 + 用户名），取不到就没必要动账。
+	u, err := a.store.GetUserByID(id)
+	if err != nil {
+		audit.Result, audit.Error = auditRejected, "用户不存在"
+		a.store.RecordBalanceAudit(audit)
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "用户不存在"})
 		return
 	}
-	u, _ := a.store.GetUserByID(id)
-	writeJSON(w, http.StatusOK, map[string]any{"id": id, "balance": MicroToPoint(u.BalanceMicro)})
+	audit.Username, audit.BeforeMicro = u.Username, u.BalanceMicro
+
+	if err := a.store.AddUserBalance(id, audit.DeltaMicro); err != nil {
+		audit.Result, audit.Error = auditRejected, err.Error()
+		a.store.RecordBalanceAudit(audit)
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "用户不存在"})
+		return
+	}
+	after, err := a.store.GetUserByID(id)
+	if err != nil {
+		// 极罕见：刚更新过就读不到。仍然按成功返回（钱确实动了），
+		// 审计里 after 留 0 并记明原因，便于事后核对。
+		audit.Result, audit.Error = auditOK, "回读失败: "+err.Error()
+		a.store.RecordBalanceAudit(audit)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "balance": MicroToPoint(
+			audit.BeforeMicro + audit.DeltaMicro)})
+		return
+	}
+	audit.AfterMicro = after.BalanceMicro
+	a.store.RecordBalanceAudit(audit)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":      id,
+		"balance": MicroToPoint(after.BalanceMicro),
+		// 回显变动前后，前端可以直接把"已调整"写成"已从 X 调整为 Y" —— 一个
+		// 只有"已调整"的提示无法让人确认到底改成功了没有。
+		"before": MicroToPoint(audit.BeforeMicro),
+		"after":  MicroToPoint(audit.AfterMicro),
+		"delta":  MicroToPoint(audit.DeltaMicro),
+	})
 }
 
 // handleAdminSetLimits 设置某用户的日 / 月消费闸（单位：点，0 = 不限）。
@@ -1221,7 +1291,9 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Multiplier      *float64 `json:"multiplier"`
+		Multiplier *float64 `json:"multiplier"`
+		// MultiplierNote 调价说明（v0.27.0）：会原样出现在自动公告里给用户看。
+		MultiplierNote  *string  `json:"multiplier_note"`
 		RegisterEnabled *bool    `json:"register_enabled"`
 		ReserveRate     *float64 `json:"reserve_rate"`      // 兜底单价：点 / 1k token
 		ReserveMax      *float64 `json:"reserve_max"`       // 单笔预扣上限（点，0=不限）
@@ -1308,12 +1380,28 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	if req.Multiplier != nil {
-		if *req.Multiplier <= 0 || *req.Multiplier > 1000 {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "计费倍率需在 0-1000 之间（点 / 1 号池积分）"})
+		if err := validateMultiplier(*req.Multiplier); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
+		// 旧值必须在写入**之前**读：写完再读只能拿到新值，"从多少调到多少"就没了。
+		oldMult := a.store.PricingMultiplier()
 		if !setFloat(settingMultiplier, *req.Multiplier) {
 			return
+		}
+		// 只有真的变了才记历史 + 发公告。保存设置时顺手带上原值（前端回显后再保存）
+		// 是很常见的行为，把那种提交也记一笔会让历史里塞满 1→1 的空记录，
+		// 真正的调价反而被淹没 —— 而"上次是什么时候调的"正是这张表存在的理由。
+		if math.Abs(*req.Multiplier-oldMult) > 1e-9 {
+			note := ""
+			if req.MultiplierNote != nil {
+				note = strings.TrimSpace(*req.MultiplierNote)
+				if len([]rune(note)) > 200 {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "调价说明过长（最多 200 字）"})
+					return
+				}
+			}
+			a.recordMultiplierChange(oldMult, *req.Multiplier, userFrom(r), note)
 		}
 	}
 	if req.RegisterEnabled != nil {

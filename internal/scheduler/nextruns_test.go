@@ -19,7 +19,6 @@ func TestNextRunsCoversEnabledKinds(t *testing.T) {
 		KeepaliveHours: []int{22},
 		CatHours:       []int{1},
 		// 显式禁用两类，验证它们不出现在结果里。
-		SchoolDisabled:   true,
 		ActivityDisabled: true,
 	})
 	got := s.NextRuns()
@@ -33,7 +32,7 @@ func TestNextRunsCoversEnabledKinds(t *testing.T) {
 	if _, ok := got[taskGrowth.String()]; ok {
 		t.Errorf("成长任务不排程，不应有下次触发时刻，得 %v", keysOf(got))
 	}
-	for _, k := range []taskKind{taskSchool, taskActivity} {
+	for _, k := range []taskKind{taskActivity} {
 		if _, ok := got[k.String()]; ok {
 			t.Errorf("已禁用的 %s 不应有下次触发时刻，得 %v", k, keysOf(got))
 		}

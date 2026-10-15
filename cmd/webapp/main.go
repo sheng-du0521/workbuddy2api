@@ -69,7 +69,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.26.9"
+const version = "0.27.0"
 
 type app struct {
 	store  *Store
@@ -220,6 +220,15 @@ func main() {
 		//
 		// 优先级：-key 参数 > 环境变量（脚本侧读）> admin.key 文件 > 新生成。
 		// 环境变量由启动脚本处理（见 start-webapp.bat），这里只管文件与生成。
+		// ⚠️ 数据目录必须**先建**（v0.27.0 修）：下面要把 admin.key 写进去，
+		// 而首次部署时该目录还不存在，MkdirAll 却排在密钥处理之后 —— 结果是
+		// 全新目录首次启动**密钥落盘失败**，退化成"临时密钥、重启就变"；
+		// 而启动脚本 / 隧道探活引用的是上一次的密钥，表现为"刚配好就又失效"。
+		if dir := filepath.Dir(*dbPath); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				log.Fatalf("创建数据目录失败: %v", err)
+			}
+		}
 		keyPath := filepath.Join(filepath.Dir(*dbPath), "admin.key")
 		// R4：被拦样本文件与库 / 密钥同目录（-db 决定），避免依赖进程 CWD。
 		fpSampleFile = filepath.Join(filepath.Dir(*dbPath), "fingerprint_samples.jsonl")
@@ -248,11 +257,6 @@ func main() {
 		}
 	}
 
-	if dir := filepath.Dir(*dbPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Fatalf("创建数据目录失败: %v", err)
-		}
-	}
 	store, err := OpenStore(*dbPath)
 	if err != nil {
 		log.Fatalf("打开数据库失败: %v", err)
@@ -1370,6 +1374,11 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/admin/accounts/{uid}/growth-tasks", a.adminGuard(a.handleGrowthTasks))
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/growth-tasks/accept", a.adminGuard(a.handleGrowthTaskAccept))
 	mux.HandleFunc("POST /api/admin/users/{id}/balance", a.adminGuard(a.handleAdminSetBalance))
+	// 余额变动审计（v0.27.0）：谁在什么时候把谁的钱改了多少、结果如何。
+	mux.HandleFunc("GET /api/admin/balance-audits", a.adminGuard(a.handleAdminBalanceAudits))
+	// 计费倍率：变更历史（后台，含调整人）与用户侧只读视图（不含管理员信息）。
+	mux.HandleFunc("GET /api/admin/multiplier-history", a.adminGuard(a.handleAdminMultiplierHistory))
+	mux.HandleFunc("GET /api/multiplier", a.userGuard(a.handleMultiplier))
 	mux.HandleFunc("POST /api/admin/users/{id}/status", a.adminGuard(a.handleAdminSetUserStatus))
 	mux.HandleFunc("POST /api/admin/users/{id}/limits", a.adminGuard(a.handleAdminSetLimits))
 	// 逐用户返点比例（v0.17.7）：查看 / 编辑该用户的号池分成与推广返点比例。

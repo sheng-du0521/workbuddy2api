@@ -225,6 +225,23 @@
         <div class="cards" id="bkCards"></div>
       </div>
 
+      <div class="card">
+        <div class="section-head">
+          <h2>计费倍率与调价</h2>
+          <span class="slot-refresh" data-refresh="loadMultiplier" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          计费倍率 = <b>扣点 / 1 号池积分</b>。倍率<b>上调</b>即同样的用量扣更多点（变贵），
+          <b>下调</b>即变便宜。平台每次调整都会在此留痕，并自动发布公告。
+        </div>
+        <div class="mini-grid" id="multKpis"></div>
+        <div id="multTrend" style="margin-top:14px;"></div>
+        <div class="section-head" style="margin:14px 0 8px;">
+          <h2 style="font-size:12.5px;">调价记录</h2>
+        </div>
+        <div id="multHistory"></div>
+      </div>
+
       <div class="live-grid">
         <div class="card" style="margin:0;">
           <div class="section-head">
@@ -841,6 +858,89 @@ function breakdownCards(bk) {
   }
 }
 
+// loadMultiplier 计费倍率面板（v0.27.0）。
+//
+// 三条信息缺一不可：
+//   - **当前倍率**：用户算自己的成本要用它（而它此前只在管理后台可见）；
+//   - **趋势**：只有当前值看不出"最近变贵了还是变便宜了"，而这正是用户最想知道的；
+//   - **逐条记录**：有几次、什么时候、从多少到多少、为什么 —— 涨价不给理由是最
+//     容易失去信任的一件事。
+//
+// 不暴露调整人（后端已剔除）：调价是平台行为，用户需要的是事实与理由，不是人名。
+async function loadMultiplier() {
+  const host = document.querySelector('.pane[data-pane="usage"]');
+  let d;
+  try {
+    d = await api('/api/multiplier');
+  } catch (e) {
+    // 失败只弹 toast 的话，切回来看到的仍是"上次的倍率" —— 而倍率直接影响
+    // 用户算钱的结论，看错比看不到更糟。
+    loadBanner(host, '计费倍率加载失败（' + e.message + '）', loadMultiplier, 'mult');
+    return;
+  }
+  clearLoadBanner(host, 'mult');
+  const cur = Number(d.current || 1);
+  const hist = d.history || []; // 倒序（最新在前）
+
+  const last = hist[0] || null;
+  const dir = last ? last.direction : 'flat';
+  const dirText = dir === 'up' ? '↑ 上调' : (dir === 'down' ? '↓ 下调' : '— 未调整');
+  const dirCls = dir === 'up' ? 'err' : (dir === 'down' ? 'ok' : '');
+
+  miniGrid($('multKpis'), [
+    { k: '当前倍率', v: Number(cur.toFixed(4)), cls: 'accent',
+      d: '扣点 / 1 号池积分' },
+    { k: '最近调整', v: last ? fmtDate(last.created_at) : '无记录',
+      d: last ? (`${last.old_value} → ${last.new_value}`) : '平台尚未调整过倍率' },
+    { k: '方向', v: dirText, cls: dirCls,
+      d: last && last.change_percent ? (last.change_percent > 0 ? '+' : '') +
+        last.change_percent.toFixed(1) + '%' : '—' },
+    { k: '调整次数', v: fmtNum(hist.length), d: '本页显示最近 ' + hist.length + ' 次' },
+  ]);
+
+  // 趋势：按时间**正序**画（倒序数据直接画会得到一条反向的曲线，读起来完全相反）。
+  const trend = $('multTrend');
+  trend.textContent = '';
+  const pts = hist.slice().reverse().map((h) => ({
+    label: fmtDate(h.created_at), value: Number(h.new_value),
+  }));
+  if (!pts.length) {
+    trend.appendChild(el('div', 'hintbar', '平台尚未调整过计费倍率，一直保持当前值。'));
+  } else {
+    // 起点补一个"调整前"的点，趋势线才有参照（否则第一个点就是终值，看不出变化）。
+    pts.unshift({ label: fmtDate(hist[hist.length - 1].created_at), value: Number(hist[hist.length - 1].old_value) });
+    // 终点补当前值：若最新一次调整后又有人改过库，趋势与"当前倍率"会不一致。
+    const lastPoint = pts[pts.length - 1];
+    if (lastPoint.value !== cur) pts.push({ label: '当前', value: cur });
+    trend.appendChild(svgLineChart(pts, { height: 40 }));
+    trend.appendChild(legend([{ label: '计费倍率（点 / 1 号池积分）', color: 'var(--accent)' }]));
+  }
+
+  // 逐条记录用事件流（.feed / .ev）而不是表格：这是**事件**（什么时候发生、
+  // 变成多少），不是需要对齐比较的多列数据 —— 表格会让人下意识去横着比数字。
+  const box = $('multHistory');
+  box.textContent = '';
+  if (!hist.length) {
+    box.appendChild(el('div', 'hintbar', '暂无调价记录。'));
+    return;
+  }
+  const wrap = el('div', 'feed');
+  for (const h of hist) {
+    const up = h.direction === 'up';
+    const down = h.direction === 'down';
+    // 涨价标红（bad）、降价标绿：与中国用户对"涨跌"的颜色直觉一致。
+    const ev = el('div', 'ev' + (up ? ' bad' : ''));
+    ev.appendChild(el('span', 'dot'));
+    ev.appendChild(el('span', 't', fmtTime(h.created_at)));
+    ev.appendChild(el('span', 'who', h.old_value + ' → ' + h.new_value));
+    ev.appendChild(el('span', 'msg', h.note || (up ? '倍率上调' : (down ? '倍率下调' : '无说明'))));
+    ev.appendChild(el('span', 'amt',
+      (h.change_percent > 0 ? '+' : '') + Number(h.change_percent || 0).toFixed(1) + '%'));
+    wrap.appendChild(ev);
+  }
+  box.appendChild(wrap);
+}
+
 async function loadUsageLive() {
   try {
     const [rep, log, bk] = await Promise.all([
@@ -878,6 +978,9 @@ async function loadUsageLive() {
     dailyTable($('myDailyTable'), (rep.daily || []).slice().reverse());
     await loadRecentFeed('usFeed', null, 50);
   } catch (e) { toast(e.message, 'err'); }
+  // 倍率面板**独立加载**（自带失败横幅与重试）：它是另一份数据源，
+  // 失败不该让整页的用量数据一起消失，也不该被上一段的 catch 吞掉。
+  loadMultiplier();
 }
 
 // 只在「用量账单」页轮询，切走即停（首次加载由导航 data-on="loadUsageLive" 触发）。
@@ -1443,7 +1546,17 @@ function hostCard(h) {
   }
   sel.onchange = async () => {
     let g = sel.value;
-    if (g === '__custom__') { g = prompt('输入代挂分组名（留空 = 取消分组）', cur) || ''; if (g === '__custom__') return; }
+    if (g === '__custom__') {
+      const r = await promptDialog({
+        title: '代挂分组',
+        message: '留空 = 取消分组（该账号不出现在任何分组下）。',
+        fields: [{ name: 'group', label: '分组名', value: cur, placeholder: '例如：主力 / 备用' }],
+        confirmText: '保存',
+      });
+      if (r === null) return;
+      g = r.group;
+      if (g === '__custom__') return; // 防呆：填了保留字
+    }
     try {
       await post('/api/host/accounts/' + encodeURIComponent(h.uid) + '/group', { group: g });
       toast('分组已更新', 'ok');
@@ -1665,10 +1778,17 @@ function ownedAccountCard(a, rate) {
     b.title = '设置挂牌价（元）后上架';
     b.onclick = async () => {
       // 需求 2：上架时设置金额，以**元**为单位，前端做输入校验。
-      const input = prompt('请设置挂牌价（元，最多两位小数）：\n账号：' +
-        (a.nickname || a.uid.slice(0, 8)) + '\n积分：' + fmtCredit(a.credits || 0) +
-        '\n\n挂牌期间账号归属「闲置」（不参与平台反代）；成交后金额全额进你的余额。');
-      if (input === null) return;
+      const r = await promptDialog({
+        title: '上架挂牌',
+        message: '账号：' + (a.nickname || a.uid.slice(0, 8)) +
+          '\n积分：' + fmtCredit(a.credits || 0) +
+          '\n\n挂牌期间账号归属「闲置」（不参与平台反代）；成交后金额全额进你的余额。',
+        fields: [{ name: 'price', label: '挂牌价（元，最多两位小数）', type: 'number',
+          placeholder: '例如 88.00', required: true }],
+        confirmText: '下一步',
+      });
+      if (r === null) return;
+      const input = r.price;
       const yuan = Number(String(input).trim());
       if (!Number.isFinite(yuan) || yuan <= 0) { toast('挂牌价必须大于 0', 'err'); return; }
       // 两位小数校验（与后端 parseSalePriceYuan 同口径）
@@ -2034,6 +2154,11 @@ async function loadWallet() {
       d: '≈ ' + fmtMoney(d.balance_cny) },
     { k: '可提现 · 点', v: fmtPoints(s.withdrawable), cls: 'ok',
       d: '≈ ' + fmtMoney(s.withdrawable_cny) },
+    // 冻结中（v0.27.0）：审核中的提现申请金额。**必须单独显示** —— 钱还在账上
+    // 但不可动用，用户看不到这一项就会觉得"我明明有这笔钱，可提现里却没有"。
+    { k: '审核中（已冻结）· 点', v: fmtPoints(s.frozen || 0),
+      cls: (s.frozen > 0 ? 'warn' : ''),
+      d: '≈ ' + fmtMoney(s.frozen_cny || 0) },
     // 分桶（v0.21.0）：这两个是**累计**统计（历史共到账多少），不是可花余额
     // —— 余额已在上面单独展示。两类点都只能消费、不可提现。
     { k: '累计体验点', v: fmtPoints(d.exp_points || 0),
@@ -2050,9 +2175,15 @@ async function loadWallet() {
   ]);
   // 折算说明：同时给出「元/点」与反向「1 元 ≈ N 点」——用户按点申请，需要的是后者。
   setTxt('wdHint', `最小 ${fmtPoints(p.min_points)} 点（≈ ${fmtMoney(p.min_cny)}） · ${fmtRate(p.rate)}`);
+  // 文案口径（v0.27.0）：额度与冻结是**互斥的两堆钱**，不是"额度减去待审"。
+  // 提交申请那一刻额度就被划走了，所以这里不能再写"已扣待审申请"（那会让人以为
+  // 是"先看后扣"，而实际是"提交即冻结、审核必然成功或由管理员驳回"）。
   setTxt('wdApplyHint', s.withdrawable > 0
-    ? `可提现 ${fmtPointsU(s.withdrawable)} ≈ ${fmtMoney(s.withdrawable_cny)}（已扣待审申请）`
-    : '当前没有可提现额度');
+    ? `可提现 ${fmtPointsU(s.withdrawable)} ≈ ${fmtMoney(s.withdrawable_cny)}`
+      + (s.frozen > 0 ? `；另有 ${fmtPointsU(s.frozen)} 点审核中（已冻结）` : '')
+    : (s.frozen > 0
+      ? `额度已全部冻结（${fmtPointsU(s.frozen)} 点审核中）`
+      : '当前没有可提现额度'));
 
   // 收款方式分段控件
   loadWalletMethods();

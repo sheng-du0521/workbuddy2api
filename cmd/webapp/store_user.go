@@ -57,6 +57,19 @@ type User struct {
 	// WeChat 微信号（v0.21.0）：注册时选填，供管理员联系用户。
 	WeChat string
 
+	// FrozenMicro 已冻结金额（微点，v0.27.0）：提现申请提交时从**可提现额度**转入，
+	// 审核通过时随余额一并扣除、驳回时原路退回可提现额度。
+	//
+	// 为什么要冻结（而不是像 v0.21.0 那样只在查询时减去待审额）：
+	// 「待审额」是**派生值**，不占住任何东西 —— 用户在等审核期间继续消费或再提一笔，
+	// 余额就会被打到低于待审额，审核那一刻必然失败（`ErrInsufficientWithdraw`），
+	// 表现为管理员点「通过并打款」被拒、只能驳回。冻结把这件事变成**不可能发生**：
+	// 钱在提交那一刻就离开了可提现额度，审核时只可能成功或由管理员主动驳回。
+	//
+	// 不变量（v0.27.0 起）：withdrawable_micro + frozen_micro ≤ balance_micro，
+	// 且 frozen_micro == Σ(status='pending' 的申请额)。
+	FrozenMicro int64
+
 	// ---- 余额分桶（v0.21.0）----
 	//
 	// 为什么分桶：需求要求「体验点不可提现、充值点不可提现、**仅返点收益与账号买卖金额
@@ -388,6 +401,10 @@ func (s *Store) migrateUsers() error {
 		{"exp_micro", "exp_micro INTEGER NOT NULL DEFAULT 0"},
 		{"recharge_micro", "recharge_micro INTEGER NOT NULL DEFAULT 0"},
 		{"withdrawable_micro", "withdrawable_micro INTEGER NOT NULL DEFAULT 0"},
+		// 提现冻结（v0.27.0）：见 User.FrozenMicro。老库全 0，由
+		// backfillWithdrawFreeze 把**已存在的待审申请**补冻（否则老 pending 记录
+		// 的可提现额度仍暴露在 withdrawable 里，能被重复申请）。
+		{"frozen_micro", "frozen_micro INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn("users", c.col, c.ddl); err != nil {
 			return fmt.Errorf("migrate users column %s: %w", c.col, err)
@@ -638,7 +655,7 @@ var ErrNotFound = errors.New("not found")
 const userCols = `id, username, password_hash, role, status, balance_micro,
 	daily_limit_micro, monthly_limit_micro, invite_code, referred_by,
 	host_ratio, referral_ratio, wechat,
-	exp_micro, recharge_micro, withdrawable_micro, created_at, updated_at`
+	exp_micro, recharge_micro, withdrawable_micro, frozen_micro, created_at, updated_at`
 
 func scanUser(row interface{ Scan(dest ...any) error }) (*User, error) {
 	var u User
@@ -646,7 +663,7 @@ func scanUser(row interface{ Scan(dest ...any) error }) (*User, error) {
 		&u.BalanceMicro, &u.DailyLimitMicro, &u.MonthlyLimitMicro,
 		&u.InviteCode, &u.ReferredBy,
 		&u.HostRatio, &u.ReferralRatio, &u.WeChat,
-		&u.ExpMicro, &u.RechargeMicro, &u.WithdrawableMicro,
+		&u.ExpMicro, &u.RechargeMicro, &u.WithdrawableMicro, &u.FrozenMicro,
 		&u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -874,11 +891,18 @@ func (s *Store) AddUserBalance(id int64, deltaMicro int64) error {
 //	recharge_micro      累计充值点（**累计统计**，不参与额度计算）
 //	balance_micro       总可用余额（唯一可消费来源，全部既有计费逻辑不变）
 //
-// 关键不变量：**withdrawable_micro ≤ balance_micro**（可提现额度不得超过总余额）。
+// 关键不变量：**withdrawable_micro + frozen_micro ≤ balance_micro**
+//（可提现额度与冻结额之和不得超过总余额）。
 //
 // 每次**扣减余额**时把额度钳到「扣减后的余额」：MIN(withdrawable, MAX(balance-delta,0))。
+// 每次**退回冻结额**时同样钳制：MIN(withdrawable+amt, MAX(balance,0))。
 //
-//	可提现额度 = min(withdrawable_micro, balance_micro) − 待审申请额
+//	可提现额度 = min(withdrawable_micro, balance_micro)
+//
+// ⚠️ v0.27.0 起**不再**在查询时减「待审申请额」：申请提交那一刻就把它从
+// withdrawable_micro 转进 frozen_micro（见 CreateWithdrawal）。「减去待审额」是
+// 派生算法，不占住任何东西，用户在审核期间一消费就会让审核必然失败
+//（这正是用户报的「审核操作无法执行」）。
 //
 // 为什么钳制就够（不用记扣了哪个桶）：体验点与充值点**同为不可提现**，二者之间的
 // 花费顺序对「能提多少」毫无影响 —— 只有「余额被打到低于可提现额度」时，超出的
@@ -961,33 +985,132 @@ func (s *Store) ChargeUser(id int64, micro int64) (int64, error) {
 	return bal, nil
 }
 
-// WithdrawableQuota 返回用户**当前可提现额度**（已扣除待审申请）与总额度。
-// 额度 = min(withdrawable_micro, balance_micro) − 待审申请额。
-// 第二个返回值是「尚未扣除待审」的原额度，供展示。
-func (s *Store) WithdrawableQuota(userID int64) (quotaMicro, rawMicro int64, err error) {
-	var bal, wd int64
-	if err := s.db.QueryRow(`SELECT balance_micro, withdrawable_micro FROM users WHERE id = ?`, userID).
-		Scan(&bal, &wd); err != nil {
+// WithdrawableQuota 返回用户**当前可提现额度**与其原值。
+//
+// v0.27.0 起两个返回值通常相等：待审申请在提交时就已经被扣进 frozen_micro，
+// 不再需要用「减去待审额」的方式在查询时派生（那个派生值不占住任何东西，
+// 用户一消费就让审核必然失败）。保留两个返回值是为了兼容既有调用与展示。
+//
+// 额度 = min(withdrawable_micro, balance_micro)：上限钳到余额是防御历史脏数据
+// 或外部直改库；负值归零。
+func (s *Store) WithdrawableQuota(userID int64) (int64, int64, error) {
+	q, r, _, err := s.WithdrawableState(userID)
+	return q, r, err
+}
+
+// WithdrawableState 返回（可提现额度, 额度原值, 已冻结额）。三个值一次读回，
+// 避免调用方为拿冻结额再查一次（多一次查询就多一个"两次读到不一致"的窗口）。
+func (s *Store) WithdrawableState(userID int64) (quotaMicro, rawMicro, frozenMicro int64, err error) {
+	var bal, wd, fr int64
+	if err := s.db.QueryRow(
+		`SELECT balance_micro, withdrawable_micro, frozen_micro FROM users WHERE id = ?`, userID).
+		Scan(&bal, &wd, &fr); err != nil {
 		if err == sql.ErrNoRows {
-			return 0, 0, ErrNotFound
+			return 0, 0, 0, ErrNotFound
 		}
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	if wd > bal {
-		wd = bal // 防御：历史脏数据/外部直改库导致的越界
+	rawMicro = wd
+	if rawMicro < 0 {
+		rawMicro = 0
 	}
-	if wd < 0 {
-		wd = 0
+	quotaMicro = rawMicro
+	if quotaMicro > bal {
+		quotaMicro = bal // 防御：历史脏数据/外部直改库导致的越界
 	}
-	pending, err := s.PendingWithdrawMicro(userID)
+	if quotaMicro < 0 {
+		quotaMicro = 0
+	}
+	return quotaMicro, rawMicro, fr, nil
+}
+
+// kvWithdrawFreezeMigrated 提现冻结回填的一次性标记（v0.27.0）。
+const kvWithdrawFreezeMigrated = "migrate_withdraw_freeze_v1"
+
+// backfillWithdrawFreeze 把**在途的待审申请**补冻（v0.27.0 一次性迁移）。
+//
+// 为什么必须回填：改冻结前，待审提现只是"查询时减去"，钱仍留在 withdrawable_micro
+// 里。不补冻的话，那些老 pending 记录对应的额度**可以被再申请一次** —— 同一笔钱
+// 提两次。而当管理员审核老记录时，`frozen_micro >= amount` 又会不成立，直接报错。
+// 两头都坏，所以必须在升级当刻把存量对齐。
+//
+// 为什么用 kv 标记而不是"每次启动按盘面自愈"：金额类迁移必须**可预期、可审计**。
+// 每次启动重算会让运维无法判断"这笔钱到底被动过没有"，而这类判断一旦出错就是钱。
+// 迁移只跑一次，跑过的结论写死在 kv 里；日志留一行"补冻了 N 笔"作为凭据。
+//
+// 额度不足时**只划到 0**（MAX(…,0)）而不是失败：那说明该额度在等待期间已被消费
+// 掉（旧口径下这是允许的），差额会以日志告警暴露，由人工决定是否驳回该申请。
+func (s *Store) backfillWithdrawFreeze() error {
+	if v, err := s.GetKV(kvWithdrawFreezeMigrated); err == nil && v == "1" {
+		return nil
+	}
+	rows, err := s.db.Query(
+		`SELECT user_id, COALESCE(SUM(amount_micro),0) FROM withdrawals
+		 WHERE status = ? GROUP BY user_id`, WithdrawPending)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
-	q := wd - pending
-	if q < 0 {
-		q = 0
+	type pend struct {
+		uid int64
+		amt int64
 	}
-	return q, wd, nil
+	var list []pend
+	for rows.Next() {
+		var x pend
+		if err := rows.Scan(&x.uid, &x.amt); err != nil {
+			rows.Close()
+			return err
+		}
+		if x.amt > 0 {
+			list = append(list, x)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	var done, short int
+	for _, x := range list {
+		// 先看够不够，够不着就记一笔告警（不静默）。
+		var wd, bal int64
+		if err := tx.QueryRow(`SELECT withdrawable_micro, balance_micro FROM users WHERE id = ?`, x.uid).
+			Scan(&wd, &bal); err != nil {
+			if err == sql.ErrNoRows {
+				continue // 用户已删，跳过
+			}
+			return err
+		}
+		if wd < x.amt {
+			short++
+			log.Printf("WARN: [withdraw] 存量补冻额度不足：user=%d 待审 %d 微点，可提现额度仅 %d 微点"+
+				"（该额度可能已在旧口径下被消费；请人工复核该申请是否需要驳回）", x.uid, x.amt, wd)
+		}
+		if _, err := tx.Exec(`UPDATE users SET withdrawable_micro = MAX(withdrawable_micro - ?, 0),
+			frozen_micro = frozen_micro + ?, updated_at = ? WHERE id = ?`,
+			x.amt, x.amt, now, x.uid); err != nil {
+			return err
+		}
+		done++
+	}
+	if _, err := tx.Exec(`INSERT INTO kv (k, v) VALUES (?, '1')
+		ON CONFLICT(k) DO UPDATE SET v = '1'`, kvWithdrawFreezeMigrated); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if done > 0 {
+		log.Printf("INFO: [withdraw] 已把 %d 笔在途待审提现补冻（共 %d 笔额度不足，见上方 WARN）"+
+			"—— 这些金额已从可提现额度转入冻结额，审核时不再可能因余额变动而失败", done, short)
+	}
+	return nil
 }
 
 // backfillBalanceBuckets 一次性回填可提现额度（v0.21.0）。
@@ -2041,7 +2164,30 @@ type Withdrawal struct {
 	CreatedAt     int64
 }
 
-// CreateWithdrawal 提交一笔提现申请（状态 pending，不扣余额）。
+// ErrInsufficientWithdrawable 可提现额度不足，无法受理提现申请。
+//
+// 与 ErrInsufficientWithdraw（审核时失败）刻意分开：两者对用户意味着完全不同的
+// 下一步 —— 前者是"再赚一点或改小金额"，后者是"数据异常，请找管理员"。
+var ErrInsufficientWithdrawable = errors.New("insufficient withdrawable quota")
+
+// CreateWithdrawal 提交一笔提现申请：**事务内先把金额冻结**，再落申请记录。
+//
+// ## 为什么必须冻结（v0.27.0 修的是用户报的「审核操作无法执行」）
+//
+// 旧实现（v0.21.0）只在**查询时**把待审额从可提现额度里减掉 —— 那是派生值，
+// 不占住任何东西。于是用户在等审核期间正常消费（或再提一笔）就会把余额打到低于
+// 待审额，审核那一刻 `balance < amount` 必然成立 → 管理员点「通过并打款」被拒、
+// 只能驳回。用户看到的就是"审核按钮点了没反应/报错"。
+//
+// 冻结把这件事变成不可能：钱在**提交那一刻**就离开可提现额度并计入 frozen_micro，
+// 审核时只可能成功，或由管理员主动驳回（驳回原路退回）。
+//
+// ## 校验与扣减必须在**同一条 UPDATE** 里
+//
+// 语句带 `AND withdrawable_micro >= ?`：先查后写之间存在窗口，两笔并发申请会双双
+// 读到"够"然后各扣一次（同一笔钱提两次）。合并成一条条件 UPDATE 后，先到者扣完，
+// 后到者条件不成立 → RowsAffected==0 → 报额度不足。这就是"防止重复提现/超额提现"
+// 的全部机制，不依赖任何应用层锁。
 func (s *Store) CreateWithdrawal(w *Withdrawal) error {
 	if w.CreatedAt == 0 {
 		w.CreatedAt = time.Now().Unix()
@@ -2049,7 +2195,35 @@ func (s *Store) CreateWithdrawal(w *Withdrawal) error {
 	if w.Status == "" {
 		w.Status = WithdrawPending
 	}
-	res, err := s.db.Exec(`INSERT INTO withdrawals
+	if w.AmountMicro <= 0 {
+		return errors.New("withdrawal amount must be positive")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`UPDATE users SET withdrawable_micro = withdrawable_micro - ?,
+		frozen_micro = frozen_micro + ?, updated_at = ?
+		WHERE id = ? AND withdrawable_micro >= ?`,
+		w.AmountMicro, w.AmountMicro, time.Now().Unix(), w.UserID, w.AmountMicro)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// 区分「用户不存在」与「额度不足」：把两者混成一句会让用户以为是自己填错了。
+		var exists int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, w.UserID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return ErrNotFound
+		}
+		return ErrInsufficientWithdrawable
+	}
+
+	res2, err := tx.Exec(`INSERT INTO withdrawals
 		(user_id, amount_micro, fee_micro, method, account_info, alipay_account, real_name, status, note, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		w.UserID, w.AmountMicro, w.FeeMicro, w.Method, w.AccountInfo,
@@ -2057,7 +2231,14 @@ func (s *Store) CreateWithdrawal(w *Withdrawal) error {
 	if err != nil {
 		return err
 	}
-	w.ID, _ = res.LastInsertId()
+	id, err := res2.LastInsertId()
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	w.ID = id
 	return nil
 }
 
@@ -2113,11 +2294,26 @@ func (s *Store) PendingWithdrawMicro(userID int64) (int64, error) {
 	return total.Int64, nil
 }
 
-// ErrInsufficientWithdraw 审核通过时余额不足。
-var ErrInsufficientWithdraw = errors.New("insufficient balance for withdrawal")
+// ErrInsufficientWithdraw 审核时**冻结额**不足（数据异常）。
+//
+// v0.27.0 起它不再是"用户余额不够"（那件事被冻结机制消除了），而是：
+// 这条申请在提交时没有冻结过（v0.27.0 之前的历史 pending 记录未被回填），
+// 或有人直接改过库。恢复方式：驳回该申请，或人工把 frozen_micro 补上。
+var ErrInsufficientWithdraw = errors.New("insufficient frozen amount for withdrawal")
 
-// ReviewWithdrawal 管理员审核提现：通过 = 事务内扣余额并置 approved；驳回 = 只置 rejected。
-// 仅允许对 pending 记录操作，避免重复打款。
+// ReviewWithdrawal 管理员审核提现。
+//
+//	通过 → 从**冻结额**出账（balance -= amount, frozen -= amount）并置 approved；
+//	驳回 → 冻结额**原路退回**可提现额度（frozen -= amount, withdrawable += amount）
+//	       并置 rejected。
+//
+// 仅允许对 pending 记录操作：重复审核会让同一笔钱被扣两次（或退两次）。
+//
+// 为什么通过时不再检查"用户余额够不够"（v0.27.0 的行为变更）：钱在**申请提交
+// 那一刻**就已经从可提现额度划进冻结额，等待期间用户的消费动不了它 —— 所以
+// "余额不足导致审核失败"这件事从根上不可能发生（那正是用户报的故障）。
+// 现在唯一可能失败的是冻结额本身对不上（历史未回填的记录 / 外部改库），
+// 那种情况必须明确报错而不是把余额扣成负数还显示"打款成功"。
 func (s *Store) ReviewWithdrawal(id int64, approve bool, note string, reviewerID int64) (*Withdrawal, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -2143,23 +2339,40 @@ func (s *Store) ReviewWithdrawal(id int64, approve bool, note string, reviewerID
 	}
 	now := time.Now().Unix()
 	if approve {
-		// 打款同时扣总余额与**可提现额度**（v0.21.0）：本功能只允许提取返点收益
-		// 与账号买卖所得，故额度必须同步减少，否则同一笔钱可被反复提取。
-		var bal, wd int64
-		if err := tx.QueryRow(`SELECT balance_micro, withdrawable_micro FROM users WHERE id = ?`,
-			w.UserID).Scan(&bal, &wd); err != nil {
+		// 打款：从**冻结额**出账（v0.27.0）。额度早在申请时就已扣走，这里只做
+		// "钱真正离开账户"这一步。
+		//
+		// `AND frozen_micro >= ?` 是最后一道闸：老数据（v0.27.0 之前提交、未冻结）
+		// 或外部直改库会让冻结额不足，此时必须**明确报错**而不是把余额扣成负数
+		// 还显示"打款成功"。
+		res, err := tx.Exec(`UPDATE users SET balance_micro = balance_micro - ?,
+			frozen_micro = frozen_micro - ?,
+			withdrawable_micro = MIN(withdrawable_micro, MAX(balance_micro - ?, 0)),
+			updated_at = ? WHERE id = ? AND frozen_micro >= ?`,
+			w.AmountMicro, w.AmountMicro, w.AmountMicro, now, w.UserID, w.AmountMicro)
+		if err != nil {
 			return nil, err
 		}
-		if bal < w.AmountMicro || wd < w.AmountMicro {
+		if n, _ := res.RowsAffected(); n == 0 {
 			return nil, ErrInsufficientWithdraw
-		}
-		if _, err := tx.Exec(`UPDATE users SET balance_micro = balance_micro - ?,
-			withdrawable_micro = withdrawable_micro - ?, updated_at = ? WHERE id = ?`,
-			w.AmountMicro, w.AmountMicro, now, w.UserID); err != nil {
-			return nil, err
 		}
 		w.Status = WithdrawApproved
 	} else {
+		// 驳回：冻结额**原路退回**可提现额度。
+		//
+		// 退回时同样要钳制（MIN(…, MAX(balance,0))）：等待期间用户可能已把余额
+		// 消费到低于该额度，直接加回去会让 withdrawable > balance（违反不变量，
+		// 且那部分"复活"的额度实际已被花掉，能再提一次就是凭空印钱）。
+		res, err := tx.Exec(`UPDATE users SET frozen_micro = frozen_micro - ?,
+			withdrawable_micro = MIN(withdrawable_micro + ?, MAX(balance_micro, 0)),
+			updated_at = ? WHERE id = ? AND frozen_micro >= ?`,
+			w.AmountMicro, w.AmountMicro, now, w.UserID, w.AmountMicro)
+		if err != nil {
+			return nil, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, ErrInsufficientWithdraw
+		}
 		w.Status = WithdrawRejected
 	}
 	if _, err := tx.Exec(`UPDATE withdrawals SET status = ?, note = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?`,

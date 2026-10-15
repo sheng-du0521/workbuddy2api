@@ -24,14 +24,6 @@ func ledgerScheduler(cfg Config) *Scheduler {
 	if cfg.Pool == nil {
 		cfg.Pool = pool.New("")
 	}
-	// 默认给一份**最小可用凭证**（v0.26.9）：runSchool 现在会先取凭证，
-	// 拿不到就不启动子进程（那是对的 —— 无凭证时脚本必然报"无可用账号"）。
-	// 台账类用例关心的是"跑完之后怎么记账"，不关心凭证来自哪里，所以在这里
-	// 统一兜住，避免每个用例都重复写一遍。
-	// 需要验证"无凭证"路径的用例请用 New(Config{}) 直接构造（见 school_test.go）。
-	if cfg.School == nil {
-		cfg.School = schoolCredsFor("ledger-acct")
-	}
 	return New(cfg)
 }
 
@@ -214,23 +206,23 @@ func TestTakeRetryTrigger(t *testing.T) {
 
 // TestDispatchMarksRetryTrigger 端到端：一次已到点的重试经 dispatch 跑完后，
 // 台账里的 trigger 是 retry 而不是 schedule（运维要能分辨「这是补跑」）。
+//
+// 载体用 checkin 而不是脚本任务（v0.27.0）：开学季移除后，**排程内已没有脚本类
+// 任务**（成长任务是纯手动、不参与重试），而这条用例要的是「重试经 dispatch 跑完
+// 后 trigger 被正确标记」，与任务是脚本还是原生实现无关。
 func TestDispatchMarksRetryTrigger(t *testing.T) {
-	installFakeExec(t) // 脚本类任务不真拉 python3，Run() 返回 nil
 	s := ledgerScheduler(Config{RetryDelayMinutes: 15, RetryMaxPerDay: 2})
 	now := time.Now()
-	if d := s.Ledger().PlanRetry("school", now, time.Millisecond, 2); d.Reason != "" {
+	if d := s.Ledger().PlanRetry("checkin", now, time.Millisecond, 2); d.Reason != "" {
 		t.Fatalf("排期失败：%q", d.Reason)
 	}
 	time.Sleep(5 * time.Millisecond) // 让计划时刻成为「已到点」
 
-	s.dispatch(context.Background(), taskSchool)
+	s.dispatch(context.Background(), taskCheckin)
 
-	r := s.Ledger().Runs()["school"]
+	r := s.Ledger().Runs()["checkin"]
 	if r.Trigger != triggerRetry {
 		t.Errorf("Trigger=%q want %q", r.Trigger, triggerRetry)
-	}
-	if r.Total != 1 || r.OK != 1 || r.Fail != 0 {
-		t.Errorf("脚本成功应记 total=1 ok=1 fail=0，got %+v", r)
 	}
 	// 已消费：不该再留着（否则主循环会反复拿到同一个已过时刻空转）。
 	if armed := s.Ledger().ArmedRetries(time.Now()); len(armed) != 0 {
@@ -238,16 +230,21 @@ func TestDispatchMarksRetryTrigger(t *testing.T) {
 	}
 }
 
-// TestRunSchoolFailureRecordsNoteAndArmsRetry 脚本失败：退出码非 0 即算失败，
-// 记下失败摘要，并在定时轮次里排重试。
-func TestRunSchoolFailureRecordsNoteAndArmsRetry(t *testing.T) {
+// TestRunScriptTaskFailureRecordsNote 脚本失败：退出码非 0 即算失败，记下失败摘要。
+//
+// 载体用 growth（v0.27.0 起唯一在用脚本的任务）：开学季移除后它就是 runScriptTask
+// 的唯一在册使用者。**刻意不再断言"会排重试"** —— 成长任务是纯手动、不参与排重试，
+// 这是正确行为（重试的价值在于救"整体抖动"，而手动任务本就由人决定何时再跑）。
+func TestRunScriptTaskFailureRecordsNote(t *testing.T) {
 	f := installFakeExec(t)
 	f.err = errors.New("exit status 1")
 	s := ledgerScheduler(Config{RetryDelayMinutes: 15, RetryMaxPerDay: 1})
 
-	s.runSchool(triggerSchedule)
+	s.runScriptTask(taskGrowth, triggerSchedule, "growth", [][]string{
+		{"python", "scripts/growth_run.py", "--phase", "zero"},
+	}, []byte("[]"))
 
-	r := s.Ledger().Runs()["school"]
+	r := s.Ledger().Runs()["growth"]
 	if r.Total != 1 || r.Fail != 1 || r.OK != 0 {
 		t.Errorf("失败应记 total=1 fail=1 ok=0，got %+v", r)
 	}
@@ -417,20 +414,21 @@ func TestLedgerPersistsAcrossSchedulers(t *testing.T) {
 	path := t.TempDir() + "/task_ledger.json"
 	cfg := Config{LedgerFile: path, RetryDelayMinutes: 15, RetryMaxPerDay: 2}
 
+	cmds := [][]string{{"python", "scripts/growth_run.py", "--phase", "zero"}}
 	s1 := ledgerScheduler(cfg)
-	s1.runSchool(triggerSchedule)
+	s1.runScriptTask(taskGrowth, triggerSchedule, "growth", cmds, []byte("[]"))
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("台账应已落盘：%v", err)
 	}
 
 	s2 := ledgerScheduler(cfg)
-	got := s2.Ledger().Runs()["school"]
+	got := s2.Ledger().Runs()["growth"]
 	if got.OK != 1 || got.Trigger != triggerSchedule {
 		t.Errorf("重启后应读回上一轮台账，got %+v", got)
 	}
 	// 重试排期也应恢复（否则重启会白送一次补跑额度）。
-	if st := s2.Ledger().RetryStates()["school"]; st.Used != 0 || st.Next != nil {
-		t.Logf("school 本轮成功、无重试，retry 状态：%+v", st)
+	if st := s2.Ledger().RetryStates()["growth"]; st.Used != 0 || st.Next != nil {
+		t.Logf("growth 本轮成功、无重试，retry 状态：%+v", st)
 	}
 }
 

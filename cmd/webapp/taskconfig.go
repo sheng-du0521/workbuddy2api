@@ -31,14 +31,12 @@ type TaskConfig struct {
 	TravelHours    []int `json:"travel_hours"`
 	ActivityHours  []int `json:"activity_hours"`
 	KeepaliveHours []int `json:"keepalive_hours"`
-	SchoolHours    []int `json:"school_hours"`
 	CatHours       []int `json:"cat_hours"`
 
 	CheckinDisabled   bool `json:"checkin_disabled"`
 	TravelDisabled    bool `json:"travel_disabled"`
 	ActivityDisabled  bool `json:"activity_disabled"`
 	KeepaliveDisabled bool `json:"keepalive_disabled"`
-	SchoolDisabled    bool `json:"school_disabled"`
 	CatDisabled       bool `json:"cat_disabled"`
 
 	// BatchStaggerSeconds 批内任务错峰上限（秒，v0.17.3）。同一唤醒时刻常派发
@@ -70,7 +68,6 @@ func DefaultTaskConfig() TaskConfig {
 		TravelHours:         []int{9, 21},
 		ActivityHours:       []int{10},
 		KeepaliveHours:      []int{22},
-		SchoolHours:         []int{12},
 		CatHours:            []int{1},
 		ActivityReportCount: 5,
 		ExpiringSoonDays:    7,
@@ -113,7 +110,6 @@ func (tc TaskConfig) normalize() TaskConfig {
 	tc.TravelHours = normHours(tc.TravelHours, d.TravelHours)
 	tc.ActivityHours = normHours(tc.ActivityHours, d.ActivityHours)
 	tc.KeepaliveHours = normHours(tc.KeepaliveHours, d.KeepaliveHours)
-	tc.SchoolHours = normHours(tc.SchoolHours, d.SchoolHours)
 	tc.CatHours = normHours(tc.CatHours, d.CatHours)
 	// 错峰上下限收敛：负值归零（= 关闭）；只配上限时下限回落默认 60。
 	if tc.BatchStaggerSeconds < 0 {
@@ -167,21 +163,16 @@ func normHours(in, def []int) []int {
 }
 
 // schedulerConfig 把管理端配置翻译成调度器依赖。
-// schoolOK=false 时强制禁用开学季（脚本链路不可用）。
-// growth 为成长任务的账号凭证提供方（nil = 手动执行不可用；成长任务不排程）。
+// growthOK=false 时强制丢弃成长任务的脚本提供方（nil = 手动执行不可用；
+// 成长任务本身不排程）。
 // accountTaskFilter 为逐账号任务过滤器（nil = 全部账号参与全部任务）。
-func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growthOK bool, growth scheduler.GrowthProvider, school scheduler.SchoolProvider, accountTaskFilter func(uid, task string) bool) scheduler.Config {
+func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, growthOK bool, growth scheduler.GrowthProvider, accountTaskFilter func(uid, task string) bool) scheduler.Config {
 	tc = tc.normalize()
 	off := !tc.Enabled // 全局关闭 = 各类任务全禁
 	// 成长任务不排程，但脚本链路不可用时应把 Provider 一并丢弃，
 	// 让手动入口拿到「功能不可用」而不是跑到一半才失败。
 	if !growthOK {
 		growth = nil
-	}
-	// 开学季同理（v0.26.9）：脚本链路不可用时丢掉 Provider，
-	// 让当轮记录成"无可用凭证"而不是跑到脚本里才报"无可用账号"。
-	if !schoolOK {
-		school = nil
 	}
 	return scheduler.Config{
 		Pool:                px.pool,
@@ -190,7 +181,6 @@ func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growth
 		TravelHours:         tc.TravelHours,
 		ActivityHours:       tc.ActivityHours,
 		KeepaliveHours:      tc.KeepaliveHours,
-		SchoolHours:         tc.SchoolHours,
 		CatHours:            tc.CatHours,
 		JitterMinutes:       tc.JitterMinutes,
 		ActivityReportCount: tc.ActivityReportCount,
@@ -199,7 +189,6 @@ func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growth
 		TravelDisabled:      off || tc.TravelDisabled,
 		ActivityDisabled:    off || tc.ActivityDisabled,
 		KeepaliveDisabled:   off || tc.KeepaliveDisabled,
-		SchoolDisabled:      off || tc.SchoolDisabled || !schoolOK,
 		CatDisabled:         off || tc.CatDisabled,
 		// 批内错峰（v0.17.3）：全局关闭时一并停掉（总开关语义与各类任务一致）。
 		BatchStaggerMinSeconds: func() int {
@@ -215,7 +204,6 @@ func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growth
 			return tc.BatchStaggerSeconds
 		}(),
 		Growth:            growth,
-		School:            school,
 		KeepaliveDays:     tc.KeepaliveDays,
 		LazyRefreshHours:  tc.LazyRefreshHours,
 		LedgerFile:        filepath.Join(dataDir, "task_ledger.json"),

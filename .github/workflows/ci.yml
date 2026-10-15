@@ -63,14 +63,19 @@ jobs:
         run: go vet ./...
 
       # -race 需要 cgo；ubuntu-latest 自带 gcc，故这里能跑（本机 Windows 无 gcc 跑不了）。
+      # ⚠️ 显式给 -timeout：Go 默认每包 10 分钟，而 cmd/webapp 是最大的包，
+      # -race 会再放慢 2~5 倍。v0.27.0 之前该包在非 race 模式下就要约 600 秒
+      # （数据库每条 SQL 各 fsync 一次，实测已改用 WAL 降到约 65 秒），
+      # 当时这条步骤在 CI 上必然超时。给足余量并保留这个注释：
+      # 「测试超时」与「测试失败」是两回事，缺了超时参数会把前者伪装成后者。
       - name: go test -race
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout 20m ./...
 
       # 覆盖率只作报告：存量 cmd/webapp 覆盖率偏低（产品本体），
       # 若一开始就设阈值，会把「补测试」这件长期工作变成阻断发布的即时故障。
       - name: go test -cover
         run: |
-          go test -count=1 -coverprofile=coverage.out ./...
+          go test -count=1 -timeout 20m -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
 
       - name: upload coverage

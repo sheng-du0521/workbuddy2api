@@ -70,7 +70,6 @@ func newGrowthScheduler(p GrowthProvider) *Scheduler {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
 	})
 }
