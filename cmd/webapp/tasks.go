@@ -18,6 +18,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/scheduler"
+	"workbuddy2api/internal/taskledger"
 )
 
 // tokenFlushInterval 池内凭证回写数据库的兜底周期。
@@ -105,6 +106,12 @@ func (t *taskRunner) Start() {
 	t.startScheduler()
 	t.mu.Unlock()
 	go t.flushLoop(ctx)
+	// 台账清理（v0.29.0）：剪掉**已从本版本移除**的任务类别。
+	//
+	// 放在 Start（而不是构造函数）里：Start 才是"服务真的要开始工作"的那一刻，
+	// 而首次落盘也发生在这里之后 —— 在构造里清会在纯单测（不 Start）时产生写副作用。
+	// 清理结果务必打日志：静默删掉运维的历史数据，哪怕那是幽灵数据，也需要留痕。
+	t.PruneLedger()
 	log.Printf("定时任务已启用：%s", t.cfgSummary())
 	// 脚本任务链路的**诊断行**（v0.26.9）：解释器探测过程 + 脚本根 + 成长任务可用性，
 	// 一次说清。（开学季排程已于 v0.27.0 移除，不再出现在这里。）
@@ -115,6 +122,29 @@ func (t *taskRunner) Start() {
 	// 现在解释器是**自动探测**的（见 scheduler.probePython），本行只负责把结论与过程摊开。
 	log.Printf("脚本任务链路：%s；脚本根 %s；成长任务 %s",
 		scheduler.PythonDiagnosis(), scheduler.ScriptRoot(), availText(t.growthOK))
+}
+
+// PruneLedger 从台账里删掉当前版本已不存在的任务类别（v0.29.0）。
+//
+// 场景：v0.27.0 把「开学季」从任务体系里整体移除，但 `task_ledger.json` 里
+// 还留着它最后一轮的记录 —— 执行台账上于是持续显示一张 school 卡片，
+// 点它没反应、也永远不会更新。它看起来像"这个任务还在，只是很久没跑"，
+// 比"少一张卡"更容易把人引到错误的排查方向。
+//
+// 返回被清掉的类别（供日志）；无变化时返回空切片。
+func (t *taskRunner) PruneLedger() []string {
+	t.mu.Lock()
+	sch := t.sch
+	t.mu.Unlock()
+	if sch == nil {
+		return nil
+	}
+	dropped := sch.Ledger().DropKinds(knownLedgerKind)
+	if len(dropped) > 0 {
+		log.Printf("INFO: [tasks] 已从执行台账移除 %d 个当前版本不存在的任务类别：%s",
+			len(dropped), strings.Join(dropped, "、"))
+	}
+	return dropped
 }
 
 // availText 可用性的人话文案（避免在日志里出现裸 true/false —— 那需要读者自己回忆极性）。
@@ -246,6 +276,30 @@ var runnableKinds = map[string]string{
 	"activity":  "活跃上报（领猫前置 5 次对话）",
 	"keepalive": "token 保活刷新",
 	"cat":       "夜猫子（夜间对话点亮，窗口 23-08 CST）",
+}
+
+// ledgerKindGrowth 成长任务在台账里的类别名。
+//
+// 单独列出来是因为它**不在 runnableKinds 里**（它是手动选号执行，不属于
+// "一键跑一类"），但它确实会往台账写 runs —— 若签名集合漏了它，
+// 台账清理会把每一次成长任务的记录当成"已移除的类别"删掉。
+const ledgerKindGrowth = "growth"
+
+// knownLedgerKind 该类任务在当前版本是否仍然存在（台账只该保留这些类别）。
+//
+// 用途有两个，都在"清理历史残留"这条线上：
+//  1. 启动时一次性剪掉已移除类别的台账记录（如 v0.27.0 移除的「开学季」）；
+//  2. 出接口前再过滤一遍（防御：将来任何被删掉的类别都不会漏到界面）。
+//
+// 为什么是"存在性白名单"而不是"黑名单里写 school"：黑名单只能记住**已经**
+// 被删掉的那些，下一次删任务时又要记得回来加一条 —— 而漏掉的表现正是本次这个
+// 缺陷（界面上多出一张永远不会更新的幽灵卡片）。白名单天然对未来成立。
+func knownLedgerKind(kind string) bool {
+	if kind == ledgerKindGrowth {
+		return true
+	}
+	_, ok := runnableKinds[kind]
+	return ok
 }
 
 // ErrTaskBusy 任务正在跑（同一类任务已有执行中的一轮）。
@@ -611,9 +665,12 @@ func (t *taskRunner) Ledger() map[string]any {
 		return map[string]any{"runs": map[string]any{}, "retry_states": map[string]any{}}
 	}
 	l := sch.Ledger()
+	// 出接口前按「当前版本仍存在」的类别过滤（v0.29.0）。启动时的 DropKinds 已经
+	// 清过一次，这里是第二道闸：进程长期运行期间若发生"任务被下线"的运行时变更，
+	// 界面也不会凭空冒出一张永远不会更新的幽灵卡片。
 	out := map[string]any{
-		"runs":          l.Runs(),
-		"retry_states":  l.RetryStates(),
+		"runs":          filterLedgerRuns(l.Runs()),
+		"retry_states":  filterLedgerRetries(l.RetryStates()),
 		"scheduler_up":  t.started.Unix(),
 		"scheduler_sec": int64(time.Since(t.started).Seconds()),
 	}
@@ -623,7 +680,7 @@ func (t *taskRunner) Ledger() map[string]any {
 	out["running"] = sch.RunningKinds()
 	// 上次**自动**触发的快照：台账（runs）只保留最近一轮、会被人工触发覆盖，
 	// 这份让「定时跑过没」始终可查（v0.17.4）。
-	out["last_auto_runs"] = sch.LastAutoRuns()
+	out["last_auto_runs"] = filterLedgerRuns(sch.LastAutoRuns())
 	next := map[string]nextRunView{}
 	now := time.Now()
 	for k, at := range sch.NextRuns() {
@@ -636,6 +693,31 @@ func (t *taskRunner) Ledger() map[string]any {
 		}
 	}
 	out["next_runs"] = next
+	return out
+}
+
+// filterLedgerRuns 只保留当前版本仍存在的任务类别。
+//
+// 返回**新 map**而不是原地删：调用方拿到的可能是调度器内部结构的副本，
+// 原地改会让"过滤"这个只读动作产生写副作用（下一处调用者会拿到已删过的视图）。
+func filterLedgerRuns(m map[string]taskledger.Run) map[string]taskledger.Run {
+	out := make(map[string]taskledger.Run, len(m))
+	for k, v := range m {
+		if knownLedgerKind(k) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// filterLedgerRetries 同上，作用于当日重试状态。
+func filterLedgerRetries(m map[string]taskledger.RetryState) map[string]taskledger.RetryState {
+	out := make(map[string]taskledger.RetryState, len(m))
+	for k, v := range m {
+		if knownLedgerKind(k) {
+			out[k] = v
+		}
+	}
 	return out
 }
 

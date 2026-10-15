@@ -108,14 +108,30 @@ const FX = {
       },
     ],
   },
+  // v0.29.0：桩必须**按真接口行为**返回（字段名事故的护栏）。
+  // 真接口下发的是 snake_case（id/status/created_at/alipay_account…）—— 桩若写成
+  // Go 字段名或漏掉 status，前端就渲染不出审核按钮，而测试照样"通过"。
   '/api/admin/withdrawals': {
     pending_count: 1,
-    params: { rate: 0.01, min_points: 100 },
+    status_counts: { pending: 1, approved: 1, rejected: 0 },
+    // 三方一致性自检：一致时 ok=1（界面不显示任何横幅）。
+    consistency: { ok: 1, frozen_micro: 500000, pending_micro: 500000, pending_count: 1,
+      overdraw_users: 0, unreviewed_done: 0, frozen_pending_diff: 0 },
+    params: { rate: 0.01, min_points: 100, review_mode: 'manual',
+      review_mode_label: '人工审核', auto_max_points: 0, auto_max_cny: 0, auto_unlimited: true },
     withdrawals: [
-      { id: 1, user_id: 2, username: 'tester', amount: 500, fee: 0, cny: 5, method: '支付宝',
-        account_info: 'tester@example.com', status: 'pending', note: '', reviewed_at: 0, created_at: now },
-      { id: 2, user_id: 2, username: 'tester', amount: 200, fee: 0, cny: 2, method: '微信',
-        account_info: 'wxid_abc', status: 'approved', note: '已打款', reviewed_at: now, created_at: now - 3600 },
+      { id: 1, user_id: 2, username: 'tester', amount: 500, fee: 0, cny: 5,
+        method: 'alipay', method_label: '支付宝',
+        alipay_account: 'tester@example.com', real_name: '测试者',
+        account_info: 'tester@example.com / 测试者',
+        status: 'pending', status_label: '待审核', note: '', reviewed_at: 0, reviewed_by: 0,
+        reviewer_name: '', created_at: now, auto: false },
+      { id: 2, user_id: 2, username: 'tester', amount: 200, fee: 0, cny: 2,
+        method: 'alipay', method_label: '支付宝',
+        alipay_account: 'tester@example.com', real_name: '测试者',
+        account_info: 'tester@example.com / 测试者',
+        status: 'approved', status_label: '已打款', note: '已打款', reviewed_at: now, reviewed_by: 1,
+        reviewer_name: 'admin', created_at: now - 3600, auto: false },
     ],
   },
   '/api/admin/settings': {
@@ -124,6 +140,8 @@ const FX = {
     proxy_groups: '反代', proxy_accounts: '', proxy_min_gap_seconds: 45, pick_mode: 'weighted',
     egress_proxy_default: '', observed_models: 2, host_share_ratio: 0.6, referral_ratio: 0.1,
     withdraw_rate: 0.01, withdraw_min_points: 100,
+    // v0.29.0：提现审核方式（默认人工）与免审额度上限。
+    withdraw_review_mode: 'manual', withdraw_auto_max_points: 0,
     egress_max_per_proxy: 3, egress_jitter_ms: 0,
     // v0.26.1（R1）：线路失效处置策略，strict = 不静默换出口。
     egress_on_line_down: 'strict',
@@ -274,6 +292,10 @@ const FX = {
     runs: {
       'checkin:1': { kind: 'checkin', trigger: 'manual', started: new Date().toISOString(), finished: new Date().toISOString(), elapsed: '5s', total: 3, ok: 2, already: 1, fail: 0, skipped: 0, all_failed: false },
       'cat:1': { kind: 'cat', trigger: 'schedule', started: new Date(Date.now() - 3600000).toISOString(), finished: new Date(Date.now() - 3599000).toISOString(), elapsed: '3s', total: 1, ok: 1, already: 0, fail: 0, skipped: 0, all_failed: false },
+      // v0.29.0：**刻意**塞一条已移除类别的记录（模拟上一版留下的台账文件 /
+      // 手工改过的 json）。它必须在渲染前被丢掉 —— 多渲染一张"永远不会更新、
+      // 点了也没反应"的卡片，比少一张更容易把人带偏（看起来像这个任务还在）。
+      'school:1': { kind: 'school', trigger: 'manual', started: new Date(Date.now() - 86400000).toISOString(), finished: new Date(Date.now() - 86390000).toISOString(), elapsed: '16.8s', total: 33, ok: 33, already: 0, fail: 0, skipped: 0, all_failed: false },
     },
     scheduler_up: now - 3700, scheduler_sec: 3700,
   },
@@ -283,14 +305,13 @@ const FX = {
     config: {
       enabled: true, jitter_minutes: 5,
       checkin_hours: [9, 21], travel_hours: [9, 21], activity_hours: [10],
-      keepalive_hours: [22], school_hours: [12], cat_hours: [1],
+      keepalive_hours: [22], cat_hours: [1],
       checkin_disabled: false, travel_disabled: false, activity_disabled: false,
-      keepalive_disabled: false, school_disabled: true, cat_disabled: false,
+      keepalive_disabled: false, cat_disabled: false,
       activity_report_count: 5, expiring_soon_days: 7, keepalive_days: 0, lazy_refresh_hours: 0,
       // v0.17.3：批内任务错峰（0 = 关闭）。
       batch_stagger_seconds: 150, batch_stagger_min_seconds: 60,
     },
-    school_available: false,
     growth_available: true,
   },
   // 成长任务（v0.17.1）：手动选号执行 + 完成进度。
@@ -1316,13 +1337,18 @@ function run(pageFile, meOverride, plan) {
         ['#setPickSink', 1], ['#setFpSamples', 1],
         // v0.26.5：样本面板的跨页入口 + 实时条数；更新提醒的导航徽标容器
         ['#btnFpGo', 1], ['#fpCfgCount', 1], ['#updBadge', 1],
+        // v0.29.0：提现审核方式（下拉 2 项）+ 免审额度上限
+        ['#setWithdrawMode', 1], ['#setWithdrawMode option', 2],
+        ['#setWithdrawAutoMax', 1], ['#wdModeHint', 1],
         ['#setPickSink option', 2], ['#setFpSamples option', 2],
         // v0.26.3：设备凭证的派生兜底与陈旧阈值
         ['#setDevTokFallback', 1], ['#setDevTokStaleDays', 1],
         ['#setDevTokFallback option', 2],
         // v0.15.1：选号模式下拉（加权随机 / 顺序轮转）。
         ['#setPickMode', 1], ['#setPickMode option', 2]],
-      textIn: [['#setPickMode', '顺序轮转'], ['#setPickMode', '加权随机'],
+      textIn: [['#setWithdrawMode', '人工审核'], ['#setWithdrawMode', '自动审核（提交即通过并打款）'],
+        ['#wdModeHint', '当前：人工审核'],
+        ['#setPickMode', '顺序轮转'], ['#setPickMode', '加权随机'],
         ['#setPickSink', '关闭（默认）'], ['#setFpSamples', '关闭（默认）'],
         ['#setFpSamples ~ .hint', '唯一会把请求内容写到磁盘'],
         ['#setDevTokFallback ~ .hint', '上游 SDK 签发的真凭证']] },
@@ -1345,7 +1371,10 @@ function run(pageFile, meOverride, plan) {
       // 与「本轮 · 人工」（fixture 里 checkin 是 manual 触发）。
       // lacks 断言旧标签「手动」已消失：签到明明是自动任务，之前只挂一个孤立
       // 的「手动」标签，会被直接读成「签到是手动的」。
-      lacks: [['#taskGrid', '成长任务'], ['#runCards', '手动']],
+      // v0.29.0：台账里**残留**的 school 记录也不得进界面 —— fixture 的 runs 里
+      // **刻意塞了一条**，因此这里查 'school' 文案就是在证明"那张卡片没被画出来"
+      // （卡片标题取 TASK_LABELS[kind] || kind → 若没过滤，就会渲染成裸 "school"）。
+      lacks: [['#taskGrid', '成长任务'], ['#runCards', '手动'], ['#runCards', 'school']],
       textIn: [['#growthNoteBox', '手动选号'], ['#growthNoteBox', '零消耗'],
         // 签到：自动排程 + 本轮人工（两个维度并存）
         ['#runCards', '自动排程 · 9/21 点'], ['#runCards', '本轮 · 人工'],
@@ -1384,7 +1413,57 @@ function run(pageFile, meOverride, plan) {
     { input: [['userSearch', '']], counts: [['userCards', 2]] },
     // v0.12.0：兑换码卡片每条带单个复制按钮。
     { nav: 'codes', counts: [['codeCards', 2]], has: [['#codeCards .code-name .icon-btn', 2]] },
-    { nav: 'withdrawals', counts: [['wdKpis', 6], ['wdCards', 2], ['wdFilter', 1]], texts: [['wdBadge', '1']] },
+    // v0.29.0：提现审核页 —— 审核方式必须可见、待审卡片必须**有审核按钮**、
+    // 状态必须是中文（这三件事此前全部失效，原因见 handleAdminWithdrawals 的注释：
+    // 列表接口内嵌无 json tag 的 *Withdrawal → status 为 undefined → 按钮不渲染）。
+    { nav: 'withdrawals', counts: [['wdKpis', 6], ['wdCards', 2], ['wdFilter', 1]],
+      has: [['#wdCards .ecard footer button', 2], ['#wdModeBar', 1], ['#wdConsistency', 1],
+        // 一致时**不显示**告警横幅（常驻的"一切正常"提示几天后就会被无视）。
+        ['#wdConsistency .hintbar', 0]],
+      absent: ['#wdConsistency .hintbar'],
+      texts: [['wdBadge', '1']],
+      textIn: [['#wdModeBar', '人工审核'], ['#wdModeBar', '逐笔通过或驳回'],
+        // 流程说明（静态文案）必须把"通过=成功+从冻结额出账"与"驳回=原路退回"写清楚 ——
+        // 这正是用户第二问要的"明确审核流程"。
+        ['.pane[data-pane="withdrawals"]', '已从可提现额度划入冻结额'],
+        ['.pane[data-pane="withdrawals"]', '从'],
+        ['.pane[data-pane="withdrawals"]', '原路退回到可提现额度'],
+        ['#wdKpis', '审核方式'], ['#wdKpis', '人工审核'],
+        // 状态中文来自服务端下发的 status_label（本地映射仅兜底）
+        ['#wdCards', '待审核'], ['#wdCards', '已打款'],
+        // 审核按钮的文案就是"通过"要做什么
+        ['#wdCards', '通过并打款'],
+        // 管理端收款信息必须是明文（打码就没法照着打款）
+        ['#wdCards', 'tester@example.com']],
+      // 旧桩里的 '微信' 已随「仅支付宝」口径移除；泄漏收款信息的打码形态也不该出现。
+      lacks: [['#wdCards', 'undefined']] },
+    // v0.29.0：自动审核 + 账目不一致 —— 两个告警都要显式可见。
+    { nav: 'withdrawals',
+      fx: [['/api/admin/withdrawals', {
+        pending_count: 1,
+        status_counts: { pending: 1, approved: 0, rejected: 0 },
+        consistency: { ok: 0, frozen_micro: 0, pending_micro: 500000, pending_count: 1,
+          overdraw_users: 1, unreviewed_done: 2, frozen_pending_diff: -500000 },
+        params: { rate: 0.01, min_points: 100, review_mode: 'auto',
+          review_mode_label: '自动审核', auto_max_points: 500, auto_max_cny: 5, auto_unlimited: false },
+        withdrawals: [
+          { id: 9, user_id: 2, username: 'tester', amount: 100, fee: 0, cny: 1,
+            method: 'alipay', method_label: '支付宝',
+            alipay_account: 'auto@example.com', real_name: '自动者',
+            account_info: 'auto@example.com / 自动者',
+            status: 'approved', status_label: '已打款', note: '自动审核放行（免审额度内）',
+            reviewed_at: now, reviewed_by: 0, reviewer_name: '', created_at: now, auto: true },
+        ],
+      }]],
+      has: [['#wdConsistency .hintbar', 1]],
+      textIn: [['#wdModeBar', '自动审核'], ['#wdModeBar', '免审'],
+        ['#wdKpis', '自动审核'],
+        // 自动放行的记录必须能一眼看出来（谁放的款）
+        ['#wdCards', '自动审核'], ['#wdCards', '系统自动'],
+        // 账目不一致必须喊出来，并给出可核对的数字
+        ['#wdConsistency', '一致性自检未通过'],
+        ['#wdConsistency', '超过了余额'],
+        ['#wdConsistency', '审核时间为空']] },
     // v0.26.7：性能与前缀缓存面板（耗时 + 命中率）。三档耗时形态各断言一个，
     // 避免"数字渲染对了但单位错了"这类不会被计数断言抓到的问题。
     { nav: 'report',

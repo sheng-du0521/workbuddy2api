@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -31,6 +32,25 @@ const (
 	kvWithdrawRate = "withdraw_rate"
 	// kvWithdrawMinPoints 最小提现额（点，默认 100）。
 	kvWithdrawMinPoints = "withdraw_min_points"
+	// kvWithdrawReviewMode 提现审核方式（v0.29.0）：
+	//
+	//	"manual"（默认）—— 提交进待审队列，管理员逐笔审核；
+	//	"auto"           —— 提交后**立即**走「通过」路径（打款），不进队列。
+	kvWithdrawReviewMode = "withdraw_review_mode"
+	// kvWithdrawAutoMaxPoints 自动放行的**免审额度上限**（点，默认 0 = 不限）。
+	//
+	// 只在 auto 模式下生效：额度内自动通过，超过则仍进人工队列。
+	// 为什么需要这一档：「小额免审、大额人工」是提现审核的常规做法 ——
+	// 一刀切全自动会把大额风险放掉，一刀切全人工又回到现在的痛点。
+	kvWithdrawAutoMaxPoints = "withdraw_auto_max_points"
+)
+
+// 审核方式取值。值是稳定字符串（会落 kv、会出现在接口里），不要改。
+const (
+	// WithdrawReviewManual 人工审核（默认）。
+	WithdrawReviewManual = "manual"
+	// WithdrawReviewAuto 自动审核（提交即通过并打款）。
+	WithdrawReviewAuto = "auto"
 )
 
 // 提现默认参数。
@@ -38,6 +58,13 @@ const (
 	defaultWithdrawRate      = 0.01
 	defaultWithdrawMinPoints = 100.0
 )
+
+// autoReviewNote 自动放行时写入的固定备注前缀。
+//
+// 「该笔是自动放行的」这个事实由 `withdrawals.auto` 列承载（可靠、可查）；
+// 这里再写一句人话只是为了让管理员在列表里**不必点开就知道**。
+// 判定绝不依赖本串（见 Withdrawal.Auto 的注释）。
+const autoReviewNote = "自动审核放行（免审额度内）"
 
 // withdrawParams 读取提现参数（比例与最小额），非法值回落默认。
 func (a *app) withdrawParams() (rate, minPoints float64) {
@@ -53,6 +80,28 @@ func (a *app) withdrawParams() (rate, minPoints float64) {
 		}
 	}
 	return
+}
+
+// withdrawReviewMode 生效的审核方式。未配置 / 非法值一律回落**人工审核**。
+//
+// 为什么非法值回落 manual 而不是 auto：两者错判的代价不对称 ——
+// 回落 manual 最坏是"多审了几笔"；回落 auto 最坏是"未经审核自动把钱打出去"。
+func (a *app) withdrawReviewMode() string {
+	v, _ := a.store.GetKV(kvWithdrawReviewMode)
+	if strings.EqualFold(strings.TrimSpace(v), WithdrawReviewAuto) {
+		return WithdrawReviewAuto
+	}
+	return WithdrawReviewManual
+}
+
+// withdrawAutoMaxMicro 免审额度上限（微点）。0 = 不限。
+func (a *app) withdrawAutoMaxMicro() int64 {
+	v, _ := a.store.GetKV(kvWithdrawAutoMaxPoints)
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0 // 未配置 / 非法 → 不限（"不限额"是 auto 模式的本意，不是笔误）
+	}
+	return PointToMicro(f)
 }
 
 // maskAccountInfo 收款账号打码（仅保留首尾，避免列表里明文暴露）。
@@ -316,12 +365,50 @@ func (a *app) handleWithdrawApply(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// ---- 审核方式（v0.29.0）----
+	//
+	// auto 模式下，申请在**同一请求内**被自动放行（走与人工审核完全相同的
+	// reviewWithdrawal：从冻结额出账 → balance/frozen 同减 → 状态 approved）。
+	//
+	// 为什么放在 CreateWithdrawal 之后而不是"直接打款不落 pending"：
+	//   · 冻结与出账是两个可独立审计的动作，中间必须有一条**真实的记录**；
+	//   · 若放行失败（理论上不该发生：钱刚冻上），记录会**留在 pending**，
+	//     管理员看得见、可人工处理 —— 而"直接打款"的实现会让失败无处落账。
+	autoMax := a.withdrawAutoMaxMicro()
+	auto := a.withdrawReviewMode() == WithdrawReviewAuto && (autoMax <= 0 || amountMicro <= autoMax)
+	if auto {
+		approved, aerr := a.store.AutoApproveWithdrawal(row.ID, autoReviewNote)
+		if aerr != nil {
+			// 钱已冻结、状态仍 pending —— 必须让管理员知道"有人工可做的事"，
+			// 而不是把失败吞掉让用户以为已经到账。
+			log.Printf("WARN: [withdraw] 自动审核放行失败 id=%d user=%d err=%v（该笔留待人工审核）", row.ID, u.ID, aerr)
+			quota3, _, frozen3, _ := a.store.WithdrawableState(u.ID)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"withdrawal":   withdrawView(row, rate),
+				"message":      "提现申请已提交并已冻结对应金额；自动放行未成功，已转人工审核",
+				"auto":         false,
+				"withdrawable": MicroToPoint(quota3),
+				"frozen":       MicroToPoint(frozen3),
+			})
+			return
+		}
+		quota3, _, frozen3, _ := a.store.WithdrawableState(u.ID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"withdrawal":   withdrawView(approved, rate),
+			"message":      "提现已提交并按当前审核方式自动通过（免审额度内），冻结金额已扣除",
+			"auto":         true,
+			"withdrawable": MicroToPoint(quota3),
+			"frozen":       MicroToPoint(frozen3),
+		})
+		return
+	}
 	// 冻结后的账目快照：提交成功时把"现在还剩多少可提 / 冻结了多少"一并回给前端，
 	// 免得它再拉一次接口才知道（少一次往返就少一处不一致的可能）。
 	quota2, _, frozen2, _ := a.store.WithdrawableState(u.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"withdrawal":   withdrawView(row, rate),
 		"message":      "提现申请已提交并已冻结对应金额，等待管理员审核",
+		"auto":         false,
 		"withdrawable": MicroToPoint(quota2),
 		"frozen":       MicroToPoint(frozen2),
 	})
@@ -331,15 +418,90 @@ func (a *app) handleWithdrawApply(w http.ResponseWriter, r *http.Request) {
 // 管理侧
 // ---------------------------------------------------------------------
 
-// adminWithdrawRow 管理侧提现记录（含号主信息，收款账号明文供打款）。
-type adminWithdrawRow struct {
-	*Withdrawal
-	Username    string  `json:"username"`
-	AccountInfo string  `json:"account_info"`
-	CNY         float64 `json:"cny"`
+// adminWithdrawView 管理侧提现记录（含号主信息，收款账号**明文**供打款）。
+//
+// ⚠️ 为什么必须显式声明每个字段、不能内嵌 *Withdrawal（v0.29.0 修的真缺陷）：
+//
+// 此前这里是 `struct { *Withdrawal; Username string; ... }` —— 而 `Withdrawal`
+// **没有 json tag**，于是下发的键名是 Go 字段名（`ID` / `Status` / `CreatedAt`
+// / `AmountMicro` / `AlipayAccount` …），而前端读的是 snake_case
+// （`x.id` / `x.status` / `x.created_at` / `x.amount` / `x.alipay_account`）。
+// 结果：管理后台提现页上**每一张卡片的状态都是 undefined**，而审核按钮的渲染
+// 条件是 `x.status === 'pending'` —— **按钮根本不出现**。
+// 用户的描述正是「无法进行审核操作」，而接口一直返回 200、没有任何报错。
+//
+// 教训：内嵌结构体 + 没有 tag 会把「字段名」这个接口契约变成隐式的 Go 命名
+// （改名即静默破坏前端）。对外视图一律显式写全字段与 tag，并用单测锁死键名。
+type adminWithdrawView struct {
+	ID     int64 `json:"id"`
+	UserID int64 `json:"user_id"`
+	// Username 号主用户名（列表里没它就没法辨认是谁提的）。
+	Username string `json:"username"`
+	// Amount 提现点数；CNY 折算金额（元）。两者的换算口径 = withdrawParams 的比例。
+	Amount float64 `json:"amount"`
+	Fee    float64 `json:"fee"`
+	CNY    float64 `json:"cny"`
+	// Method 恒 "alipay"；MethodLabel 中文名（界面直接显示，不在前端再映射一遍）。
+	Method      string `json:"method"`
+	MethodLabel string `json:"method_label"`
+	// AlipayAccount / RealName **明文**（管理员要照着打款，打码没法用）；
+	// AccountInfo 兼容旧数据的组合串。
+	AlipayAccount string `json:"alipay_account"`
+	RealName      string `json:"real_name"`
+	AccountInfo   string `json:"account_info"`
+	// Status 取值 pending / approved / rejected；StatusLabel 中文名。
+	Status      string `json:"status"`
+	StatusLabel string `json:"status_label"`
+	Note        string `json:"note"`
+	ReviewedAt  int64  `json:"reviewed_at"`
+	ReviewedBy  int64  `json:"reviewed_by"`
+	// ReviewerName 审核人用户名（reviewed_by=0 且 Auto=true 时为空 —— 没人审它）。
+	ReviewerName string `json:"reviewer_name"`
+	CreatedAt    int64  `json:"created_at"`
+	// Auto 该笔是否由「自动审核」放行（v0.29.0）。
+	Auto bool `json:"auto"`
+}
+
+// withdrawStatusLabel 状态中文名（唯一口径，前后端不再各写一份映射）。
+func withdrawStatusLabel(s string) string {
+	switch s {
+	case WithdrawPending:
+		return "待审核"
+	case WithdrawApproved:
+		return "已打款"
+	case WithdrawRejected:
+		return "已驳回"
+	}
+	return s
+}
+
+// newAdminWithdrawView 组装管理侧视图。userName / reviewerName 由调用方查好后传入
+// （store 不持有用户名，避免在这里做 N+1 查询）。
+func newAdminWithdrawView(w *Withdrawal, userName, reviewerName string, rate float64) adminWithdrawView {
+	acct, name := withdrawalPayee(w)
+	return adminWithdrawView{
+		ID: w.ID, UserID: w.UserID, Username: userName,
+		Amount: MicroToPoint(w.AmountMicro), Fee: MicroToPoint(w.FeeMicro),
+		CNY:         microToCNY(w.AmountMicro, rate),
+		Method:      normalizeWithdrawMethod(w.Method),
+		MethodLabel: withdrawMethodLabel(w.Method),
+		// 明文：打款需要。页头已有"收款账号为明文，请谨慎操作"的警示。
+		AlipayAccount: acct,
+		RealName:      name,
+		AccountInfo:   w.AccountInfo,
+		Status:        w.Status, StatusLabel: withdrawStatusLabel(w.Status),
+		Note: w.Note, ReviewedAt: w.ReviewedAt, ReviewedBy: w.ReviewedBy,
+		ReviewerName: reviewerName, CreatedAt: w.CreatedAt, Auto: w.Auto,
+	}
 }
 
 // handleAdminWithdrawals 管理侧提现列表（可按状态过滤）。
+//
+// 除列表外还回三样东西，它们共同回答"现在能不能审、审了会怎样"：
+//   - params.review_mode / auto_max_points：当前审核方式（人工 / 自动）与免审额度；
+//   - consistency：冻结额与待审合计的一致性自检（不一致必须显式告警，
+//     而不是让管理员在一份对不上的账上继续操作）；
+//   - status_counts：各状态笔数（徽标与筛选提示用，不必在前端再数一遍）。
 func (a *app) handleAdminWithdrawals(w http.ResponseWriter, r *http.Request) {
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
 	rate, minPoints := a.withdrawParams()
@@ -350,25 +512,54 @@ func (a *app) handleAdminWithdrawals(w http.ResponseWriter, r *http.Request) {
 	}
 	users, _ := a.store.ListUsers()
 	nameOf := map[int64]string{}
+	nameByID := map[int64]string{}
 	for _, u := range users {
 		nameOf[u.ID] = u.Username
+		nameByID[u.ID] = u.Username
 	}
-	out := make([]adminWithdrawRow, 0, len(rows))
+	out := make([]adminWithdrawView, 0, len(rows))
 	for _, x := range rows {
-		out = append(out, adminWithdrawRow{
-			Withdrawal:  x,
-			Username:    nameOf[x.UserID],
-			AccountInfo: x.AccountInfo,
-			CNY:         MicroToPoint(x.AmountMicro) * rate,
-		})
+		// 审核人姓名：reviewed_by=0（自动放行 / 密钥通道）时为空串，
+		// 前端据此显示「系统自动」而不是一个空名字。
+		out = append(out, newAdminWithdrawView(x, nameOf[x.UserID], nameByID[x.ReviewedBy], rate))
 	}
 	// 待审计数（前端角标用）。
 	pendingList, _ := a.store.ListWithdrawals(WithdrawPending, 500)
+	// 各状态笔数：前端筛选条与徽标直接用，避免"界面数与列表长度不一致"。
+	counts := map[string]int{"pending": 0, "approved": 0, "rejected": 0}
+	all, _ := a.store.ListWithdrawals("", 500)
+	for _, x := range all {
+		counts[x.Status]++
+	}
+	consistency, err := a.store.WithdrawConsistency()
+	if err != nil {
+		// 自检失败**不影响列表**：它是诊断增强，不该把提现页整个打不开。
+		log.Printf("WARN: [withdraw] 一致性自检失败：%v", err)
+		consistency = map[string]int64{}
+	}
+	autoMax := a.withdrawAutoMaxMicro()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"withdrawals":   out,
 		"pending_count": len(pendingList),
-		"params":        map[string]any{"rate": rate, "min_points": minPoints},
+		"status_counts": counts,
+		"consistency":   consistency,
+		"params": map[string]any{
+			"rate": rate, "min_points": minPoints,
+			"review_mode":       a.withdrawReviewMode(),
+			"review_mode_label": withdrawReviewModeLabel(a.withdrawReviewMode()),
+			"auto_max_points":   MicroToPoint(autoMax),
+			"auto_max_cny":      microToCNY(autoMax, rate),
+			"auto_unlimited":    autoMax <= 0,
+		},
 	})
+}
+
+// withdrawReviewModeLabel 审核方式中文名（单一口径）。
+func withdrawReviewModeLabel(mode string) string {
+	if mode == WithdrawReviewAuto {
+		return "自动审核"
+	}
+	return "人工审核"
 }
 
 // handleAdminWithdrawReview 管理员审核提现（approve=true 扣余额打款 / false 驳回）。

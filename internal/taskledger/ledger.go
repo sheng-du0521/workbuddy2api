@@ -25,6 +25,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -156,6 +157,65 @@ func (s *Store) RetryStates() map[string]RetryState {
 		out[k] = *v
 	}
 	return out
+}
+
+// DropKinds 删除不在 keep 里的任务类别（runs 与 retry 两处），返回被删掉的类别名。
+//
+// ## 为什么需要它
+//
+// 任务类别会**被移除**（v0.27.0 删掉了开学季），而台账文件是上一版留下的。
+// 不清理的话，界面上会持续出现一个已经不存在、也永远不会再更新的"幽灵卡片"——
+// 这比"少一张卡"更容易误导人：它看起来像是这个任务还在、只是很久没跑过。
+//
+// ## 为什么由调用方传白名单
+//
+// 本包不认识任何具体任务名（那是 cmd/webapp 的知识）。keep 由上层给，
+// 本包只负责按它裁剪并落盘 —— 这样"类别集合"永远只有**一个**事实来源，
+// 不会出现"台账里留了一份副本、改代码时忘同步"。
+//
+// 只删不增：本方法永远不会创建任何条目（它只做减法，因此可以安全地反复调用）。
+func (s *Store) DropKinds(keep func(kind string) bool) []string {
+	if s == nil || keep == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var dropped []string
+	for k := range s.runs {
+		if !keep(k) {
+			delete(s.runs, k)
+			dropped = append(dropped, k)
+		}
+	}
+	for k := range s.retry {
+		// retry 里出现但 runs 里没有的类别同样要删（重试状态也是"这个任务存在"的证据）。
+		if !keep(k) {
+			delete(s.retry, k)
+			// 已经在 dropped 里就不重复记（同一个类别两处都在，只报一次）。
+			if _, ok := s.runs[k]; !ok && !containsStr(dropped, k) {
+				dropped = append(dropped, k)
+			}
+		}
+	}
+	if len(dropped) > 0 {
+		// 必须落盘：只在内存里删的话，重启后幽灵卡片会**再回来**，
+		// 表现为"每次重启都冒出来一次"，比不删更难理解。
+		saveNow := s.path != ""
+		if saveNow {
+			s.saveLocked()
+		}
+	}
+	sort.Strings(dropped)
+	return dropped
+}
+
+func containsStr(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // Record 记录一类任务的一轮执行结果（覆盖该类上一轮），并落盘。

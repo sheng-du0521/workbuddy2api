@@ -376,7 +376,8 @@ func (s *Store) migrateUsers() error {
 			note         TEXT NOT NULL DEFAULT '',
 			reviewed_by  INTEGER NOT NULL DEFAULT 0,
 			reviewed_at  INTEGER NOT NULL DEFAULT 0,
-			created_at   INTEGER NOT NULL DEFAULT 0
+			created_at   INTEGER NOT NULL DEFAULT 0,
+			auto         INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status, created_at DESC)`,
@@ -472,6 +473,12 @@ func (s *Store) migrateUsers() error {
 	for _, c := range []struct{ col, ddl string }{
 		{"alipay_account", "alipay_account TEXT NOT NULL DEFAULT ''"},
 		{"real_name", "real_name TEXT NOT NULL DEFAULT ''"},
+		// auto（v0.29.0）该笔是否由「自动审核」放行（免审额度内）。
+		//
+		// 为什么要单开一列而不是从 note 文案里猜：它是这笔记录的**属性**，
+		// 而 note 是给人看的自由文本（用户可改需求、管理员可改措辞）。
+		// 靠文案前缀判定会在文案一改时静默失效 —— 而它要支撑的是"谁放的款"这类追溯。
+		{"auto", "auto INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn("withdrawals", c.col, c.ddl); err != nil {
 			return fmt.Errorf("migrate withdrawals column %s: %w", c.col, err)
@@ -2162,6 +2169,31 @@ type Withdrawal struct {
 	ReviewedBy    int64
 	ReviewedAt    int64
 	CreatedAt     int64
+	// Auto 该笔是否由「自动审核」放行（v0.29.0）。见 withdrawals.auto 列注释。
+	Auto bool
+}
+
+// withdrawCols 提现表的**唯一**列清单与扫描口径。
+//
+// 为什么抽出来：这张表的读取点有两处（审核时按 id 取、列表按状态取），
+// 此前两处各写一遍列名与 Scan 顺序 —— 加一列就要改两处，漏一处的表现是
+// "某个界面上的字段永远是零值"（不会报错）。列口径只有一份才不会分叉。
+const withdrawCols = `id, user_id, amount_micro, fee_micro, method, account_info,
+	alipay_account, real_name, status, note, reviewed_by, reviewed_at, created_at, auto`
+
+// rowScanner *sql.Row 与 *sql.Rows 的公共部分（两者都有 Scan）。
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanWithdrawal 按 withdrawCols 的顺序解出一行。
+func scanWithdrawal(sc rowScanner, w *Withdrawal) error {
+	var auto int
+	if err := sc.Scan(&w.ID, &w.UserID, &w.AmountMicro, &w.FeeMicro, &w.Method, &w.AccountInfo,
+		&w.AlipayAccount, &w.RealName, &w.Status, &w.Note, &w.ReviewedBy, &w.ReviewedAt,
+		&w.CreatedAt, &auto); err != nil {
+		return err
+	}
+	w.Auto = auto != 0
+	return nil
 }
 
 // ErrInsufficientWithdrawable 可提现额度不足，无法受理提现申请。
@@ -2259,9 +2291,7 @@ func (s *Store) listWithdrawals(where string, args []any, limit int) ([]*Withdra
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	q := `SELECT id, user_id, amount_micro, fee_micro, method, account_info,
-		alipay_account, real_name, status, note,
-		reviewed_by, reviewed_at, created_at FROM withdrawals ` + where +
+	q := `SELECT ` + withdrawCols + ` FROM withdrawals ` + where +
 		` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.Query(q, args...)
@@ -2272,9 +2302,7 @@ func (s *Store) listWithdrawals(where string, args []any, limit int) ([]*Withdra
 	var out []*Withdrawal
 	for rows.Next() {
 		var w Withdrawal
-		if err := rows.Scan(&w.ID, &w.UserID, &w.AmountMicro, &w.FeeMicro, &w.Method, &w.AccountInfo,
-			&w.AlipayAccount, &w.RealName,
-			&w.Status, &w.Note, &w.ReviewedBy, &w.ReviewedAt, &w.CreatedAt); err != nil {
+		if err := scanWithdrawal(rows, &w); err != nil {
 			return nil, err
 		}
 		out = append(out, &w)
@@ -2315,6 +2343,25 @@ var ErrInsufficientWithdraw = errors.New("insufficient frozen amount for withdra
 // 现在唯一可能失败的是冻结额本身对不上（历史未回填的记录 / 外部改库），
 // 那种情况必须明确报错而不是把余额扣成负数还显示"打款成功"。
 func (s *Store) ReviewWithdrawal(id int64, approve bool, note string, reviewerID int64) (*Withdrawal, error) {
+	return s.reviewWithdrawal(id, approve, note, reviewerID, false)
+}
+
+// AutoApproveWithdrawal 「自动审核」放行一笔提现（v0.29.0，审核方式 = auto）。
+//
+// 与人工审核**走同一条实现**（reviewWithdrawal）：这是刻意的 —— 两条独立实现
+// 迟早会在「冻结额怎么扣」「余额怎么钳」「状态写什么」上分叉，而分叉的表现是
+// 账目对不上，属于最难事后查的一类问题。区别只有两个人事字段：
+//
+//	reviewed_by = 0（没有人审核它）   auto = 1（但必须能一眼看出来它是自动放行的）
+//
+// 为什么 reviewerID 不借用某个"系统用户"的 ID：那会让审计读出"某个管理员批的"，
+// 而事实是没有人批。0 + auto=1 才如实表达"系统按配置自动放行"。
+func (s *Store) AutoApproveWithdrawal(id int64, note string) (*Withdrawal, error) {
+	return s.reviewWithdrawal(id, true, note, 0, true)
+}
+
+// reviewWithdrawal 审核提现的**唯一实现**（人工 / 自动都走这里）。
+func (s *Store) reviewWithdrawal(id int64, approve bool, note string, reviewerID int64, auto bool) (*Withdrawal, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -2322,12 +2369,7 @@ func (s *Store) ReviewWithdrawal(id int64, approve bool, note string, reviewerID
 	defer tx.Rollback()
 
 	var w Withdrawal
-	err = tx.QueryRow(`SELECT id, user_id, amount_micro, fee_micro, method, account_info,
-		alipay_account, real_name, status, note,
-		reviewed_by, reviewed_at, created_at FROM withdrawals WHERE id = ?`, id).
-		Scan(&w.ID, &w.UserID, &w.AmountMicro, &w.FeeMicro, &w.Method, &w.AccountInfo,
-			&w.AlipayAccount, &w.RealName,
-			&w.Status, &w.Note, &w.ReviewedBy, &w.ReviewedAt, &w.CreatedAt)
+	err = scanWithdrawal(tx.QueryRow(`SELECT `+withdrawCols+` FROM withdrawals WHERE id = ?`, id), &w)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -2375,8 +2417,8 @@ func (s *Store) ReviewWithdrawal(id int64, approve bool, note string, reviewerID
 		}
 		w.Status = WithdrawRejected
 	}
-	if _, err := tx.Exec(`UPDATE withdrawals SET status = ?, note = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?`,
-		w.Status, strings.TrimSpace(note), reviewerID, now, id); err != nil {
+	if _, err := tx.Exec(`UPDATE withdrawals SET status = ?, note = ?, reviewed_by = ?, reviewed_at = ?, auto = ? WHERE id = ?`,
+		w.Status, strings.TrimSpace(note), reviewerID, now, boolToInt(auto), id); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -2385,7 +2427,57 @@ func (s *Store) ReviewWithdrawal(id int64, approve bool, note string, reviewerID
 	w.Note = strings.TrimSpace(note)
 	w.ReviewedBy = reviewerID
 	w.ReviewedAt = now
+	w.Auto = auto
 	return &w, nil
+}
+
+// WithdrawConsistency 提现账目一致性自检（v0.29.0）。
+//
+// 要回答的是用户最关心的那个问题：「审核通过的记录、用户余额、冻结额三者
+// 到底对不对得上」。三条判据：
+//
+//	① frozen 合计 == Σ(pending 申请额)   —— 冻结额里装的**只能**是待审申请
+//	② 违反 withdrawable + frozen ≤ balance 的用户数 == 0
+//	③ 非 pending 的记录里，已打款/已驳回必须动过账（reviewed_at > 0）
+//
+// 为什么做成"自检"而不是"自动修"：金额类的不一致必须**先看见再决定**。
+// 自动"修"等于替管理员判断哪一边是对的 —— 而两边都有可能是对的（外部改过库、
+// 历史版本回填不全）。自动修会把一个可解释的差异变成一个不可解释的静默改动。
+func (s *Store) WithdrawConsistency() (map[string]int64, error) {
+	var frozenSum, pendingSum, overdraw, pendingCount, unreviewedDone int64
+	if err := s.db.QueryRow(`SELECT COALESCE(SUM(frozen_micro),0) FROM users`).Scan(&frozenSum); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(
+		`SELECT COALESCE(SUM(amount_micro),0), COUNT(*) FROM withdrawals WHERE status = ?`,
+		WithdrawPending).Scan(&pendingSum, &pendingCount); err != nil {
+		return nil, err
+	}
+	// ③ 用 reviewed_at 当"账是否动过"的代理判据：它与 status 是同一条 UPDATE 写的，
+	// 因此两者不一致只可能来自外部改库或历史脏数据（正是自检要抓的东西）。
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM withdrawals WHERE status <> ? AND reviewed_at <= 0`,
+		WithdrawPending).Scan(&unreviewedDone); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM users WHERE withdrawable_micro + frozen_micro > balance_micro`).Scan(&overdraw); err != nil {
+		return nil, err
+	}
+	out := map[string]int64{
+		"frozen_micro":        frozenSum,
+		"pending_micro":       pendingSum,
+		"pending_count":       pendingCount,
+		"overdraw_users":      overdraw,
+		"unreviewed_done":     unreviewedDone,
+		"frozen_pending_diff": frozenSum - pendingSum,
+	}
+	if frozenSum == pendingSum && overdraw == 0 && out["unreviewed_done"] == 0 {
+		out["ok"] = 1
+	} else {
+		out["ok"] = 0
+	}
+	return out, nil
 }
 
 // WithdrawalSummaryByUser 某用户各状态提现汇总（微点）。

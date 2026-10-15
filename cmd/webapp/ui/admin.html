@@ -456,9 +456,17 @@
           </div>
         </div>
         <div class="sub" style="margin:0 0 12px;">
-          用户发起提现申请后在此审核：<b>通过</b> 会即时扣减用户余额并记为已打款；<b>驳回</b> 不动余额。
+          用户发起提现申请时，对应金额<b>已从可提现额度划入冻结额</b>（余额总额不变，只是不可动用）。
+          在此审核：<b>通过</b> ⇒ 该笔提现<b>成功</b>（状态「已打款」），并从<b>冻结额</b>出账
+          （用户余额与冻结额同减、不变量 <code>可提现 + 冻结 ≤ 余额</code> 保持）；
+          <b>驳回</b> ⇒ 冻结额<b>原路退回到可提现额度</b>。
           收款账号为明文（打款用），请谨慎操作。
         </div>
+        <!-- 审核方式与当前流程（v0.29.0）：由服务端下发，避免这里再写一份口径。 -->
+        <div class="hintbar" id="wdModeBar"></div>
+        <!-- 三方一致性自检（v0.29.0）：冻结额合计 vs 待审合计。不一致必须显式告警 —— 
+             让管理员在一份对不上的账上继续点"通过"是更糟的选择。 -->
+        <div id="wdConsistency"></div>
         <div class="cards" id="wdCards"></div>
       </div>
     </section>
@@ -1569,7 +1577,7 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
         <h2>提现 · 结算参数</h2>
         <div class="sub" style="margin:0 0 12px;">
           用户在控制台「充值提现」页发起提现，管理员在「提现审核」页处理。
-          这里配置<b>点数折算比例</b>（用于展示换算金额）与<b>最小提现额</b>。
+          这里配置<b>点数折算比例</b>、<b>最小提现额</b>与<b>审核方式</b>。
           点为站内内部单位，提现仅落台账与打款记录，不接真实支付通道。
         </div>
         <div class="setting-grid">
@@ -1586,6 +1594,28 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
             <label>最小提现额（点）</label>
             <input type="number" id="setWithdrawMin" step="1" min="0">
             <div class="hint">低于该值的申请会被拒绝提交。</div>
+          </div>
+          <div class="setting-card">
+            <label>审核方式</label>
+            <select id="setWithdrawMode">
+              <option value="manual">人工审核（提交进队列，逐笔审核）</option>
+              <option value="auto">自动审核（提交即通过并打款）</option>
+            </select>
+            <div class="hint" id="wdModeHint"></div>
+            <div class="hint">
+              两种方式走的是<b>同一条出账实现</b>：<b>通过</b> ⇒ 该笔提现成功（状态「已打款」）+
+              从<b>冻结额</b>出账（余额与冻结额同减，可提现额度钳到 ≤ 余额）；
+              <b>驳回</b> ⇒ 冻结额原路退回到可提现额度。
+              金额在用户<b>提交申请那一刻</b>就已冻结，因此审核不会因用户期间消费而失败。
+            </div>
+          </div>
+          <div class="setting-card">
+            <label>免审额度上限（点，0 = 不限）</label>
+            <input type="number" id="setWithdrawAutoMax" step="1" min="0">
+            <div class="hint">
+              仅<b>自动审核</b>方式下生效：不超过该额度的申请自动通过，超过的仍进人工队列。
+              「小额免审、大额人工」是提现审核的常规做法。
+            </div>
           </div>
         </div>
         <div class="row" style="margin-top:14px;">
@@ -4139,9 +4169,15 @@ async function loadSettings() {
       const r = d.withdraw_rate || 0.01;
       $('wdRateHint').textContent = `当前：100 点 ≈ ${(100 * r).toFixed(2)} 元`;
     }
+    // 审核方式（v0.29.0）：必须把"当前是哪一种"写清楚 ——
+    // 自动审核意味着钱会不经人工直接出去，这是全站风险最高的一项配置。
+    if ($('setWithdrawMode')) $('setWithdrawMode').value = d.withdraw_review_mode || 'manual';
+    if ($('setWithdrawAutoMax')) $('setWithdrawAutoMax').value = d.withdraw_auto_max_points || 0;
+    syncWithdrawModeHint(d);
     if ($('withdrawHint')) {
       $('withdrawHint').textContent =
-        `最小提现 ${fmtPointsU(d.withdraw_min_points || 0)} · ${fmtRate(d.withdraw_rate)}`;
+        `最小提现 ${fmtPointsU(d.withdraw_min_points || 0)} · ${fmtRate(d.withdraw_rate)}`
+        + ` · ${d.withdraw_review_mode === 'auto' ? '自动审核' : '人工审核'}`;
     }
     if ($('hostShareHint')) {
       const hs = (d.host_share_ratio > 0)
@@ -4442,7 +4478,15 @@ async function refreshTaskLedger(showError) {
     };
     renderScheduleBar(d);
 
-    const runs = Object.values(d.runs || {}).sort((a, b) => new Date(b.started) - new Date(a.started));
+    // v0.29.0：渲染前再按「当前版本仍存在的任务」过滤一遍。
+    //
+    // 为什么服务端已经过滤了这里还要做：台账是**落盘文件**，任何来源的旧数据
+    // （历史备份、手工改过的 json、多实例共用一个数据目录）都可能带进已移除的
+    // 类别；而多渲染一张"永远不会更新、点了也没反应"的卡片，比少一张更容易把人
+    // 带偏（它看起来像这个任务还在）。这一层是纯展示侧的兜底，零成本。
+    const runs = Object.values(d.runs || {})
+      .filter((x) => TASK_META.some((t) => t.kind === x.kind))
+      .sort((a, b) => new Date(b.started) - new Date(a.started));
     const rc = $('runCards');
     rc.textContent = '';
     // 正在跑但台账里还没有记录的（第一次跑 / 刚点「立即执行」）：补一张占位卡，
@@ -5164,13 +5208,47 @@ $('btnSaveHost').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+// syncWithdrawModeHint 审核方式提示（写入前先让人看清自己选了什么）。
+function syncWithdrawModeHint(d) {
+  const el2 = $('wdModeHint');
+  if (!el2) return;
+  const mode = ($('setWithdrawMode') || {}).value || 'manual';
+  const max = Number(($('setWithdrawAutoMax') || {}).value || 0);
+  const rate = d && d.withdraw_rate ? d.withdraw_rate : 0.01;
+  if (mode === 'auto') {
+    el2.textContent = max > 0
+      ? `当前：自动审核 · 免审上限 ${fmtPointsU(max)}（≈ ${fmtCNY(max * rate)}），超出仍进人工队列`
+      : '当前：自动审核 · 不限额 —— 所有提现申请提交后会被立即打款，不再有人工复核';
+    el2.style.color = max > 0 ? '' : 'var(--warn)';
+  } else {
+    el2.textContent = '当前：人工审核 —— 申请进入待审队列，由你在「提现审核」页逐笔处理';
+    el2.style.color = '';
+  }
+}
+if ($('setWithdrawMode')) $('setWithdrawMode').onchange = () => syncWithdrawModeHint(null);
+if ($('setWithdrawAutoMax')) $('setWithdrawAutoMax').oninput = () => syncWithdrawModeHint(null);
+
 $('btnSaveWithdraw').onclick = async () => {
   try {
     const r = Number($('setWithdrawRate').value);
     if (!(r > 0)) { toast('折算比例需大于 0', 'err'); return; }
     const m = Number($('setWithdrawMin').value);
     if (isNaN(m) || m < 0) { toast('最小提现额不能为负', 'err'); return; }
-    await post('/api/admin/settings', { withdraw_rate: r, withdraw_min_points: m });
+    const mode = ($('setWithdrawMode') || {}).value || 'manual';
+    const amax = Number(($('setWithdrawAutoMax') || {}).value || 0);
+    if (isNaN(amax) || amax < 0) { toast('免审额度上限不能为负', 'err'); return; }
+    // 全自动（auto 且不限额度）是**不可逆风险**操作：一次确认，把后果说清楚。
+    // 这里不用 danger 样式（不是删除），但文案必须让人读到"立即打款"。
+    if (mode === 'auto' && amax === 0) {
+      if (!(await confirmAsk('确认开启「自动审核 · 不限额」？\n\n'
+        + '之后用户提交的任何提现申请都会被立即视为通过并打款（从冻结额出账），不再有人工复核。'
+        + '这是全站风险最高的配置项，建议至少设置一个免审额度上限。',
+        { confirmText: '我确认开启' }))) return;
+    }
+    await post('/api/admin/settings', {
+      withdraw_rate: r, withdraw_min_points: m,
+      withdraw_review_mode: mode, withdraw_auto_max_points: amax,
+    });
     toast('提现参数已保存', 'ok');
     loadSettings();
   } catch (e) { toast(e.message, 'err'); }
@@ -5449,6 +5527,67 @@ function renderWdFilter() {
   box.appendChild(segmented(opts, wdFilter, (v) => { wdFilter = v; renderWdFilter(); loadWithdrawals(); }));
 }
 
+// renderWdModeBar 顶部审核方式说明条（v0.29.0）。
+//
+// 为什么要单独一条而不是只放在 KPI 里：审核方式决定了"下面这些卡片还需要你做什么"。
+// 自动审核模式下队列可能永远是空的 —— 不写清楚的话，运维会以为"提现功能坏了"。
+function renderWdModeBar(p) {
+  const box = $('wdModeBar');
+  if (!box) return;
+  box.textContent = '';
+  // hintbar 只有一种底色（style.css 里没有 warn/danger 变体），
+  // 需要强调时直接给内联色 —— 与仓库其它告警处的做法一致。
+  box.className = 'hintbar';
+  box.style.borderColor = p.review_mode === 'auto' ? 'var(--warn)' : '';
+  box.style.color = p.review_mode === 'auto' ? 'var(--warn)' : '';
+  if (p.review_mode === 'auto') {
+    box.textContent = '当前审核方式：自动审核'
+      + (p.auto_unlimited
+        ? '（不限额）—— 任何申请提交后立即通过并打款，队列通常为空；'
+        : ('（免审 ≤ ' + fmtPointsU(p.auto_max_points || 0) + '，≈ ' + fmtCNY(p.auto_max_cny || 0) + '）—— '
+          + '该额度内的申请自动通过，超过的进本队列；'))
+      + '如需人工逐笔审核，去「设置 → 提现 · 结算参数」把审核方式改为「人工审核」。';
+  } else {
+    box.textContent = '当前审核方式：人工审核 —— 申请提交后进入本队列，逐笔通过或驳回。'
+      + '（可在「设置 → 提现 · 结算参数」改为自动审核或设置免审额度）';
+  }
+}
+
+// renderWdConsistency 三方一致性自检（v0.29.0）。
+//
+// 三条判据由服务端算好（Store.WithdrawConsistency），这里只负责"把不一致喊出来"：
+//   · 冻结额合计 == 待审申请合计
+//   · 不存在 可提现 + 冻结 > 余额 的用户
+//   · 非待审记录都动过账（reviewed_at > 0）
+// 一致时**不显示任何东西** —— 一个常驻的"一切正常"横幅几天后就会被无视，
+// 而它恰恰要在出问题时被看见。
+function renderWdConsistency(c, pendingSum) {
+  const box = $('wdConsistency');
+  if (!box) return;
+  box.textContent = '';
+  if (!c || typeof c.ok === 'undefined') return; // 旧后端 / 自检失败：不显示，不误报
+  if (c.ok) return;
+  const items = [];
+  if (c.frozen_pending_diff) {
+    items.push('冻结额合计（' + fmtPointsU(c.frozen_micro / 1000) + ' 点）与待审申请合计（'
+      + fmtPointsU(c.pending_micro / 1000) + ' 点）相差 '
+      + fmtPointsU(Math.abs(c.frozen_pending_diff) / 1000) + ' 点');
+  }
+  if (c.overdraw_users > 0) {
+    items.push(c.overdraw_users + ' 个用户的「可提现 + 冻结」超过了余额');
+  }
+  if (c.unreviewed_done > 0) {
+    items.push(c.unreviewed_done + ' 条已处理记录的审核时间为空（状态与账目可能不同步）');
+  }
+  if (!items.length) return; // ok=0 但没有可解释的项：不显示空告警
+  const bar = el('div', 'hintbar',
+    '⚠ 账目一致性自检未通过：' + items.join('；')
+    + '。这不影响单据本身可读，但请在继续审核前先核对 —— 必要时把对应申请驳回让用户重新提交。');
+  bar.style.borderColor = 'var(--err)';
+  bar.style.color = 'var(--err)';
+  box.appendChild(bar);
+}
+
 async function reviewWithdraw(id, approve) {
   let note = '';
   if (approve) {
@@ -5502,9 +5641,17 @@ async function loadWithdrawals() {
     '折合 ' + fmtPointsU(sum(pend, (x) => x.amount)) + '（已冻结）'));
   kb.appendChild(kpiCard('已打款金额', fmtMoney(sum(appr, (x) => x.cny)), '元',
     '折合 ' + fmtPointsU(sum(appr, (x) => x.amount))));
-  kb.appendChild(kpiCard('已打款金额', fmtCNY(sum(appr, (x) => x.cny))));
   kb.appendChild(kpiCard('已驳回笔数', fmtNum(rej.length)));
+  // 审核方式（v0.29.0）：做成 KPI 而不是只写在说明里 ——
+  // "自动审核"是钱会不会不经人工出去的唯一决定项，必须一眼可见。
+  kb.appendChild(kpiCard('审核方式', p.review_mode_label || '人工审核',
+    '', p.review_mode === 'auto'
+      ? (p.auto_unlimited ? '⚠ 不限额：提交即打款' : ('免审 ≤ ' + fmtPointsU(p.auto_max_points || 0)))
+      : '提交进队列，逐笔人工审核'));
   kb.appendChild(kpiCard('折算比例', String(p.rate), '元/点'));
+
+  renderWdModeBar(p);
+  renderWdConsistency(d.consistency, sum(pend, (x) => x.amount));
 
   const badge = $('wdBadge');
   if (badge) { badge.textContent = pend.length; badge.classList.toggle('hidden', !pend.length); }
@@ -5523,7 +5670,14 @@ async function loadWithdrawals() {
     who.appendChild(el('div', 'name', x.username || ('#' + x.user_id)));
     who.appendChild(el('div', 'ident', '申请时间 ' + fmtTime(x.created_at)));
     head.appendChild(who);
-    head.appendChild(el('span', 'wd-status ' + (x.status || 'pending'), WD_STATUS_LABEL[x.status] || x.status));
+    // 状态文案优先用服务端下发的 status_label（唯一口径）；本地映射仅作兜底。
+    head.appendChild(el('span', 'wd-status ' + (x.status || 'pending'),
+      x.status_label || WD_STATUS_LABEL[x.status] || x.status || '—'));
+    if (x.auto) {
+      // 「自动放行」必须与人工审核可区分：它回答的是"这笔是谁放的款"。
+      head.appendChild(chipWithTitle('自动审核', 'warn',
+        '该笔由「自动审核」在免审额度内自动放行，没有人工复核（审核人字段为空是正常的）'));
+    }
     card.appendChild(head);
 
     const chips = el('div', 'chips');
@@ -5544,7 +5698,14 @@ async function loadWithdrawals() {
     const payAcct = x.alipay_account || x.account_info || '';
     line('支付宝账号', payAcct || '—');
     if (x.real_name) line('姓名', x.real_name);
-    if (x.reviewed_at) line('审核时间', fmtTime(x.reviewed_at));
+    // 提现方式（服务端下发中文名，前端不再自己映射一遍）。
+    if (x.method_label) line('提现方式', x.method_label);
+    if (x.reviewed_at) {
+      line('审核时间', fmtTime(x.reviewed_at));
+      // 审核人：自动放行的记录 reviewed_by=0，此时显示「系统自动」而不是空白 —— 
+      // 空名字会让人以为"数据丢了"，而真相是"没有人审它"。
+      line('审核人', x.reviewer_name || (x.auto ? '系统自动' : '（管理密钥通道）'));
+    }
     if (x.note) line('审核备注', x.note);
     body.appendChild(copyBtn(() => payAcct + (x.real_name ? ('\t' + x.real_name) : ''), '复制收款信息'));
     card.appendChild(body);

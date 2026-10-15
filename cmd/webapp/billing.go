@@ -1310,6 +1310,13 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		// 提现（v0.11.0）：兑换比例（元/点）与最小提现额（点）。
 		WithdrawRate      *float64 `json:"withdraw_rate"`
 		WithdrawMinPoints *float64 `json:"withdraw_min_points"`
+		// 提现审核方式（v0.29.0）：manual（默认，人工逐笔） / auto（提交即通过并打款）。
+		// WithdrawAutoMaxPoints 是 auto 模式下的**免审额度上限**（点，0 = 不限）。
+		//
+		// 指针类型：必须能区分"没带这个字段"与"显式设为 0"—— 0 在 auto 模式下
+		// 是合法且有意义的取值（= 不限额），用值类型会被"未提供"覆盖掉。
+		WithdrawReviewMode    *string  `json:"withdraw_review_mode"`
+		WithdrawAutoMaxPoints *float64 `json:"withdraw_auto_max_points"`
 
 		// 反代选号（分组 + 白名单）与防封（节流间隔 / 默认出站代理）。
 		ProxyAccounts      *string `json:"proxy_accounts"`        // 反代白名单 uid（逗号分隔，空=全部）
@@ -1508,6 +1515,37 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.store.SetKV(kvWithdrawMinPoints, strconv.FormatFloat(v, 'f', -1, 64)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	// 提现审核方式（v0.29.0）：只接受两个稳定取值，非法值**显式拒绝**而不是静默回落。
+	//
+	// 为什么这里不像读取路径那样"非法即回落 manual"：写入是**有人的操作**，
+	// 拼错一个字符串就把"自动打款"存成了"人工审核"（或反之），静默切换审核方式
+	// 属于最不该悄悄发生的一类行为变更。读取路径回落是为了服务能起得来，
+	// 写入路径拒绝是为了让人知道自己的输入没生效。
+	if req.WithdrawReviewMode != nil {
+		v := strings.ToLower(strings.TrimSpace(*req.WithdrawReviewMode))
+		if v != WithdrawReviewManual && v != WithdrawReviewAuto {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "审核方式只能是 manual（人工审核）或 auto（自动审核）",
+			})
+			return
+		}
+		if err := a.store.SetKV(kvWithdrawReviewMode, v); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		log.Printf("INFO: [withdraw] 提现审核方式已设为 %s（%s）", v, withdrawReviewModeLabel(v))
+	}
+	if req.WithdrawAutoMaxPoints != nil {
+		v := *req.WithdrawAutoMaxPoints
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "免审额度上限不能为负"})
+			return
+		}
+		if err := a.store.SetKV(kvWithdrawAutoMaxPoints, strconv.FormatFloat(v, 'f', -1, 64)); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -1837,10 +1875,12 @@ func (a *app) settingsView() map[string]any {
 		// 推广返点比例（0 = 关闭）。
 		"referral_ratio": a.proxy.referralRatioNow(),
 	}
-	// 提现参数（兑换比例 元/点 + 最小提现额 点）。
+	// 提现参数（兑换比例 元/点 + 最小提现额 点 + 审核方式，v0.29.0）。
 	wRate, wMin := a.withdrawParams()
 	out["withdraw_rate"] = wRate
 	out["withdraw_min_points"] = wMin
+	out["withdraw_review_mode"] = a.withdrawReviewMode()
+	out["withdraw_auto_max_points"] = MicroToPoint(a.withdrawAutoMaxMicro())
 	// 反代选号（分组/白名单）+ 防封（节流间隔/默认出站代理）摘要。
 	for k, v := range a.proxy.SelectionSummary() {
 		out[k] = v
