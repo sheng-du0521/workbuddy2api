@@ -177,7 +177,17 @@ type UsageLog struct {
 	StickyKeyHash string
 	// Attempts 本次请求实际尝试的账号数（v0.17.5）。1 = 首选成功；>1 = 中途换过号，
 	// 说明那一轮发生过失败回退（冷却/4xx/传输错误）。
-	Attempts  int
+	Attempts int
+	// 上游前缀缓存的三个计数（v0.26.7）。
+	//
+	// 为什么落库而不是只放内存：命中率是回答"为什么又慢又贵"的**唯一直接证据** ——
+	// 48 万 token 的请求若命中缓存，预处理几乎免费；若未命中则每次全量重算
+	// （实测 92~129 秒 / 24~25 点）。只放实时面板的话重启即丢，无法做趋势判断。
+	CacheHitTokens   int
+	CacheMissTokens  int
+	CacheWriteTokens int
+	// LatencyMS 端到端耗时（毫秒，v0.26.7）。同理由"内存态 90 分钟"落到账上。
+	LatencyMS int64
 	CreatedAt int64
 }
 
@@ -279,7 +289,11 @@ func (s *Store) migrateUsers() error {
 			error_msg         TEXT NOT NULL DEFAULT '',
 			created_at        INTEGER NOT NULL DEFAULT 0,
 			sticky_key_hash   TEXT NOT NULL DEFAULT '',
-			attempts          INTEGER NOT NULL DEFAULT 0
+			attempts          INTEGER NOT NULL DEFAULT 0,
+			cache_hit_tokens   INTEGER NOT NULL DEFAULT 0,
+			cache_miss_tokens  INTEGER NOT NULL DEFAULT 0,
+			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+			latency_ms         INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_logs(user_id, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS redeem_codes (
@@ -390,6 +404,20 @@ func (s *Store) migrateUsers() error {
 	}
 	if err := s.ensureColumn("usage_logs", "attempts", "attempts INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate usage_logs column attempts: %w", err)
+	}
+	// 缓存命中与耗时增量列（v0.26.7）。老库平滑补齐：历史行留 0。
+	//
+	// 0 = "未采集"而非"命中 0 次" —— 历史行本就无从考据，当成 0 会让命中率被
+	// 严重低估。统计侧据此只在**有观测**的行上算（hit+miss > 0）。
+	for _, c := range []struct{ col, ddl string }{
+		{"cache_hit_tokens", "cache_hit_tokens INTEGER NOT NULL DEFAULT 0"},
+		{"cache_miss_tokens", "cache_miss_tokens INTEGER NOT NULL DEFAULT 0"},
+		{"cache_write_tokens", "cache_write_tokens INTEGER NOT NULL DEFAULT 0"},
+		{"latency_ms", "latency_ms INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn("usage_logs", c.col, c.ddl); err != nil {
+			return fmt.Errorf("migrate usage_logs column %s: %w", c.col, err)
+		}
 	}
 	// scope 索引必须在列的 ensureColumn 之后建（老库建表语句不会补列）。
 	// usage_logs 的补充索引（v0.24.0，P2-6）。
@@ -1327,11 +1355,12 @@ func (s *Store) InsertUsageLog(l *UsageLog) error {
 	_, err := s.db.Exec(
 		`INSERT INTO usage_logs (user_id, key_id, model, prompt_tokens, completion_tokens,
 		 upstream_credit, charged_micro, upstream_uid, scope, status, error_msg, created_at,
-		 sticky_key_hash, attempts)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 sticky_key_hash, attempts, cache_hit_tokens, cache_miss_tokens, cache_write_tokens, latency_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		l.UserID, l.KeyID, l.Model, l.PromptTokens, l.CompletionTokens,
 		l.UpstreamCredit, l.ChargedMicro, l.UpstreamUID, l.Scope, l.Status, l.ErrorMsg, l.CreatedAt,
 		l.StickyKeyHash, l.Attempts,
+		l.CacheHitTokens, l.CacheMissTokens, l.CacheWriteTokens, l.LatencyMS,
 	)
 	return err
 }
@@ -1344,7 +1373,8 @@ func (s *Store) ListUsageLogs(userID int64, limit, offset int) ([]*UsageLog, err
 	rows, err := s.db.Query(
 		`SELECT id, user_id, key_id, model, prompt_tokens, completion_tokens,
 		        upstream_credit, charged_micro, upstream_uid, scope, status, error_msg, created_at,
-		        sticky_key_hash, attempts
+		        sticky_key_hash, attempts,
+		        cache_hit_tokens, cache_miss_tokens, cache_write_tokens, latency_ms
 		 FROM usage_logs WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset)
 	if err != nil {
@@ -1357,7 +1387,8 @@ func (s *Store) ListUsageLogs(userID int64, limit, offset int) ([]*UsageLog, err
 		if err := rows.Scan(&l.ID, &l.UserID, &l.KeyID, &l.Model, &l.PromptTokens,
 			&l.CompletionTokens, &l.UpstreamCredit, &l.ChargedMicro, &l.UpstreamUID,
 			&l.Scope, &l.Status, &l.ErrorMsg, &l.CreatedAt,
-			&l.StickyKeyHash, &l.Attempts); err != nil {
+			&l.StickyKeyHash, &l.Attempts,
+			&l.CacheHitTokens, &l.CacheMissTokens, &l.CacheWriteTokens, &l.LatencyMS); err != nil {
 			return nil, err
 		}
 		out = append(out, &l)
@@ -1378,7 +1409,8 @@ func (s *Store) UsageLogsBySticky(hash string, limit int) ([]*UsageLog, error) {
 	rows, err := s.db.Query(
 		`SELECT id, user_id, key_id, model, prompt_tokens, completion_tokens,
 		        upstream_credit, charged_micro, upstream_uid, scope, status, error_msg, created_at,
-		        sticky_key_hash, attempts
+		        sticky_key_hash, attempts,
+		        cache_hit_tokens, cache_miss_tokens, cache_write_tokens, latency_ms
 		 FROM usage_logs WHERE sticky_key_hash = ? ORDER BY id DESC LIMIT ?`,
 		hash, limit)
 	if err != nil {
@@ -1391,7 +1423,8 @@ func (s *Store) UsageLogsBySticky(hash string, limit int) ([]*UsageLog, error) {
 		if err := rows.Scan(&l.ID, &l.UserID, &l.KeyID, &l.Model, &l.PromptTokens,
 			&l.CompletionTokens, &l.UpstreamCredit, &l.ChargedMicro, &l.UpstreamUID,
 			&l.Scope, &l.Status, &l.ErrorMsg, &l.CreatedAt,
-			&l.StickyKeyHash, &l.Attempts); err != nil {
+			&l.StickyKeyHash, &l.Attempts,
+			&l.CacheHitTokens, &l.CacheMissTokens, &l.CacheWriteTokens, &l.LatencyMS); err != nil {
 			return nil, err
 		}
 		out = append(out, &l)
@@ -1465,8 +1498,7 @@ func (s *Store) UsageByUser(userID int64, days, limit int) ([]UsageUserStat, err
 	if days <= 0 || days > 365 {
 		days = 14
 	}
-	off := localDayOffset()
-	since := time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
+	since := localDayStart(days)
 	q := `SELECT l.user_id, COALESCE(u.username,''), COUNT(*),
 	             COALESCE(SUM(l.prompt_tokens + l.completion_tokens),0),
 	             COALESCE(SUM(l.charged_micro),0), COALESCE(SUM(l.upstream_credit),0)
@@ -1505,8 +1537,7 @@ func (s *Store) CountUsageUsers(days int) (int, error) {
 	if days <= 0 || days > 365 {
 		days = 14
 	}
-	off := localDayOffset()
-	since := time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
+	since := localDayStart(days)
 	var n int
 	err := s.db.QueryRow(
 		`SELECT COUNT(DISTINCT user_id) FROM usage_logs WHERE created_at >= ? AND user_id > 0`,
@@ -1540,6 +1571,31 @@ func localDayOffset() int64 {
 	return int64(off)
 }
 
+// localDayStart 返回近 days 天窗口的**最早本地日界**（unix 秒）。
+//
+// ⚠️ 修复记录（v0.26.7，真实缺陷）：此前 7 处一律写成
+//
+//	time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
+//
+// 而 `Truncate(24h)` 是按 **UTC 零点**切的，再 `+off` 得到的是「本地日界 + 2×off」
+// —— 东八区下即 **本地今天 16:00**（在未来）。后果很具体：**当天 00:00~16:00
+// 产生的流水全部落在窗口之外**，报表在每天前 16 小时里看不到"今天"的数据。
+// 实测：本地 15:05 刚落库的两条流水，`days=1` 窗口查不到（perf 样本数为 0）。
+//
+// 正确做法：用 time.Date 按**本地时区**构造当天零点（与分组口径
+// `(created_at+off)/86400` 同源），再往前推 days-1 天。
+//
+// 抽成单点函数的意义：这个边界是 7 处报表查询的公共前提，散写必然再次漂移
+// （本次就是一处写错、复制了 7 份）。
+func localDayStart(days int) int64 {
+	if days < 1 {
+		days = 1
+	}
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	return start.AddDate(0, 0, -(days - 1)).Unix()
+}
+
 // UsageDaily 按本地自然日聚合近 days 天的用量；userID <= 0 表示全站。
 // 返回按日期升序（便于前端直接画折线）。
 func (s *Store) UsageDaily(userID int64, days int) ([]UsageDailyStat, error) {
@@ -1553,8 +1609,9 @@ func (s *Store) UsageDailyScoped(userID int64, days int, scope string) ([]UsageD
 		days = 14
 	}
 	off := localDayOffset()
-	since := time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
-	// 注意：Truncate 按 UTC 切，故上式的 since 只用于粗筛，真正的日界仍由 (created_at+off)/86400 决定。
+	since := localDayStart(days)
+	// since 是**精确**的本地日界（localDayStart，见其注释）；分组口径
+	// (created_at+off)/86400 与它同源，两者不会错位。
 	query := `SELECT (created_at + ?) / 86400 AS d,
 	                 COUNT(*), COALESCE(SUM(prompt_tokens + completion_tokens),0), COALESCE(SUM(charged_micro),0),
 	                 COALESCE(SUM(upstream_credit),0)
@@ -1592,13 +1649,123 @@ func (s *Store) UsageByModel(userID int64, days int) ([]UsageModelStat, error) {
 	return s.UsageByModelScoped(userID, days, "")
 }
 
+// UsagePerf 性能与缓存观测汇总（v0.26.7）。
+//
+// 为什么单开一个结构：这是回答"为什么又慢又贵"的两个直接指标 ——
+// **端到端耗时**（用户感知）与**前缀缓存命中率**（决定预处理成本）。
+// 此前前者只活在 90 分钟的内存态实时面板里，后者**根本没采**，
+// 于是"延迟高"只能靠肉眼看单个事件、无法归因。
+type UsagePerf struct {
+	// 耗时（仅统计有观测的行：latency_ms > 0）
+	LatencySampled int64   `json:"latency_sampled"`
+	AvgLatencyMS   float64 `json:"avg_latency_ms"`
+	P50LatencyMS   int64   `json:"p50_latency_ms"`
+	P95LatencyMS   int64   `json:"p95_latency_ms"`
+	MaxLatencyMS   int64   `json:"max_latency_ms"`
+
+	// 前缀缓存（仅统计上游**明确回报**过的行：hit+miss > 0）
+	CacheSampled     int64   `json:"cache_sampled"`
+	CacheHitTokens   int64   `json:"cache_hit_tokens"`
+	CacheMissTokens  int64   `json:"cache_miss_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	CacheHitRate     float64 `json:"cache_hit_rate"`
+}
+
+// UsagePerf 汇总近 days 天的耗时与缓存指标；userID<=0 表示全站。
+//
+// 口径说明（重要，别把"没采到"当成"是 0"）：
+//   - 历史行（v0.26.7 之前）两个指标都是 0，**计入 sampled 会把平均值拉低**。
+//     所以分母只算"有观测"的行，并把 sampled 一并返回，让调用方知道样本量。
+//   - 命中率用 token 加权（hit / (hit+miss)），不是按请求数 —— 缓存省的是
+//     token 预处理成本，按请求数算会让一个 48 万 token 的请求和一次 100 token
+//     的探活等权，完全没有意义。
+func (s *Store) UsagePerf(userID int64, days int) (UsagePerf, error) {
+	var p UsagePerf
+	if days <= 0 || days > 365 {
+		days = 14
+	}
+	since := localDayStart(days)
+
+	where := ` WHERE created_at >= ?`
+	args := []any{since}
+	if userID > 0 {
+		where += ` AND user_id = ?`
+		args = append(args, userID)
+	}
+
+	// 1) 耗时聚合
+	var avg sql.NullFloat64
+	var maxMS sql.NullInt64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*), AVG(latency_ms), MAX(latency_ms) FROM usage_logs`+
+			where+` AND latency_ms > 0`, args...).
+		Scan(&p.LatencySampled, &avg, &maxMS); err != nil {
+		return p, err
+	}
+	if avg.Valid {
+		p.AvgLatencyMS = avg.Float64
+	}
+	p.MaxLatencyMS = maxMS.Int64
+
+	// 2) 分位（行数在报告窗口内可控；直接取有序切片算，避免方言依赖）
+	if p.LatencySampled > 0 {
+		rows, err := s.db.Query(
+			`SELECT latency_ms FROM usage_logs`+where+` AND latency_ms > 0 ORDER BY latency_ms`, args...)
+		if err != nil {
+			return p, err
+		}
+		vals := make([]int64, 0, p.LatencySampled)
+		for rows.Next() {
+			var v int64
+			if err := rows.Scan(&v); err != nil {
+				rows.Close()
+				return p, err
+			}
+			vals = append(vals, v)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return p, err
+		}
+		p.P50LatencyMS = percentile(vals, 0.50)
+		p.P95LatencyMS = percentile(vals, 0.95)
+	}
+
+	// 3) 缓存聚合（只算上游回报过的行）
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0),
+		        COALESCE(SUM(cache_write_tokens),0)
+		 FROM usage_logs`+where+` AND (cache_hit_tokens + cache_miss_tokens) > 0`, args...).
+		Scan(&p.CacheSampled, &p.CacheHitTokens, &p.CacheMissTokens, &p.CacheWriteTokens); err != nil {
+		return p, err
+	}
+	if denom := p.CacheHitTokens + p.CacheMissTokens; denom > 0 {
+		p.CacheHitRate = float64(p.CacheHitTokens) / float64(denom)
+	}
+	return p, nil
+}
+
+// percentile 取升序切片的分位值（最近秩法）。空切片返回 0。
+//
+// 用最近秩而不是插值：耗时分布是长尾的，"950ms 与 1200ms 之间插出 1075ms"
+// 这种精度对排障没有价值，反而让数字看起来比实际更可信。
+func percentile(sorted []int64, q float64) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(len(sorted)) * q)
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
 // UsageByModelScoped 同上，可限定 scope。
 func (s *Store) UsageByModelScoped(userID int64, days int, scope string) ([]UsageModelStat, error) {
 	if days <= 0 || days > 365 {
 		days = 14
 	}
-	off := localDayOffset()
-	since := time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
+	since := localDayStart(days)
 	query := `SELECT model, COUNT(*), COALESCE(SUM(prompt_tokens + completion_tokens),0), COALESCE(SUM(charged_micro),0),
 	                 COALESCE(SUM(upstream_credit),0)
 	          FROM usage_logs WHERE created_at >= ?`
@@ -1652,7 +1819,7 @@ func (s *Store) HostEarningsDaily(ownerUserID int64, days int) ([]HostEarnDailyS
 		days = 14
 	}
 	off := localDayOffset()
-	since := time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
+	since := localDayStart(days)
 	rows, err := s.db.Query(
 		`SELECT (created_at + ?) / 86400 AS d, COUNT(*),
 		        COALESCE(SUM(charged_micro),0), COALESCE(SUM(earned_micro),0)
@@ -1680,8 +1847,7 @@ func (s *Store) HostEarningsByModel(ownerUserID int64, days int) ([]HostEarnMode
 	if days <= 0 || days > 365 {
 		days = 14
 	}
-	off := localDayOffset()
-	since := time.Now().AddDate(0, 0, -(days-1)).Truncate(24*time.Hour).Unix() + off
+	since := localDayStart(days)
 	rows, err := s.db.Query(
 		`SELECT model, COUNT(*), COALESCE(SUM(charged_micro),0), COALESCE(SUM(earned_micro),0)
 		 FROM host_earnings WHERE owner_user_id = ? AND created_at >= ?

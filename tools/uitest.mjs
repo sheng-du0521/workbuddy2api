@@ -382,6 +382,14 @@ const FX = {
     days: 14, totals: { requests: 120, tokens: 12345, charged: 1.23 },
     daily: [{ day: '2026-10-09', requests: 10, tokens: 1000, charged: 0.1 }],
     models: [{ model: 'deepseek-v4-flash', requests: 80, tokens: 9000, charged: 0.9 }],
+    // v0.26.7：性能与前缀缓存观测。刻意给三段不同量级的耗时（1 秒内 / 几秒 /
+    // 两分多钟）—— 这正好覆盖 fmtDur 的三个分支，也是真实排查里同时存在的形态。
+    perf: {
+      latency_sampled: 40, avg_latency_ms: 99000, p50_latency_ms: 4520,
+      p95_latency_ms: 126481, max_latency_ms: 216800,
+      cache_sampled: 12, cache_hit_rate: 0.994,
+      cache_note: '命中率按 token 加权：hit / (hit + miss)，仅统计上游明确回报过的请求',
+    },
   },
   '/api/usage/report': {
     days: 14, totals: { requests: 12, tokens: 3456, charged: 0.05 },
@@ -1229,6 +1237,29 @@ function run(pageFile, meOverride, plan) {
     // v0.12.0：兑换码卡片每条带单个复制按钮。
     { nav: 'codes', counts: [['codeCards', 2]], has: [['#codeCards .code-name .icon-btn', 2]] },
     { nav: 'withdrawals', counts: [['wdKpis', 6], ['wdCards', 2], ['wdFilter', 1]], texts: [['wdBadge', '1']] },
+    // v0.26.7：性能与前缀缓存面板（耗时 + 命中率）。三档耗时形态各断言一个，
+    // 避免"数字渲染对了但单位错了"这类不会被计数断言抓到的问题。
+    { nav: 'report',
+      has: [['#perfKpis .kpi-card', 3]],
+      textIn: [['#perfKpis', '平均耗时'], ['#perfKpis', 'P95 耗时'], ['#perfKpis', '缓存命中率'],
+        ['#perfKpis', '1 分 39 秒'], ['#perfKpis', '99.4'], ['#perfKpis', '2 分 6 秒'],
+        ['#perfNote', '耗时样本 40 条'], ['#perfNote', 'token 加权']],
+      // 空态提示语不得出现（这是"有数据"的用例）。
+      lacks: [['#perfNote', '还没有性能观测']] },
+    // 空态：本窗口没有任何观测时**必须明说"没有观测"，不许画成 0**。
+    // 把命中率画成 0% 会被读成"缓存完全没生效"，与"还没采到"的下一步动作相反。
+    { nav: 'report',
+      fx: [['/api/admin/usage', {
+        days: 14, totals: { requests: 5, tokens: 100, charged: 0.1 },
+        daily: [{ day: '2026-10-09', requests: 5, tokens: 100, charged: 0.1 }],
+        models: [{ model: 'm', requests: 5, tokens: 100, charged: 0.1 }],
+        perf: { latency_sampled: 0, cache_sampled: 0, avg_latency_ms: 0,
+          p50_latency_ms: 0, p95_latency_ms: 0, max_latency_ms: 0, cache_hit_rate: 0 },
+      }]],
+      textIn: [['#perfKpis', '—'], ['#perfNote', '还没有性能观测'],
+        ['#perfNote', '显示为"—"而不是 0']],
+      lacks: [['#perfKpis', '0.0']] },
+
     { nav: 'report', counts: [['reportTotals', 4], ['reportChart', 1], ['reportModelBars', 1], ['reportModelTokens', 1], ['reportDailyTable', 1], ['rpBars', 60]],
       // v0.17.8：用户消耗排行（横向条 + 明细表；按消耗点数降序）。
       has: [['#reportUserRank .hbar-row', 2], ['#reportUserRank table', 1], ['#rankLimit', 1], ['#btnRankRefresh', 1]],

@@ -52,6 +52,28 @@ type usageInfo struct {
 	CompletionTokens int
 	Credit           float64
 	HasCredit        bool
+
+	// 前缀缓存观测（v0.26.7）：上游在末帧 usage 里**明确回报**的三个计数。
+	//
+	// 为什么必须采（这是一次真实排查逼出来的）：上游对同一前缀有缓存，
+	// 命中时预处理几乎免费、未命中则要全量重算 —— 实测本机 48 万 token 的请求
+	// 单次耗时 92~129 秒、计 24~25 点，但按缓存命中口径该低一个数量级。
+	// 旧网关（internal/server/logging.go）一直在采这三个字段并有命中率统计，
+	// **只有 webapp 这条链路把它们丢了** —— 于是"缓存到底有没有生效"根本无从判断，
+	// 只能对着耗时和费用猜。观测缺口本身就是缺陷。
+	//
+	// 口径：hit + miss 才是本次 prompt 的全量（write 是本次**新写入**缓存的量）。
+	// 三者都为 0 = 上游没返回（老版本 / 非缓存模型），**不等于命中率为 0**。
+	CacheHitTokens   int
+	CacheMissTokens  int
+	CacheWriteTokens int
+
+	// LatencyMS 本次请求的端到端耗时（毫秒），由转发层在结算前填入。
+	//
+	// 为什么不从上游取：上游只给处理时长，用户感知的是"从发出到收完"的整体，
+	// 含排队、换号重试、反代回程。此前它只存在于 90 分钟的内存态实时面板里，
+	// 进程一重启就没，无法做"最近一天 p95 是多少"这类判断。
+	LatencyMS int64
 }
 
 // Total 总 token 数。
@@ -708,10 +730,30 @@ func (a *app) writeUsageReport(w http.ResponseWriter, r *http.Request, userID in
 			"charged": MicroToPoint(m.ChargedMicro),
 		})
 	}
+	// 性能与缓存汇总（v0.26.7）：耗时与前缀缓存命中率是"又慢又贵"的两个直接指标。
+	// 取不到不阻断报表（它是**附加观测**，不是账目本身）—— 失败就留零值并在
+	// perf_error 里说明，免得把"查不到"显示成"很健康"。
+	perf, perfErr := a.store.UsagePerf(userID, days)
+	perfPayload := map[string]any{
+		"latency_sampled": perf.LatencySampled,
+		"avg_latency_ms":  perf.AvgLatencyMS,
+		"p50_latency_ms":  perf.P50LatencyMS,
+		"p95_latency_ms":  perf.P95LatencyMS,
+		"max_latency_ms":  perf.MaxLatencyMS,
+		"cache_sampled":   perf.CacheSampled,
+		"cache_hit_rate":  perf.CacheHitRate,
+		// 命中率的口径写在响应里，避免前端各自解读（token 加权 ≠ 请求数加权）。
+		"cache_note": "命中率按 token 加权：hit / (hit + miss)，仅统计上游明确回报过的请求",
+	}
+	if perfErr != nil {
+		perfPayload["perf_error"] = perfErr.Error()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"days":   days,
 		"daily":  dailyItems,
 		"models": modelItems,
+		"perf":   perfPayload,
 		"totals": map[string]any{
 			"requests": reqs, "tokens": tokens, "charged": MicroToPoint(charged),
 		},

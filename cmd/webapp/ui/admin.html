@@ -1034,6 +1034,16 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
         <div class="chart-legend" id="reportLegend"></div>
       </div>
 
+      <!-- ==================== 性能与前缀缓存（v0.26.7） ==================== -->
+      <div class="card">
+        <div class="section-head">
+          <h2>性能与前缀缓存</h2>
+          <span class="muted" style="font-size:12px;">回答「为什么又慢又贵」</span>
+        </div>
+        <div class="kpis" id="perfKpis"></div>
+        <div class="sub" id="perfNote" style="margin-top:12px;"></div>
+      </div>
+
       <div class="live-grid">
         <div class="card" style="margin:0;">
           <h2>按模型消耗</h2>
@@ -4967,6 +4977,60 @@ async function loadUserRanking(days) {
   }
 }
 
+// fmtDur 把毫秒渲染成人话（ms / s / m s）。耗时跨越 1 秒到 2 分钟量级，
+// 固定用毫秒会让 126481 这种数字读不出"两分多钟"。
+function fmtDur(ms) {
+  const n = Number(ms) || 0;
+  if (n <= 0) return '—';
+  if (n < 1000) return n + ' ms';
+  if (n < 60000) return (n / 1000).toFixed(n < 10000 ? 2 : 1) + ' s';
+  const m = Math.floor(n / 60000), sec = Math.round((n % 60000) / 1000);
+  return m + ' 分 ' + sec + ' 秒';
+}
+
+// renderReportPerf 渲染「性能与前缀缓存」一块。
+//
+// 为什么单独抽成函数：这块有**空态与有数据两套文案**，且空态的分支是这条
+// 功能里唯一容易被写错的（把"没采到"画成"0"）。抽出来便于用例直接调用验证。
+function renderReportPerf(perf) {
+  const box = $('perfKpis'), note = $('perfNote');
+  if (!box) return;
+  box.textContent = '';
+  note.textContent = '';
+
+  const latN = Number(perf.latency_sampled) || 0;
+  const cacheN = Number(perf.cache_sampled) || 0;
+
+  if (!latN && !cacheN) {
+    // 空态：明确说"还没有观测"，并说明原因与窗口。
+    box.appendChild(kpiCard('平均耗时', '—'));
+    box.appendChild(kpiCard('P95 耗时', '—'));
+    box.appendChild(kpiCard('缓存命中率', '—'));
+    note.appendChild(el('div', 'hintbar',
+      '本窗口内还没有性能观测。耗时与缓存命中量自 v0.26.7 起采集，'
+      + '此前的历史请求没有这两项数据（显示为"—"而不是 0）。'));
+    return;
+  }
+
+  box.appendChild(kpiCard('平均耗时', fmtDur(perf.avg_latency_ms)));
+  box.appendChild(kpiCard('P95 耗时', fmtDur(perf.p95_latency_ms)));
+  const rate = cacheN ? (Number(perf.cache_hit_rate) || 0) * 100 : null;
+  box.appendChild(kpiCard('缓存命中率', rate == null ? '—' : rate.toFixed(1), '%'));
+
+  const parts = [];
+  parts.push('耗时样本 ' + latN + ' 条');
+  if (latN) {
+    parts.push('中位 ' + fmtDur(perf.p50_latency_ms) + '，最大 ' + fmtDur(perf.max_latency_ms));
+  }
+  if (cacheN) {
+    parts.push('缓存样本 ' + cacheN + ' 条（仅上游明确回报的请求）');
+    parts.push(perf.cache_note || '命中率按 token 加权');
+  } else {
+    parts.push('本窗口内上游未回报缓存计数');
+  }
+  note.appendChild(el('div', 'sub', parts.join(' · ')));
+}
+
 async function loadReport() {
   loadConsumeFailures(); // 消耗失败台账（独立拉，失败不影响主报表）
   const days = Number($('reportDays').value) || 14;
@@ -4997,6 +5061,12 @@ async function loadReport() {
       chart.appendChild(el('div', 'hintbar', '暂无数据'));
       $('reportLegend').textContent = '';
     }
+
+    // 性能与前缀缓存（v0.26.7）。三件事必须一起说清楚，否则会被误读：
+    //   · 样本数（有多少请求真的带了观测）—— 没有它，平均值无从判断可信度；
+    //   · 命中率按 **token 加权**（口径随响应下发）；
+    //   · **没有观测时绝不画 0** —— "命中率 0%"与"还没有观测"下一步动作相反。
+    renderReportPerf(d.perf || {});
 
     // 按模型：扣费 / Tokens 横向条。
     const models = d.models || [];

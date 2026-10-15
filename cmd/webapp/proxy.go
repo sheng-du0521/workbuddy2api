@@ -1364,7 +1364,9 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			})
 			// 记一条「中断」流水：0 费用（usage 为空、status≠ok → consumedCredit=0），
 			// 预扣由 settleUsage 内部全额退还。这样「执行到一半断了」在账单里查得到。
-			settled, _ = p.settleUsage(u, key, model, au.UID, usageInfo{}, resv, "interrupted",
+			settled, _ = p.settleUsage(u, key, model, au.UID,
+				usageInfo{LatencyMS: time.Since(start).Milliseconds()},
+				resv, "interrupted",
 				"upstream stream interrupted: "+streamErr.Error(), stickyHash, attempt+1)
 			return
 		}
@@ -1372,6 +1374,10 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		// 注意用 `=` 而非 `:=`：settled 是外层变量，`:=" 会在循环块里遮蔽它，
 		// 导致下面 defer 的「未结算则释放预扣」判据永远为真（成功也退一次）。
 		var chargedMicro int64
+		// 端到端耗时（含排队 / 换号重试 / 回程）：在结算前填一次。
+		// 走 usageInfo 而不是给 settleUsage 再加一个参数 —— 该函数已有 10 个入参，
+		// 而这是一个纯粹的"本次请求观测值"，与 prompt/completion 同性质。
+		ui.LatencyMS = time.Since(start).Milliseconds()
 		settled, chargedMicro = p.settleUsage(u, key, model, au.UID, ui, resv, "ok", "", stickyHash, attempt+1)
 		// 号池侧成本账簿 + 余额实时收敛（v0.17.6 修复）。
 		//
@@ -1938,6 +1944,12 @@ func parseUsageLine(line string, ui *usageInfo) {
 			CompletionTokens int      `json:"completion_tokens"`
 			PromptTokens     int      `json:"prompt_tokens"`
 			Credit           *float64 `json:"credit"`
+			// 前缀缓存三计数（v0.26.7）：旧网关一直在采，webapp 此前漏了。
+			// 字段名与 internal/server/logging.go 保持一字不差 —— 两套转发实现的
+			// 观测口径必须是同一份，否则两个面板的"命中率"不可比。
+			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
+			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -1945,6 +1957,9 @@ func parseUsageLine(line string, ui *usageInfo) {
 	}
 	ui.PromptTokens = chunk.Usage.PromptTokens
 	ui.CompletionTokens = chunk.Usage.CompletionTokens
+	ui.CacheHitTokens = chunk.Usage.PromptCacheHitTokens
+	ui.CacheMissTokens = chunk.Usage.PromptCacheMissTokens
+	ui.CacheWriteTokens = chunk.Usage.PromptCacheWriteTokens
 	if chunk.Usage.Credit != nil {
 		ui.Credit = *chunk.Usage.Credit
 		ui.HasCredit = true
@@ -2111,12 +2126,19 @@ func parseUsageJSON(raw json.RawMessage) usageInfo {
 		CompletionTokens int      `json:"completion_tokens"`
 		PromptTokens     int      `json:"prompt_tokens"`
 		Credit           *float64 `json:"credit"`
+		// 缓存三计数：与流式路径（parseUsageLine）逐字段对齐，两条链路口径必须一致。
+		PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
+		PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
 	}
 	if json.Unmarshal(raw, &u) != nil {
 		return ui
 	}
 	ui.PromptTokens = u.PromptTokens
 	ui.CompletionTokens = u.CompletionTokens
+	ui.CacheHitTokens = u.PromptCacheHitTokens
+	ui.CacheMissTokens = u.PromptCacheMissTokens
+	ui.CacheWriteTokens = u.PromptCacheWriteTokens
 	if u.Credit != nil {
 		ui.Credit = *u.Credit
 		ui.HasCredit = true
@@ -2237,6 +2259,10 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 		ErrorMsg:         errMsg,
 		StickyKeyHash:    stickyHash,
 		Attempts:         attempts,
+		CacheHitTokens:   ui.CacheHitTokens,
+		CacheMissTokens:  ui.CacheMissTokens,
+		CacheWriteTokens: ui.CacheWriteTokens,
+		LatencyMS:        ui.LatencyMS,
 	})
 	// 代挂分成：本次若由某号主的「已入池」代挂账号服务平台流量，
 	// 按「号池积分消耗 × 分成比例」折入号主余额（以本次实收封顶）。
@@ -2282,6 +2308,10 @@ func (p *Proxy) logAdminChannelUsage(key *APIKey, model, upstreamUID string, ui 
 		ErrorMsg:         errMsg,
 		StickyKeyHash:    stickyHash,
 		Attempts:         attempts,
+		CacheHitTokens:   ui.CacheHitTokens,
+		CacheMissTokens:  ui.CacheMissTokens,
+		CacheWriteTokens: ui.CacheWriteTokens,
+		LatencyMS:        ui.LatencyMS,
 	})
 }
 
