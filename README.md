@@ -90,6 +90,9 @@ OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时积�
   产物随 **GitHub Release** 发布（`version.json` 的 `assets` 按平台列出 url / sha256 / size，
   windows-amd64 已填）；发布用 `release.py`（上传前校验"清单声明的 sha256 == 实际字节"，
   不一致就拒绝 —— 否则线上会下到一个永远校验失败的文件）。
+  ⚠️ 清单客户端对**本机/内网目标直连**（`internal/egress.Bypass` 同一判据）：Go 的 httpproxy
+  只特判 `localhost`，`127.0.0.1` / `10.x` / `192.168.x` 会被照发给环境代理并拦成 502 ——
+  「清单放内网文件服务」这种正当用法曾因此表现为"更新检查莫名失败"（v0.31.8 修）；
   ⚠️ 更新**检查**走仓库清单（`raw` 候选 + `api.github.com` Contents API 回退），
   更新**下载**走 Release 资产地址（`github.com` → 其 CDN）—— 两者可达性可以不同，
   本机实测 `raw.githubusercontent.com` 与 `github.com` 均不可达、只有 `api.github.com` 通，

@@ -16,11 +16,14 @@ package selfupdate
 
 import (
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/egress"
 )
 
 const (
@@ -59,7 +62,29 @@ const (
 
 // HTTPClient 拉取清单用的客户端。抽成变量以便测试注入
 // （否则每个用例都要真连外网 —— 又慢又 flaky，最后没人愿意为它写测试）。
-var HTTPClient = &http.Client{Timeout: NetTimeout}
+//
+// ## 为什么自定义 Transport 的 Proxy（v0.31.7）
+//
+// 部署环境常带 `http_proxy/https_proxy`（本项目本机就是），而 Go 的 httpproxy 只特判
+// `localhost` **这一个词**：`127.0.0.1` / `10.x` / `192.168.x` / `172.16-31.x` 一律照发给代理。
+// 后果是"把清单放在内网文件服务 / 本机自测"这种完全正当的用法会被代理拦成
+// 502（表现为"更新检查莫名失败"，且看不出跟代理有关）。这与本项目在出站链路上
+// 已经修过的 R3 是同一类问题（见 internal/egress.Bypass），此处复用同一个判据。
+var HTTPClient = &http.Client{Timeout: NetTimeout, Transport: newTransport()}
+
+// newTransport 克隆默认 Transport（保留 ProxyFromEnvironment 与连接池调优），
+// 只加一层"本机/内网目标直连"的过滤。
+func newTransport() *http.Transport {
+	envProxy := http.ProxyFromEnvironment
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req != nil && req.URL != nil && egress.Bypass(req.URL.Hostname()) {
+			return nil, nil
+		}
+		return envProxy(req)
+	}
+	return t
+}
 
 // updateFetchMu 保证同一时刻只有一次真实出站（单飞）。
 // 包级变量即可：一个进程只有一个 app 实例，它只是防并发，不承载状态。

@@ -1,16 +1,16 @@
 {
-  "version": "0.31.7",
+  "version": "0.31.8",
   "min_supported": "0.24.0",
-  "notes": "v0.31.7：三件事一起交付 —— 并发窗口的重复调度（软偏好）、P2-7 拆包第一刀、自动更新产物落地。① **同 (账号, 模型) 的在途请求**：6004 冷却是响应到达后才写入的，所以同一 (账号,模型) 的并发请求会在冷却写下之前各自选到同一个号，把一次上游限额放大成 N 次必然失败的请求。处置做成**软偏好**而不是硬互斥：有别的候选就换一个，只剩它就照用（可用性绝不因此下降）；并加计数 model_busy_skips（/api/admin/live 的 route 块）留证据。**为什么不做硬互斥**：实测近 7 天 4086 次请求里，同 (账号,模型) ≤10s 的重复调度有 398 对、其中含失败的 **0** 对，67 次 6004 里也没有一次是它造成的 —— 用未观测到的问题换并发能力不划算。② **P2-7 拆包第一刀**：把版本更新子系统的**纯逻辑**（清单类型/语义化版本/候选推导/状态判定/CLI 输出）从 5 万行的 cmd/webapp 下沉到新包 `internal/selfupdate`（约 600 行），IO 胶水留在原处；原包用过渡别名保持调用点与既有测试**一行不改**（零行为变化），新包自带测试网（含 JSON 键名契约断言）。③ **自动更新产物落地**：`version.json` 的 `assets` 从空数组变为真实条目（windows/amd64，release v0.31.7 的 webapp.exe，含 sha256 与 size），并在 GitHub 建了同名 release 承载产物；下载链路仍严格「校验 sha256 才落盘为 .new」、不自动替换运行中的 exe。默认清单地址与多候选回退不变：本机实测 raw.githubusercontent.com 不可达，链路的等价候选（api.github.com 的 Contents API）才是实际生效的那条 —— 这正是候选回退存在的意义。",
-  "released_at": 1792092600,
+  "notes": "v0.31.8：v0.31.7 的收尾 —— 清单拉取的私网直连修复 + 更新通道端到端验证证据 + 重新发布产物。① **修复**：清单拉取用的 HTTP 客户端此前直接吃 `http_proxy/https_proxy` 环境变量，而 Go 的 httpproxy 只特判 `localhost` 这一个词 —— `127.0.0.1` / `10.x` / `192.168.x` / `172.16-31.x` 一律照发给代理。后果是「把清单放在内网文件服务或本机自测」这种正当用法会被代理拦成 502，表现为「更新检查莫名失败」且看不出与代理有关（与本项目在出站链路上修过的 R3 同类，复用 internal/egress.Bypass 判据）。② **为什么另发一版而不是改 v0.31.7 的产物**：release 产物一旦发布就不该改字节 —— 已缓存的清单里写着旧 sha256，换了产物会让那些客户端校验失败。版本号不要钱，语义正确更值钱。③ **端到端验证证据（本轮实测）**：本地起 HTTP 服务提供「清单 + 产物」，隔离实例触发检测→自动下载→**sha256 校验通过**→落盘 `webapp.exe.new`（262144 字节，实测摘要与夹具一致）+ 生成 `apply-update.bat`；再把清单摘要改成 64 个 0 重跑 → `WARN: [update] 产物下载失败：sha256 校验不通过（已丢弃）`、状态落 `failed`、**磁盘上零落盘**。④ 发布：release v0.31.8 承载 windows/amd64 产物（本条目 sha256/size 即其实测值），发布脚本上传前会校验「清单声明 == 实际字节」。",
+  "released_at": 1792094200,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.7/webapp.exe",
-      "sha256": "28acef04823273666611d55e6af0149ce8e52e5259d9b1687489c7215efeb3ee",
-      "size": 14882304
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.8/webapp.exe",
+      "sha256": "a0b6faef719cbbb3b0c98d5aad16d0569e2f466711bb7a4fac759d2dab77d48b",
+      "size": 14883840
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.7）；换版本时同步换 url 与 sha256。"
