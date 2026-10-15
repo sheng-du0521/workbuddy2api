@@ -1371,12 +1371,20 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		}
 		var ui usageInfo
 		var streamErr error
+		var se streamModelErr
 		if wantStream {
-			ui, streamErr = streamSSE(w, resp)
+			ui, se, streamErr = streamSSE(w, resp)
 		} else {
-			ui, streamErr = aggregateSSE(w, resp)
+			ui, se, streamErr = aggregateSSE(w, resp)
 		}
 		resp.Body.Close()
+		// 流内模型级错误帧（HTTP 200 + error 帧）：补做 (账号, 模型) 冷却（v0.31.1）。
+		//
+		// 放在 streamErr 分支**之前**：流中途断了也要冷却（错误帧已到达，结论已定），
+		// 何况断流本身就是"这个号这条路走不通"的旁证。
+		if se.Code != 0 {
+			p.reportInStreamModelError(au.UID, model, se.Raw, raw)
+		}
 		if streamErr != nil {
 			// 上游流中断（读 body 出错：上游掐断 / 网络抖动 / 客户端断连传播）。
 			// 流式路径此刻 HTTP 头已发出，改不了状态码 —— 但 [DONE] 已由 streamSSE
@@ -1903,6 +1911,84 @@ func toInt(v any) (int, bool) {
 // streamSSE 把上游 SSE 原样转发给客户端，同时抽取 usage 供计费。
 // 边转发边解析：上游通常在末帧才补全 usage.credit，但逐帧覆盖式采集能兼容
 // 「首帧给 token、末帧给 credit」与「末帧一次性给全」两种形态。
+// streamModelErr 流内（HTTP 200）出现的**模型级**错误帧。
+//
+// 为什么需要这个类型（v0.31.1）：上游有时把错误放在**已经 200 的流里**（error 帧），
+// 而不是用 4xx 拒绝请求。旧实现把带 error 键的帧原样透传给客户端，
+// **池侧完全不知道** —— 于是这个 (账号, 模型) 不会被冷却，下一个同模型请求照样被
+// 路由到它，再次撞同一个错。这正是「冷却机制存在但没生效」的一类漏洞。
+type streamModelErr struct {
+	Code int
+	Raw  []byte // 该帧原文（供台账记录与重置时刻解析）
+}
+
+// detectStreamModelErrorFrame 从一行 SSE 文本里提取模型级错误帧。
+//
+// 只认**模型级** code（6004 模型限额 / 11102 该后端无此模型）—— 这是它存在的唯一目的。
+// 其他 code 一律返回零值，交给既有链路处置：流式热路径上不做重复分类，
+// 也让本函数的语义边界与 (账号, 模型) 冷却严格对齐。
+//
+// 快速拒绝：绝大多数行不含 "error"，一次 Contains 即排除（热路径零分配、零解析）。
+func detectStreamModelErrorFrame(line string) streamModelErr {
+	if !strings.Contains(line, "error") {
+		return streamModelErr{}
+	}
+	payload, ok := upstream.StripSSEDataPrefix(line)
+	if !ok || !strings.Contains(payload, "error") {
+		return streamModelErr{}
+	}
+	raw := []byte(payload)
+	switch code := parseUpstreamCode(raw); code {
+	case 6004, 11102: // 模型级：需要 (账号, 模型) 维度的避让
+		return streamModelErr{Code: code, Raw: raw}
+	}
+	return streamModelErr{}
+}
+
+// reportInStreamModelError 对「HTTP 200 + 流内模型级错误帧」补做 (账号, 模型) 冷却。
+//
+// 与 4xx 路径**共用同一套冷却原语**（CooldownSoftForModel / BlockModelBackoff），
+// 因此「生效范围、时长、恢复逻辑」与 6004 的 4xx 形态完全一致，不存在两套口径。
+//
+// 刻意**只**做模型级那一件事，不跑 reportUpstreamError 的全部分支：
+// 这条路径上响应已经发出去一半，换号重试早已无意义；账号级处罚（熔断/归档/停用）
+// 需要更强的证据，不该由一段流内文本触发。
+//
+// status 传真实值（200）而不是伪装成 429：台账要能区分「上游用 4xx 拒绝」与
+// 「上游在流里报错」这两种形态，否则排障时会把后者读成前者。
+func (p *Proxy) reportInStreamModelError(uid, model string, body, reqBody []byte) {
+	code := parseUpstreamCode(body)
+	if code == 0 || uid == "" {
+		return
+	}
+	var src upstream.ResetSource
+	switch code {
+	case 6004:
+		var resetAt time.Time
+		resetAt, src = upstream.ResolveResetAt(nil, body, time.Now())
+		p.pool.CooldownSoftForModel(uid, softCooldown, resetAt, model,
+			"6004 model rate limit (in-stream)"+resetSrcSuffix(src))
+	case 11102:
+		p.pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+	default:
+		return
+	}
+	p.store.recordConsumeFailure(ConsumeFailure{
+		Stage:       FailStageUpstream,
+		Code:        code,
+		Kind:        upstream.Classify(http.StatusOK, string(body)).String(),
+		Status:      http.StatusOK,
+		Model:       model,
+		UID:         uid,
+		Source:      "proxy-stream",
+		ResetSource: string(src),
+		Detail: fmt.Sprintf("上游 200 + 流内错误帧：%s｜请求形状 %s",
+			firstLine(upstream.UpstreamDisplayMsg(string(body))), requestShape(reqBody)),
+	})
+	log.Printf("WARN: [proxy] 流内错误帧 acct=%s model=%s code=%d → 已按 (账号,模型) 写入冷却",
+		logfmt.Label(uid, ""), model, code)
+}
+
 // streamSSE 逐行透传上游 SSE 到客户端，并返回本次用量。
 //
 // 返回值 err（v0.17.5 新增）：读上游 body 过程中的错误。**必须返回而不是吞掉** ——
@@ -1914,8 +2000,9 @@ func toInt(v any) (int, bool) {
 // 客户端以 `[DONE]`（或 finish_reason）判定「回答结束」，没有它就一直挂着等，
 // 表现为「会话中断 / 一直转圈」。这里无条件兜底补一个，与 internal/upstream 的
 // StreamHint 同口径（那条成熟链路一直有，本链路此前缺失）。
-func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error) {
+func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, streamModelErr, error) {
 	var ui usageInfo
+	var me streamModelErr // 首个模型级错误帧（若有）：供调用方补做 (账号,模型) 冷却
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1928,6 +2015,11 @@ func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		parseUsageLine(line, &ui)
+		// 只取**首个**模型级错误帧：一次流里同一 (账号,模型) 只会被冷却一次，
+		// 重复取没有增量，反而让"首个原因"被后面的帧覆盖掉。
+		if me.Code == 0 {
+			me = detectStreamModelErrorFrame(line)
+		}
 		if isSSEDone(line) {
 			sawDone = true
 		}
@@ -1946,7 +2038,7 @@ func streamSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error) {
 			flusher.Flush()
 		}
 	}
-	return ui, err
+	return ui, me, err
 }
 
 // isSSEDone 判定一行是否为 SSE 结束帧（容忍 "data: [DONE]" 与 "data:[DONE]" 两种写法）。
@@ -2023,7 +2115,8 @@ type AggregateResult struct {
 // 它不逐帧发给客户端，而是读完整流再一口气写 JSON：上游中途断掉时，此前的实现会把
 // 半截 content 当成**完整回答**以 200 发出，客户端完全无法察觉后半段丢了。
 // 现在改为：中断即 502（此时尚未写任何响应字节，状态码还能改），让失败可诊断、可重试。
-func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error) {
+func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, streamModelErr, error) {
+	var me streamModelErr // 同上：流内模型级错误帧（非流式客户端也会遇到）
 	var (
 		content strings.Builder
 		id      string
@@ -2036,6 +2129,9 @@ func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error)
 	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if me.Code == 0 {
+			me = detectStreamModelErrorFrame(line)
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -2084,7 +2180,7 @@ func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error)
 			if content.Len() > maxAggregateContentBytes {
 				writeOpenAIError(w, http.StatusBadGateway,
 					fmt.Sprintf("upstream stream too large (> %d bytes)", maxAggregateContentBytes))
-				return usageInfo{}, fmt.Errorf("aggregate content exceeds %d bytes", maxAggregateContentBytes)
+				return usageInfo{}, me, fmt.Errorf("aggregate content exceeds %d bytes", maxAggregateContentBytes)
 			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
 				finish = *c.FinishReason
@@ -2093,7 +2189,7 @@ func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error)
 	}
 	if err := scanner.Err(); err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream stream interrupted: "+err.Error())
-		return usageInfo{}, err
+		return usageInfo{}, me, err
 	}
 	if id == "" {
 		id = "chatcmpl-" + newRandomID(12)
@@ -2127,7 +2223,7 @@ func aggregateSSE(w http.ResponseWriter, resp *http.Response) (usageInfo, error)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(out)
-	return parseUsageJSON(usage), nil
+	return parseUsageJSON(usage), me, nil
 }
 
 // parseUsageJSON 从 usage 原始 JSON 抽取计费字段。

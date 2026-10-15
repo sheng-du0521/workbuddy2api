@@ -315,6 +315,15 @@ func (p *Pool) cappedUntilLocked(now, resetAt time.Time, max time.Duration) time
 	if resetAt.After(now) {
 		return resetAt
 	}
+	// resetAt 已过期（上游给的恢复时刻已经过去）：收敛成 `now+1ms` 而不是零值。
+	//
+	// 为什么不是零值：零值 Until 在台账与 `short()` 文案里都表示"没有冷却"，
+	// 与"刚刚在上游那里结束的一档限流"混起来会让排障看不出这条记录从哪来；
+	// 1ms 是一个**已经在释放**的冷却，语义准确，且下一次选号就会把它清掉
+	// （见 pruneExpiredModelCooldowns）。
+	//
+	// 断言"到期即恢复"时要注意这 1ms（测试需让它过去），别用"Until 为零"来断言 ——
+	// 那在实现换成零值时同样通过，测不到任何东西。
 	return now.Add(time.Millisecond)
 }
 

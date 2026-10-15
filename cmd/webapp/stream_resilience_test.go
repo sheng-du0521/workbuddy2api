@@ -80,7 +80,7 @@ func TestChatClientForDropsTimeoutOnStream(t *testing.T) {
 func TestStreamSSESynthesizesDone(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"choices\":[]}\n\n"))
 	rec := httptest.NewRecorder()
-	_, err := streamSSE(rec, &http.Response{Body: body})
+	_, _, err := streamSSE(rec, &http.Response{Body: body})
 	if err != nil {
 		t.Fatalf("正常读完不应报错: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestStreamSSESynthesizesDone(t *testing.T) {
 func TestStreamSSEDoneNotDuplicated(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"choices\":[]}\n\ndata: [DONE]\n\n"))
 	rec := httptest.NewRecorder()
-	if _, err := streamSSE(rec, &http.Response{Body: body}); err != nil {
+	if _, _, err := streamSSE(rec, &http.Response{Body: body}); err != nil {
 		t.Fatalf("正常读完不应报错: %v", err)
 	}
 	if n := strings.Count(rec.Body.String(), "[DONE]"); n != 1 {
@@ -108,7 +108,7 @@ func TestStreamSSEDoneNotDuplicated(t *testing.T) {
 func TestStreamSSEInterruptedStillWritesDone(t *testing.T) {
 	body := &brokenBody{r: strings.NewReader("data: {\"choices\":[]}\n\n")}
 	rec := httptest.NewRecorder()
-	_, err := streamSSE(rec, &http.Response{Body: body})
+	_, _, err := streamSSE(rec, &http.Response{Body: body})
 	if err == nil {
 		t.Fatal("上游断流必须返回错误（此前被静默吞掉，失败流被记成成功）")
 	}
@@ -125,7 +125,7 @@ func TestAggregateSSEInterruptedReturnsBadGateway(t *testing.T) {
 	body := &brokenBody{r: strings.NewReader(
 		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"前半段\"}}]}\n\n")}
 	rec := httptest.NewRecorder()
-	ui, err := aggregateSSE(rec, &http.Response{Body: body})
+	ui, _, err := aggregateSSE(rec, &http.Response{Body: body})
 	if err == nil {
 		t.Fatal("上游中断必须返回错误，否则残缺回答被当成完整响应")
 	}
@@ -193,5 +193,52 @@ func TestUsageLogStoresSelectionTrace(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].StickyKeyHash != "abc123def456" {
 		t.Fatalf("ListUsageLogs 未带回选号轨迹: %+v", list)
+	}
+}
+
+// TestStreamSSEReportsModelErrorFrame 流内模型级错误帧必须被识别并回传给调用方。
+//
+// 这是 (账号, 模型) 冷却的关键上游形态：错误放在**已经 200 的流**里，
+// 客户端看得见但池侧此前完全不知道 —— 于是该 (账号,模型) 不冷却，
+// 下一个同模型请求照样被路由过去，再次撞同一个错。
+func TestStreamSSEReportsModelErrorFrame(t *testing.T) {
+	frame := `data: {"error":{"code":6004,"message":"model rate limited","resets_at":"2030-01-01T00:00:00Z"}}` + "\n\n"
+	rec := httptest.NewRecorder()
+	_, me, err := streamSSE(rec, &http.Response{Body: io.NopCloser(strings.NewReader(frame))})
+	if err != nil {
+		t.Fatalf("读流不应报错: %v", err)
+	}
+	if me.Code != 6004 {
+		t.Fatalf("应识别出模型级错误帧 code=6004，got %d（原文 %q）", me.Code, string(me.Raw))
+	}
+	if !strings.Contains(string(me.Raw), "resets_at") {
+		t.Errorf("应保留该帧原文（供重置时刻解析），got %q", string(me.Raw))
+	}
+	// 错误帧仍必须**透传**给客户端（不能因为识别了就吞掉）。
+	if !strings.Contains(rec.Body.String(), `"code":6004`) {
+		t.Errorf("错误帧应原样透传，实际输出 %q", rec.Body.String())
+	}
+}
+
+// TestStreamSSEIgnoresNonModelErrorFrame 非模型级错误帧不得被误当成模型级信号。
+//
+// 只认 6004 / 11102：其他 code（内容审核、参数错误…）有自己的处置链路，
+// 在流式热路径上重复分类只会制造两套口径。
+func TestStreamSSEIgnoresNonModelErrorFrame(t *testing.T) {
+	for _, line := range []string{
+		`data: {"error":{"code":11140,"message":"request illegal"}}`,
+		`data: {"error":{"code":12153,"message":"session dead"}}`,
+		`data: {"choices":[{"delta":{"content":"no error keyword"}}]}`,
+		`data: {"choices":[{"delta":{"content":"mentions error but no code"}}]}`,
+		`data: [DONE]`,
+		`: comment line`,
+	} {
+		if me := detectStreamModelErrorFrame(line); me.Code != 0 {
+			t.Errorf("%q 不应被识别为模型级错误帧，got code=%d", line, me.Code)
+		}
+	}
+	// 11102（该后端无此模型）同样是**模型级**，必须认。
+	if me := detectStreamModelErrorFrame(`data: {"error":{"code":11102}}`); me.Code != 11102 {
+		t.Errorf("11102 是模型级信号，应被识别，got %d", me.Code)
 	}
 }
