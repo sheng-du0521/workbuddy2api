@@ -9,25 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// 余额单位：微点（micro point）。1 点 = 1000 微点。
-// 用整数记账避免浮点累积误差；对外展示一律除以 MicroPerPoint。
-const MicroPerPoint = 1000
-
-// PointToMicro 点数 → 微点。
-//
-// 必须用 math.Round 而不是 `int64(p*1000 + 0.5)`：Go 的 float→int 是向零截断，
-// 对负数而言 `+0.5` 不是四舍五入 —— int64(-95000 + 0.5) = int64(-94999.5) 截断成
-// -94999，每笔负向调整都会少扣 1 微点。math.Round 是「四舍五入、中点远离零」。
-func PointToMicro(p float64) int64 { return int64(math.Round(p * MicroPerPoint)) }
-
-// MicroToPoint 微点 → 点数（浮点，仅供展示）。
-func MicroToPoint(m int64) float64 { return float64(m) / MicroPerPoint }
+// 余额单位与换算（MicroPerPoint / PointToMicro / MicroToPoint）已于 v0.31.10 下沉到
+// internal/billing —— 见本包 billingalias.go 的过渡别名。这里只留一句指路，避免下一个人
+// 在本文件里找它们不到。
 
 // 用户角色与状态。
 const (

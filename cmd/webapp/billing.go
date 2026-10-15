@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"workbuddy2api/internal/billing"
 
 	"workbuddy2api/internal/egress"
 	"workbuddy2api/internal/pool"
@@ -88,13 +89,10 @@ const (
 	settingReserveMax  = "reserve_max_point"   // 单笔预扣上限（点，0 = 不限）
 )
 
-// 预扣估算参数。
-const (
-	defaultMaxTokens = 4096 // 客户端未声明 max_tokens 时按此上界估
-	minReserveMicro  = 1    // 有单价时至少预扣 1 微点，避免估成 0 形同虚设
-	// 观测单价的持久化前缀（跨重启保留，否则重启后预扣能力归零）。
-	kvModelCostPrefix = "model_cost_1k:"
-)
+// 预扣估算参数：`defaultMaxTokens` / `minReserveMicro` 已随估算逻辑下沉
+// internal/billing（v0.31.10）；本包只剩这个持久化前缀 —— 它描述的是**存储键**，
+// 属于本包的职责（新包不认识 kv）。
+const kvModelCostPrefix = "model_cost_1k:"
 
 // estimateReserveMicro 估算一次请求的预扣额（微点）。
 //
@@ -110,18 +108,10 @@ func (p *Proxy) estimateReserveMicro(payload map[string]any, model string) int64
 	if !ok || per1kPoint <= 0 {
 		return 0
 	}
-	tokens := estimatePromptTokens(payload) + requestMaxTokens(payload)
-	if tokens <= 0 {
-		return 0
-	}
-	micro := PointToMicro(per1kPoint * float64(tokens) / 1000.0)
-	if micro < minReserveMicro {
-		micro = minReserveMicro
-	}
-	if cap := p.reserveCapMicro(); cap > 0 && micro > cap {
-		micro = cap
-	}
-	return micro
+	tokens := billing.EstimatePromptTokens(payload) + billing.RequestMaxTokens(payload)
+	// 算术本身（下限 / 上限 / 折算）在 internal/billing：这里只负责"单价与上限从哪来"
+	// —— 那是本包的 IO 职责（读 kv、读观测表），新包不认识这些来源。
+	return billing.ReserveMicro(per1kPoint, tokens, p.reserveCapMicro())
 }
 
 // reserveUnitPrice 取该模型用于预扣的单价，单位统一为「点 / 1k token」。
@@ -172,11 +162,12 @@ func (p *Proxy) observeCost(model string, per1k float64) {
 	}
 	p.costMu.Lock()
 	old, seen := p.costPer1k[model]
-	if seen && old >= per1k {
+	kept, update := billing.MaxKeptCost(old, seen, per1k)
+	if !update {
 		p.costMu.Unlock()
 		return
 	}
-	p.costPer1k[model] = per1k
+	p.costPer1k[model] = kept
 	p.costMu.Unlock()
 	_ = p.store.SetKV(kvModelCostPrefix+model, strconv.FormatFloat(per1k, 'f', 6, 64))
 }
@@ -204,52 +195,6 @@ func (p *Proxy) observedModelCount() int {
 	p.costMu.RLock()
 	defer p.costMu.RUnlock()
 	return len(p.costPer1k)
-}
-
-// estimatePromptTokens 粗略估算 prompt token 数（取保守上界）。
-// 中文 UTF-8 每字 3 字节约 1 token，英文每 3 字节约 1 token，
-// 故统一用 bytes/3 对两种语言都贴近上界。
-func estimatePromptTokens(payload map[string]any) int {
-	msgs, _ := payload["messages"].([]any)
-	total := 0
-	for _, m := range msgs {
-		mm, _ := m.(map[string]any)
-		if mm == nil {
-			continue
-		}
-		total += 4 // 每条消息的角色/分隔符结构开销
-		switch c := mm["content"].(type) {
-		case string:
-			total += len(c)/3 + 1
-		case []any:
-			for _, part := range c {
-				pm, _ := part.(map[string]any)
-				if pm == nil {
-					continue
-				}
-				if s, ok := pm["text"].(string); ok {
-					total += len(s)/3 + 1
-				}
-				if _, ok := pm["image_url"]; ok {
-					total += 1000 // 图片按固定量保守估
-				}
-			}
-		}
-	}
-	return total
-}
-
-// requestMaxTokens 取客户端声明的输出上限，缺省给保守默认值。
-func requestMaxTokens(payload map[string]any) int {
-	for _, k := range []string{"max_completion_tokens", "max_tokens"} {
-		if v, ok := payload[k].(float64); ok && v > 0 {
-			if v > 1<<20 {
-				return 1 << 20
-			}
-			return int(v)
-		}
-	}
-	return defaultMaxTokens
 }
 
 // ---------- 消费闸 ----------
@@ -293,10 +238,15 @@ func (a *app) quotaUsage(u *User) (dayUsed, monthUsed int64) {
 	return dayUsed, monthUsed
 }
 
-// formatPoints 微点 → 展示字符串（去掉无意义的小数尾零）。
-func formatPoints(micro int64) string {
-	return strconv.FormatFloat(MicroToPoint(micro), 'f', -1, 64)
-}
+// 本文件里曾经还住着这几样，已于 v0.31.10 随计费纯算术下沉 internal/billing
+// （本包 billingalias.go 提供同名别名，调用点未改）：
+//
+//	estimatePromptTokens / requestMaxTokens —— 预扣的 token 上界估算
+//	formatPoints                            —— 微点 → 展示字符串
+//	defaultMaxTokens / minReserveMicro      —— 估算参数（前者仍是测试引用的常量别名）
+//
+// 为什么留这段指路：它们的调用点共 10 余处（配额提示、用户列表、提现审核、预扣），
+// 直接删干净会让人 grep 不到"它去哪了"。
 
 // ---------- API Key 中间件 ----------
 

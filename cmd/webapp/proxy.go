@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"workbuddy2api/internal/billing"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/egress"
@@ -2569,8 +2569,10 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 	}
 	// 记录实测单价（积分 / 1k token），供后续请求的预扣估算使用
 	// （取历史最大值，另持久化到 kv，使重启后预扣能力不丢）。
-	if ui.Total() > 0 && consumedCredit > 0 {
-		p.observeCost(model, consumedCredit/float64(ui.Total())*1000)
+	// 折算与"取最大值"两条规则都在 internal/billing（Per1kCost / MaxKeptCost）——
+	// 这里只负责"什么时候记"（有真实用量才记）。
+	if per1k := billing.Per1kCost(consumedCredit, ui.Total()); per1k > 0 {
+		p.observeCost(model, per1k)
 	}
 	// 扣费 = 号池积分消耗 × 倍率。倍率即「1 号池积分折多少点」。
 	chargedMicro = PointToMicro(consumedCredit * mult)
@@ -2660,8 +2662,8 @@ func (p *Proxy) logAdminChannelUsage(key *APIKey, model, upstreamUID string, ui 
 		}
 	}
 	// 单价观测与计费路径同口径（只认真实用量），否则管理通道的请求白白浪费一次学习机会。
-	if ui.Total() > 0 && consumedCredit > 0 {
-		p.observeCost(model, consumedCredit/float64(ui.Total())*1000)
+	if per1k := billing.Per1kCost(consumedCredit, ui.Total()); per1k > 0 {
+		p.observeCost(model, per1k)
 	}
 	var keyID int64
 	if key != nil {
@@ -2722,13 +2724,11 @@ func (p *Proxy) creditHostOwner(uid string, from *User, model string, consumedCr
 	if ratio <= 0 {
 		return
 	}
-	// 微点记账一律 math.Round（与 PointToMicro 同口径）：直接截断会让小额收益
-	// 长期归零——实测 credit=0.01、分成 0.6、推广 0.1 时 10×0.6×0.1=0.6 微点，
-	// 截断成 0，号主的上级永远拿不到返点。
-	earn := PointToMicro(consumedCredit * ratio)
-	if earn > chargedMicro {
-		earn = chargedMicro // 平台实收封顶：倍率低于分成比例时不倒贴
-	}
+	// 收益公式与"平台实收封顶"在 internal/billing.HostEarn（含 math.Round 口径）。
+	// 为什么下沉：这条公式与推广返点的"平台留成"约束是**成对的钱的规则**，
+	// 两处各写一份必然漂移（本项目最贵的一类缺陷）；且它是"算错不崩、只让账目静默偏移"
+	// 的典型，必须能被独立单测钉住。
+	earn := billing.HostEarn(consumedCredit, ratio, chargedMicro)
 	if earn <= 0 {
 		return
 	}
@@ -2773,13 +2773,8 @@ func (p *Proxy) creditReferrerOfPool(owner int64, uid, model string, chargedMicr
 	if ratio <= 0 {
 		return
 	}
-	rebate := int64(math.Round(float64(earn) * ratio))
-	if rebate <= 0 {
-		return
-	}
-	if margin := chargedMicro - earn; rebate > margin {
-		rebate = margin // 不侵占平台留成之外的额度
-	}
+	// 返点公式与"不侵占平台留成"的钳位在 internal/billing.ReferralRebate。
+	rebate := billing.ReferralRebate(earn, ratio, chargedMicro)
 	if rebate <= 0 {
 		return
 	}
@@ -2815,14 +2810,14 @@ func (p *Proxy) estimateCredit(upstreamUID, model string, tokens int) float64 {
 	}
 	if upstreamUID != "" {
 		if per1k, ok := p.pool.ModelCost(upstreamUID, model); ok && per1k > 0 {
-			return per1k * float64(tokens) / 1000.0
+			return billing.EstimateCredit(per1k, tokens)
 		}
 	}
 	p.costMu.RLock()
 	per1k, ok := p.costPer1k[model]
 	p.costMu.RUnlock()
-	if ok && per1k > 0 {
-		return per1k * float64(tokens) / 1000.0
+	if ok {
+		return billing.EstimateCredit(per1k, tokens) // per1k <= 0 时自返 0（与旧行为一致）
 	}
 	return 0
 }
