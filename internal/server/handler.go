@@ -22,6 +22,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/modelname"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
@@ -611,6 +612,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
 
+	// 模型名写法归一（v0.31.3，与主产品共用 internal/modelname）：
+	// 去空白/零宽字符 → 剥 realm 前缀 → 按已知清单折回规范写法（大小写/分隔符）。
+	//
+	// **必须在选号之前**完成：bareModel 之后会同时用作 (账号,模型) 冷却键、负缓存键、
+	// 成本账本键与出站 body 的 model 字段。若先选号再归一，就会出现"冷却写在 A 键、
+	// 查到 B 键"的分裂（主产品 v0.31.2 修过的同类问题）。
+	knownModels := h.knownModelNames()
+	bareModel = normalizeRequestModel(bareModel, knownModels)
+	// 归一化后仍不在已知清单里 → 记一条 WARN（同名一次）。这是"客户端模型名配置错"
+	// 最直接的症状：每次调用都会拿到上游 400/11102，而我们回 404。
+	if !modelname.IsKnown(knownModels, bareModel) {
+		modelname.NoteUnknown(bareModel, knownModels, "server")
+	}
+	// selModel 是「归一化后的完整模型名」（realm 前缀 + 归一化裸名），供粘性可用性
+	// 闭包使用：闭包内部会再剥一次前缀并按 realm 过滤可用集合，剥出来的裸名必须
+	// 与选号/冷却键**同一个写法**，否则"冷却中的号"在闭包眼里仍然可用。
+	selModel := bareModel
+	if realm != "cn" {
+		selModel = realm + ":" + bareModel
+	}
+
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
 	defer st.done()
@@ -635,13 +657,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	stickyUID := ""
 	if h.cfg.Session != nil && stickyKey != "" {
-		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
-		// 粘性命中校验走 injected AvailableForModel 闭包 → 闭包内部 resolveModel 剥前缀
-		// 得 realm+bare，再按 realm 过滤可用集合。若传已剥前缀的 bareModel，闭包对裸名
-		// 恒剥出 realm=cn，跨 realm 粘性会话会被错误钉回 CN 集合；完整前缀才能让
-		// 闭包正确过滤到 global 集合（见 cmd/server/wiring.go realmAwareAvailableForModel）。
+		// 传给 ResolveForModel 的是**完整**模型名（selModel：含 realm 前缀，裸名为
+		// 归一化后的规范写法）。粘性命中校验走 injected AvailableForModel 闭包 →
+		// 闭包内部 resolveModel 剥前缀得 realm+bare，再按 realm 过滤可用集合。
+		// 若传已剥前缀的 bareModel，闭包对裸名恒剥出 realm=cn，跨 realm 粘性会话会被
+		// 错误钉回 CN 集合；完整前缀才能让闭包正确过滤到 global 集合
+		// （见 cmd/server/wiring.go realmAwareAvailableForModel）。
+		// 用 selModel 而非 peek.Model：闭包查的可用集合必须与选号/冷却键同一写法，
+		// 否则被归一化过的请求会绕过模型级冷却（见上方归一化段的注释）。
 		// 模型名也参与成本账本与选号过滤，不能用 "-" 占位污染模型键。
-		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, selModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -957,9 +982,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
-			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+			sErr := upstream.StreamObserve(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}))
+			}), func(payload string) {
+				// 流内模型级错误帧（HTTP 200 + error 帧）：补做 (账号, 模型) 冷却。
+				// 与主产品同源（v0.31.1 起主产品已做，旧网关此前只有 4xx 那半条链路）。
+				h.noteInStreamModelError(acct.UID, bareModel, payload)
+			})
 			if upstream.IsEmptyStreamError(sErr) {
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
 				// 兜底（HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/
@@ -999,7 +1028,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		// AggregateObserve：非流式请求同样是"上游 200 + 流内 error 帧"的受害者，
+		// 只是它读完整条流才聚合 —— 观察者让池侧照样拿得到那帧错误。
+		resp, err := upstream.AggregateObserve(rc, func(payload string) {
+			h.noteInStreamModelError(acct.UID, bareModel, payload)
+		})
 		rc.Close()
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。

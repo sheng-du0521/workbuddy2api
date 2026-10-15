@@ -1898,37 +1898,11 @@ func restoreGroupValue(acc *Account) string {
 }
 
 // parseUpstreamCode 从上游响应体里尽力解析业务错误码；解析不出返回 0。
-// 兼容 {"code":6004} 与 {"error":{"code":6004}} 两种形态。
-func parseUpstreamCode(body []byte) int {
-	var obj struct {
-		Code  any `json:"code"`
-		Error struct {
-			Code any `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return 0
-	}
-	if n, ok := toInt(obj.Code); ok {
-		return n
-	}
-	if n, ok := toInt(obj.Error.Code); ok {
-		return n
-	}
-	return 0
-}
-
-func toInt(v any) (int, bool) {
-	switch n := v.(type) {
-	case float64:
-		return int(n), true
-	case string:
-		if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
-			return i, true
-		}
-	}
-	return 0, false
-}
+//
+// 实现收敛在 `upstream.ErrorCode`（v0.31.3）：旧网关也要判同一批码，而"同一个错误码
+// 只能有一套纪律"是本项目最贵的一条教训 —— 解析口径抄两份就会出现"一个产品认得、
+// 另一个不认得"的漂移。此处只是本包调用点的薄封装。
+func parseUpstreamCode(body []byte) int { return upstream.ErrorCode(body) }
 
 // streamSSE 把上游 SSE 原样转发给客户端，同时抽取 usage 供计费。
 // 边转发边解析：上游通常在末帧才补全 usage.credit，但逐帧覆盖式采集能兼容
@@ -1960,8 +1934,8 @@ func detectStreamModelErrorFrame(line string) streamModelErr {
 		return streamModelErr{}
 	}
 	raw := []byte(payload)
-	switch code := parseUpstreamCode(raw); code {
-	case 6004, 11102: // 模型级：需要 (账号, 模型) 维度的避让
+	// 「模型级」的判据是共享单点（upstream.ModelLevelErrorCode）：6004 / 11102。
+	if code := upstream.ErrorCode(raw); upstream.ModelLevelErrorCode(code) {
 		return streamModelErr{Code: code, Raw: raw}
 	}
 	return streamModelErr{}

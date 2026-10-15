@@ -280,20 +280,7 @@ func codeKeyOf(code, status int) string {
 // 为什么值得单独标出来：同一个 6004，"对齐到上游明示的重置时刻"与"本地估算的
 // 有界退避"在排障时是完全不同的结论 —— 前者说明上游确实在限这个模型，后者
 // 说明我们连上游说的时刻都没读到（可能解析失效），后者才是要查的。
-func resetSrcSuffix(src upstream.ResetSource) string {
-	switch src {
-	case upstream.ResetBodyText:
-		return " [reset=body-text]"
-	case upstream.ResetBodyJSON:
-		return " [reset=body-json]"
-	case upstream.ResetHeader:
-		return " [reset=header]"
-	case upstream.ResetExpired:
-		return " [reset=expired→退避]"
-	default:
-		return " [reset=none→退避]"
-	}
-}
+func resetSrcSuffix(src upstream.ResetSource) string { return upstream.ResetSourceSuffix(src) }
 
 // ---------------------------------------------------------------------------
 // 台账：结构 + 落库 + 查询

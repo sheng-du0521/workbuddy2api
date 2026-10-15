@@ -160,6 +160,27 @@ func ResolveResetAtWith(body []byte, headerWait time.Duration, now time.Time) (t
 	return time.Time{}, ResetNone
 }
 
+// ResetSourceSuffix 把重置来源渲染成「冷却原因」里可读的后缀（供日志与台账）。
+//
+// 收敛到 upstream 包的理由：这段文案此前在主产品（cmd/webapp 的 resetSrcSuffix）
+// 与旧网关（applyErrorPolicy 内联判断）各写一份，而它写进的是 (账号,模型) 冷却的
+// **reason 字段** —— 两份文案漂移会让"同一个上游错误在两个产品上的冷却原因不同名"，
+// 排障时看起来像两种不同的故障。与 ResolveResetAtWith 共用同一份优先级是同一件事。
+func ResetSourceSuffix(src ResetSource) string {
+	switch src {
+	case ResetBodyText:
+		return " [reset=body-text]"
+	case ResetBodyJSON:
+		return " [reset=body-json]"
+	case ResetHeader:
+		return " [reset=header]"
+	case ResetExpired:
+		return " [reset=expired→退避]"
+	default:
+		return " [reset=none→退避]"
+	}
+}
+
 // usableResetAt 把「解析到的时刻」收敛成对外契约：不在未来的一律判为过期。
 //
 // 抽出来是因为三级来源都走这一关（否则每级各写一遍 now.Before 判断，

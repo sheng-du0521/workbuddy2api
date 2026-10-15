@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/modelname"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -69,7 +70,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.2"
+const version = "0.31.3"
 
 type app struct {
 	store  *Store
@@ -1266,13 +1267,10 @@ func fetchModelIDs(uc *upstream.Client, au *auth.Auth) (ids []string, err error)
 }
 
 // fallbackModels 上游模型列表取不到时兜底（真实可用名以账号实际权限为准）。
-var fallbackModels = []string{
-	"deepseek-v4-flash",
-	"deepseek-v4-pro",
-	"glm-5.2",
-	"claude-sonnet-4.5",
-	"gpt-5",
-}
+//
+// 清单本体在 internal/modelname（v0.31.3）：两个产品（主产品 / 旧网关）对「最小已知
+// 模型集合」必须一致，否则同一个写法只在一个产品上能被折回规范名。此处只是别名。
+var fallbackModels = modelname.FallbackModels
 
 // writeJSON 所有 JSON 响应的**唯一出口**（v0.24.1 起兼做内部错误脱敏）。
 //

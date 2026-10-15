@@ -31,7 +31,16 @@ func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
-func Aggregate(r io.Reader) (map[string]any, error) {
+func Aggregate(r io.Reader) (map[string]any, error) { return AggregateObserve(r, nil) }
+
+// AggregateObserve 同 Aggregate，额外把流内出现的上游 error 帧回调给 errFrameFn
+// （nil = 不观察）。
+//
+// 为什么非流式路径也需要它（v0.31.3）：上游把错误放进**已经 200 的流**里时，
+// 非流式请求走的是"整条流读进来再聚合"这条路 —— 使用方此前完全看不到那帧错误，
+// 于是 (账号, 模型) 不会被冷却，下一个同模型请求照样被路由到它，再次撞同一个错。
+// 回调发生在**帧透传之前/聚合过程中**，与流式路径的观察时机同语义。
+func AggregateObserve(r io.Reader, errFrameFn func(string)) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id, model     string
@@ -158,6 +167,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					// 上游 error 帧（HTTP 200 + 流内报错）：交给观察者做池侧处置。
+					// 计数口径不变（仍是"有效数据帧"，否则会被误判成空流）。
+					if _, hasErr := chunk["error"]; hasErr {
+						notifyErrFrame(errFrameFn, payload)
+					}
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {
@@ -482,6 +496,19 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 // 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
 // 未覆盖，不编造）。
 func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) error {
+	return StreamObserve(w, r, hintFn, nil)
+}
+
+// StreamObserve 同 StreamHint，额外把上游 error 帧**原文**回调给 errFrameFn
+// （nil = 不观察）。回调在使用方（池侧）用于对「HTTP 200 + 流内模型级错误帧」
+// 补做 (账号, 模型) 冷却 —— 见 cmd/webapp 的 reportInStreamModelError 与
+// internal/server 的同名逻辑。
+//
+// 回调纪律：
+//   - 只对**上游**帧调用（本地空流兜底帧不调，它不是上游说的话）；
+//   - 在帧写出**之前**调用，使用方能拿到完整 payload（含尾部 displayMsg）；
+//   - panic 隔离：观察者是补充处置，任何实现缺陷不得击穿流透传主路径。
+func StreamObserve(w http.ResponseWriter, r io.Reader, hintFn func(string) string, errFrameFn func(string)) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -527,6 +554,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 			// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 			// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
 			if _, hasErr := obj["error"]; hasErr {
+				notifyErrFrame(errFrameFn, payload)
 				if werr := writeRaw(payload); werr != nil {
 					return 0, werr
 				}
@@ -611,6 +639,17 @@ readLoop:
 		return errEmptyStream
 	}
 	return nil
+}
+
+// notifyErrFrame 调用错误帧观察者：nil 安全 + panic 隔离。
+// 观察者是池侧处置入口（写 (账号,模型) 冷却），属于"补充功能"——
+// 任何实现缺陷都不得击穿流透传主路径（与 frameGatewayHint 同一条纪律）。
+func notifyErrFrame(fn func(string), payload string) {
+	if fn == nil || payload == "" {
+		return
+	}
+	defer func() { _ = recover() }()
+	fn(payload)
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。
