@@ -333,8 +333,11 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .action-card.running { opacity: .75; cursor: default; border-color: var(--warn); }
 
 .bars { display: flex; align-items: flex-end; gap: 2px; height: 96px; margin: 8px 0 4px; }
-.bars .bar { flex: 1 1 0; min-width: 2px; background: var(--accent); border-radius: 2px 2px 0 0; opacity: .85; align-self: flex-end; transition: height .3s; }
-.bars .bar.bad { background: var(--err); }
+.bars .bar { position: relative; overflow: hidden; flex: 1 1 0; min-width: 2px; background: var(--accent); border-radius: 2px 2px 0 0; opacity: .85; align-self: flex-end; transition: height .3s; }
+/* 柱内失败段（v0.30.0）：高度 = 失败数 / 该分钟总数，贴底显示。
+   取代了此前"整根柱子染红"的表达 —— 那种表达看不出失败占比（1 失败 + 9 成功
+   与 10 成功一样高），而失败段能让"这一分钟基本全挂了"一眼可见。 */
+.bars .bar > i { position: absolute; left: 0; right: 0; bottom: 0; background: var(--err); }
 .bars .bar.empty { background: var(--border); }
 .bars-axis { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); }
 .bars-legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--muted); margin-top: 6px; flex-wrap: wrap; }

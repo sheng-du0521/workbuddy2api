@@ -69,7 +69,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.29.0"
+const version = "0.30.0"
 
 type app struct {
 	store  *Store
@@ -1512,7 +1512,11 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/task", a.adminGuard(a.handleAdminSetTask))
 
 	// OpenAI 兼容层：用户 API Key 鉴权（多租户核心）
-	mux.HandleFunc("POST /v1/chat/completions", a.apiKeyGuard(a.proxy.ServeChat))
+	// liveCapture 必须在**最外层**（v0.30.0）：它负责把"被前置环节拒绝"的请求
+	// （鉴权失败 / 密钥停用 / 账号封禁 / 余额不足 / 配额超限 / 限流 / 请求体非法）
+	// 也补记进实时面板 —— 否则曲线与事件流只反映走到上游的请求，
+	// 呈现"只有成功、没有失败"的假象（详见 live.go 的说明）。
+	mux.HandleFunc("POST /v1/chat/completions", a.liveCapture(a.apiKeyGuard(a.proxy.ServeChat)))
 	// /v1/models 是客户端接入时的第一个探测请求，且不产生消费 —— 故豁免余额校验，
 	// 否则余额为 0 的用户在客户端里只会看到「连接失败」（详见 apiKeyGuardNoBalance）。
 	mux.HandleFunc("GET /v1/models", a.apiKeyGuardNoBalance(a.handleModels))

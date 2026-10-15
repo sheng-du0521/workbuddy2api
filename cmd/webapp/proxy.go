@@ -1043,7 +1043,10 @@ func (p *Proxy) refreshIfNeeded(au *auth.Auth) error {
 // ServeChat 处理 OpenAI 兼容的 /v1/chat/completions。
 // 出站一律强制 stream=true，再按客户端要求原样转发 SSE 或聚合为单次响应。
 func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
-	p.reqTotal.Add(1)
+	// 注意：请求计数（reqTotal/reqOK/reqFail）**不在这里**加了（v0.30.0）。
+	// 它们统一由 liveCapture（/v1 链路的最外层）在请求结束时记一次 —— 否则
+	// "被前置环节拒绝的请求"只让 total +1、ok/fail 都不进，出现
+	// `total != ok + fail` 的自相矛盾（这正是实时面板此前计数对不上的原因之一）。
 	start := time.Now()
 	p.live.begin()
 	defer p.live.done()
@@ -1061,6 +1064,9 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		payload = map[string]any{}
 	}
 	model, _ := payload["model"].(string)
+	// 把 model 回填给实时面板的兜底层（liveCapture）：它在 ServeChat 返回**之后**
+	// 才知道结果，那时请求体早已读完，无法再解析一次。
+	setLiveModel(r, model)
 	// 租户上下文由 apiKeyGuard 注入；取不到则说明该路由未挂鉴权中间件。
 	u := userFrom(r)
 	key := apiKeyFrom(r)
@@ -1135,9 +1141,10 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusPaymentRequired, fmt.Sprintf(
 					"insufficient balance: this request reserves up to %s points, current balance %s",
 					formatPoints(reserve), formatPoints(u.BalanceMicro)))
-				p.live.record(liveEvent{
+				p.noteLive(r, liveEvent{
 					At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
-					Err: "余额不足（预扣被拒）", ElapsedMS: time.Since(start).Milliseconds(),
+					Err: "余额不足（预扣被拒）", Status: http.StatusPaymentRequired,
+					ElapsedMS: time.Since(start).Milliseconds(),
 				})
 				// 消耗失败台账（failures.go）：预扣阶段被拒是**用户侧**失败，
 				// 与上游无关 —— 记下来是为了让"用户看到余额不足的次数"可查，
@@ -1356,8 +1363,7 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			// 关键变化（v0.17.5）：从这里开始**不再静默** —— 有日志、有实时事件、有流水。
 			log.Printf("WARN: [proxy] upstream stream interrupted acct=%s model=%s: %v",
 				logfmt.Label(au.UID, au.Nickname), model, streamErr)
-			p.reqFail.Add(1)
-			p.live.record(liveEvent{
+			p.noteLive(r, liveEvent{
 				At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
 				Err:       "上游流中断（" + streamErr.Error() + "）",
 				ElapsedMS: time.Since(start).Milliseconds(),
@@ -1407,10 +1413,10 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("WARN: [proxy] usage without credit acct=%s model=%s (no cost observation)",
 				logfmt.Label(au.UID, au.Nickname), model)
 		}
-		p.reqOK.Add(1)
-		p.live.record(liveEvent{
+		p.noteLive(r, liveEvent{
 			At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: true,
 			Tokens: ui.Total(), Charged: MicroToPoint(chargedMicro),
+			Status:    http.StatusOK,
 			ElapsedMS: time.Since(start).Milliseconds(),
 		})
 		return
@@ -1418,21 +1424,23 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	if lastErr == "" {
 		lastErr = "no available account (all cooling or disabled)"
 	}
-	p.reqFail.Add(1)
-	p.live.record(liveEvent{
-		At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
-		Err: lastErr, ElapsedMS: time.Since(start).Milliseconds(),
-	})
 	// 状态码按**失败归因**映射，而不是一律 503（v0.24.0，P2-1）：
 	// 请求本身的问题回 4xx（客户端不该重试），我方容量/上游故障才回 5xx。
 	finalKind := lastKind
 	if clientKind != upstream.ErrNone {
 		finalKind = clientKind // 请求级错误优先：根因在请求，与账号/容量无关
 	}
+	finalStatus := upstreamFailureStatus(finalKind)
+	// 状态码在**记录之前**算好（v0.30.0）：此前这一笔记在映射之前，
+	// 于是事件流里所有"上游失败"都没有状态码，无法按 402/429/503 分类。
+	p.noteLive(r, liveEvent{
+		At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
+		Err: lastErr, Status: finalStatus, ElapsedMS: time.Since(start).Milliseconds(),
+	})
 	if lastRetryAfter != "" {
 		w.Header().Set("Retry-After", lastRetryAfter)
 	}
-	writeOpenAIError(w, upstreamFailureStatus(finalKind), "upstream unavailable: "+lastErr)
+	writeOpenAIError(w, finalStatus, "upstream unavailable: "+lastErr)
 }
 
 // isClientFaultKind 该错误是否由**请求本身**引起（换任何账号结果相同）。

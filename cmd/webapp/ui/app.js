@@ -317,8 +317,21 @@ function sparkbars(box, series, opts) {
   for (const p of series) {
     const req = Number(p.req) || 0;
     const fail = Number(p.fail) || 0;
-    const b = el('div', 'bar' + (fail > 0 ? ' bad' : '') + (req === 0 ? ' empty' : ''));
+    const b = el('div', 'bar' + (req === 0 ? ' empty' : ''));
     b.style.height = (req === 0 ? 3 : Math.max(7, Math.round((req / max) * 100))) + '%';
+    // 失败段（v0.30.0）：把"这根柱子里有多少失败"画成柱内的红色段。
+    //
+    // 此前只有"整根柱子染红"这一种表达，它在两种情况下看不出任何信息：
+    //   · 1 成功 + 9 失败 与 10 成功 —— 柱子**一样高**，只有颜色不同，
+    //     而颜色没有比例含义，运维读不出"这一分钟基本全挂了"；
+    //   · 全失败的分钟（req>0 且 ok=0）与"含少量失败"的分钟是同一种红。
+    // 柱内分段让"失败占比"直接可见，且与"空闲"（req=0 的灰柱）互不混淆。
+    if (req > 0 && fail > 0) {
+      const seg = el('i');
+      // 最小 6%：占比极低时也要留一条可见的红线，否则"有失败"会看不出来。
+      seg.style.height = Math.max(6, Math.round((fail / req) * 100)) + '%';
+      b.appendChild(seg);
+    }
     const parts = [p.label ? p.label + ' · ' : '', req + ' 次'];
     if (fail > 0) parts.push(fail + ' 失败');
     if (p.tokens) parts.push(fmtNum(p.tokens) + ' tokens');

@@ -84,7 +84,7 @@
           <div class="bars-axis"><span id="ovAxisL">—</span><span id="ovAxisR">—</span></div>
           <div class="bars-legend">
             <span><i style="background:var(--accent);"></i>成功请求</span>
-            <span><i style="background:var(--err);"></i>含失败</span>
+            <span><i style="background:var(--err);"></i>失败请求（柱内红段＝该分钟失败占比）</span>
             <span><i style="background:var(--border);"></i>空闲</span>
           </div>
         </div>
@@ -1908,9 +1908,14 @@ function renderLive(d) {
         row.appendChild(el('span', 'dot'));
         row.appendChild(el('span', 't', fmtClock(ev.at)));
         row.appendChild(el('span', 'who', ev.user));
+        // 失败行带上 HTTP 状态码（v0.30.0）：文案说"为什么失败"，状态码说"归哪一类"
+        // —— 余额不足(402) / 密钥停用(403) / 限流(429) / 上游故障(5xx) 的处置方向完全不同。
+        // 流式中断这类"响应头已发出、状态码无可比对象"的记录 status 为 0，此时不显示，
+        // 而不是假装它有个状态码。
+        const why = ev.ok ? '' : ' · ' + (ev.status ? 'HTTP ' + ev.status + ' ' : '') + (ev.err || '失败');
         row.appendChild(el('span', 'msg', (ev.model || '—') + (ev.ok
           ? ' · ' + fmtNum(ev.tokens) + ' tok'
-          : ' · ' + (ev.err || '失败'))));
+          : why)));
         row.appendChild(el('span', 'amt', ev.ok ? (fmtPoints(ev.charged) + ' 点') : '—'));
         feed.appendChild(row);
       }

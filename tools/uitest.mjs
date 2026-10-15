@@ -13,10 +13,17 @@ const UI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'cmd
 const APP_JS = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
 
 const now = Math.floor(Date.now() / 1000);
-const series = Array.from({ length: 60 }, (_, i) => ({
-  minute: i, label: '0' + (i % 10) + ':00',
-  req: i % 7, ok: i % 7, fail: i % 11 === 0 ? 1 : 0, tokens: 100 * i, charged: 0.01 * i,
-}));
+// series 刻意含三种分钟：空闲（req=0）/ 纯成功 / 含失败 —— 混合态才测得出
+// 「失败段只画在失败的柱子上、空闲柱不长出红段」这两件事（v0.30.0）。
+// fail 只在 req>0 的分钟出现 = 真接口的不变量（fail 是 req 的子集）。
+const series = Array.from({ length: 60 }, (_, i) => {
+  const req = i % 7;
+  const fail = (i % 11 === 0 && req > 0) ? 1 : 0;
+  return {
+    minute: i, label: '0' + (i % 10) + ':00',
+    req, ok: req - fail, fail, tokens: 100 * i, charged: 0.01 * i,
+  };
+});
 
 // GROWTH_PV 一份成长任务进度样本（v0.17.1）：含未完成 / 可领 / 已完成 / 非自动四种状态，
 // 便于断言「未完成排前、非自动标注、中文名」这些展示规则。
@@ -48,7 +55,7 @@ const FX = {
     alerts: { active: ['min_healthy_cn'], webhook_set: false, min_healthy: 3, last_eval: now },
     events: [
       { at: now, user: 'admin-key', model: 'deepseek-v4-flash', ok: true, tokens: 12, charged: 0, elapsed_ms: 1250 },
-      { at: now - 60, user: 'tester', model: 'glm-5.2', ok: false, err: 'upstream 503', elapsed_ms: 300 },
+      { at: now - 60, user: 'tester', model: 'glm-5.2', ok: false, err: 'upstream 503', status: 503, elapsed_ms: 300 },
     ],
     observed_models: 2,
   },
@@ -959,8 +966,20 @@ function run(pageFile, meOverride, plan) {
 (async () => {
   const adminPlan = [
     // v0.17.8：侧边栏底部新增「深色/浅色」与「改密码」两个入口（两页都有）。
+    // v0.30.0：曲线与事件流必须同时体现**成功与失败**（此前只显示成功 ——
+    // 根因是大量失败在被记录之前就被前置环节拒绝了，详见 live.go）。
     { nav: 'overview', counts: [['ovBars', 60], ['ovFeed', 2], ['ovPool', 4], ['rpBars', 60]],
-      has: [['#btnTheme', 1], ['#btnChangePw', 1]] },
+      has: [['#btnTheme', 1], ['#btnChangePw', 1],
+        // 失败段：fixture 里恰有 5 个"req>0 且 fail>0"的分钟
+        ['#ovBars .bar > i', 5],
+        // 事件流里的失败行（红点 + 底色）必须真的渲染出来
+        ['#ovFeed .ev.bad', 1], ['#ovFeed .ev.bad .dot', 1]],
+      // 空闲分钟（req=0）**不得**长出红段 —— 那会把"没流量"读成"全失败"。
+      // ⚠️ 必须用 absent（"必须为 0 个"）：has 的语义是 >=n，写 has:[sel,0] 永远通过。
+      absent: ['#ovBars .bar.empty > i'],
+      textIn: [['#ovReq60d', '失败 5'], ['#ovKpis', '失败'],
+        // 失败行带 HTTP 状态码：文案说"为什么失败"，状态码说"归哪一类"
+        ['#ovFeed', 'HTTP 503'], ['#ovFeed', 'upstream 503']] },
     // v0.12.0：号池页顶部两个扫码按钮 + 导入桌面账号按钮。
     // v0.13.0：新增消耗分组统计条（全部 + 4 组）+ 批量设置控件。
     // v0.13.1：卡片 footer 合并为**单个**分组下拉（消耗分组），并新增任务完成情况行。

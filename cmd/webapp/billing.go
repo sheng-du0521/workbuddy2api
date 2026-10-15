@@ -348,6 +348,10 @@ func (a *app) apiKeyGuardOpt(next http.HandlerFunc, requireBalance bool) http.Ha
 			writeOpenAIError(w, http.StatusUnauthorized, "api key owner not found")
 			return
 		}
+		// 回填身份给实时面板（v0.30.0）：下面几条拒绝都在"用户进 ctx"之前，
+		// 不回填的话面板只能显示「未鉴权」—— 而"谁的余额不足/被停用"是这些失败里
+		// 最该看清的一件事。只影响面板展示，不改变鉴权语义。
+		setLiveUser(r, u.Username)
 		if u.Status != StatusActive {
 			writeOpenAIError(w, http.StatusForbidden, "account banned")
 			return
