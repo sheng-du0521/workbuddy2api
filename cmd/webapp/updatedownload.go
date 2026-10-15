@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"workbuddy2api/internal/selfupdate"
 )
 
 const (
@@ -61,27 +62,6 @@ const (
 	// updateHelperName 生成的替换脚本名。
 	updateHelperName = "apply-update.bat"
 )
-
-// updateDownload 下载状态（给前端）。
-type updateDownload struct {
-	// State none / ready / downloading / done / failed
-	State string `json:"state"`
-	// Version 已下载（或正在下载）的版本；未下载时为空。
-	Version string `json:"version,omitempty"`
-	// Size 期望体积（清单声明，0 = 未知）；GotSize 实际落盘体积。
-	Size    int64 `json:"size,omitempty"`
-	GotSize int64 `json:"got_size,omitempty"`
-	// SHA256 期望摘要（清单声明）。**必须非空**才允许下载 —— 见 downloadUpdate。
-	SHA256 string `json:"sha256,omitempty"`
-	// File 落盘文件名（相对 exe 目录，不暴露绝对路径。
-	// 绝对路径在面板上既无用又可能在截图/日志里泄露部署目录结构）。
-	File string `json:"file,omitempty"`
-	// At 完成时刻；Error 失败原因。
-	At    int64  `json:"at,omitempty"`
-	Error string `json:"error,omitempty"`
-	// ApplyHint 应用更新的操作指引（人话，直接可粘贴）。
-	ApplyHint string `json:"apply_hint,omitempty"`
-}
 
 // updateAutoDownloadEnabled 读自动下载开关（默认**开**）。
 func (a *app) updateAutoDownloadEnabled() bool {
@@ -124,8 +104,12 @@ var updateArgs = func() []string { return os.Args[1:] }
 
 // updateExecutable 返回当前可执行文件路径。抽成变量以便测试注入 ——
 // 否则每个用例都会把 `.new` 写到 `go test` 的临时二进制旁边（跑完留一地垃圾，
-// 且用例之间互相干扰）。与 updateHTTPClient 同一套路。
+// 且用例之间互相干扰）。与 selfupdate.HTTPClient 同一套路。
 var updateExecutable = os.Executable
+
+// updateDownload 下载状态的过渡期别名（v0.31.7，类型本体已下沉 internal/selfupdate）：
+// 与 updatecheck.go 的别名块同一用途 —— 让本包既有调用点与测试一行不改。
+type updateDownload = selfupdate.Download
 
 // updateNewFile 返回 `<exe>.new` 的绝对路径（与 exe 同目录，保证同在 C 盘/同分区
 // —— 跨分区的替换不是原子操作）。
@@ -257,7 +241,7 @@ func (a *app) downloadUpdate(ctx context.Context, st updateStatus) updateDownloa
 		return a.failDownload(d, "构造请求失败："+err.Error())
 	}
 	req.Header.Set("User-Agent", "workbuddy2api/"+version)
-	resp, err := updateHTTPClient.Do(req)
+	resp, err := selfupdate.HTTPClient.Do(req)
 	if err != nil {
 		return a.failDownload(d, "下载失败："+err.Error())
 	}

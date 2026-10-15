@@ -470,7 +470,11 @@ func (a *app) handleLive(w http.ResponseWriter, r *http.Request) {
 		// 提示词降级（v0.31.4）：**进程级**状态 —— 降级期内**所有**请求的 system 都被
 		// 换成中性提示词。这种"悄悄影响全站"的状态必须在运维能看到的地方出现，
 		// 否则"为什么日志里 system 变了 / 为什么回答风格变了"只能靠翻代码回答。
-		"prompt":          a.proxy.promptDegradeView(),
+		"prompt": a.proxy.promptDegradeView(),
+		// 路由侧的可观测位（v0.31.7）：**(账号, 模型) 在途计数**造成的改选次数。
+		// 这个数长期为 0 说明"并发窗口内重复调度"在实践中没发生（也就不必升级为硬互斥）；
+		// 一旦涨起来，就是该升级的证据。口径见 Proxy.modelBusySkips 的注释。
+		"route":           a.proxy.routeView(),
 		"events":          events,
 		"observed_models": a.proxy.observedModelCount(),
 	})

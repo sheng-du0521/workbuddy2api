@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"workbuddy2api/internal/selfupdate"
 )
 
 // withTestClient 把出站客户端换成**显式禁代理**的实例。
@@ -24,12 +25,12 @@ import (
 // 默认不走代理，但显式关掉能让"测试为什么连不上"这类问题少一个变量。
 func withTestClient(t *testing.T) {
 	t.Helper()
-	old := updateHTTPClient
-	updateHTTPClient = &http.Client{
+	old := selfupdate.HTTPClient
+	selfupdate.HTTPClient = &http.Client{
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{Proxy: nil},
 	}
-	t.Cleanup(func() { updateHTTPClient = old })
+	t.Cleanup(func() { selfupdate.HTTPClient = old })
 }
 
 func newUpdateTestApp(t *testing.T) *app {
@@ -47,11 +48,11 @@ func newUpdateTestApp(t *testing.T) *app {
 func TestParseSemver(t *testing.T) {
 	cases := []struct {
 		in    string
-		ok    bool
-		major int
-		minor int
-		patch int
-		pre   string
+		OK    bool
+		Major int
+		Minor int
+		Patch int
+		Pre   string
 	}{
 		{"1.2.3", true, 1, 2, 3, ""},
 		{"v1.2.3", true, 1, 2, 3, ""},
@@ -72,18 +73,18 @@ func TestParseSemver(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := parseSemver(c.in)
-		if got.ok != c.ok {
-			t.Errorf("parseSemver(%q).ok = %v, want %v", c.in, got.ok, c.ok)
+		if got.OK != c.OK {
+			t.Errorf("parseSemver(%q).OK = %v, want %v", c.in, got.OK, c.OK)
 			continue
 		}
-		if !c.ok {
+		if !c.OK {
 			continue
 		}
-		if got.major != c.major || got.minor != c.minor || got.patch != c.patch {
+		if got.Major != c.Major || got.Minor != c.Minor || got.Patch != c.Patch {
 			t.Errorf("parseSemver(%q) = %d.%d.%d, want %d.%d.%d",
-				c.in, got.major, got.minor, got.patch, c.major, c.minor, c.patch)
+				c.in, got.Major, got.Minor, got.Patch, c.Major, c.Minor, c.Patch)
 		}
-		if wantPre := c.pre; wantPre != "" && len(got.pre) == 0 {
+		if wantPre := c.Pre; wantPre != "" && len(got.Pre) == 0 {
 			t.Errorf("parseSemver(%q) 应解析出预发布标识 %q", c.in, wantPre)
 		}
 	}
@@ -107,7 +108,7 @@ func TestCompareSemverSpecChain(t *testing.T) {
 	}
 	for i := 0; i+1 < len(chain); i++ {
 		a, b := parseSemver(chain[i]), parseSemver(chain[i+1])
-		if !a.ok || !b.ok {
+		if !a.OK || !b.OK {
 			t.Fatalf("解析失败: %q / %q", chain[i], chain[i+1])
 		}
 		if got := compareSemver(a, b); got != -1 {
@@ -351,7 +352,7 @@ func TestSplitRawGitHubURL(t *testing.T) {
 	cases := []struct {
 		in                        string
 		owner, repo, branch, path string
-		ok                        bool
+		OK                        bool
 	}{
 		{"https://raw.githubusercontent.com/o/r/main/version.json", "o", "r", "main", "version.json", true},
 		{"https://raw.githubusercontent.com/o/r/main/a/b/c.json", "o", "r", "main", "a/b/c.json", true},
@@ -361,9 +362,9 @@ func TestSplitRawGitHubURL(t *testing.T) {
 	}
 	for _, c := range cases {
 		o, r, b, p, ok := splitRawGitHubURL(c.in)
-		if ok != c.ok || o != c.owner || r != c.repo || b != c.branch || p != c.path {
+		if ok != c.OK || o != c.owner || r != c.repo || b != c.branch || p != c.path {
 			t.Errorf("%s → (%q,%q,%q,%q,%v)，期望 (%q,%q,%q,%q,%v)",
-				c.in, o, r, b, p, ok, c.owner, c.repo, c.branch, c.path, c.ok)
+				c.in, o, r, b, p, ok, c.owner, c.repo, c.branch, c.path, c.OK)
 		}
 	}
 }
@@ -477,12 +478,12 @@ func TestOrderUpdateCandidates(t *testing.T) {
 // 出站被替换成必定失败的 transport，因此本用例**不发任何真实请求**：
 // 断言的是"它确实去试了默认地址 + 全部失败时给出可读原因 + 不谎报有更新"。
 func TestCheckUpdateUsesDefaultManifestURLAndReportsFailure(t *testing.T) {
-	old := updateHTTPClient
-	updateHTTPClient = &http.Client{
+	old := selfupdate.HTTPClient
+	selfupdate.HTTPClient = &http.Client{
 		Timeout:   time.Second,
 		Transport: failTransport{},
 	}
-	t.Cleanup(func() { updateHTTPClient = old })
+	t.Cleanup(func() { selfupdate.HTTPClient = old })
 
 	a := newUpdateTestApp(t)
 	st := a.checkUpdate(context.Background(), true)

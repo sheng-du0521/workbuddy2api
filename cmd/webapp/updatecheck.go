@@ -6,17 +6,15 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"workbuddy2api/internal/selfupdate"
 )
 
 // ======================================================================
@@ -75,297 +73,64 @@ import (
 //     绝对时间比较会得出荒谬结论。
 //   - **降级检测**：当前版本比清单更新（开发版/预发布用户）时**不提示**"更新"。
 //   - **版本号畸形**：SemVer 解析失败时退化为"只判是否相等"，绝不因此报错。
-
-const (
-	kvUpdateEnabled  = "update_check_enabled"
-	kvUpdateManifest = "update_manifest_url"
-	kvUpdateLastAt   = "update_last_check"
-	kvUpdateLastJSON = "update_last_result"
-	kvUpdateSkip     = "update_skip_version"
-	// kvUpdateUsed 上一次**真正拉到清单**的那个候选地址（程序自写）。
-	// 存在的原因很实际：同一份清单往往有 3 个等价地址（GitHub raw / Contents API /
-	// 公共镜像），而它们在不同网络下的可达性差距是"0.6 秒"与"超时"的区别。
-	// 记住上一次成功的那个、下次优先试它，可以避免每次检查都先在不可达的地址上
-	// 白等一个 8 秒超时。
-	kvUpdateUsed = "update_manifest_used"
-
-	// defaultUpdateManifestURL 未配置清单地址时的默认值（v0.26.5）。
-	//
-	// 为什么要有默认值：本功能的整个意义是"提醒有新版本"，而"提醒"这件事
-	// 一旦需要运维先手工填一个 raw URL 才会发生，实际结果就是**永远不发生**。
-	// 这正是它此前在本项目线上被关掉（update_check_enabled=0、URL 为空）的原因链。
-	// 默认指向本仓的 version.json —— 与程序同源，改版本时一起改，不需要额外维护。
-	defaultUpdateManifestURL = "https://raw.githubusercontent.com/sheng-du0521/workbuddy2api/main/version.json"
-
-	// updateManifestMaxBytes 清单体积上限。列表本身只有几百字节，给 64KB 足够，
-	// 同时保证一个畸形/恶意响应不会把内存吃掉。
-	updateManifestMaxBytes = 64 << 10
-	// updateCacheTTL 缓存有效期：12 小时内不重复出站（启动时不打、打开页面不打）。
-	updateCacheTTL = 12 * time.Hour
-	// updateNetTimeout 单次拉取超时。
-	updateNetTimeout = 8 * time.Second
-	// updateStartupDelay 启动后延迟多久做第一次检查 —— 不与启动路径争资源。
-	updateStartupDelay = 25 * time.Second
-	// updatePeriodicEvery 后台周期性检查间隔。
-	updatePeriodicEvery = 12 * time.Hour
+//
+// ── 过渡期别名（v0.31.7）──────────────────────────────────────────────────────
+//
+// 清单解析 / 语义化版本 / 候选推导 / 状态判定这些**纯逻辑**已下沉到 internal/selfupdate
+// （P2-7 拆包第一刀）。本块只做**名字映射**，让本包既有的调用点与测试**一行不改** ——
+// 迁移分两步走：先建立边界（本步，零行为变化），再把调用点逐个迁到 selfupdate 的
+// 正式 API 并删掉这些别名（见 docs/P2-7-拆包方案.md）。
+//
+// ⚠️ 函数/常量走别名没问题；**变量不行**（`var x = pkg.X` 是值拷贝，测试改本地那份
+// 不会影响包内使用），所以 HTTPClient 是**直接引用包内变量**，测试也直接改它。
+type (
+	semver         = selfupdate.Semver
+	updateAsset    = selfupdate.Asset
+	updateManifest = selfupdate.Manifest
+	updateStatus   = selfupdate.Status
 )
 
-// updateHTTPClient 拉取清单用的客户端。抽成变量以便测试注入
-// （否则每个用例都要真连外网 —— 又慢又 flaky，最后没人愿意为它写测试）。
-var updateHTTPClient = &http.Client{Timeout: updateNetTimeout}
+const (
+	kvUpdateEnabled          = selfupdate.KVEnabled
+	kvUpdateManifest         = selfupdate.KVManifest
+	kvUpdateLastAt           = selfupdate.KVLastAt
+	kvUpdateLastJSON         = selfupdate.KVLastJSON
+	kvUpdateSkip             = selfupdate.KVSkip
+	kvUpdateUsed             = selfupdate.KVUsed
+	updateNetTimeout         = selfupdate.NetTimeout
+	updateStartupDelay       = selfupdate.StartupDelay
+	updatePeriodicEvery      = selfupdate.PeriodicEvery
+	updateCacheTTL           = selfupdate.CacheTTL
+	updateManifestMaxBytes   = selfupdate.ManifestMaxBytes
+	defaultUpdateManifestURL = selfupdate.DefaultManifestURL
+)
+
+var (
+	parseSemver              = selfupdate.ParseSemver
+	compareSemver            = selfupdate.CompareSemver
+	decideUpdate             = selfupdate.Decide
+	severityOf               = selfupdate.SeverityOf
+	updateManifestCandidates = selfupdate.Candidates
+	splitRawGitHubURL        = selfupdate.SplitRawGitHubURL
+	parseUpdateManifestBody  = selfupdate.ParseBody
+	fetchUpdateManifest      = selfupdate.Fetch
+	orderUpdateCandidates    = selfupdate.OrderCandidates
+	shortHost                = selfupdate.ShortHost
+	printUpdateStatus        = selfupdate.PrintStatus
+	updateExitCode           = selfupdate.ExitCode
+)
+
+// ⚠️ 这里**刻意没有** updateHTTPClient 这个名字：曾经有过一个
+// `var updateHTTPClient = selfupdate.HTTPClient` 的"别名"，但变量别名是**值拷贝** ——
+// 测试改它只改本地那份，包内 fetch 仍用 selfupdate.HTTPClient（表现为"注入了假 client
+// 却真的去连了外网"，静默失效）。要注入就写 `selfupdate.HTTPClient = ...`，
+// 或者干脆让这个名字不存在（误用者直接编译失败，比静默失效好）。
 
 // updateFetchMu 保证同一时刻只有一次真实出站（单飞）。
-// 包级变量即可：一个进程只有一个 app 实例，它只是防并发，不承载状态。
+//
+// 刻意**留在本包**：它是调用方的策略（"整个应用同一时刻只打一次清单"），而不是
+// 清单库的能力 —— 库只管"怎么取一份清单"，要不要串行化由使用方决定。
 var updateFetchMu sync.Mutex
-
-// ---------------------------------------------------------------- 语义化版本
-
-// semver 精简的 SemVer 2.0.0 表示。
-type semver struct {
-	major, minor, patch int
-	pre                 []string // 预发布标识符；空表示正式版
-	ok                  bool     // 解析是否成功
-}
-
-// parseSemver 解析版本号。宽松接受 `1` / `1.2` / `v1.2.3` / `1.2.3-rc.1+build`。
-//
-// 为什么宽松：清单是人手写的，逼着别人写全三段只会制造无意义的失败。
-// 但**宽松不等于乱认** —— 非数字段一律判为解析失败，交给调用方降级处理。
-func parseSemver(s string) semver {
-	v := semver{}
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "v")
-	s = strings.TrimPrefix(s, "V")
-	if s == "" {
-		return v
-	}
-	// 去掉 +build 元数据（SemVer 规定它不参与优先级比较）
-	if i := strings.IndexByte(s, '+'); i >= 0 {
-		s = s[:i]
-	}
-	var pre string
-	if i := strings.IndexByte(s, '-'); i >= 0 {
-		pre = s[i+1:]
-		s = s[:i]
-		// "1.2.3-" 这种尾随横线是畸形的。不特判的话 pre 为空字符串，
-		// 会被下面 `if pre != ""` 静默跳过、当成 "1.2.3" —— 把一个写错的
-		// 版本号当成合法版本，正是"更新提醒"最不该犯的错误。
-		if pre == "" {
-			return v
-		}
-	}
-	parts := strings.Split(s, ".")
-	if len(parts) == 0 || len(parts) > 3 {
-		return v
-	}
-	nums := make([]int, 3)
-	for i, p := range parts {
-		n, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil || n < 0 {
-			return v
-		}
-		nums[i] = n
-	}
-	if pre != "" {
-		ids := strings.Split(pre, ".")
-		for _, id := range ids {
-			if id == "" {
-				return v
-			}
-		}
-		v.pre = ids
-	}
-	v.major, v.minor, v.patch = nums[0], nums[1], nums[2]
-	v.ok = true
-	return v
-}
-
-func sign(n int) int {
-	switch {
-	case n > 0:
-		return 1
-	case n < 0:
-		return -1
-	default:
-		return 0
-	}
-}
-
-// compareSemver 按 SemVer 2.0.0 的优先级规则比较，返回 -1 / 0 / 1。
-//
-// 规则要点（最容易写错的两条）：
-//   - **有预发布标识的版本 < 对应的正式版**（1.0.0-rc.1 < 1.0.0）；
-//   - 预发布逐段比较时，**纯数字段 < 非数字段**，且数字段按数值比较（不是字典序）。
-func compareSemver(a, b semver) int {
-	if a.major != b.major {
-		return sign(a.major - b.major)
-	}
-	if a.minor != b.minor {
-		return sign(a.minor - b.minor)
-	}
-	if a.patch != b.patch {
-		return sign(a.patch - b.patch)
-	}
-	if len(a.pre) == 0 && len(b.pre) == 0 {
-		return 0
-	}
-	if len(a.pre) == 0 {
-		return 1
-	}
-	if len(b.pre) == 0 {
-		return -1
-	}
-	n := len(a.pre)
-	if len(b.pre) < n {
-		n = len(b.pre)
-	}
-	for i := 0; i < n; i++ {
-		ai, aerr := strconv.Atoi(a.pre[i])
-		bi, berr := strconv.Atoi(b.pre[i])
-		switch {
-		case aerr == nil && berr == nil:
-			if ai != bi {
-				return sign(ai - bi)
-			}
-		case aerr == nil:
-			return -1 // 数字标识符优先级更低
-		case berr == nil:
-			return 1
-		default:
-			if c := strings.Compare(a.pre[i], b.pre[i]); c != 0 {
-				return c
-			}
-		}
-	}
-	return sign(len(a.pre) - len(b.pre))
-}
-
-// ---------------------------------------------------------------- 清单与状态
-
-// updateAsset 一个平台产物。
-type updateAsset struct {
-	OS     string `json:"os"`
-	Arch   string `json:"arch"`
-	URL    string `json:"url"`
-	SHA256 string `json:"sha256,omitempty"`
-	Size   int64  `json:"size,omitempty"`
-}
-
-// updateManifest 更新清单（version.json 的结构）。
-type updateManifest struct {
-	Version      string        `json:"version"`
-	MinSupported string        `json:"min_supported,omitempty"`
-	Notes        string        `json:"notes,omitempty"`
-	ReleasedAt   int64         `json:"released_at,omitempty"`
-	URL          string        `json:"url,omitempty"`
-	Assets       []updateAsset `json:"assets,omitempty"`
-}
-
-// updateStatus 交给前端的完整状态。
-//
-// 刻意把「检查失败」也表达出来（Error 字段）而不是隐藏：运维需要区分
-// 「已是最新」和「压根没查成功」—— 后者会让人以为项目停止维护了。
-type updateStatus struct {
-	Current     string       `json:"current"`    // 本机版本
-	Latest      string       `json:"latest"`     // 清单里的最新版本（可能为空）
-	HasUpdate   bool         `json:"has_update"` // 是否有更新可用
-	Severity    string       `json:"severity"`   // none / patch / minor / major
-	Notes       string       `json:"notes,omitempty"`
-	ReleaseURL  string       `json:"release_url,omitempty"`
-	ReleasedAt  int64        `json:"released_at,omitempty"`
-	CheckedAt   int64        `json:"checked_at,omitempty"`
-	ManifestURL string       `json:"manifest_url"`            // 生效的清单地址（空 = 未配置）
-	ManifestUse string       `json:"manifest_used,omitempty"` // 实际拉成功的候选地址（多地址回退时与上面不同）
-	Enabled     bool         `json:"enabled"`
-	Skipped     string       `json:"skipped,omitempty"`       // 已跳过的版本
-	MinSupport  string       `json:"min_supported,omitempty"` // 清单声明的最低支持版本
-	TooOld      bool         `json:"too_old"`                 // 当前版本已低于最低支持
-	Asset       *updateAsset `json:"asset,omitempty"`         // 匹配当前平台+架构的产物
-	Error       string       `json:"error,omitempty"`         // 上次检查的失败原因（空=成功）
-	Stale       bool         `json:"stale"`                   // 结果来自过期缓存（离线时）
-
-	// ---- 自动下载（v0.26.7）----
-	// AutoDownload 自动下载开关的当前值（面板据此显示"自动/手动"）。
-	AutoDownload bool `json:"auto_download"`
-	// Download 产物下载状态。**始终非 nil**（未下载时 State="none"）——
-	// 让前端无需判空就能渲染"未提供产物 / 正在下载 / 已就绪"三态。
-	Download *updateDownload `json:"download,omitempty"`
-}
-
-// decideUpdate **纯函数**：给定当前版本、清单与用户偏好，算出要展示什么。
-//
-// 抽成纯函数是刻意的 —— 版本比较有一条边界特别容易写错（预发布、畸形版本号、
-// 降级），而它又完全没有 IO 依赖，正好可以钉进单测。
-func decideUpdate(current string, m *updateManifest, skipped string, checkedAt int64) updateStatus {
-	st := updateStatus{Current: current, CheckedAt: checkedAt}
-	if m == nil {
-		return st
-	}
-	st.Latest = m.Version
-	st.Notes = m.Notes
-	st.ReleaseURL = m.URL
-	st.ReleasedAt = m.ReleasedAt
-	st.MinSupport = m.MinSupported
-	st.Skipped = skipped
-
-	cur, lat := parseSemver(current), parseSemver(m.Version)
-	switch {
-	case cur.ok && lat.ok:
-		// 正常路径：语义化比较。
-		if compareSemver(lat, cur) > 0 {
-			st.HasUpdate = true
-			st.Severity = severityOf(cur, lat)
-		}
-	case current != "" && m.Version != "":
-		// 版本号畸形（如 "2026.10.13"、"dev"）：退化为**只判是否相等**。
-		// 不报错、不猜大小 —— 猜错方向会让"更新提醒"变成"降级提醒"。
-		if strings.TrimPrefix(strings.TrimPrefix(current, "v"), "V") !=
-			strings.TrimPrefix(strings.TrimPrefix(m.Version, "v"), "V") {
-			st.HasUpdate = true
-			st.Severity = "unknown"
-		}
-	}
-
-	// 用户点过"跳过此版本"：不再提示，但仍把最新版本号显示出来
-	// （静静消失会让人怀疑检查坏了）。
-	if st.HasUpdate && skipped != "" && skipped == m.Version {
-		st.HasUpdate = false
-	}
-	if !st.HasUpdate {
-		st.Severity = "none"
-	}
-
-	// 当前版本低于清单声明的最低支持版本 → 标记为需要尽快升级。
-	if cur.ok && parseSemver(m.MinSupported).ok {
-		if compareSemver(cur, parseSemver(m.MinSupported)) < 0 {
-			st.TooOld = true
-		}
-	}
-
-	// 匹配当前平台的产物（找不到也没关系，用 ReleaseURL 兜底）。
-	for i := range m.Assets {
-		a := m.Assets[i]
-		if strings.EqualFold(a.OS, runtime.GOOS) && strings.EqualFold(a.Arch, runtime.GOARCH) {
-			st.Asset = &m.Assets[i]
-			break
-		}
-	}
-	return st
-}
-
-// severityOf 新版比当前版高了哪一档。
-func severityOf(cur, lat semver) string {
-	switch {
-	case lat.major != cur.major:
-		return "major"
-	case lat.minor != cur.minor:
-		return "minor"
-	default:
-		return "patch"
-	}
-}
-
-// ---------------------------------------------------------------- kv 读写
 
 func (a *app) updateCheckEnabled() bool {
 	v, _ := a.store.GetKV(kvUpdateEnabled)
@@ -406,215 +171,6 @@ func (a *app) updateCacheFresh(now time.Time) bool {
 }
 
 // ---------------------------------------------------------------- 出站拉取
-
-// updateManifestCandidates 列出一个地址的**等价候选**，按建议尝试顺序返回。
-//
-// ## 为什么需要回退（v0.26.5）
-//
-// `raw.githubusercontent.com` 在部分网络下**直接不可达**（本项目实测：本机连不通，
-// 12 秒超时；而 `api.github.com` 0.6 秒返回）。于是"检查更新"在这类环境里恒失败，
-// 提醒功能等于不存在 —— 而它恰恰是私有化部署最需要的那个功能（用户不会天天来翻仓库）。
-//
-// 候选的来源是**从 raw 地址推导**，不是硬编码一个第三方域名列表：
-//
-//	https://raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH
-//	  → https://api.github.com/repos/OWNER/REPO/contents/PATH?ref=BRANCH   （GitHub 官方 API，可解析 base64）
-//	  → https://cdn.jsdelivr.net/gh/OWNER/REPO@BRANCH/PATH                （公共 CDN 镜像）
-//	  → https://ghproxy.net/https://raw.githubusercontent.com/...          （反代）
-//
-// 非 raw 形态的地址（自建 CDN、内网文件服务）**不做推导**：那种情况下"多试几个
-// 第三方站点"没有任何依据，只会把出站面扩大。此时候选就是它自己。
-//
-// ⚠️ 安全边界：回退只改**传输路径**，不改**校验口径** —— 清单里给出的下载地址与
-// SHA-256 照旧原样展示给运维，程序从不自动下载替换 exe（见文件头"为什么不做自动更新"）。
-// 也就是说镜像被投毒的影响面是"提示里的说明文字"，不是"被自动装上的二进制"。
-func updateManifestCandidates(primary string) []string {
-	p := strings.TrimSpace(primary)
-	if p == "" {
-		return nil
-	}
-	out := []string{p}
-	owner, repo, branch, path, ok := splitRawGitHubURL(p)
-	if !ok {
-		return out
-	}
-	out = append(out,
-		fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repo, path, branch),
-		fmt.Sprintf("https://cdn.jsdelivr.net/gh/%s/%s@%s/%s", owner, repo, branch, path),
-		"https://ghproxy.net/https://raw.githubusercontent.com/"+owner+"/"+repo+"/"+branch+"/"+path,
-	)
-	return out
-}
-
-// splitRawGitHubURL 解析 raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH... 形态。
-// 路径可以有多段（如 dist/version.json），故只切前三段、其余整体作为 path。
-func splitRawGitHubURL(u string) (owner, repo, branch, path string, ok bool) {
-	const prefix = "https://raw.githubusercontent.com/"
-	rest, found := strings.CutPrefix(u, prefix)
-	if !found {
-		// 也接受 http:// 形态（老配置里可能有）。
-		rest, found = strings.CutPrefix(u, "http://raw.githubusercontent.com/")
-		if !found {
-			return "", "", "", "", false
-		}
-	}
-	rest = strings.TrimPrefix(rest, "/")
-	parts := strings.SplitN(rest, "/", 4)
-	if len(parts) < 4 {
-		return "", "", "", "", false
-	}
-	owner, repo, branch, path = parts[0], parts[1], parts[2], parts[3]
-	if owner == "" || repo == "" || branch == "" || path == "" {
-		return "", "", "", "", false
-	}
-	return owner, repo, branch, path, true
-}
-
-// parseUpdateManifestBody 把响应体解析成清单，**同时接受两种封装**：
-//
-//  1. 裸清单 JSON（version.json 本体，raw / CDN 镜像返回的就是它）；
-//  2. GitHub Contents API 信封：{name,path,size,content:"<base64>",encoding:"base64",...}。
-//
-// 第 2 种必须支持 —— 它正是 raw 不可达时的那条回退路径。不支持的话"回退"
-// 只会拿到一个没有 version 字段的 JSON 然后报"清单缺少 version 字段"，
-// 看起来像清单写错了，实际是解析口径没跟上。
-func parseUpdateManifestBody(body []byte) (*updateManifest, error) {
-	var m updateManifest
-	if err := json.Unmarshal(body, &m); err == nil && strings.TrimSpace(m.Version) != "" {
-		return &m, nil
-	}
-	var env struct {
-		Content  string `json:"content"`
-		Encoding string `json:"encoding"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, fmt.Errorf("清单解析失败: %w", err)
-	}
-	if strings.EqualFold(strings.TrimSpace(env.Encoding), "base64") && strings.TrimSpace(env.Content) != "" {
-		// Contents API 的 content 是**折行**的 base64（每 60 字符一个 \n）。
-		raw, err := base64.StdEncoding.DecodeString(stripSpace(env.Content))
-		if err != nil {
-			return nil, fmt.Errorf("清单 base64 解码失败: %w", err)
-		}
-		if err := json.Unmarshal(raw, &m); err != nil {
-			return nil, fmt.Errorf("清单解析失败（Contents API 内容）: %w", err)
-		}
-	}
-	if strings.TrimSpace(m.Version) == "" {
-		return nil, fmt.Errorf("清单缺少 version 字段")
-	}
-	return &m, nil
-}
-
-// stripSpace 去掉字符串里所有空白（base64 折行、缩进、\r）。
-func stripSpace(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		switch r {
-		case ' ', '\t', '\n', '\r':
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// fetchManifestOnce 在**一个**候选地址上拉一次清单。失败返回 error 由调用方决定是否换地址。
-func fetchManifestOnce(ctx context.Context, url, curVersion string) (*updateManifest, error) {
-	if url == "" {
-		return nil, fmt.Errorf("未配置更新清单地址")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	// 带 UA 是礼貌也是实践：GitHub raw / CDN / 反代都可能拒绝空 UA 的客户端。
-	req.Header.Set("User-Agent", "workbuddy2api/"+curVersion)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := updateHTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		// 403/429 常见于被限流；这里不做重试（下次周期再试即可），
-		// 把状态码如实带回，便于运维判断是不是被 CDN 拦了。
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, updateManifestMaxBytes))
-	if err != nil {
-		return nil, err
-	}
-	return parseUpdateManifestBody(body)
-}
-
-// fetchUpdateManifest 依候选顺序尝试，返回第一个成功的清单与其实际地址。
-//
-// 每个候选各自受 ctx 约束（ctx 的预算由调用方给足，见 handleAdminUpdateStatus）；
-// **逐个试**而不是并发打，是因为候选之间有明确的主次（canonical 优先），
-// 并发只会让我们对外多打几个包。
-//
-// 全部失败时 error 汇总每个候选的失败原因 —— 排障时一眼能看出"是全都超时
-// （网络不通）"还是"只有 raw 超时而 API 报 404（路径写错了）"。
-func fetchUpdateManifest(ctx context.Context, primary, curVersion, lastUsed string) (*updateManifest, string, error) {
-	cands := updateManifestCandidates(primary)
-	if len(cands) == 0 {
-		return nil, "", fmt.Errorf("未配置更新清单地址")
-	}
-	// 上次成功的候选提到最前：避免每次都在已知不可达的地址上白等一个超时。
-	cands = orderUpdateCandidates(cands, lastUsed)
-	errs := make([]string, 0, len(cands))
-	for _, c := range cands {
-		m, err := fetchManifestOnce(ctx, c, curVersion)
-		if err == nil {
-			return m, c, nil
-		}
-		errs = append(errs, shortHost(c)+": "+err.Error())
-		if ctx.Err() != nil {
-			break // 预算用尽：剩下的候选不必再试（免得把"超时"记成"全部不可达"）
-		}
-	}
-	return nil, "", fmt.Errorf("所有候选地址均失败（%s）", strings.Join(errs, "；"))
-}
-
-// orderUpdateCandidates 把上次命中的候选提到最前（抽成纯函数以便钉进测试：
-// "优先试上次成功的地址"这条规则看不见摸不着，只靠端到端很难断言）。
-//
-// lastUsed 不在候选里（运维改了清单地址 / 候选推导规则变了）时**原样返回** ——
-// 不把外部输入塞进候选列表，否则一个陈旧的 kv 值就能让程序去访问任意 URL。
-func orderUpdateCandidates(cands []string, lastUsed string) []string {
-	if lastUsed == "" || len(cands) < 2 {
-		return cands
-	}
-	for i, c := range cands {
-		if c == lastUsed {
-			if i == 0 {
-				return cands
-			}
-			out := make([]string, 0, len(cands))
-			out = append(out, lastUsed)
-			out = append(out, cands[:i]...)
-			out = append(out, cands[i+1:]...)
-			return out
-		}
-	}
-	return cands
-}
-
-// shortHost 把地址压成 host+路径，用于错误汇总（完整 URL 太长，且反代形态会嵌套）。
-func shortHost(u string) string {
-	s := strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
-	if i := strings.IndexByte(s, '/'); i > 0 {
-		return s[:i]
-	}
-	return s
-}
-
-// checkUpdate 执行一次检查（带缓存与单飞），返回给前端的状态。
-//
-// force=true 时忽略缓存（用户手动点了"立即检查"）。
 func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 	now := time.Now()
 	st := updateStatus{
@@ -837,73 +393,4 @@ func (a *app) handleAdminUpdateSkip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": v})
-}
-
-// ---------------------------------------------------------------- CLI
-
-// printUpdateStatus -check-update 的输出。
-//
-// 输出刻意是**人类可读的多行文本**而不是 JSON：它的用途是"运维跑一下看一眼"。
-// 需要机器可读的话直接请求 /api/admin/update-status（那里是 JSON）。
-func printUpdateStatus(st updateStatus) {
-	fmt.Printf("当前版本: %s\n", st.Current)
-	if !st.Enabled {
-		fmt.Println("版本检查: 已关闭（设置 → 关于 / 版本更新）")
-		return
-	}
-	if st.ManifestURL == "" {
-		fmt.Println("更新源:   未配置（设置 → 关于 / 版本更新 可填清单地址）")
-		return
-	}
-	fmt.Printf("更新源:   %s\n", st.ManifestURL)
-	if st.ManifestUse != "" && st.ManifestUse != st.ManifestURL {
-		fmt.Printf("实际命中: %s\n", st.ManifestUse)
-	}
-	if st.Error != "" {
-		fmt.Printf("检查结果: 失败 —— %s\n", st.Error)
-		return
-	}
-	fmt.Printf("最新版本: %s\n", st.Latest)
-	if st.HasUpdate {
-		fmt.Printf("状态:     有新版本可用（%s 级别）\n", st.Severity)
-		if st.ReleaseURL != "" {
-			fmt.Printf("发布页:   %s\n", st.ReleaseURL)
-		}
-		if st.Asset != nil && st.Asset.URL != "" {
-			fmt.Printf("下载:     %s\n", st.Asset.URL)
-			if st.Asset.SHA256 != "" {
-				fmt.Printf("SHA-256:  %s\n", st.Asset.SHA256)
-			}
-		}
-		if st.Notes != "" {
-			fmt.Printf("更新说明: %s\n", st.Notes)
-		}
-		if st.Skipped == st.Latest {
-			fmt.Println("注意:     该版本此前已被标记为「跳过」")
-		}
-	} else {
-		fmt.Println("状态:     已是最新")
-	}
-	if st.TooOld {
-		fmt.Printf("警告:     当前版本低于最低支持版本 %s，建议尽快升级\n", st.MinSupport)
-	}
-	if st.CheckedAt > 0 {
-		fmt.Printf("检查时间: %s\n", time.Unix(st.CheckedAt, 0).Format("2006-01-02 15:04:05"))
-	}
-}
-
-// updateExitCode -check-update 的退出码。
-//
-// 刻意分三档：**巡检脚本必须能区分「有新版本」和「根本没查成功」**。
-// 把检查失败当成"已是最新"（都返回 0）是这类脚本最常见的坑 ——
-// 结果是更新源挂了两周都没人发现。
-func updateExitCode(st updateStatus) int {
-	switch {
-	case st.Error != "" || !st.Enabled || st.ManifestURL == "":
-		return 2
-	case st.HasUpdate:
-		return 1
-	default:
-		return 0
-	}
 }

@@ -26,9 +26,15 @@ func coolAllForModel(t *testing.T, px *Proxy) {
 		"6004 model rate limit [reset=body-json]")
 	px.pool.CooldownSoftForModel(coolUIDB, time.Minute, now.Add(6*time.Hour), probeModel,
 		"6004 model rate limit [reset=body-json]")
-	// 单测等不起默认的 20m：把 delay 压到 1ns（窗口长度过滤仍是 3h，不受影响）；
+	// 单测等不起默认的 20m：把 delay 压到 1ms，并 sleep 一小段确保**时钟已越过 Since+delay**。
+	//
+	// ⚠️ 不能压到 1ns：Windows 的 time.Now 粒度可达毫秒级，两次调用可能返回**同一时刻**，
+	// 于是 `now.Before(Since+delay)` 成立 → 探测被判定"还没到点"。
+	// 本用例在全量跑时偶发失败正是这个原因（单独跑却总是过 —— 因为单独跑时代码路径更慢）。
+	// 这是**夹具**问题不是实现问题：生产默认 delay 是 20 分钟，粗粒度时钟毫无影响。
 	// interval 用 1h（要验证"同号间隔内不重复探"）；global 用 1m（要验证"全池不连探"）。
-	px.pool.SetModelProbe(time.Nanosecond, time.Hour, time.Minute)
+	px.pool.SetModelProbe(time.Millisecond, time.Hour, time.Minute)
+	time.Sleep(20 * time.Millisecond)
 }
 
 // TestModelProbeRecoversWhenUpstreamLiftedEarly 核心收益：上游提前解除 → 一次探测把
@@ -120,7 +126,7 @@ func TestModelProbeSkips11102NegativeCache(t *testing.T) {
 	_, px, srv, raw := newCoolingApp(t, stub)
 	px.pool.BlockModelBackoff(coolUIDA, probeModel, "11102 model not found on this backend")
 	px.pool.BlockModelBackoff(coolUIDB, probeModel, "11102 model not found on this backend")
-	px.pool.SetModelProbe(time.Nanosecond, time.Hour, time.Minute)
+	px.pool.SetModelProbe(time.Millisecond, time.Hour, time.Minute)
 
 	resp := doChat(t, srv, raw, `{"model":"`+probeModel+`","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode == http.StatusOK {
@@ -136,7 +142,7 @@ func TestModelProbeDisabledByZeroInterval(t *testing.T) {
 	stub, _ := newStub()
 	_, px, srv, raw := newCoolingApp(t, stub)
 	coolAllForModel(t, px)
-	px.pool.SetModelProbe(time.Nanosecond, 0, -1) // 关停
+	px.pool.SetModelProbe(time.Millisecond, 0, -1) // 关停
 
 	resp := doChat(t, srv, raw, `{"model":"`+probeModel+`","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode == http.StatusOK {
@@ -155,7 +161,7 @@ func TestModelProbeNotUsedWhenHealthyAccountExists(t *testing.T) {
 	// 只有 A 对该模型冷却；B 完全可用
 	px.pool.CooldownSoftForModel(coolUIDA, time.Minute, time.Now().Add(3*time.Hour), probeModel,
 		"6004 model rate limit [reset=body-json]")
-	px.pool.SetModelProbe(time.Nanosecond, time.Hour, time.Minute)
+	px.pool.SetModelProbe(time.Millisecond, time.Hour, time.Minute)
 
 	resp := doChat(t, srv, raw, `{"model":"`+probeModel+`","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != http.StatusOK {

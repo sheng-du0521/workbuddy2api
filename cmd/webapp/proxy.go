@@ -190,6 +190,23 @@ type Proxy struct {
 	hostShareRatio float64 // 代挂分成比例（0~1）
 	referralRatio  float64 // 推广返点比例（0~1）：下级充值 / 下级号池收益时给上级的返点
 
+	// mifMu/modelInFlight 记 **(账号, 模型) 维度的在途请求数**（v0.31.7）。
+	//
+	// 要解决的问题：模型级冷却（6004）是**响应到达之后**才写入的，于是同一个
+	// (账号, 模型) 的并发请求会在冷却写下之前各自选到同一个号 —— 一次上游限额
+	// 被放大成 N 次必然失败的请求（而且都从同一个出口 IP 出去）。
+	//
+	// 处置口径刻意是**软偏好、不是硬互斥**：
+	//   - 有别的候选 → 换一个（把重复调度消掉）；
+	//   - 该模型只剩这个号 → **照用**（可用性优先，绝不因为"忙"而回 503）。
+	// 为什么不硬互斥：实测近 7 天 4086 次请求里，同 (账号,模型) ≤10s 的重复调度有
+	// 398 对、其中含失败的 **0** 对（67 次 6004 里也没有一次是它造成的）——
+	// 用一个未观测到的问题去换"并发能力下降"不划算；软偏好零成本且不会更差。
+	// 计数 modelBusySkips 留证据：将来它涨起来就说明该升级为硬互斥。
+	mifMu         sync.Mutex
+	modelInFlight map[string]int
+	// modelBusySkips 因"该 (账号,模型) 已有在途请求"而改选别的号的次数（/api/admin/live 透出）。
+	modelBusySkips atomic.Int64
 	// hitMu/lastHit 同账号最近一次被选中的时间戳（Unix 秒），用于最小复用间隔节流。
 	hitMu   sync.Mutex
 	lastHit map[string]int64
@@ -653,6 +670,52 @@ func (p *Proxy) noteChatSuccess(uid, model string) {
 	p.pool.BlockModelClear(uid, model)
 }
 
+// modelKey (账号, 模型) 维度的在途计数键。用 \x1f 分隔：它不可能出现在 uid 或
+// 模型名里，避免 "a|b" + "c" 与 "a" + "b|c" 撞键（本项目既有口径，见 costExplore 的键）。
+func modelBusyKey(uid, model string) string { return uid + "\x1f" + model }
+
+// noteModelInFlight 记一次「该 (账号, 模型) 开始了在途请求」。model 为空时不记
+// （没有模型维度就没有这个问题，见 pool 侧"空模型退化账号级"的同一纪律）。
+func (p *Proxy) noteModelInFlight(uid, model string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mifMu.Lock()
+	if p.modelInFlight == nil {
+		p.modelInFlight = map[string]int{}
+	}
+	p.modelInFlight[modelBusyKey(uid, model)]++
+	p.mifMu.Unlock()
+}
+
+// clearModelInFlight 在途请求结束时递减。**必须与 noteModelInFlight 严格配对** ——
+// 计数泄漏会让这个号被永久"偏爱跳过"，是比原问题更糟的形态（所以所有释放路径
+// 都收敛到 releaseHeld 这一个入口）。
+func (p *Proxy) clearModelInFlight(uid, model string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mifMu.Lock()
+	k := modelBusyKey(uid, model)
+	if n := p.modelInFlight[k]; n <= 1 {
+		delete(p.modelInFlight, k) // 归零即删键：map 不无限膨胀
+	} else {
+		p.modelInFlight[k] = n - 1
+	}
+	p.mifMu.Unlock()
+}
+
+// modelBusy 该 (账号, 模型) 是否已有在途请求。供选号做"优先换一个"的软偏好。
+func (p *Proxy) modelBusy(uid, model string) bool {
+	if uid == "" || model == "" {
+		return false
+	}
+	p.mifMu.Lock()
+	n := p.modelInFlight[modelBusyKey(uid, model)]
+	p.mifMu.Unlock()
+	return n > 0
+}
+
 // noteHit 记账「该账号刚被用于一次请求」，供节流判定。
 func (p *Proxy) noteHit(uid string) {
 	p.hitMu.Lock()
@@ -770,13 +833,24 @@ func copyTried(tried map[string]bool) map[string]bool {
 // 上限 512：代挂自用场景下，个人账号可能只是池中很小一部分，需要多轮跳过平台账号
 // 才能命中自己的号；512 远超实际账号规模，又不会成为死循环。
 func (p *Proxy) pickScopedWith(tried map[string]bool, model string, sc pickScope, group string, one pickOneFn) *auth.Auth {
-	var fallback *auth.Auth
+	var fallback, busyFallback *auth.Auth
 	for i := 0; i < 512; i++ {
 		cand := one(tried, model)
 		if cand == nil {
 			break
 		}
 		if !p.allowsSelection(cand.UID, sc) || (group != "" && !p.inConsumeGroup(cand.UID, group)) {
+			tried[cand.UID] = true
+			continue
+		}
+		// 该 (账号, 模型) 已有在途请求 → **优先换一个**（把重复调度消灭在冷却写入之前），
+		// 但不排除它：候选只剩它时下面的 busyFallback 仍会把请求交出去。
+		// 标记 tried 是有意的：同一客户端请求后续轮次也不该再选它（省一次无谓比较）。
+		if p.modelBusy(cand.UID, model) {
+			if busyFallback == nil {
+				busyFallback = cand
+			}
+			p.modelBusySkips.Add(1)
 			tried[cand.UID] = true
 			continue
 		}
@@ -788,7 +862,10 @@ func (p *Proxy) pickScopedWith(tried map[string]bool, model string, sc pickScope
 		}
 		tried[cand.UID] = true
 	}
-	return fallback
+	if fallback != nil {
+		return fallback
+	}
+	return busyFallback
 }
 
 // inConsumeGroup 该账号生效的消耗分组是否等于 group。
@@ -1273,12 +1350,10 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		ConversationRequestID: newRandomID(16),
 	}
 
-	var heldUID string
-	defer func() {
-		if heldUID != "" {
-			p.pool.Release(heldUID)
-		}
-	}()
+	// heldUID/heldModel 本次请求**当前持有**的租约（成功路径会一直持有到函数返回）。
+	// 两者必须一起维护：释放时按 (uid, model) 递减在途计数（见 releaseHeld）。
+	var heldUID, heldModel string
+	defer func() { p.releaseHeld(&heldUID, &heldModel, model) }()
 	tried := map[string]bool{}
 	// probeAttempt 本次轮转是否由**半开探测**拿到号（v0.31.6）：决定成功时是否
 	// 提前解除该 (账号, 模型) 的 6004 冷却，以及失败时是否补一条可读日志。
@@ -1345,11 +1420,12 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		if !p.pool.Acquire(au.UID) {
 			continue // 在途名额被抢，换下一个
 		}
-		heldUID = au.UID
+		heldUID, heldModel = au.UID, model
+		p.noteModelInFlight(au.UID, model)
 
 		if err := p.refreshIfNeeded(au); err != nil {
 			lastErr = "refresh token: " + err.Error()
-			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			p.releaseAndUnbind(&heldUID, &heldModel, model, stickyKey, au.UID, &stickyUID)
 			// 按 ErrKind 分流（v0.24.8）：12153 走会话失效的累计纪律，
 			// 其余保持降权口径。此前一律 NoteFailures，导致 12153 既不被摘除、
 			// 又永远重复被选中（见 applyRefreshFailure 注释）。
@@ -1376,7 +1452,7 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-time.After(d):
 			case <-r.Context().Done():
-				p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+				p.releaseAndUnbind(&heldUID, &heldModel, model, stickyKey, au.UID, &stickyUID)
 				return
 			}
 		}
@@ -1387,14 +1463,14 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		client, cerr := p.chatClientFor(au.UID, wantStream)
 		if cerr != nil {
 			lastErr = cerr.Error()
-			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			p.releaseAndUnbind(&heldUID, &heldModel, model, stickyKey, au.UID, &stickyUID)
 			p.pool.NoteFailures(au.UID)
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err.Error()
-			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			p.releaseAndUnbind(&heldUID, &heldModel, model, stickyKey, au.UID, &stickyUID)
 			if errors.Is(err, contextDone(r)) {
 				return
 			}
@@ -1405,7 +1481,7 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
 			lastErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-			p.releaseAndUnbind(&heldUID, stickyKey, au.UID, &stickyUID)
+			p.releaseAndUnbind(&heldUID, &heldModel, model, stickyKey, au.UID, &stickyUID)
 			retryAfter := resp.Header.Get("Retry-After")
 			// 上游明示的恢复时刻：三级来源解析（body 文案 > body 字段 > 响应头），
 			// 见 internal/upstream/resetat.go。解析放在调用点而不是策略函数内部，
@@ -1670,10 +1746,25 @@ func upstreamFailureStatus(k upstream.ErrKind) int {
 }
 
 // releaseAndUnbind 释放租约，并在失败号正是粘性号时解绑。
-func (p *Proxy) releaseAndUnbind(held *string, stickyKey, uid string, stickyUID *string) {
+// releaseHeld 释放本次请求持有的账号租约，并同步递减 (账号, 模型) 在途计数。
+//
+// **所有释放路径都必须走这里**（成功、失败换号、客户端断连、defer 兜底）：
+// 在途计数与租约必须同生同死 —— 计数泄漏会让该 (账号,模型) 被永久偏爱跳过，
+// 比"重复调度"本身更糟。heldModel 与 held 一起清空，防止把旧模型记到新号上。
+func (p *Proxy) releaseHeld(held *string, heldModel *string, model string) {
+	if *held == "" {
+		return
+	}
+	p.clearModelInFlight(*held, model)
+	p.pool.Release(*held)
+	*held, *heldModel = "", ""
+}
+
+func (p *Proxy) releaseAndUnbind(held *string, heldModel *string, model, stickyKey, uid string, stickyUID *string) {
 	if *held != "" {
+		p.clearModelInFlight(*held, model)
 		p.pool.Release(*held)
-		*held = ""
+		*held, *heldModel = "", ""
 	}
 	if *stickyUID != "" && uid == *stickyUID {
 		p.sess.Unbind(stickyKey)
@@ -1844,6 +1935,22 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 	// 分类已经算好，各 case 各写一遍必然漏一份。默认关闭时这里是零成本返回。
 	p.maybeSampleFingerprint(kind, uid, model, reqBody, body)
 	return kind
+}
+
+// routeView 路由侧的可观测位（v0.31.7）。
+//
+// 用 map 而不是结构体：这是**对外下发**的视图，字段名必须显式（v0.29.0 的
+// 「提现审核按钮点不动」就是内嵌无 json tag 结构体导致键名变成 Go 字段名）。
+func (p *Proxy) routeView() map[string]any {
+	p.mifMu.Lock()
+	inflight := len(p.modelInFlight)
+	p.mifMu.Unlock()
+	return map[string]any{
+		// model_inflight 当前有在途请求的 (账号, 模型) 键数（>0 说明正在起作用）。
+		"model_inflight": inflight,
+		// model_busy_skips 累计"因该 (账号,模型) 忙而改选别的号"的次数。
+		"model_busy_skips": p.modelBusySkips.Load(),
+	}
 }
 
 // promptDegradeView 提示词降级的可观测面（v0.31.4）。
