@@ -1,17 +1,17 @@
 {
-  "version": "0.31.12",
+  "version": "0.31.13",
   "min_supported": "0.24.0",
-  "notes": "v0.31.12：P2-7 第四刀第一刀 —— admin HTTP 面开始按域外迁（cmd/webapp −396 行）。① **先量化再动刀**：实测 `app` 有 **136 个 `handle*` 方法**；按\"依赖字段数\"排序，最窄的一簇是 `fingerprintrules.go`（5 个 handler、只依赖 `store`）→ 选它作第一刀。② **新 `internal/httpx`（共享层）**：`WriteJSON` + 内部错误文本脱敏（原 `cmd/webapp/errsafe.go`）。这是**每个** handler 的横切关注点（`writeJSON` 全项目 **552** 处调用），若各 `internal/api/*` 各复制一份，脱敏策略就会出现多个版本。纪律：本包**只放\"对所有 handler 都一样\"的东西** —— 带业务判断的写出必须留在业务域，否则它会变成第二个上帝对象（已写进包注释）。③ **新 `internal/api/fingerprint`（业务域）**：5 个 handler + `Load`/`Save` + 请求/响应类型。依赖面只有**窄接口** `Store`（**仅 GetKV/SetKV 两个方法**）+ 注入的 `SampleReader`（样本文件 IO 留调用方 —— 路径可被 flag 改，属部署细节）+ `httpx` + `upstream`。④ **边界**：路由注册**留在 cmd/webapp**（应用级装配，不是领域逻辑）；cmd/webapp 侧只剩 **33 行桥接**（常量别名 + 启动加载转发），**桥接层只转发不判断**。`fingerprintSampleTexts` 迁到 `fpsample.go`（它属采集侧，与样本面板同文件才内聚）。⑤ **收益**：`cmd/webapp` 非测试源码 **28472 → 28076 行（−396）**；`fingerprintrules.go` 347 → 33 行、`errsafe.go` 166 → 39 行。⑥ **这一刀买到的能力**：新增 14 条独立用例（内存 Store，不需要 app/数据库/HTTP 服务），钉住的都是**设计上知道但过去测不到**的纪律：**保存失败不改变现有规则**（校验失败时 kv 一个字都不能写、内存里仍是旧规则 —— 若顺序反了，一次失败保存会在 kv 留下非法规则，重启时启动路径只能吞掉它）、坏 JSON 不阻断启动但要**清掉进程内残留**、落盘的是归一化后规则（ID/AddedAt 与内存逐字一致）、删不存在的 ID **不写 kv**（计数 Store 断言）、回放缺接线要**如实报 500**（\"0 条样本\"与\"没接线\"是两件事）、对外 JSON **键名契约**（期望键必须存在且 Go 字段名键必须不存在）。⑦ **变异检验**：临时改坏三处（先落盘再校验 / 坏 JSON 不清残留 / 去掉 json tag）→ **测试都会红**，其中前两处**包级与 app 级都有命中**。⑧ **零行为变化的最强证据**：`cmd/webapp/fingerprintrules_test.go`（9 条）与 `errsafe_test.go` **一行未改、全绿** —— 它们走的是**真实 mux 的 HTTP 契约**，等于证明了路由/状态码/响应键值逐字节未变。⑨ **诚实边界**：**只搬了 1 个域（5/136 个 handler）**；`wallet`（提现，4 个）、`insights`/`ranking`、`accounts`（30 个，最大的一块）都还没动，`app` 仍是 200+ 方法；新包的测试用内存 Store，钉的是本域逻辑与顺序，**不负责**验证真实 SQLite 的 kv 语义。",
-  "released_at": 1792099000,
+  "notes": "v0.31.13：P2-7 第四刀第二刀 —— 用量报表域外迁（`cmd/webapp` −394 行）。① **选簇：先量化，再看\"有没有自己的类型\"**。上一刀之后 `app` 仍有 131/136 个 handler 未迁。把候选文件按**依赖字段数**排序，最窄的一簇是 `insights.go` / `ranking.go`（各 2 个 handler、只用 `store`）—— 但决定\"能不能一刀切干净\"的是另一项：**它是否引用 cmd/webapp 自有类型**。`wallet` 看似更小（4 个 handler），却依赖 `Withdrawal` / `RedeemCode` 等**存储层类型**，迁它等于顺手搬存储模型（是另一件事）；报表域则只依赖只读聚合。② **先下沉、再外迁**：`HostEarnDailyStat` / `HostEarnModelStat` 与三条 `host_earnings` 聚合查询搬进 `internal/usage`（它已经是\"台账只读聚合\"的家），靠 **Store 嵌入**做到零调用点改动；报表域最终只需要 **7 个只读方法、0 个 cmd/webapp 自有类型** → **本刀不需要任何类型别名**。③ **新 `internal/api/report`**：消耗排行（管理端 / 用户侧）、用量账单三类拆分、四个组装函数、三个纯辅助函数；身份由调用方**注入**（`UserIDOf` 返回 **(id, ok) 显式布尔** —— 不用\"ID==0 就是匿名\"去推断一个事实）。④ **边界**：路由注册仍在 cmd/webapp；`cmd/webapp/reportsvc.go` 只剩 **3 个转发方法 + 2 个接线函数**，**桥接层只转发不判断**；`handleUserModels` 按\"依赖什么就归到哪\"留在 cmd/webapp（它属**模型缓存**域，与账单只是碰巧同屏）。⑤ **两处顺带清理**：残留的 `percentile` 文档注释（该函数 v0.31.9 已迁走）此前被粘在 `HostEarnDailyStat` 头上—— 既丢了归属、又污染了结构体 godoc，一并删除。⑥ **收益**：`cmd/webapp` 非测试源码 **28076 → 27682 行（−394）**；`ranking.go`(217 行) / `insights.go`(132 行) 两个文件整体消失，只剩 `reportsvc.go` + `usermodels.go`。⑦ **测试形态升级（本刀最重要的一步）**：原 `ranking_test.go` 是\"直接调 `a.usageRanking`\"，迁完若照抄，就只证明\"那个函数还在\"。改为**走真实 mux 的 HTTP 契约**（路由 + 鉴权中间件 + 状态码 + JSON 键名一起被证明），并把两个纯辅助函数的用例随代码迁进新包。新增 **17 条用例**：新包 14 条（内存假 Store，不需要 app/数据库/HTTP）+ `internal/usage` 3 条 SQLite 级（本地日桶 / 边界秒 / 模型次序 / 号主隔离 / **汇总不设窗口**）+ cmd/webapp 新增账单契约 1 条。⑧ **变异检验（9 处）**：limit 不下传 SQL · 自用与用池 scope 对调 · 不再脱敏他人 · total 用窗口求和冒充全时段 · 脱敏形态被改 · 身份注入恒失败 · 汇总被加窗口 · 模型次序被改 · 收益按日窗口前移一天 —— **每一处都有对应用例变红**。⑨ **诚实边界**：只搬了 **3/136** 个 handler（排行 2 + 账单 1；`wallet`(4)、`accounts`(30) 仍未动，`app` 仍是 200+ 方法）；`HandleUsageBreakdown` 新增了一条**此前不可达**的未登录 401（迁移前没有这个分支，靠 `userGuard` 保证用户非 nil；路由有守卫 → **生产行为零变化**）；新包测试用内存假 Store，**不负责**验证真实 SQLite 语义（那是 `internal/usage` 的 SQLite 用例的职责）。",
+  "released_at": 1792104459,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.12/webapp.exe",
-      "sha256": "44fbd23f5789977165b5a313b755d2bfa6ffbc075ff9ba990ae82bff98ca7042",
-      "size": 14905344
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.13/webapp.exe",
+      "sha256": "15efec2cd78ef4fbaf06a570c64d207f07d14bab55ba3e097746d236f3a6861f",
+      "size": 14913536
     }
   ],
-  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.7）；换版本时同步换 url 与 sha256。"
+  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.13）；换版本时同步换 url 与 sha256。"
 }

@@ -2,9 +2,10 @@
 // 允许：个人学习 / 研究 / 自用部署 / 非营利分享与二次开发。
 // 禁止：以本源码或其衍生版本为标的的商业转售、倒卖、付费分发。
 
-// 用量台账（usage_logs）的**只读聚合**：明细查询、按账号/用户/模型/日的统计与性能分布。
+// 台账（usage_logs 用量 + host_earnings 代挂收益）的**只读聚合**：
+// 明细查询、按账号/用户/模型/日的统计、性能分布、号主收益按日/按模型。
 //
-// 为什么单独成包（v0.31.9，P2-7 拆包第二刀）：
+// 为什么单独成包（v0.31.9，P2-7 拆包第二刀；v0.31.13 并入 host_earnings 聚合）：
 //  1. 这一簇在 `Store`（169 个方法）里是**唯一全部只读、且只依赖 db 的聚合面** ——
 //     实测 10 个方法里 9 个只碰 `s.db`，第 10 个只调本簇内的另一个方法；
 //  2. 聚合 SQL 是"错了不会崩、只会给出错误数字"的那类代码，最需要**独立测试**
@@ -439,7 +440,97 @@ func (uq *Queries) UsageByModelScoped(userID int64, days int, scope string) ([]U
 	return out, rows.Err()
 }
 
-// ---------- 代挂收益聚合（号池返点） ----------
+// ---------- 代挂收益聚合（host_earnings，号池返点） ----------
+//
+// 与 usage_logs 聚合同属「报表读取侧」：只读、只碰 uq.db、错了不会崩只会给出错误数字。
+// v0.31.13 从 cmd/webapp 的 Store 搬到这里，理由与第二刀相同 —— 独立包能用临时 SQLite
+// 直接钉住"哪些行该被算进去"（含「汇总口径是全时段、按日/按模型才有窗口」这个易错点）。
+//
+// 边界：仍然**只读**。写 host_earnings（号主分成入账）留在 cmd/webapp 的结算路径里 ——
+// 写入要参与预扣/结算事务，与报表读取不是一件事。
+
+// HostEarnDailyStat 号池返点按日聚合。
+type HostEarnDailyStat struct {
+	Day          string
+	Requests     int64
+	ChargedMicro int64
+	EarnedMicro  int64
+}
+
+// HostEarnModelStat 号池返点按模型聚合。
+type HostEarnModelStat struct {
+	Model        string
+	Requests     int64
+	ChargedMicro int64
+	EarnedMicro  int64
+}
+
+// HostEarningsDaily 某号主的号池收益按本地自然日聚合近 days 天（按日升序，便于直接画折线）。
+func (uq *Queries) HostEarningsDaily(ownerUserID int64, days int) ([]HostEarnDailyStat, error) {
+	if days <= 0 || days > 365 {
+		days = 14
+	}
+	off := LocalDayOffset()
+	since := LocalDayStart(days)
+	rows, err := uq.db.Query(
+		`SELECT (created_at + ?) / 86400 AS d, COUNT(*),
+		        COALESCE(SUM(charged_micro),0), COALESCE(SUM(earned_micro),0)
+		 FROM host_earnings WHERE owner_user_id = ? AND created_at >= ?
+		 GROUP BY d ORDER BY d ASC`, off, ownerUserID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HostEarnDailyStat
+	for rows.Next() {
+		var dayIdx int64
+		var st HostEarnDailyStat
+		if err := rows.Scan(&dayIdx, &st.Requests, &st.ChargedMicro, &st.EarnedMicro); err != nil {
+			return nil, err
+		}
+		st.Day = time.Unix(dayIdx*86400-off, 0).Format("2006-01-02")
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// HostEarningsByModel 某号主的号池收益按模型聚合近 days 天（按收益降序）。
+func (uq *Queries) HostEarningsByModel(ownerUserID int64, days int) ([]HostEarnModelStat, error) {
+	if days <= 0 || days > 365 {
+		days = 14
+	}
+	since := LocalDayStart(days)
+	rows, err := uq.db.Query(
+		`SELECT model, COUNT(*), COALESCE(SUM(charged_micro),0), COALESCE(SUM(earned_micro),0)
+		 FROM host_earnings WHERE owner_user_id = ? AND created_at >= ?
+		 GROUP BY model ORDER BY COALESCE(SUM(earned_micro),0) DESC, COUNT(*) DESC`, ownerUserID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HostEarnModelStat
+	for rows.Next() {
+		var st HostEarnModelStat
+		if err := rows.Scan(&st.Model, &st.Requests, &st.ChargedMicro, &st.EarnedMicro); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// HostEarningSummary 某号主的收益汇总：总入账微点 + 笔数。
+//
+// ⚠️ 口径与上面两个**不同**：本方法是**全时段**累计（没有 days 参数、不带 created_at 过滤）。
+// 「进号池」块的 total/count 给的就是这个累计值，而 daily/models 是窗口值 —— 二者不等是
+// 设计如此（用户看"一共赚了多少"时不该被 days 参数影响）。**别顺手给它加窗口**。
+func (uq *Queries) HostEarningSummary(ownerUserID int64) (totalMicro int64, count int64, err error) {
+	err = uq.db.QueryRow(`SELECT COALESCE(SUM(earned_micro),0), COUNT(*) FROM host_earnings WHERE owner_user_id = ?`,
+		ownerUserID).Scan(&totalMicro, &count)
+	return
+}
+
+// ---------- 本地日界与分位 ----------
 
 // LocalDayOffset 本地时区偏移（秒，东为正）。
 // 用它把 UTC 秒换算成「本地自然日」序号，避免依赖 SQLite 的 localtime 修饰符

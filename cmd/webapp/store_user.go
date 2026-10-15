@@ -1462,79 +1462,14 @@ func (s *Store) UsageDaily(userID int64, days int) ([]UsageDailyStat, error) {
 	return s.UsageDailyScoped(userID, days, "")
 }
 
-// percentile 取升序切片的分位值（最近秩法）。空切片返回 0。
+// HostEarnDailyStat / HostEarnModelStat 与它们的三个聚合查询已于 v0.31.13 下沉到
+// internal/usage（P2-7 拆包第四刀第二刀）。Store **嵌入** *usage.Queries 且方法名未变
+// → 调用点零改动。
 //
-// 用最近秩而不是插值：耗时分布是长尾的，"950ms 与 1200ms 之间插出 1075ms"
-// 这种精度对排障没有价值，反而让数字看起来比实际更可信。
-// HostEarnDailyStat 号池返点按日聚合。
-type HostEarnDailyStat struct {
-	Day          string
-	Requests     int64
-	ChargedMicro int64
-	EarnedMicro  int64
-}
-
-// HostEarnModelStat 号池返点按模型聚合。
-type HostEarnModelStat struct {
-	Model        string
-	Requests     int64
-	ChargedMicro int64
-	EarnedMicro  int64
-}
-
-// HostEarningsDaily 某号主的号池收益按本地自然日聚合近 days 天。
-func (s *Store) HostEarningsDaily(ownerUserID int64, days int) ([]HostEarnDailyStat, error) {
-	if days <= 0 || days > 365 {
-		days = 14
-	}
-	off := localDayOffset()
-	since := localDayStart(days)
-	rows, err := s.db.Query(
-		`SELECT (created_at + ?) / 86400 AS d, COUNT(*),
-		        COALESCE(SUM(charged_micro),0), COALESCE(SUM(earned_micro),0)
-		 FROM host_earnings WHERE owner_user_id = ? AND created_at >= ?
-		 GROUP BY d ORDER BY d ASC`, off, ownerUserID, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []HostEarnDailyStat
-	for rows.Next() {
-		var dayIdx int64
-		var st HostEarnDailyStat
-		if err := rows.Scan(&dayIdx, &st.Requests, &st.ChargedMicro, &st.EarnedMicro); err != nil {
-			return nil, err
-		}
-		st.Day = time.Unix(dayIdx*86400-off, 0).Format("2006-01-02")
-		out = append(out, st)
-	}
-	return out, rows.Err()
-}
-
-// HostEarningsByModel 某号主的号池收益按模型聚合近 days 天（按收益降序）。
-func (s *Store) HostEarningsByModel(ownerUserID int64, days int) ([]HostEarnModelStat, error) {
-	if days <= 0 || days > 365 {
-		days = 14
-	}
-	since := localDayStart(days)
-	rows, err := s.db.Query(
-		`SELECT model, COUNT(*), COALESCE(SUM(charged_micro),0), COALESCE(SUM(earned_micro),0)
-		 FROM host_earnings WHERE owner_user_id = ? AND created_at >= ?
-		 GROUP BY model ORDER BY COALESCE(SUM(earned_micro),0) DESC, COUNT(*) DESC`, ownerUserID, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []HostEarnModelStat
-	for rows.Next() {
-		var st HostEarnModelStat
-		if err := rows.Scan(&st.Model, &st.Requests, &st.ChargedMicro, &st.EarnedMicro); err != nil {
-			return nil, err
-		}
-		out = append(out, st)
-	}
-	return out, rows.Err()
-}
+// 顺带清掉一处**挂错的文档注释**：这里原本残留着 `percentile 取升序切片的分位值…`
+// 的注释（该函数 v0.31.9 已迁到 internal/usage.Percentile），却被粘在
+// `type HostEarnDailyStat` 头上 —— 那段注释既丢了归属，又污染了结构体的 godoc。
+// 搬迁时一并删除（内容没丢：internal/usage.Percentile 自带说明）。
 
 // ---------- 返点台账 ----------
 

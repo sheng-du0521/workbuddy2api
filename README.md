@@ -82,6 +82,12 @@ OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时积�
   （原 `cmd/webapp/errsafe.go`）。它们是每个 handler 的横切关注点（552 处调用），
   `internal/api/*` 各自复制一份就会让脱敏策略出现多个版本。
   **本包只放"对所有 handler 都一样"的东西** —— 带业务判断的写出留在业务域，否则它会变成第二个上帝对象；
+- **用量报表域**（v0.31.13）—— `internal/api/report`：消耗排行（管理端 / 用户侧）+ 用量账单三类拆分
+  （自用 / 用号池 / 进号池）。依赖面是 **7 个只读聚合方法 + 0 个自有类型**（`host_earnings` 的三个聚合
+  先下沉到 `internal/usage`，靠 Store 嵌入做到零调用点改动）；身份由调用方**注入**
+  （`UserIDOf` 回 `(id, ok)` 显式布尔，不用 `id == 0` 去推断"没登录"）。
+  用户侧榜单**他人用户名一律脱敏、且不给他人 `user_id`** —— 排行榜天然要展示别人，不脱敏等于半张
+  开着的账号名录；故管理端与用户侧**共用同一计算**，只有展示口径不同；
 - **结算编排单点**（v0.31.11）—— "什么时候记账、按什么顺序记"在 `internal/billing/settle.go`：
   预扣对账 → 扣费/退还 → 写流水；所有 IO 走**窄接口** `billing.Ledger`（5 个方法，由
   `cmd/webapp/billingledger.go` 用 Store 适配，**只转发不判断**）。分成/返点仍由 `cmd/webapp` 执行
@@ -215,7 +221,8 @@ v0.31.5 起本仓**只有一个产品**（`cmd/webapp`）。下列口径当年�
 | 2 | `Store` 只读查询面 | ⬜ |
 | 3 | 计费纯算术 → `internal/billing`（单位/估算/预扣/单价观测/分成返点公式） | ✅ v0.31.10 |
 | 3b | 结算编排 → `internal/billing/settle.go`（预扣对账/扣费/写流水；IO 走 `Ledger` 窄接口） | ✅ v0.31.11 |
-| 4 | admin HTTP 面 → `internal/httpx`（共享层）+ `internal/api/*`（按域） | 🟡 v0.31.12 |
+| 4 | admin HTTP 面 → `internal/httpx`（共享层）+ `internal/api/*`（按域） | 🟡 v0.31.12 起（共享层 + `fingerprint` 5 个 handler） |
+| 4b | 用量报表域 → `internal/api/report`（排行 + 账单三类拆分，3 个 handler） | ✅ v0.31.13 |
 
 细节与每刀流程见 `docs/P2-7-拆包方案.md`。
 
