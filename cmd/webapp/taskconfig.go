@@ -170,13 +170,18 @@ func normHours(in, def []int) []int {
 // schoolOK=false 时强制禁用开学季（脚本链路不可用）。
 // growth 为成长任务的账号凭证提供方（nil = 手动执行不可用；成长任务不排程）。
 // accountTaskFilter 为逐账号任务过滤器（nil = 全部账号参与全部任务）。
-func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growthOK bool, growth scheduler.GrowthProvider, accountTaskFilter func(uid, task string) bool) scheduler.Config {
+func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growthOK bool, growth scheduler.GrowthProvider, school scheduler.SchoolProvider, accountTaskFilter func(uid, task string) bool) scheduler.Config {
 	tc = tc.normalize()
 	off := !tc.Enabled // 全局关闭 = 各类任务全禁
 	// 成长任务不排程，但脚本链路不可用时应把 Provider 一并丢弃，
 	// 让手动入口拿到「功能不可用」而不是跑到一半才失败。
 	if !growthOK {
 		growth = nil
+	}
+	// 开学季同理（v0.26.9）：脚本链路不可用时丢掉 Provider，
+	// 让当轮记录成"无可用凭证"而不是跑到脚本里才报"无可用账号"。
+	if !schoolOK {
+		school = nil
 	}
 	return scheduler.Config{
 		Pool:                px.pool,
@@ -210,6 +215,7 @@ func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, schoolOK, growth
 			return tc.BatchStaggerSeconds
 		}(),
 		Growth:            growth,
+		School:            school,
 		KeepaliveDays:     tc.KeepaliveDays,
 		LazyRefreshHours:  tc.LazyRefreshHours,
 		LedgerFile:        filepath.Join(dataDir, "task_ledger.json"),

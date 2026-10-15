@@ -1,8 +1,8 @@
 {
-  "version": "0.26.8",
+  "version": "0.26.9",
   "min_supported": "0.24.0",
-  "notes": "v0.26.8：① 网关口径收敛 —— 上游 usage 解析（含缓存三计数、credit 缺失语义、data 前缀两种形态）统一到 internal/upstream，两条转发链路共用一份；顺带修掉旧网关「只认带空格的 data: 前缀、会整帧丢掉 usage 与计费依据 credit」；并新增示例配置的双向完整性测试（当场抓到 schedule.activity_report_count 遗漏）。② 账号已挂载天数可视化：管理后台账号卡与控制台代挂卡均显示「已挂载 N 天（起算日）」，口径为从入库时刻起算的自然日数，未知时刻显示「—」而非 0 天。③ 更新检测升级：发现新版本自动下载产物（sha256 必校验、只落盘 .new、不动运行中的程序），面板展示逐行渲染的版本说明与产物状态，并提供「应用更新」生成替换脚本（不自动替换、不自动重启）。",
-  "released_at": 1792050941,
+  "notes": "v0.26.9：修复脚本类定时任务在本机静默禁用。① 解释器**自动探测** —— 此前默认写死 python3，而 Windows 上 python3 往往只是 Microsoft Store 的存根（LookPath 找得到、一跑就退 9009），真解释器叫 python；现在按 python3 → python 实跑 --version 取首个可用者（WB2A_PYTHON 显式指定仍优先且不做探测）。② 脚本根定位**不再只认一个标志文件** （原来只认 school_open_day_2026.py，它缺失会连带成长任务失效），并新增 exe 目录参与上溯 —— 独立部署（把发布目录拷出去）也能找到 scripts/。③ 启动日志新增脚本链路诊断行：解释器探测过程 + 实际脚本根 + 两个脚本任务可用性。④ 发布目录补齐 scripts/。",
+  "released_at": 1792053643,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。"

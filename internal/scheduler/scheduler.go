@@ -61,6 +61,13 @@ type Config struct {
 	KeepaliveDisabled bool
 	// SchoolDisabled 显式关闭开学季任务排程（schedule.school_enabled=false）。
 	SchoolDisabled bool
+	// School 开学季任务的凭证提供方（nil = 功能不可用，按"无凭证"跳过）。
+	//
+	// 与 Growth 分开是因为**需要的形状不同**：成长任务是"管理员选的这几个号"，
+	// 开学季任务一次跑全部账号（脚本本身按 ALL 执行）。
+	// 不把它并进 GrowthProvider：那是"按 uid 取"的接口，为 school 硬加一个
+	// "取全部"的方法会逼所有实现者都实现一个自己用不到的能力。
+	School SchoolProvider
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
 

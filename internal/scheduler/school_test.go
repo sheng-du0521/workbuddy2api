@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -31,10 +32,44 @@ type fakeScriptExec struct {
 	lastDir  string
 	runN     int
 	err      error
+	// lastStdin 记录子进程收到的标准输入（v0.26.9：开学季凭证必须走这里）。
+	lastStdin string
+	// out Run 时写进 output 的内容（模拟脚本的 stdout）。
+	out    string
+	output io.Writer
+}
+
+// fakeSchoolProvider 开学季凭证提供方（v0.26.9 起 runSchool 必须先拿到凭证，
+// 否则不会启动子进程 —— 那是刻意的：无凭证时跑起来必然报"无可用账号"，
+// 白白多一个子进程与一条失败台账）。
+type fakeSchoolProvider struct{ creds []GrowthCred }
+
+func (f fakeSchoolProvider) AllCreds() ([]GrowthCred, error) { return f.creds, nil }
+
+// schoolCredsFor 造一份最小可用凭证（探针用，token 是假的但足以走完链路）。
+func schoolCredsFor(uid string) fakeSchoolProvider {
+	return fakeSchoolProvider{creds: []GrowthCred{
+		{UID: uid, Nickname: "探针", Realm: "cn", AccessToken: "tok-" + uid},
+	}}
 }
 
 func (f *fakeScriptExec) SetDir(dir string) { f.lastDir = dir }
-func (f *fakeScriptExec) Run() error        { f.runN++; return f.err }
+func (f *fakeScriptExec) SetStdin(r io.Reader) {
+	if r == nil {
+		f.lastStdin = ""
+		return
+	}
+	b, _ := io.ReadAll(r)
+	f.lastStdin = string(b)
+}
+func (f *fakeScriptExec) SetOutput(w io.Writer) { f.output = w }
+func (f *fakeScriptExec) Run() error {
+	f.runN++
+	if f.output != nil && f.out != "" {
+		_, _ = io.WriteString(f.output, f.out)
+	}
+	return f.err
+}
 
 // installFakeExec 替换 newScriptCmd，测试结束还原。
 func installFakeExec(t *testing.T) *fakeScriptExec {
@@ -119,25 +154,59 @@ func TestNextWakeSchoolCatDisabled(t *testing.T) {
 }
 
 // TestRunSchoolNowBuildsCommand RunSchoolNow 构造
-// python3 scripts/school_open_day_2026.py ALL --run --yes，工作目录设为仓库根。
+// `<python> scripts/school_open_day_2026.py ALL --run --yes --creds-stdin`，
+// 工作目录设为脚本根，**凭证经 stdin**（v0.26.9）。
+//
+// 解释器断言用 pythonCmd() 而不是字面量 "python3"：v0.26.9 起解释器是**自动探测**的
+// （见 probePython），在本机探测结果是 python —— 写死 "python3" 会让这条断言
+// 在"功能其实正常"的情况下失败。
 func TestRunSchoolNowBuildsCommand(t *testing.T) {
-	// 防环境泄漏：WB2A_PYTHON 若在测试机已设置会改写 pythonCmd()，使默认值断言失败。
+	// 防环境泄漏：WB2A_PYTHON 若在测试机已设置会改写 pythonCmd()。
 	t.Setenv("WB2A_PYTHON", "")
 	f := installFakeExec(t)
-	s := New(Config{})
+	s := New(Config{School: schoolCredsFor("acct-1")})
 	s.RunSchoolNow()
-	if f.lastName != "python3" {
-		t.Errorf("name=%q want python3", f.lastName)
+	if f.lastName != pythonCmd() {
+		t.Errorf("name=%q want %q", f.lastName, pythonCmd())
 	}
-	want := []string{"scripts/school_open_day_2026.py", "ALL", "--run", "--yes"}
+	want := []string{"scripts/school_open_day_2026.py", "ALL", "--run", "--yes", "--creds-stdin"}
 	if !equalArgs(f.lastArgs, want) {
 		t.Errorf("args=%v want %v", f.lastArgs, want)
 	}
 	if f.lastDir != repoRoot() {
-		t.Errorf("dir=%q want repo root %q", f.lastDir, repoRoot())
+		t.Errorf("dir=%q want 脚本根 %q", f.lastDir, repoRoot())
 	}
 	if _, err := os.Stat(filepath.Join(f.lastDir, "scripts", "school_open_day_2026.py")); err != nil {
-		t.Errorf("仓库根 %q 内应有 scripts/school_open_day_2026.py: %v", f.lastDir, err)
+		t.Errorf("脚本根 %q 内应有 scripts/school_open_day_2026.py: %v", f.lastDir, err)
+	}
+	// **凭证必须真的经 stdin 传出**：这是本次修复的核心（此前脚本只认 auths/，
+	// Web 版没有那个目录 → 必然失败）。
+	if !strings.Contains(f.lastStdin, "tok-acct-1") {
+		t.Errorf("凭证未经 stdin 传出，得 %q", f.lastStdin)
+	}
+	if !strings.Contains(f.lastStdin, "acct-1") {
+		t.Errorf("stdin 里应含 uid，得 %q", f.lastStdin)
+	}
+}
+
+// TestRunSchoolSkipsWithoutCreds 没有凭证时**不启动子进程**。
+//
+// 为什么这是对的：脚本在没有凭证时必然打印"无可用账号"并以非零退出 ——
+// 启动一个注定失败的子进程只会多一条误导性的失败台账（本机历史上那条
+// `exit status 1` 正是它），却让人以为"脚本坏了"。
+func TestRunSchoolSkipsWithoutCreds(t *testing.T) {
+	t.Setenv("WB2A_PYTHON", "")
+	f := installFakeExec(t)
+	s := New(Config{}) // School 为 nil
+	s.RunSchoolNow()
+	if f.runN != 0 {
+		t.Errorf("无凭证不该启动脚本，runN=%d", f.runN)
+	}
+	// 空凭证列表同样不启动。
+	s2 := New(Config{School: fakeSchoolProvider{}})
+	s2.RunSchoolNow()
+	if f.runN != 0 {
+		t.Errorf("凭证列表为空时不该启动脚本，runN=%d", f.runN)
 	}
 }
 
@@ -330,7 +399,7 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 	t.Setenv("WB2A_PYTHON", "")
 	f := installFakeExec(t)
 	f.err = errors.New("boom boom")
-	s := New(Config{})
+	s := New(Config{School: schoolCredsFor("acct-9")})
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -358,18 +427,36 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 	}
 }
 
-// TestPythonCmd WB2A_PYTHON 覆盖解释器名：缺省/空白回落 "python3"（保持
-// 容器与既有测试的行为不变），显式设置时取其值（Windows 等仅有 python 的环境）。
+// TestPythonCmd pythonCmd 的取值优先级。
+//
+// ⚠️ 行为变更（v0.26.9）：缺省**不再恒定返回 "python3"**，而是自动探测
+// （`python3` → `python`，取首个能真正跑起来的）。旧断言把"Windows 上要用 python"
+// 推给运维去设 `WB2A_PYTHON`，结果是没人设 → 成长任务与开学季双双静默禁用
+// （本机的 `python3` 是 Microsoft Store 存根，跑不起来）。详见 scriptchain_test.go。
+//
+// 显式指定与 trim 的语义**不变**，原样保留。
 func TestPythonCmd(t *testing.T) {
-	t.Setenv("WB2A_PYTHON", "")
-	if got := pythonCmd(); got != "python3" {
-		t.Errorf("default pythonCmd()=%q want python3", got)
-	}
+	t.Run("探测到可用解释器时用它", func(t *testing.T) {
+		// python3 在 PATH 但跑不起来（Store 存根），python 可用。
+		withFakePython(t, map[string]bool{"python3": true, "python": true},
+			map[string]bool{"python": true})
+		t.Setenv("WB2A_PYTHON", "")
+		if got := pythonCmd(); got != "python" {
+			t.Errorf("缺省应取探测结果 python，得 %q", got)
+		}
+	})
 
-	t.Setenv("WB2A_PYTHON", "   ")
-	if got := pythonCmd(); got != "python3" {
-		t.Errorf("blank pythonCmd()=%q want python3", got)
-	}
+	t.Run("探测不到时回落 python3", func(t *testing.T) {
+		withFakePython(t, map[string]bool{}, map[string]bool{})
+		t.Setenv("WB2A_PYTHON", "")
+		if got := pythonCmd(); got != "python3" {
+			t.Errorf("探测不到应回落 python3（让失败暴露在原处），得 %q", got)
+		}
+		t.Setenv("WB2A_PYTHON", "   ")
+		if got := pythonCmd(); got != "python3" {
+			t.Errorf("空白 WB2A_PYTHON 视同未设置，得 %q", got)
+		}
+	})
 
 	t.Setenv("WB2A_PYTHON", "python")
 	if got := pythonCmd(); got != "python" {
@@ -379,5 +466,98 @@ func TestPythonCmd(t *testing.T) {
 	t.Setenv("WB2A_PYTHON", "  /usr/bin/python3.10  ")
 	if got := pythonCmd(); got != "/usr/bin/python3.10" {
 		t.Errorf("trim pythonCmd()=%q want /usr/bin/python3.10", got)
+	}
+}
+
+// ======================================================================
+// v0.26.9 · 脚本输出的可见性
+//
+// 此前脚本的子进程输出直接继承父进程，脚本自己的**汇总行**
+// （`school2026 done: accounts=27 ok=.. fail=..`）只是"碰巧飘进日志"——
+// 程序自己拿不到，于是台账里只有 "ok" 两个字：看不出处理了几个账号、
+// 活动是不是进行期。而这两个结论恰恰是核查定时任务时最想知道的。
+// ======================================================================
+
+// TestRunScriptLogsSummaryLineOnSuccess 成功时日志必须带上脚本的汇总行。
+func TestRunScriptLogsSummaryLineOnSuccess(t *testing.T) {
+	f := installFakeExec(t)
+	f.out = "逐账号过程…\n[school2026] xxx 活动非进行期\n" +
+		"school2026 done: accounts=27 ok=0 already=0 skipped=27 pending=0 fail=0\n"
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(os.Stderr); log.SetFlags(log.LstdFlags) })
+
+	s := New(Config{School: schoolCredsFor("acct-1")})
+	s.RunSchoolNow()
+
+	if !strings.Contains(buf.String(), "school2026 done") {
+		t.Errorf("日志应包含脚本汇总行，得：\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "skipped=27") {
+		t.Errorf("汇总行的关键计数应可见（否则等于没记），得：\n%s", buf.String())
+	}
+}
+
+// TestRunScriptLogsScriptOutputOnFailure 失败时除了 exec 的错误，
+// 还要带上脚本自己的末行 —— "无可用账号"比 "exit status 1" 有用得多。
+func TestRunScriptLogsScriptOutputOnFailure(t *testing.T) {
+	f := installFakeExec(t)
+	f.err = errors.New("exit status 1")
+	f.out = "mode=RUN\nERR: 无可用账号（检查 auths/ 或 --token）\n"
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(os.Stderr); log.SetFlags(log.LstdFlags) })
+
+	s := New(Config{School: schoolCredsFor("acct-1")})
+	s.RunSchoolNow()
+
+	out := buf.String()
+	if !strings.Contains(out, "无可用账号") {
+		t.Errorf("失败日志应带回脚本末行（它是真正的失败原因），得：\n%s", out)
+	}
+	if !strings.Contains(out, "exit status 1") {
+		t.Errorf("仍应保留 exec 的错误，得：\n%s", out)
+	}
+}
+
+// TestScriptSummaryLinePrefersDoneLine 结论行优先取含 `done:` 的那行。
+//
+// 真实场景（本机实测）：脚本在 done 之后还会打一段"说明"，末行因此变成说明文字
+// —— 那样日志里就看不到 `accounts=33 fail=0` 这个核查时最想要的结论。
+func TestScriptSummaryLinePrefersDoneLine(t *testing.T) {
+	out := "逐账号过程…\n" +
+		"school2026 done: accounts=33 ok=0 already=0 skipped=0 fail=0\n" +
+		"\n" +
+		"[school2026] 说明：非人工任务自动点亮并领奖…\n"
+	got := scriptSummaryLine(out)
+	if !strings.Contains(got, "accounts=33") {
+		t.Errorf("应取含 done: 的结论行，得 %q", got)
+	}
+	// 没有 done: 行时回落末行。
+	got2 := scriptSummaryLine("a\nERR: 无可用账号\n")
+	if !strings.Contains(got2, "无可用账号") {
+		t.Errorf("无 done: 行时应回落末行，得 %q", got2)
+	}
+}
+
+// TestLastNonEmptyLine 取末行要跳过空行与 CR（脚本在 Windows 上输出 \r\n）。
+func TestLastNonEmptyLine(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"a\nb\n", "b"},
+		{"a\nb\n\n\n", "b"},
+		{"a\r\nb\r\n", "b"},
+		{"  \n only \n  \n", "only"},
+		{"", ""},
+		{"\n\n", ""},
+		{"单行", "单行"},
+	}
+	for _, c := range cases {
+		if got := lastNonEmptyLine(c.in); got != c.want {
+			t.Errorf("lastNonEmptyLine(%q) = %q，期望 %q", c.in, got, c.want)
+		}
 	}
 }

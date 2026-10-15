@@ -21,29 +21,72 @@ import (
 	"strings"
 	"time"
 
+	"bytes"
+	"encoding/json"
+	"io"
+	"sync"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
 )
 
-// repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
-// 策略：从当前工作目录逐级向上找 scripts/school_open_day_2026.py，
-// 找不到回落 os.Getwd()（此时 Run 会因脚本缺失打 WARN，不 panic）。
-// 注意：Go scheduler 在 cmd/server 内以工作目录启动（容器 WORKDIR /app），
-// 若进程以别的工作目录拉起（如 systemd/裸 binary），上溯穷尽后仍以
-// os.Getwd() 兜底，把缺失暴露成 WARN 而非静默。
+// scriptRootMarkers 判定"这里就是脚本根"的标志（**任一存在**即可）。
+//
+// 为什么是一组而不是一个：此前只认 `school_open_day_2026.py` 一个文件 ——
+// 于是**开学季脚本一旦改名/缺失，成长任务会连带失效**（两者共用 repoRoot）。
+// 两个功能共用的定位函数，不该把其中一个的文件当成硬依赖。
+var scriptRootMarkers = []string{
+	filepath.Join("scripts", "school_open_day_2026.py"),
+	filepath.Join("scripts", "growth_run.py"),
+	filepath.Join("scripts", "task_common.py"),
+}
+
+// repoRoot 定位"脚本根"（含 scripts/ 的那一层）。
+//
+// 两个起点分别上溯，取先命中者：
+//  1. **exe 所在目录** —— 发布包形态（scripts/ 放在 exe 旁边）时它才权威；
+//  2. 当前工作目录 —— 开发/容器形态（`cd dist && ./webapp.exe` 时需要上溯到仓库根）。
+//
+// 为什么必须加 exe 这条链（v0.26.9）：此前只看工作目录，本机之所以"还能用"，
+// 纯粹是因为 `dist/` 恰好在仓库里、上溯一级就撞见 scripts/。
+// **一旦把 dist/ 单独拷出去部署，脚本任务会全部失效且原因不明显** ——
+// 而"独立部署"正是发布包的目标形态。
+//
+// 两条链都找不到时回落工作目录（调用方会因脚本缺失打 WARN，不 panic）。
 func repoRoot() string {
-	start, err := os.Getwd()
+	if exe, err := os.Executable(); err == nil {
+		if root := ascendToScriptRoot(filepath.Dir(exe)); root != "" {
+			return root
+		}
+	}
+	wd, err := os.Getwd()
 	if err != nil {
 		return "."
 	}
+	if root := ascendToScriptRoot(wd); root != "" {
+		return root
+	}
+	return wd
+}
+
+// ScriptRoot 导出脚本根路径，仅供启动日志与诊断展示（业务代码一律用 repoRoot）。
+//
+// 为什么值得导出一个只为打印的函数：脚本类任务的失败**几乎全部**是"找不到脚本"
+// 或"解释器不对"，而这两件事在日志里此前都不可见 —— 运维只能猜。
+// 把实际生效的路径打出来，问题自解释。
+func ScriptRoot() string { return repoRoot() }
+
+// ascendToScriptRoot 从 start 逐级向上找含标志脚本的目录；找不到返回 ""。
+func ascendToScriptRoot(start string) string {
 	dir := start
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "scripts", "school_open_day_2026.py")); err == nil {
-			return dir
+		for _, m := range scriptRootMarkers {
+			if _, err := os.Stat(filepath.Join(dir, m)); err == nil {
+				return dir
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return start
+			return ""
 		}
 		dir = parent
 	}
@@ -53,6 +96,20 @@ func repoRoot() string {
 type scriptRunner interface {
 	SetDir(string)
 	Run() error
+	// SetStdin 提供子进程的标准输入。
+	//
+	// 存在的唯一理由：**Web 版的凭证只能走 stdin**。账号存库且加密（token 是
+	// `enc1:` 前缀的密文），既没有 auths/ 目录可读，明文落盘又违背既有取舍
+	// （见 growth_run.py 顶部注释）。晚于 SetDir 加它是被现实逼出来的：
+	// 开学季脚本此前只认 auths/，于是 Web 版触发的任务**必然**以"无可用账号"退出。
+	SetStdin(r io.Reader)
+	// SetOutput 指定子进程的 stdout/stderr 去向。
+	//
+	// 为什么需要（v0.26.9）：此前子进程默认继承父进程输出，脚本的**汇总行**
+	// （`school2026 done: accounts=27 ok=.. fail=..`）就这么飘进日志、Grep 得到
+	// 但程序自己拿不到 —— 于是台账里只有"ok"两个字，看不出到底处理了几个账号、
+	// 活动是不是进行期。核查定时任务时这正是最想知道的那一行。
+	SetOutput(w io.Writer)
 }
 
 // scriptTimeout 单个脚本子进程的执行上限（v0.24.1，审查报告 P3-10）。
@@ -80,6 +137,16 @@ type scriptCmd struct {
 
 func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
 
+func (c *scriptCmd) SetStdin(r io.Reader) { c.cmd.Stdin = r }
+
+func (c *scriptCmd) SetOutput(w io.Writer) {
+	if w == nil {
+		return
+	}
+	c.cmd.Stdout = w
+	c.cmd.Stderr = w
+}
+
 // Run 执行子进程；退出时释放 ctx（避免 withTimeout 的 cancel 泄漏，
 // 这正是 go vet 的 lostcancel 检查所要求的）。
 func (c *scriptCmd) Run() error {
@@ -97,21 +164,143 @@ var newScriptCmd = func(program string, args ...string) scriptRunner {
 	return &scriptCmd{cmd: exec.CommandContext(ctx, program, args...), cancel: cancel}
 }
 
+// pythonCandidates 候选解释器（按优先级）。**首个能真正跑起来的胜出**。
+//
+// 顺序的理由：Linux / 容器里叫 `python3`；Windows 官方安装器只提供 `python.exe`，
+// 而 PATH 上往往**还存在** Microsoft Store 的 `python3.exe` App Execution Alias 存根
+// ——`exec.LookPath` 找得到、`exec.Command` 也起得来，但一执行就退 9009。
+//
+// 所以**只看 LookPath 是不够的**：必须实跑一次 `--version`（见 probePython）。
+// 这正是本仓此前"脚本类任务在本机统一不可用"的直接原因：默认值写死 `python3`，
+// 而本机的 `python3` 恰好是那个跑不起来的存根。
+var pythonCandidates = []string{"python3", "python"}
+
+// lookPath 抽成变量以便测试注入 —— 否则每个用例都得真在 PATH 上造一个
+// 叫做 python3 的可执行文件（做不到，也不该做）。与 newScriptCmd 同一套路。
+var lookPath = exec.LookPath
+
+var (
+	pythonMu sync.Mutex
+	// pythonProbed 用"标志 + 惰性检查"而不是 sync.Once：Once 执行过就再也
+	// 不执行，测试想重新探测（或将来支持运行期改配置）会永远拿回旧值。
+	// 这是本仓踩过的坑（见 initCaches 的注释），此处沿用同一纪律。
+	pythonProbed   bool
+	pythonResolved string
+	pythonProbeLog string
+)
+
 // pythonCmd 返回执行 scripts/*.py 的解释器名。
 //
-// 默认 "python3"，与容器/Linux 现状完全一致，行为零变更；WB2A_PYTHON
-// 显式指定时优先，供解释器不叫 python3 的环境使用（命名对齐仓库 Go 侧
-// WB2A_* env 约定，如 WB2A_AUTH_DIR / WB2A_LISTEN）。
+// 优先级：
+//  1. `WB2A_PYTHON` —— 显式指定则**原样使用、不做探测**（用户可能给绝对路径）；
+//  2. 自动探测 `python3` → `python`，取首个能真正跑起来的（结果进程内缓存）。
 //
-// 需要该开关的原因：Windows 官方安装器只提供 python.exe，且 PATH 上常存在
-// Microsoft Store 的 python3.exe App Execution Alias 存根——exec.Command 能找到
-// 它却无法真正执行，脚本类任务统一报 `exit status 9009`。
-// 设 WB2A_PYTHON=python 即可绕过。
+// 为什么要有自动探测（v0.26.9）：此前默认值写死 `python3`，把"Windows 上要用 python"
+// 这件事**推给了运维去设环境变量**。结果是：没人设 → 成长任务与开学季双双静默禁用
+// （启动日志只有一句"未探测到可用解释器/脚本"，没说试过什么、为什么失败）。
+// 一个能自己判断的事情不该要求人工配置 —— 而且配错了还很难看出来。
 func pythonCmd() string {
 	if v := strings.TrimSpace(os.Getenv("WB2A_PYTHON")); v != "" {
 		return v
 	}
-	return "python3"
+	pythonMu.Lock()
+	defer pythonMu.Unlock()
+	if !pythonProbed {
+		pythonProbed = true
+		pythonResolved, pythonProbeLog = probePython()
+	}
+	if pythonResolved == "" {
+		// 一个都没探到：回落默认值，让失败**暴露在原来的位置**（执行时报 9009），
+		// 而不是悄悄换一个也不存在的名字。诊断信息见 PythonDiagnosis()。
+		return "python3"
+	}
+	return pythonResolved
+}
+
+// probePython 依次实跑候选解释器，返回 (可用者, 人话探测过程)。
+//
+// 判据是**真的执行一次 `--version` 且退出码为 0** —— 单看 LookPath 会把
+// Microsoft Store 的存根当成可用（那是本机的实际情形，也正是本函数存在的理由）。
+func probePython() (string, string) {
+	var notes []string
+	for _, cand := range pythonCandidates {
+		if _, err := lookPath(cand); err != nil {
+			notes = append(notes, cand+"（不在 PATH）")
+			continue
+		}
+		c := newScriptCmd(cand, "--version")
+		if err := c.Run(); err != nil {
+			notes = append(notes, cand+"（在 PATH 但无法执行："+oneLineErr(err)+"）")
+			continue
+		}
+		note := cand + "（可用）"
+		if len(notes) > 0 {
+			note += "；此前已排除 " + strings.Join(notes, "、")
+		}
+		return cand, note
+	}
+	if len(notes) == 0 {
+		notes = append(notes, "候选 "+strings.Join(pythonCandidates, " / ")+" 均不在 PATH")
+	}
+	return "", "试过 " + strings.Join(notes, "、")
+}
+
+// oneLineErr 把错误压成一行（exec 的错误偶尔带换行，日志里会串行）。
+func oneLineErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(err.Error()), " ")
+}
+
+// PythonDiagnosis 返回解释器探测过程的人话描述，供启动日志展示。
+//
+// 为什么要暴露过程而不是一个布尔：本机此前的现象是"日志只说没探测到，不说是谁没探到"
+// —— 运维既不知道试了什么，也不知道该改哪里。把"试过 python3（存根跑不起来）、
+// 用 python"写出来，问题自解释。
+func PythonDiagnosis() string {
+	if v := strings.TrimSpace(os.Getenv("WB2A_PYTHON")); v != "" {
+		return "WB2A_PYTHON 显式指定为 " + v
+	}
+	pythonMu.Lock()
+	defer pythonMu.Unlock()
+	if !pythonProbed {
+		pythonProbed = true
+		pythonResolved, pythonProbeLog = probePython()
+	}
+	return pythonProbeLog
+}
+
+// scriptSummaryLine 提取脚本输出里的**结论行**供日志展示。
+//
+// 优先取含 `done:` 的行（脚本约定的汇总行，形如
+// `school2026 done: accounts=33 ok=0 already=0 skipped=0 fail=0`），
+// 找不到才回落最后一行非空内容。
+//
+// 为什么不直接取末行：脚本在 done 之后还会打一段说明（"非人工任务自动点亮并领奖…"），
+// 末行就变成说明文字了 —— 而核查定时任务时想看的恰恰是那几个计数。
+func scriptSummaryLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(strings.TrimRight(lines[i], "\r")); t != "" && strings.Contains(t, "done:") {
+			return t
+		}
+	}
+	return lastNonEmptyLine(s)
+}
+
+// lastNonEmptyLine 返回文本里最后一行非空内容。
+//
+// 脚本的**汇总行**固定在最末（`school2026 done: accounts=.. ok=.. fail=..`），
+// 而它前面是几十行逐账号过程。取末行 = 取结论，且不受过程行数影响。
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(strings.TrimRight(lines[i], "\r")); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
@@ -119,18 +308,42 @@ func pythonCmd() string {
 //
 // 返回成功/失败命令数与最后一条失败摘要，供台账计数（note 取最后一条：多命令
 // 全挂时最有价值的是「最近一次为什么挂」，逐条细节已在日志里）。
-func runScript(name, root string, commands [][]string) (ok, fail int, note string) {
+func runScript(name, root string, commands [][]string, stdin []byte) (ok, fail int, note string) {
 	for _, cmdArgs := range commands {
 		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
 		c.SetDir(root)
+		if len(stdin) > 0 {
+			// 每条命令都重新给一份 Reader：同一个 Reader 被第一次读完后再给
+			// 第二条命令，第二条会读到 EOF（静默地"没有凭证"）。
+			c.SetStdin(bytes.NewReader(stdin))
+		}
+		// 输出**双写**：一份照旧进日志（运维直接看得到全过程），一份留在 buffer 里
+		// 供程序提取汇总行。不能只捕获 —— 那会让日志里再也看不到脚本过程；
+		// 也不能只继承 —— 那程序就永远拿不到汇总。
+		// 用普通 bytes.Buffer 而非带锁的：`Run()` 返回时 exec 已经等完了输出
+		// 拷贝 goroutine，此处的读与写入不存在并发（写发生在 Run 期间）。
+		var buf bytes.Buffer
+		c.SetOutput(io.MultiWriter(os.Stdout, &buf))
 		if err := c.Run(); err != nil {
 			fail++
 			note = fmt.Sprintf("%s: %v", cmdArgs[1], err)
 			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
+			if tail := lastNonEmptyLine(buf.String()); tail != "" {
+				// 失败时把脚本自己的**最后一行**也带上：脚本的汇总行通常直接说明了
+				// 原因（"无可用账号" / "活动非进行期"），比 "exit status 1" 有用得多。
+				log.Printf("WARN: %s (%s) 脚本输出末行：%s", name, cmdArgs[1], tail)
+			}
 			continue
 		}
 		ok++
-		log.Printf("%s: ok (%s)", name, cmdArgs[1])
+		// 成功时也带上脚本的汇总行（v0.26.9）：台账里只写"ok"看不出它做了多少事
+		// —— 核查定时任务时，"处理了 27 个账号 / 活动非进行期全跳过"这两个结论
+		// 差别巨大，而它们都藏在这一行里。
+		if tail := scriptSummaryLine(buf.String()); tail != "" {
+			log.Printf("%s: ok (%s) — %s", name, cmdArgs[1], tail)
+		} else {
+			log.Printf("%s: ok (%s)", name, cmdArgs[1])
+		}
 	}
 	return ok, fail, note
 }
@@ -140,7 +353,7 @@ func runScript(name, root string, commands [][]string) (ok, fail int, note strin
 //
 // 退出码非 0 即算 Fail（脚本自己会把「活动下线」「非窗口期」等正常态处理成 0 退出，
 // 见 RunSchoolNow/RunCatNow 的注释），所以这里的 Fail 就是真的失败了。
-func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands [][]string) {
+func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands [][]string, stdin []byte) {
 	started := time.Now()
 	// 运行闸门：脚本类任务的代价更高——两个 python 子进程并发跑同一批账号，
 	// 既是双倍上游请求，也可能并发写回同一份凭证（后写覆盖先写）。
@@ -150,7 +363,7 @@ func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands 
 	}
 	defer s.endRun(kind)
 
-	okN, failN, note := runScript(name, repoRoot(), commands)
+	okN, failN, note := runScript(name, repoRoot(), commands, stdin)
 	s.recordRun(kind, trigger, started, runTally{
 		total: okN + failN, ok: okN, fail: failN, note: note,
 	})
@@ -178,13 +391,70 @@ func SchoolAvailable() bool {
 	return c.Run() == nil
 }
 
+// SchoolProvider 开学季任务的凭证提供方（Web 侧实现；nil = 按"无凭证"跳过）。
+//
+// 只要求一个能力：**取全部账号的凭证**。脚本按 ALL 跑，调度器不筛号。
+type SchoolProvider interface {
+	// AllCreds 返回全部可用的账号凭证（无 access token 的应被实现方滤掉）。
+	AllCreds() ([]GrowthCred, error)
+}
+
 // runSchool 执行开学季任务：school_open_day_2026.py ALL --run --yes。
 // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
 // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
 func (s *Scheduler) runSchool(trigger string) {
+	// 凭证经 stdin（v0.26.9）：Web 版账号存库且加密，既没有 auths/ 目录，
+	// 脚本原先也只认 auths/ 或单个 --token —— 于是本任务在 Web 版**从未成功过**
+	// （台账里那条 exit status 1 就是"无可用账号"）。
+	// 现在与成长任务用同一套传递方式：解密后经 stdin，不落盘。
+	stdin := s.schoolCredsPayload()
+	if len(stdin) == 0 {
+		s.recordRun(taskSchool, trigger, time.Now(), runTally{
+			skipped: 1, note: "无可用凭证（全部账号缺 access token 或账号为空）",
+		})
+		return
+	}
 	s.runScriptTask(taskSchool, trigger, "school", [][]string{
-		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
-	})
+		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes", "--creds-stdin"},
+	}, stdin)
+}
+
+// schoolCredsPayload 把全部账号凭证序列化成 JSON 数组（脚本经 stdin 读）。
+//
+// 为什么序列化在这里而不是让脚本自己查库：脚本不该知道库结构，也不该持有密钥。
+// 与 growth 的差别只是"全部"而不是"指定的几个" —— 开学季脚本本身就按 ALL 跑。
+func (s *Scheduler) schoolCredsPayload() []byte {
+	if s.cfg.School == nil {
+		return nil
+	}
+	creds, err := s.cfg.School.AllCreds()
+	if err != nil {
+		log.Printf("WARN: [school] 取凭证失败：%v", err)
+		return nil
+	}
+	if len(creds) == 0 {
+		return nil
+	}
+	type wireCred struct {
+		UID      string `json:"uid"`
+		Nickname string `json:"nickname"`
+		Realm    string `json:"realm"`
+		Domain   string `json:"domain"`
+		Token    string `json:"token"`
+	}
+	out := make([]wireCred, 0, len(creds))
+	for _, c := range creds {
+		out = append(out, wireCred{
+			UID: c.UID, Nickname: c.Nickname, Realm: c.Realm,
+			Domain: c.Domain, Token: c.AccessToken,
+		})
+	}
+	blob, err := json.Marshal(out)
+	if err != nil {
+		log.Printf("WARN: [school] 序列化凭证失败：%v", err)
+		return nil
+	}
+	return blob
 }
 
 // RunCatNow 立即执行夜猫子任务（人工入口）。

@@ -53,6 +53,21 @@ func (g growthProvider) GrowthCredsByUID(uids []string) ([]scheduler.GrowthCred,
 	return g.toGrowthCreds(list), nil
 }
 
+// AllCreds 返回**全部**账号的凭证（开学季任务用；scheduler.SchoolProvider 的实现）。
+//
+// 与 GrowthCredsByUID 的差别只是"全部"而不是"管理员选的几个" —— 开学季脚本
+// 本身就按 ALL 执行。过滤规则一致（无 access token 的跳过）。
+func (g growthProvider) AllCreds() ([]scheduler.GrowthCred, error) {
+	if g.store == nil {
+		return nil, nil
+	}
+	list, err := g.store.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	return g.toGrowthCreds(list), nil
+}
+
 // MarkGrowthDone 记录最近一次执行时间。
 func (g growthProvider) MarkGrowthDone(uid string) error {
 	if g.store == nil {

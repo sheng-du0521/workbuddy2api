@@ -86,7 +86,9 @@ func newTaskRunner(px *Proxy, store *Store, dataDir string) *taskRunner {
 	r := &taskRunner{proxy: px, store: store, dataDir: dataDir, schoolOK: schoolOK,
 		growthOK: growthOK, growth: growthProvider{store: store}, cfg: tc,
 		taskCfg: loadAccountTaskCfg(store)}
-	r.sch = scheduler.New(tc.schedulerConfig(px, dataDir, schoolOK, growthOK, r.growth, r.accountTaskFilter))
+	// r.growth 同时实现 GrowthProvider（按 uid 取）与 SchoolProvider（取全部）——
+	// 两个接口形状不同但数据源相同，拆成两个对象只会多一处需要同步的构造。
+	r.sch = scheduler.New(tc.schedulerConfig(px, dataDir, schoolOK, growthOK, r.growth, r.growth, r.accountTaskFilter))
 	return r
 }
 
@@ -106,11 +108,25 @@ func (t *taskRunner) Start() {
 	t.startScheduler()
 	t.mu.Unlock()
 	go t.flushLoop(ctx)
-	schoolNote := "开学季依赖 python 脚本，未探测到可用解释器/脚本，已禁用"
-	if t.schoolOK {
-		schoolNote = "开学季脚本链路可用（python + scripts/），已启用"
+	log.Printf("定时任务已启用：%s", t.cfgSummary())
+	// 脚本任务链路的**诊断行**（v0.26.9）：解释器探测过程 + 脚本根 + 两个脚本任务的
+	// 可用性，一次说清。
+	//
+	// 此前这里只有一句"未探测到可用解释器/脚本，已禁用" —— 既不说试了哪个解释器、
+	// 也不说去哪找脚本，运维拿着这句话无从下手。而本机实际原因很具体：
+	// PATH 上的 `python3` 是 Microsoft Store 的存根（跑不起来），真解释器叫 `python`。
+	// 现在解释器是**自动探测**的（见 scheduler.probePython），本行只负责把结论与过程摊开。
+	log.Printf("脚本任务链路：%s；脚本根 %s；开学季 %s；成长任务 %s",
+		scheduler.PythonDiagnosis(), scheduler.ScriptRoot(),
+		availText(t.schoolOK), availText(t.growthOK))
+}
+
+// availText 可用性的人话文案（避免在日志里出现裸 true/false —— 那需要读者自己回忆极性）。
+func availText(ok bool) string {
+	if ok {
+		return "可用"
 	}
-	log.Printf("定时任务已启用：%s；%s", t.cfgSummary(), schoolNote)
+	return "不可用"
 }
 
 // Stop 停止调度（进程退出前调用）。
@@ -135,7 +151,7 @@ func (t *taskRunner) Reconfigure(tc TaskConfig) {
 		t.schCancel() // 停掉旧循环；Run(ctx) 收到取消后退出
 	}
 	t.cfg = tc
-	t.sch = scheduler.New(tc.schedulerConfig(t.proxy, t.dataDir, t.schoolOK, t.growthOK, t.growth, t.accountTaskFilter))
+	t.sch = scheduler.New(tc.schedulerConfig(t.proxy, t.dataDir, t.schoolOK, t.growthOK, t.growth, t.growth, t.accountTaskFilter))
 	t.startScheduler()
 	log.Printf("定时任务已重配置：%s", t.cfgSummary())
 }

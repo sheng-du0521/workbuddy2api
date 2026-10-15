@@ -32,6 +32,11 @@
 
 依赖：复用 scripts/task_common.py 的 load_auth / AUTHS 常量；
 账号凭证位于 auths/ 目录下 workbuddy-<uid8>.json。
+
+凭证来源（三选一，优先级从上到下）：
+  1. --creds-stdin : 从 stdin 读 JSON（对象或数组），Web 版由 Go 侧解密后传入；
+  2. --token       : 显式单个 token（逃生门，配合 --uid 打日志）；
+  3. auths/ 目录   : 命令行/旧网关用法（uid 前缀或 ALL）。
 """
 import sys, os, json, time, hashlib, argparse, glob, uuid, urllib.request, urllib.error
 
@@ -784,6 +789,9 @@ def main():
                     help="只抽奖不做任务（读余额+抽到空）")
     ap.add_argument("--yes", action="store_true", help="放行写操作（配合 --run/--lottery-only）")
     ap.add_argument("--token", default=None, help="显式覆盖 token（不同源凭证逃生门）")
+    ap.add_argument("--creds-stdin", action="store_true",
+                    help="从 stdin 读凭证 JSON（Web 版专用：由 Go 侧从加密库解密后传入，"
+                         "不读 auths/ 目录）")
     ap.add_argument("--uid", default="", help="配合 --token 指定 uid（仅日志用）")
     ap.add_argument("--gap", type=float, default=1.5, help="写动作间隔秒数（默认 1.5，最小 1.0）")
     a = ap.parse_args()
@@ -802,7 +810,43 @@ def main():
         print(f"mode={mode} {'REAL' if a.yes else ''} gap={a.gap}")
 
     auths = []
-    if a.token:
+    if a.creds_stdin:
+        # Web 版路径（与 growth_run.py 同一套凭证传递方式）：
+        # 凭证由 Go 侧从 SQLite 解密后经 stdin 传入，**不落盘**。
+        #
+        # 为什么必须支持这条路径：本脚本原先只认 auths/ 目录或单个 --token，
+        # 而 Web 版账号存库且加密、根本没有 auths/ —— 于是 Web 版触发的开学季
+        # 任务**必然**打印"无可用账号"并以 1 退出（台账里那条 fail=1 就是它）。
+        # 落盘成 auths/*.json 也能work，但那会让明文凭证多一份磁盘副本，
+        # 与 growth_run.py 的既有取舍（"stdin 让凭证只存在于进程内存与管道中"）冲突。
+        raw = sys.stdin.read().strip()
+        if not raw:
+            print("ERR: --creds-stdin 已指定，但 stdin 为空")
+            sys.exit(2)
+        try:
+            data = json.loads(raw)
+        except ValueError as e:
+            print(f"ERR: stdin 凭证不是合法 JSON: {e}")
+            sys.exit(2)
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            print("ERR: stdin 凭证应为对象或对象数组")
+            sys.exit(2)
+        for item in data:
+            if not isinstance(item, dict) or not item.get("token"):
+                continue
+            auths.append({
+                "token": item["token"],
+                "uid": item.get("uid") or "",
+                "domain": item.get("domain") or "",
+                "nick": item.get("nick") or "",
+                # realm 决定该号是否被跳过（global 不适用 CN 任务中心）。
+                # 字段名与 task_common.load_auth 的返回保持一致。
+                "realm": item.get("realm") or "",
+                "file": "<stdin>",
+            })
+    elif a.token:
         auths.append({"token": a.token, "uid": a.uid or "", "nick": "--token--", "file": "<cli>"})
     else:
         prefixes = []
@@ -823,7 +867,7 @@ def main():
                 print(f"ERR: {e}")
 
     if not auths:
-        print("ERR: 无可用账号（检查 auths/ 或 --token）")
+        print("ERR: 无可用账号（检查 auths/ 或 --token，Web 版请用 --creds-stdin）")
         sys.exit(1)
 
     for auth in auths:

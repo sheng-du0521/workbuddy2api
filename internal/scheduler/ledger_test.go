@@ -24,6 +24,14 @@ func ledgerScheduler(cfg Config) *Scheduler {
 	if cfg.Pool == nil {
 		cfg.Pool = pool.New("")
 	}
+	// 默认给一份**最小可用凭证**（v0.26.9）：runSchool 现在会先取凭证，
+	// 拿不到就不启动子进程（那是对的 —— 无凭证时脚本必然报"无可用账号"）。
+	// 台账类用例关心的是"跑完之后怎么记账"，不关心凭证来自哪里，所以在这里
+	// 统一兜住，避免每个用例都重复写一遍。
+	// 需要验证"无凭证"路径的用例请用 New(Config{}) 直接构造（见 school_test.go）。
+	if cfg.School == nil {
+		cfg.School = schoolCredsFor("ledger-acct")
+	}
 	return New(cfg)
 }
 
