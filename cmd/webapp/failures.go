@@ -49,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"workbuddy2api/internal/billing"
 
 	"workbuddy2api/internal/upstream"
 )
@@ -63,9 +64,11 @@ const (
 	// FailStageUpstream 上游拒绝（带业务码或状态码）。
 	FailStageUpstream = "upstream"
 	// FailStageSettle 预扣结算阶段。
-	FailStageSettle = "settle"
+	// FailStageSettle / FailStageCharge 的值本体在 internal/billing（v0.31.11）——
+	// 结算是唯一写这两个阶段的地方。
+	FailStageSettle = billing.StageSettle
 	// FailStageCharge 事后扣费阶段（无预扣的退化路径）。
-	FailStageCharge = "charge"
+	FailStageCharge = billing.StageCharge
 )
 
 // ---------------------------------------------------------------------------

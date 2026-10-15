@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"workbuddy2api/internal/billing"
 )
 
 // 余额单位与换算（MicroPerPoint / PointToMicro / MicroToPoint）已于 v0.31.10 下沉到
@@ -113,8 +114,11 @@ var ErrInsufficientBalance = errors.New("insufficient balance")
 func (u *User) IsAdmin() bool { return u.Role == RoleAdmin }
 
 // Key 类型："" = 平台计费 Key（走兑换余额）；KeyKindHost = 代挂自用 Key。
+//
+// 值本体在 internal/billing（v0.31.11）：结算是唯一按它分支的地方，
+// 两处各写字面量迟早会出现"一边写 host 一边查 platform"。
 const (
-	KeyKindHost = "host"
+	KeyKindHost = billing.KeyKindHost
 )
 
 // APIKey 用户申请的一把调用密钥。
@@ -155,9 +159,10 @@ type HostEarning struct {
 
 // 用量流水的 scope：区分「用平台号池」与「用自己的代挂账号自用」。
 // 控制台用量账单据此把消费拆成三类（自用 / 用号池 / 进号池的收益）。
+// 值本体在 internal/billing（v0.31.11，理由同上）。
 const (
-	ScopePool = "pool" // 走平台号池（平台计费 Key）
-	ScopeHost = "host" // 走号主自己的代挂账号（代挂自用 Key，免费）
+	ScopePool = billing.ScopePool // 走平台号池（平台计费 Key）
+	ScopeHost = billing.ScopeHost // 走号主自己的代挂账号（代挂自用 Key，免费）
 )
 
 // 返点类型。

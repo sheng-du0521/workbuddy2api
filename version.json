@@ -1,16 +1,16 @@
 {
-  "version": "0.31.10",
+  "version": "0.31.11",
   "min_supported": "0.24.0",
-  "notes": "v0.31.10：P2-7 拆包第三刀（上半）—— 计费的\"钱怎么算\"收成一处（新包约 230 行含文档注释；实际搬动的代码约 120 行。零行为变化）。① **先建回归网再动刀**（方案对这条的纪律是\"涉及钱必须先有回归网\"）：新包 11 条表驱动用例 + `cmd/webapp` 10 条边界用例（E1~E10），并做**变异检验** —— 临时删掉\"实收封顶\"与\"除零守卫\"，确认包级与端到端测试**都会红**，再还原。回归网因此是\"能咬住\"的，不是摆设。② **新包 `internal/billing`**（约 230 行含注释，纯函数、零 IO）：单位换算（MicroPerPoint/PointToMicro/MicroToPoint/FormatPoints，原在 store_user.go）、用量估算（EstimatePromptTokens/RequestMaxTokens/DefaultMaxTokens，原在 billing.go）、预扣额（ReserveMicro 把下限/上限/折算三条规则一次说清）、单价观测（Per1kCost 含**除零守卫**、MaxKeptCost 取历史最大值）、credit 估算（EstimateCredit），以及**分成与返点公式**（HostEarn / ReferralRebate）。③ **本刀最大的收获**：分成与返点公式此前**内联在 `proxy.go` 两个函数体里**，且是**成对的钱的规则** —— 分成必须以平台实收封顶（否则倍率低于分成比例时平台倒贴）、返点必须不侵占平台留成（earn+rebate ≤ charged）。这两条破掉的后果不是崩溃而是**每笔静默倒贴**，现在只有一份实现并被不变量网格测试钉住。④ **接线按调用点数量分策**：单位与估算有 250+ 调用点 → 走过渡别名（调用点一行不改）；公式类只有 1~2 处 → **直接改调用点**（加别名只会把重复实现留在原地 + 多一层跳转）。这条经验已写进方案文档的\"接线手段优先级\"。⑤ **运维须知**：要让平台每次都留成，必须保证「计费倍率 > 代挂分成比例」。⑥ 验证：全量 **24 个包全绿**（新增 internal/billing）、vet/gofmt 干净、前端 jsdom 全过；`cmd/webapp` 既有计费测试一行未改全绿 = 零行为变化的证据。⑦ **诚实边界**：本刀只完成上半 —— `settleUsage` 的**事务编排**（预扣对账 → 扣费/退还 → 写流水 → 触发分成）仍在 proxy.go，与转发主循环同文件；搬它要先定义账本接口并搬 UsageLog/ConsumeFailure 两个类型、涉及 4 张表的写入顺序，面积明显更大，按\"不追求一次到位\"留作独立一刀（方案 3b）。买到的是\"钱的规则只有一份且被独立测试钉住\"，没买到的是\"记账时机与转发解耦\"。",
-  "released_at": 1792096200,
+  "notes": "v0.31.11：P2-7 第三刀下半（3b）—— 结算的\"什么时候记账\"也搬出来了（零行为变化）。① **搬走**：`settleUsage` 的编排（预扣对账 → 扣费/退还 → 写流水）+ `logAdminChannelUsage`（并入新包 `settleAdminChannel`，两处口径从此只有一份）+ `usageInfo` 类型 + 5 个常量（ScopePool/ScopeHost/KeyKindHost/StageSettle/StageCharge —— 在 cmd/webapp 改成**别名**，只有一份定义）。`proxy.go` **2850 → 2750 行**；`settleUsage` 从 119 行编排变成 64 行适配器（含文档），**签名与 10 个入参逐字未变** → 调用点零改动。② **边界（刻意的）**：新包不碰 Proxy 状态、不碰选号、不发网络；所有 IO 走**窄接口** `billing.Ledger`（5 个方法），由 `cmd/webapp/billingledger.go` 用 Store 适配 —— 适配层的纪律是**只转发不判断**。**分成/返点仍由 cmd/webapp 执行**（它要\"号归谁、是否已入池\"这类选号侧状态），新包只通过 `Result.HostCreditDue` + `ConsumedCredit` 通知\"该分成、按多少分\"。③ **三个设计取舍**：`Request.HasUser` 用**显式布尔**而不是\"看 UserID 是否为零值\"（`UserID == 0` 恰好等于管理通道只是巧合，靠巧合的判断将来会静默走错分支）；`Settler` 接收者用**值类型** + 调用方**每次现构造**（避免\"某条构造路径忘了初始化 → nil panic\"，测试里有用字面量直接构造 Proxy 的）；适配层不用 `ConsumeFailure` 结构体做参数（它带 json tag、属查询/展示层，不该被结算反向依赖）。④ **本步真正的收益**：结算编排现在只要一个**假 Ledger** 就能单测，不必 app + Store + 临时库 + 假上游。新增 9 条独立用例（O1~O9）钉的都是过去**测不到**的分支：有预扣时不得再扣余额（会收两次钱）、结算失败必须回报 `Settled=false`（否则预扣悬空、钱被冻住）、扣费失败不阻断但要留痕、代挂自用零账本写、管理通道**不标 missing_credit**（它不是漏计而是本来就不收）、失败响应绝不估算、0 token 绝不观测、流水标记追加顺序。⑤ **变异检验**：删掉\"结算失败回报 settled=false\"与\"代挂自用清零扣费\"两处守卫 → 测试都会红（前者只在包级命中 —— 这恰好证明了这个分支此前在仓里没有任何测试能覆盖，也正是\"把编排搬出来\"的价值）。⑥ **真库不变量复核（近 7 天）**：`host_earnings` 741 条、**0 条违反 `earned ≤ charged`**、合计 6,367,291 微点；`consume_failures` 只有 131 条 upstream 阶段、**结算/扣费阶段 0 条**（记账层零失败）；`reservations` **无超过 24h 的残留**（无悬空预扣）。⑦ **诚实边界**：分成/返点的**执行**仍在 cmd/webapp（彻底搬它要抽象\"号主/入池/两级比例\"，收益低于风险）；生产 `rebates` 表近 7 天 **0 条** → 推广返点当前未启用，该链路虽已单测覆盖但**没有被真实流量走过**。",
+  "released_at": 1792097400,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.10/webapp.exe",
-      "sha256": "543e49ab959d7c419f0a8b747d00ec5b60defba99f7e31682abe11762bc0335f",
-      "size": 14877696
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.11/webapp.exe",
+      "sha256": "68d92643eaecf9511fc132a509089dbfec1e59ac07ae517dba5f030d4c996b13",
+      "size": 14884352
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.7）；换版本时同步换 url 与 sha256。"

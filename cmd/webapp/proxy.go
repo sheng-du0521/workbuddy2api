@@ -2515,11 +2515,21 @@ func parseUsageJSON(raw json.RawMessage) usageInfo {
 
 // settleUsage 结算一次请求：算钱 → 与预扣对账 → 写流水。
 //
+// **本方法是适配器**（v0.31.11，P2-7 第三刀下半）：真正的编排在
+// `internal/billing.Settler.Settle` —— 那里能独立单测（造一个假 Ledger 即可），
+// 不必拉起整个 app。本方法只负责三件**本包才有资格做的事**：
+//
+//  1. **模型名证据源**：成功请求把模型名写进"上游认过"清单（见下）；新包不认识 modelname；
+//  2. **组装 Request**：把 *User / *APIKey / *Reservation 这些本包类型摊平成标量
+//     （新包不认识它们，也不该认识）；
+//  3. **触发分成**：`Result.HostCreditDue` 为真时调用 creditHostOwner ——
+//     它需要"这个号归谁、是否已入池"这类**选号侧状态**，只有本包有。
+//
 // 计费口径（v0.12.0，需求 7 明确）：**唯一基准 = 本次被消耗的号池账号积分（consumedCredit）× 倍率**。
 //
 //	用户扣费（点）= 号池积分消耗 × 计费倍率（倍率由管理员在「设置 → 计费」配置，单位：点 / 1 积分）
 //
-// consumedCredit 取上游 usage.credit —— 即该次请求从serving 账号里**实扣掉**的积分数
+// consumedCredit 取上游 usage.credit —— 即该次请求从 serving 账号里**实扣掉**的积分数
 // （上游计费域的直接口径）。上游没回报 credit 时（老版本 / 异常响应）才用池里已学的
 // 「账号+模型」实测单价 × token 数估算，仍估不出则按 0 计并标记 missing_credit 便于对账。
 // 代挂分成 / 推广返点同样以**号池积分消耗**为基数折算（号主按自己的积分成本拿收益，
@@ -2537,159 +2547,49 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 	// 成功的模型名进入"上游认过"清单（v0.31.2），供模型名写法归一使用。
 	// 只记成功：失败记录里的名字可能正是写法错的，把它写进清单会让下一次
 	// 把**正确**写法归一成错的（最危险的方向）。
+	//
+	// ⚠️ 这一段**刻意留在本包**（而不是搬进 billing.Settle）：它是**模型名的证据源**，
+	// 属于 modelname 的职责；新包不认识它。注意它在管理通道分支**之前** —— 用管理密钥
+	// 的成功请求同样是一次"上游认过这个名字"的证据。
 	if status == "ok" {
 		rememberModel(model)
 	}
-	if u == nil {
-		// 管理密钥通道（运维 / 后台调试直连，见 apiKeyGuardOpt）：不经用户计费、
-		// 无需结算，但**必须进号池台账**（v0.17.6）。
-		//
-		// 此前这里直接 return —— 于是用管理密钥发的每一次请求在 usage_logs 里都不存在。
-		// 后果很具体：号池仪表盘的「累计服务 / 号池消耗 Top」对自己人的自测流量**视而不见**，
-		// 排查的人一边发请求一边看仪表盘纹丝不动，很容易误判「仪表盘坏了」。
-		// 「哪个号服务了这次请求、消耗了多少号池积分」是号池事实，与向谁收费无关，故照记。
-		// user_id 记 0：用户侧账单（按 user_id 过滤）天然看不到它，只有全站报表会统计。
-		p.logAdminChannelUsage(key, model, upstreamUID, ui, status, errMsg, stickyHash, attempts)
-		return true, 0
-	}
-	mult := p.store.PricingMultiplier()
-	// consumedCredit = 号池账号本次被消耗的积分（上游 direct 口径）。
-	consumedCredit := ui.Credit
-	if !ui.HasCredit {
-		// 只对成功响应做回落估算：失败响应没有真实用量（token=0），
-		// 强行估就是凭空扣费。失败一律按 0 计。
-		if status == "ok" {
-			consumedCredit = p.estimateCredit(upstreamUID, model, ui.Total())
-		} else {
-			consumedCredit = 0
-		}
-		if consumedCredit <= 0 && status == "ok" {
-			errMsg = strings.TrimSpace(errMsg + " [missing_credit]")
-		}
-	}
-	// 记录实测单价（积分 / 1k token），供后续请求的预扣估算使用
-	// （取历史最大值，另持久化到 kv，使重启后预扣能力不丢）。
-	// 折算与"取最大值"两条规则都在 internal/billing（Per1kCost / MaxKeptCost）——
-	// 这里只负责"什么时候记"（有真实用量才记）。
-	if per1k := billing.Per1kCost(consumedCredit, ui.Total()); per1k > 0 {
-		p.observeCost(model, per1k)
-	}
-	// 扣费 = 号池积分消耗 × 倍率。倍率即「1 号池积分折多少点」。
-	chargedMicro = PointToMicro(consumedCredit * mult)
 
-	// 代挂自用 Key：免费（不扣余额、不走预扣），仅记一条零费用流水便于观测/对账。
-	hostSelf := key != nil && key.Kind == KeyKindHost
-	logScope := ScopePool
-	if hostSelf {
-		chargedMicro = 0
-		logScope = ScopeHost
-		errMsg = strings.TrimSpace(errMsg + " [host_self]")
+	req := billing.Request{
+		HasUser:     u != nil,
+		Model:       model,
+		UpstreamUID: upstreamUID,
+		Usage:       ui,
+		Status:      status,
+		ErrMsg:      errMsg,
+		StickyHash:  stickyHash,
+		Attempts:    attempts,
 	}
-
-	var keyID int64
+	if u != nil {
+		req.UserID = u.ID
+	}
 	if key != nil {
-		keyID = key.ID
+		req.KeyID = key.ID
+		req.KeyKind = key.Kind
 	}
-	settled = true
-	if !hostSelf {
-		switch {
-		case resv != nil:
-			// 预扣-结算：退还冻结额、扣实际消耗，净额即多退少补。
-			if _, err := p.store.SettleReservation(resv.ID, chargedMicro); err != nil {
-				errMsg = strings.TrimSpace(errMsg + " [settle_failed:" + err.Error() + "]")
-				settled = false // 交给调用方 defer 释放，避免预扣悬空
-				// 结算失败是**账目类**失败：响应已经发出，钱的方向对用户有利，
-				// 但必须留痕，否则"账对不上"时无从追查（v0.26.2 那笔孤儿预扣
-				// 就是靠 usage_logs 的 error_msg 才定位到的；结构化之后不必再翻文本）。
-				p.store.recordConsumeFailure(ConsumeFailure{
-					Stage: FailStageSettle, Model: model, UID: upstreamUID, UserID: u.ID,
-					KeyID: keyID, Attempt: attempts, Source: "settle",
-					Detail: "预扣结算失败：" + err.Error(),
-				})
-			}
-		case chargedMicro > 0:
-			// 无预扣（池内还没有单价数据）→ 退化为事后结算。
-			if _, err := p.store.ChargeUser(u.ID, chargedMicro); err != nil {
-				// 扣费失败不阻断响应（响应已发出），但要留痕。
-				errMsg = strings.TrimSpace(errMsg + " [charge_failed:" + err.Error() + "]")
-				p.store.recordConsumeFailure(ConsumeFailure{
-					Stage: FailStageCharge, Model: model, UID: upstreamUID, UserID: u.ID,
-					KeyID: keyID, Attempt: attempts, Source: "charge",
-					Detail: "事后扣费失败：" + err.Error(),
-				})
-			}
-		}
+	if resv != nil {
+		req.HasReservation = true
+		req.ReservationID = resv.ID
 	}
-	_ = p.store.InsertUsageLog(&UsageLog{
-		UserID:           u.ID,
-		KeyID:            keyID,
-		Model:            model,
-		PromptTokens:     ui.PromptTokens,
-		CompletionTokens: ui.CompletionTokens,
-		UpstreamCredit:   consumedCredit,
-		ChargedMicro:     chargedMicro,
-		UpstreamUID:      upstreamUID,
-		Scope:            logScope,
-		Status:           status,
-		ErrorMsg:         errMsg,
-		StickyKeyHash:    stickyHash,
-		Attempts:         attempts,
-		CacheHitTokens:   ui.CacheHitTokens,
-		CacheMissTokens:  ui.CacheMissTokens,
-		CacheWriteTokens: ui.CacheWriteTokens,
-		LatencyMS:        ui.LatencyMS,
-	})
-	// 代挂分成：本次若由某号主的「已入池」代挂账号服务平台流量，
-	// 按「号池积分消耗 × 分成比例」折入号主余额（以本次实收封顶）。
-	if !hostSelf && consumedCredit > 0 {
-		p.creditHostOwner(upstreamUID, u, model, consumedCredit, chargedMicro)
+
+	res := p.billingSettler().Settle(req)
+
+	// 代挂分成：由本包执行（决策在新包的 Result.HostCreditDue）—— 它要查号主与入池状态。
+	if res.HostCreditDue {
+		p.creditHostOwner(upstreamUID, u, model, res.ConsumedCredit, res.ChargedMicro)
 	}
-	return settled, chargedMicro
+	return res.Settled, res.ChargedMicro
 }
 
-// logAdminChannelUsage 为「管理密钥通道」写一条号池台账（user_id=0，零费用）。
-//
-// 与 settleUsage 主路径的区别只有两点：不扣任何用户余额（无用户可扣）、
-// 不做预扣对账（管理通道本就不预扣）。其余（consumedCredit 口径、单价观测、
-// 流水字段）与计费路径完全一致 —— 台账要能横向比较。
-func (p *Proxy) logAdminChannelUsage(key *APIKey, model, upstreamUID string, ui usageInfo, status, errMsg, stickyHash string, attempts int) {
-	consumedCredit := ui.Credit
-	if !ui.HasCredit {
-		if status == "ok" {
-			consumedCredit = p.estimateCredit(upstreamUID, model, ui.Total())
-		} else {
-			consumedCredit = 0
-		}
-	}
-	// 单价观测与计费路径同口径（只认真实用量），否则管理通道的请求白白浪费一次学习机会。
-	if per1k := billing.Per1kCost(consumedCredit, ui.Total()); per1k > 0 {
-		p.observeCost(model, per1k)
-	}
-	var keyID int64
-	if key != nil {
-		keyID = key.ID
-	}
-	_ = p.store.InsertUsageLog(&UsageLog{
-		UserID:           0, // 0 = 无归属（运维通道）；用户侧按 user_id 过滤，天然隔离
-		KeyID:            keyID,
-		Model:            model,
-		PromptTokens:     ui.PromptTokens,
-		CompletionTokens: ui.CompletionTokens,
-		UpstreamCredit:   consumedCredit,
-		ChargedMicro:     0, // 管理通道不收费
-		UpstreamUID:      upstreamUID,
-		Scope:            ScopePool,
-		Status:           status,
-		ErrorMsg:         errMsg,
-		StickyKeyHash:    stickyHash,
-		Attempts:         attempts,
-		CacheHitTokens:   ui.CacheHitTokens,
-		CacheMissTokens:  ui.CacheMissTokens,
-		CacheWriteTokens: ui.CacheWriteTokens,
-		LatencyMS:        ui.LatencyMS,
-	})
-}
-
+// logAdminChannelUsage 已随结算编排一起下沉 internal/billing（v0.31.11）：
+// 它是 `Settler.Settle` 里 `HasUser=false` 那条分支（settleAdminChannel），
+// 口径与计费路径共用一份实现。本包不再有这个函数 —— 如果你在找它，
+// 去 internal/billing/settle.go 搜 `settleAdminChannel`。
 // creditHostOwner 把一次平台请求的分成记入所服务账号的号主余额。
 //
 // 计分成基数（v0.12.0 起）：**号池账号本次被消耗的积分 consumedCredit**，

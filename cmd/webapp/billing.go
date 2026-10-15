@@ -48,38 +48,12 @@ const defaultMultiplier = 1.0
 
 // ---------- 计费结算 ----------
 
-// usageInfo 一次请求的上游用量。
-type usageInfo struct {
-	PromptTokens     int
-	CompletionTokens int
-	Credit           float64
-	HasCredit        bool
-
-	// 前缀缓存观测（v0.26.7）：上游在末帧 usage 里**明确回报**的三个计数。
-	//
-	// 为什么必须采（这是一次真实排查逼出来的）：上游对同一前缀有缓存，
-	// 命中时预处理几乎免费、未命中则要全量重算 —— 实测本机 48 万 token 的请求
-	// 单次耗时 92~129 秒、计 24~25 点，但按缓存命中口径该低一个数量级。
-	// 旧网关（internal/server/logging.go，已于 v0.31.5 删除）一直在采这三个字段并有命中率统计，
-	// **只有 webapp 这条链路把它们丢了** —— 于是"缓存到底有没有生效"根本无从判断，
-	// 只能对着耗时和费用猜。观测缺口本身就是缺陷。
-	//
-	// 口径：hit + miss 才是本次 prompt 的全量（write 是本次**新写入**缓存的量）。
-	// 三者都为 0 = 上游没返回（老版本 / 非缓存模型），**不等于命中率为 0**。
-	CacheHitTokens   int
-	CacheMissTokens  int
-	CacheWriteTokens int
-
-	// LatencyMS 本次请求的端到端耗时（毫秒），由转发层在结算前填入。
-	//
-	// 为什么不从上游取：上游只给处理时长，用户感知的是"从发出到收完"的整体，
-	// 含排队、换号重试、反代回程。此前它只存在于 90 分钟的内存态实时面板里，
-	// 进程一重启就没，无法做"最近一天 p95 是多少"这类判断。
-	LatencyMS int64
-}
-
-// Total 总 token 数。
-func (u usageInfo) Total() int { return u.PromptTokens + u.CompletionTokens }
+// usageInfo 一次请求的上游用量 —— **类型本体已下沉 `internal/billing`**（v0.31.11）：
+// 它同时是"预扣估算的输入"与"流水/结算的输入"，属于计费域，放在结算实现旁边。
+//
+// 本包保留同名别名：它的引用有 20+ 处（转发主循环、流式解析、若干测试），
+// 改引用点不会带来任何理解收益，只会让这一刀的面积虚增。字段与 `Total()` 都在新包里。
+type usageInfo = billing.Usage
 
 // ---------- 预扣估算 ----------
 

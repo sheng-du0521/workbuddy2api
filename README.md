@@ -78,6 +78,11 @@ OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时积�
   同一模型不会再被当成两个模型（写错写法此前是"上游 400 → 客户端 404"的必然失败）
 - **失败台账区分「上游 HTTP」与「回客户端」** —— 上游对「模型不存在」固定回 400，
   而我们回 404；两列并列后不会再把它读成"网关整站 400"
+- **结算编排单点**（v0.31.11）—— "什么时候记账、按什么顺序记"在 `internal/billing/settle.go`：
+  预扣对账 → 扣费/退还 → 写流水；所有 IO 走**窄接口** `billing.Ledger`（5 个方法，由
+  `cmd/webapp/billingledger.go` 用 Store 适配，**只转发不判断**）。分成/返点仍由 `cmd/webapp` 执行
+  （它要"号归谁、是否已入池"这类选号侧状态），新包只通过 `Result.HostCreditDue` 通知。
+  → 于是结算可以用**一个假 Ledger** 单测，不必起 app / 库 / 假上游；
 - **钱的口径单点**（v0.31.10）—— 单位换算（`MicroPerPoint` / `PointToMicro` / `MicroToPoint`）、
   用量估算、预扣额（下限/上限/折算）、单价观测（除零守卫 + 取历史最大值）、
   以及**分成与返点公式**（`HostEarn` / `ReferralRebate`）全部在 `internal/billing` 且被独立测试钉住。
@@ -205,7 +210,7 @@ v0.31.5 起本仓**只有一个产品**（`cmd/webapp`）。下列口径当年�
 | 2 | 用量台账只读聚合 → `internal/usage`（约 470 行） | ✅ v0.31.9 |
 | 2 | `Store` 只读查询面 | ⬜ |
 | 3 | 计费纯算术 → `internal/billing`（单位/估算/预扣/单价观测/分成返点公式） | ✅ v0.31.10 |
-| 3b | `settleUsage` 事务编排 → `internal/billing` 的账本服务 | ⬜ |
+| 3b | 结算编排 → `internal/billing/settle.go`（预扣对账/扣费/写流水；IO 走 `Ledger` 窄接口） | ✅ v0.31.11 |
 | 4 | `app` 的 admin HTTP 面 → `internal/api/*` | ⬜ |
 
 细节与每刀流程见 `docs/P2-7-拆包方案.md`。
