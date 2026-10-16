@@ -2510,3 +2510,229 @@ async function pluginRun(p, card, panel) {
   panel.appendChild(sum);
 }
 
+
+// ---------------------------------------------------------------- ⑩ 本地出口代理（v0.31.17）
+//
+// 控制台「代理」页：把「本机的网络出口」接进平台的出站链路。
+//
+// 为什么把它放控制台而不是只有管理后台：出口是**用户自己能感知**的东西
+// （"我的号从哪出去"），把它藏起来只会让人去猜。但**执行**仍然只有管理员能做
+// —— 它改的是全平台的链路，不是单个用户的选择（见服务端 egressAdminOnly）。
+//
+// 三步闭环（页面上一句话讲清，用户不必理解隧道）：
+//   ① 本机跑起 agent（一次，之后常驻）→ ② 点「一键拉起」→ ③ 就绪后自动应用配置
+const EGRESS_POLL_MS = 2000;   // 轮询状态间隔
+const EGRESS_WAIT_MAX_MS = 90000; // 一键拉起后的最长等待
+let egressTimer = null;
+let egressSince = 0;
+
+function egressDot(ok, text) {
+  const s = el('span', null, (ok ? '● ' : '○ ') + text);
+  s.style.fontSize = '12px';
+  s.style.color = ok ? 'var(--ok, #2e7d32)' : '#888';
+  s.style.marginRight = '12px';
+  return s;
+}
+
+async function loadEgressHome() {
+  const box = document.getElementById('egressHomeBox');
+  if (!box) return;
+  try {
+    const v = await api('/api/egress/home');
+    renderEgressHome(box, v);
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'sub', '读取出口状态失败：' + (e && e.message ? e.message : e)));
+  }
+}
+
+function renderEgressHome(box, v) {
+  box.textContent = '';
+
+  // ---- 状态行 ----
+  const card = el('div', 'card');
+  const head = el('div', 'section-head');
+  head.appendChild(el('h2', null, '出口状态'));
+  card.appendChild(head);
+
+  const status = el('div');
+  status.style.margin = '6px 0 10px';
+  status.appendChild(egressDot(v.agent_online, '本机 agent ' + (v.agent_online ? '在线' : '离线')));
+  status.appendChild(egressDot(v.tunnel_reachable, '反向隧道 ' + (v.tunnel_reachable ? '已连通' : '未连通')));
+  status.appendChild(egressDot(v.applied, '配置' + (v.applied ? '已应用' : '未应用')));
+  card.appendChild(status);
+
+  const rows = [
+    ['出口 IP', (v.agent_state && v.agent_state.exit_ip) || '（未知 —— agent 尚未上报）'],
+    ['全局默认出口', v.default_egress || '（空 = 直连）'],
+    ['自挂号绑定', (v.host_bound || 0) + ' / ' + (v.host_total || 0) + ' 个'],
+    ['隧道端口', '127.0.0.1:' + (v.ports ? v.ports.tunnel_port : '?') + '（本机代理端口 ' + (v.ports ? v.ports.proxy_port : '?') + '）'],
+  ];
+  if (v.agent_state && v.agent_state.message) rows.push(['最近状态', v.agent_state.message]);
+  const tbl = el('div', 'sub');
+  for (const [k, val] of rows) {
+    const line = el('div');
+    line.style.padding = '2px 0';
+    const kk = el('span', null, k + '：');
+    kk.style.color = '#888';
+    line.appendChild(kk);
+    line.appendChild(el('span', null, String(val)));
+    tbl.appendChild(line);
+  }
+  card.appendChild(tbl);
+
+  // ---- 操作区 ----
+  if (!v.can_manage) {
+    const tip = el('div', 'sub', '出口链路的改动会影响全平台（全局默认出口 + 自挂号绑定），因此仅管理员可执行；上面是只读状态。');
+    tip.style.marginTop = '10px';
+    card.appendChild(tip);
+    box.appendChild(card);
+    return;
+  }
+
+  const row = el('div', 'row');
+  row.style.flexWrap = 'wrap';
+  row.style.alignItems = 'center';
+  row.style.gap = '8px';
+  row.style.marginTop = '10px';
+
+  const pulling = !!egressTimer;
+  const pull = el('button', null, pulling ? '等待中…' : (v.ready ? '重新拉起并应用' : '一键拉起'));
+  pull.disabled = pulling;
+  pull.addEventListener('click', () => egressPull(v));
+  row.appendChild(pull);
+
+  const applyBtn = el('button', 'ghost', '仅重新应用配置');
+  applyBtn.disabled = pulling || !v.tunnel_reachable;
+  applyBtn.addEventListener('click', async () => {
+    applyBtn.disabled = true;
+    try {
+      const d = await api('/api/egress/home/apply', { method: 'POST' });
+      toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
+            '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+      loadEgressHome();
+    } catch (e) {
+      toast('应用失败：' + (e && e.message ? e.message : e), 'bad');
+      applyBtn.disabled = false;
+    }
+  });
+  row.appendChild(applyBtn);
+
+  const rel = el('button', 'ghost', '停止本机代理');
+  rel.disabled = pulling;
+  rel.addEventListener('click', async () => {
+    try {
+      await api('/api/egress/home/release', { method: 'POST' });
+      toast('已下发停止指令（不会自动改动账号的出口配置）', 'ok');
+      loadEgressHome();
+    } catch (e) {
+      toast('停止失败：' + (e && e.message ? e.message : e), 'bad');
+    }
+  });
+  row.appendChild(rel);
+  card.appendChild(row);
+
+  // ---- 首次使用：在本机跑一次 agent ----
+  if (!v.agent_online && v.agent_command) {
+    const note = el('div', 'sub');
+    note.style.marginTop = '12px';
+    note.appendChild(document.createTextNode('本机 agent 还没跑起来。'));
+    note.appendChild(el('b', null, '在你家里那台电脑上'));
+    note.appendChild(document.createTextNode(
+      '（与 wbproxy.exe、ai.pem 放在同一目录）运行下面这行 —— 只需一次，之后它常驻：'));
+    card.appendChild(note);
+
+    const cmd = el('div', 'sub');
+    cmd.style.cssText = 'margin-top:6px;padding:8px 10px;background:rgba(127,127,127,.12);border-radius:6px;' +
+      'font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all;';
+    cmd.textContent = v.agent_command;
+    card.appendChild(cmd);
+
+    const copy = el('button', 'ghost', '复制命令');
+    copy.style.marginTop = '8px';
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(v.agent_command);
+        toast('已复制', 'ok');
+      } catch (e) {
+        // 剪贴板 API 在非 https 下不可用 → 退化成"选中让用户自己复制"
+        const r = document.createRange();
+        r.selectNodeContents(cmd);
+        const sel = window.getSelection();
+        sel.removeAllRanges(); sel.addRange(r);
+        toast('已选中，请按 Ctrl+C 复制', 'ok');
+      }
+    });
+    card.appendChild(copy);
+  }
+
+  if (egressTimer) {
+    const w = el('div', 'sub', '已下发拉起指令，正在等待本机 agent 响应…（最长 90 秒）');
+    w.style.marginTop = '10px';
+    card.appendChild(w);
+  }
+  box.appendChild(card);
+
+  // ---- 链路说明（一次讲清，避免用户去猜）----
+  const help = el('div', 'card');
+  help.style.marginTop = '14px';
+  const h2 = el('div', 'section-head');
+  h2.appendChild(el('h2', null, '这条链路是什么'));
+  help.appendChild(h2);
+  help.appendChild(el('div', 'sub',
+    '本机 agent 在你家里那台电脑上跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
+    '于是平台访问上游时，流量会从「你家的宽带」出去 —— 住宅 IP 比机房 IP 友好得多。' +
+    '拉起并应用后：全局默认出口指向这条线路（跟随默认的号自动生效），' +
+    '所有自挂号被显式绑定到它（不随默认出口漂移）。'));
+  const warn = el('div', 'sub');
+  warn.style.marginTop = '8px';
+  warn.appendChild(document.createTextNode('⚠️ 两点要知道：'));
+  warn.appendChild(el('br'));
+  warn.appendChild(document.createTextNode(
+    '① 只有这一个出口 IP —— 全部账号共用它，会保留"同一 IP 出站"的特征；'));
+  warn.appendChild(el('br'));
+  warn.appendChild(document.createTextNode(
+    '② 家宽上行带宽是全平台瓶颈，且本机断网/关机时这条链路会一起断（隧道断开后 agent 会自动重连）。'));
+  help.appendChild(warn);
+  box.appendChild(help);
+}
+
+// egressPull 一键拉起：下发指令 → 轮询状态 → 就绪后**自动应用**配置。
+async function egressPull(v) {
+  if (egressTimer) return;
+  try {
+    await api('/api/egress/home/pull', { method: 'POST' });
+  } catch (e) {
+    toast('下发指令失败：' + (e && e.message ? e.message : e), 'bad');
+    return;
+  }
+  egressSince = Date.now();
+  toast('已下发拉起指令，正在等待本机 agent…', 'ok');
+  const box = document.getElementById('egressHomeBox');
+  const step = async () => {
+    let cur = null;
+    try {
+      cur = await api('/api/egress/home');
+    } catch (e) { /* 轮询失败不终止，下一轮再试 */ }
+    if (cur && box) renderEgressHome(box, cur);
+    if (cur && cur.ready) {
+      egressTimer = null;
+      try {
+        const d = await api('/api/egress/home/apply', { method: 'POST' });
+        toast('已就绪并自动应用：自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+      } catch (e) {
+        toast('已就绪，但自动应用失败：' + (e && e.message ? e.message : e), 'bad');
+      }
+      loadEgressHome();
+      return;
+    }
+    if (Date.now() - egressSince > EGRESS_WAIT_MAX_MS) {
+      egressTimer = null;
+      toast('等待超时：本机 agent 未响应。请确认它已启动，并检查 agent 窗口里的输出。', 'bad');
+      loadEgressHome();
+      return;
+    }
+    egressTimer = setTimeout(step, EGRESS_POLL_MS);
+  };
+  egressTimer = setTimeout(step, EGRESS_POLL_MS);
+}

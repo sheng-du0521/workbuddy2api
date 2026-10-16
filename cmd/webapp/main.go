@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.16"
+const version = "0.31.17"
 
 type app struct {
 	store  *Store
@@ -1360,6 +1360,24 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/keys/{id}", a.userGuard(a.handleDeleteKey))
 	mux.HandleFunc("POST /api/keys/{id}/disable", a.userGuard(a.handleToggleKey(false)))
 	mux.HandleFunc("POST /api/keys/{id}/enable", a.userGuard(a.handleToggleKey(true)))
+
+	// 本地出口代理「一键拉起」（v0.31.17）。
+	//
+	// agent 两个端点用 **专用令牌**（X-Agent-Token）而不是 userGuard/adminGuard：
+	// agent 跑在用户家里的电脑上、没有浏览器会话；给它一把只够 poll/report 的
+	// 钥匙，比把管理密钥抄到本机安全得多（它能做的只有"拉代理"，读不到任何号）。
+	mux.HandleFunc("GET /api/agent/poll", a.handleEgressAgentPoll)
+	mux.HandleFunc("POST /api/agent/report", a.handleEgressAgentReport)
+	// 控制台「代理」页：状态对登录用户只读开放；拉起/停止/应用是**管理员**动作
+	// （它们会改变全平台的出站链路，不是单个用户的选择）。
+	mux.HandleFunc("GET /api/egress/home", a.userGuard(a.handleEgressHome))
+	// 三个**执行**端点挂 adminGuard（而不是 userGuard + 自己判管理员）：
+	// 管理员会话与**运维密钥（X-Admin-Key）**两条通道都能用 —— 与项目其它管理接口
+	// 一致。出口是平台级配置，脚本化运维（部署时拉起、巡检时重应用）是真实场景，
+	// 不该只剩"必须开浏览器点一下"这一条路。
+	mux.HandleFunc("POST /api/egress/home/pull", a.adminGuard(a.handleEgressHomePull))
+	mux.HandleFunc("POST /api/egress/home/release", a.adminGuard(a.handleEgressHomeRelease))
+	mux.HandleFunc("POST /api/egress/home/apply", a.adminGuard(a.handleEgressHomeApply))
 
 	// 插件中心（v0.31.16，用户侧）：只下发 audience 含 user 的插件。
 	// 执行接口内部按 owner_user_id 收窄 —— 用户只能领**自己的**代挂账号。

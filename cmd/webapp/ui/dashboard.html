@@ -28,6 +28,7 @@
       <button class="nav-item" data-nav="wallet" data-on="loadWallet" data-title="充值提现" data-sub="充值码兑换、提现申请与流水"><span class="ico">💳</span>充值提现</button>
       <div class="nav-group">代挂</div>
       <button class="nav-item" data-nav="host" data-on="loadHostAccounts" data-title="账号代挂" data-sub="把你的账号挂到平台：自用反代 / 申请进号池赚收益"><span class="ico">🔗</span>账号代挂</button>
+      <button class="nav-item" data-nav="egress" data-on="loadEgressHome" data-title="代理" data-sub="把本机住宅出口（家里的宽带）接进平台出站链路：一键拉起、自动应用"><span class="ico">🛡</span>代理</button>
       <button class="nav-item" data-nav="market" data-on="loadMarket" data-title="账号市场" data-sub="买断在售账号，转入你的代挂序列"><span class="ico">🏷</span>账号市场</button>
       <button class="nav-item" data-nav="growth" data-on="loadHostGrowth" data-title="成长任务" data-sub="手动选号做官方成长计划，查看完成进度"><span class="ico">🌱</span>成长任务</button>
       <div class="nav-group">收益</div>
@@ -372,6 +373,22 @@
     </section>
 
     <!-- ==================== 账号代挂 ==================== -->
+    <!-- ==================== 本地出口代理（v0.31.17） ==================== -->
+    <section class="pane" data-pane="egress">
+      <div class="section-head">
+        <h2>本地出口代理</h2>
+        <span class="slot-refresh" data-refresh="loadEgressHome" data-refresh-label="刷新状态"></span>
+      </div>
+      <div class="sub" style="margin:0 0 14px;">
+        把「<b>你家里的网络出口</b>」接进平台的出站链路：本机 agent 跑一个本地代理，
+        再用 SSH 反向隧道把它接到云端 —— 于是平台访问上游时是从<b>你家宽带</b>出去
+        （住宅 IP 比机房 IP 友好得多）。
+        <br><b>只需在本机启动一次 agent</b>（页面会给命令），之后在下面点一次就好；
+        <b>无需手工填写任何地址、端口或绑定关系</b>。
+      </div>
+      <div id="egressHomeBox"></div>
+    </section>
+
     <section class="pane" data-pane="host">
       <div class="card">
         <div class="section-head">
