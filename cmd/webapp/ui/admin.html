@@ -27,6 +27,8 @@
       <button class="nav-item" data-nav="tasks" data-on="loadTasks" data-title="定时任务" data-sub="自动签到 / 做任务，改完即时生效"><span class="ico">⏱</span>定时任务</button>
       <button class="nav-item" data-nav="growth" data-on="loadGrowthAdmin" data-title="成长任务" data-sub="手动选号执行 + 完成进度（不自动排程）"><span class="ico">🌱</span>成长任务</button>
       <button class="nav-item" data-nav="egress" data-on="loadEgress" data-title="代理" data-sub="出口代理（线路池）+ 账号代理（逐号出口），防同 IP 关联"><span class="ico">🛡</span>代理<span class="badge hidden" id="egressBadge">0</span></button>
+      <div class="nav-group">扩展</div>
+      <button class="nav-item" data-nav="plugins" data-on="loadPlugins" data-title="插件" data-sub="可独立启停的功能扩展；停用只影响入口与执行，不改动任何数据"><span class="ico">🧩</span>插件</button>
       <div class="nav-group">经营</div>
       <button class="nav-item" data-nav="users" data-on="loadUsers" data-title="用户" data-sub="余额、限额与封禁"><span class="ico">👤</span>用户</button>
       <button class="nav-item" data-nav="market" data-on="loadMarket" data-title="账号市场" data-sub="账号上架 / 下架、在售列表与买断台账"><span class="ico">🏷</span>账号市场</button>
@@ -1687,6 +1689,19 @@ go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pr
     </section>
 
     <!-- ==================== 调试对话 ==================== -->
+    <!-- ==================== 插件（v0.31.16） ==================== -->
+    <section class="pane" data-pane="plugins" data-plugin-scope="admin">
+      <div class="section-head">
+        <h2>插件</h2>
+        <span class="muted" style="font-size:12px;">可独立启停的功能扩展</span>
+      </div>
+      <div class="sub" style="margin:0 0 14px;">
+        插件是<b>可安装 / 可停用</b>的功能单元：停用只让入口与执行停下，<b>不会改动任何数据</b>。
+        点开卡片即可使用。批量类操作一律<b>逐个串行</b>出站，不做"一键全并发"。
+      </div>
+      <div class="cards" id="pluginCards"></div>
+    </section>
+
     <section class="pane" data-pane="test">
       <div class="card">
         <h2>调试对话（用管理密钥直连，不走用户计费）</h2>

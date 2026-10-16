@@ -34,6 +34,8 @@
       <button class="nav-item" data-nav="rebates" data-on="loadRebates" data-title="我的返点" data-sub="号池返点 + 推广返点"><span class="ico">💰</span>我的返点</button>
       <div class="nav-group">帮助</div>
       <button class="nav-item" data-nav="docs" data-title="接入说明" data-sub="OpenAI 兼容接口对接方式"><span class="ico">📖</span>接入说明</button>
+      <div class="nav-group">扩展</div>
+      <button class="nav-item" data-nav="plugins" data-on="loadPlugins" data-title="插件" data-sub="可独立启停的功能扩展；停用只影响入口与执行，不改动任何数据"><span class="ico">🧩</span>插件</button>
     </nav>
     <div class="sidebar-foot">
       <div class="whoami" id="whoami">…</div>
@@ -483,6 +485,19 @@
     </section>
 
     <!-- ==================== 接入说明 ==================== -->
+    <!-- ==================== 插件（v0.31.16） ==================== -->
+    <section class="pane" data-pane="plugins" data-plugin-scope="user">
+      <div class="section-head">
+        <h2>插件</h2>
+        <span class="muted" style="font-size:12px;">可独立启停的功能扩展</span>
+      </div>
+      <div class="sub" style="margin:0 0 14px;">
+        插件是<b>可安装 / 可停用</b>的功能单元：停用只让入口与执行停下，<b>不会改动任何数据</b>。
+        点开卡片即可使用。批量类操作一律<b>逐个串行</b>出站，不做"一键全并发"。
+      </div>
+      <div class="cards" id="pluginCards"></div>
+    </section>
+
     <section class="pane" data-pane="docs">
       <div class="card">
         <h2>接入信息</h2>

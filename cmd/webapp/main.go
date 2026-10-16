@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.15"
+const version = "0.31.16"
 
 type app struct {
 	store  *Store
@@ -104,6 +104,13 @@ type app struct {
 	// probes 探活类出站的全局闸（v0.24.3）：限全局并发 + 单账号最小间隔。
 	// 见 healthchat.go —— 2026-10-13 事故的产物（前端逐卡出站 → 59 并发同出口 → 上游风控）。
 	probes *probeGate
+	// pluginGate 插件执行类出站的闸（v0.31.16）：与 probes **同类型、独立实例**。
+	//
+	// 为什么不共用 probes：领取补偿是**写类**出站，可能比探活慢得多；共用一道闸
+	// 会出现"跑一次批量领取把并发额度占满 → 页面上所有积分探活都被拒"的互相干扰。
+	// 类型复用（同一套语义：全局在途上限 + 同号最小间隔）而实例独立 —— 语义一处、
+	// 额度各管各的。
+	pluginGate probeGate
 	// /v1/* 客户端维度限流（按 API Key / IP），RPM 由管理员设置，0 = 不限。
 	limiter *clientLimiter
 	// 告警状态（/metrics 暴露 + webhook 跃迁通知）。
@@ -1353,6 +1360,12 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/keys/{id}", a.userGuard(a.handleDeleteKey))
 	mux.HandleFunc("POST /api/keys/{id}/disable", a.userGuard(a.handleToggleKey(false)))
 	mux.HandleFunc("POST /api/keys/{id}/enable", a.userGuard(a.handleToggleKey(true)))
+
+	// 插件中心（v0.31.16，用户侧）：只下发 audience 含 user 的插件。
+	// 执行接口内部按 owner_user_id 收窄 —— 用户只能领**自己的**代挂账号。
+	mux.HandleFunc("GET /api/plugins", a.userGuard(a.handleUserPluginList))
+	mux.HandleFunc("POST /api/plugins/{id}/claim",
+		a.userGuard(func(w http.ResponseWriter, r *http.Request) { a.handlePluginClaim(w, r, false) }))
 	mux.HandleFunc("POST /api/keys/{id}/accounts", a.userGuard(a.handleSetKeyAccounts))
 	mux.HandleFunc("GET /api/usage", a.userGuard(a.handleUsage))
 	mux.HandleFunc("GET /api/usage/report", a.userGuard(a.handleUsageReport))
@@ -1441,6 +1454,14 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/codes", a.adminGuard(a.handleAdminGenCodes))
 	mux.HandleFunc("GET /api/admin/settings", a.adminGuard(a.handleAdminSettings))
 	mux.HandleFunc("POST /api/admin/settings", a.adminGuard(a.handleAdminSettings))
+
+	// 插件中心（v0.31.16）：注册表驱动的可启停功能单元。
+	// 两端各有入口（admin / user），**鉴权与数据范围各自独立** —— 插件不是权限模型。
+	mux.HandleFunc("GET /api/admin/plugins", a.adminGuard(a.handleAdminPluginList))
+	mux.HandleFunc("POST /api/admin/plugins/{id}/enabled",
+		a.adminGuard(func(w http.ResponseWriter, r *http.Request) { a.handlePluginToggle(w, r) }))
+	mux.HandleFunc("POST /api/admin/plugins/{id}/claim",
+		a.adminGuard(func(w http.ResponseWriter, r *http.Request) { a.handlePluginClaim(w, r, true) }))
 
 	// 版本更新提醒（v0.26.0）：读状态 + 跳过某版本。**只提醒，不自动更新**。
 	mux.HandleFunc("GET /api/admin/update-status", a.adminGuard(a.handleAdminUpdateStatus))

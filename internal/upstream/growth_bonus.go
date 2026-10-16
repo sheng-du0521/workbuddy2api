@@ -133,16 +133,37 @@ func (c *Client) ClaimCompensation(a *auth.Auth) (int64, error) {
 	return c.claimBillingCredit(a, claimCompensationPath)
 }
 
+// ClaimCompensationRaw 与 ClaimCompensation 同路径，但**连带返回上游 data 原文**。
+//
+// 存在的理由（2026-10-16，为"多账号领取积分补偿"插件加的）：
+// `credit == 0` 有两种完全不同的成因，而我们只看 credit 时**无法区分**：
+//  1. 真的没有可领的（正常态，绝大多数情况）；
+//  2. 回执里的积分字段名 / 层级与我们假设的不同（**代码 bug**）。
+//
+// 两者的处置完全相反：前者忽略即可，后者要改这一行。把原文透出，排障一次到位
+// ——不必再"加一行日志 → 重新发一版 → 再看"。
+//
+// 返回的原文截断 300 字符：够看出结构，又不会把整个响应体塞进结果表。
+func (c *Client) ClaimCompensationRaw(a *auth.Auth) (int64, string, error) {
+	return c.claimBillingCreditRaw(a, claimCompensationPath)
+}
+
 // claimBillingCredit billing 域领取类公共实现：POST path → data.credit。
 // 回执字段缺失不视为失败（调用方按 0 记日志）。
 func (c *Client) claimBillingCredit(a *auth.Auth, path string) (int64, error) {
+	credit, _, err := c.claimBillingCreditRaw(a, path)
+	return credit, err
+}
+
+// claimBillingCreditRaw 带原文的领取实现（ClaimCompensationRaw 与 claimBillingCredit 共用）。
+func (c *Client) claimBillingCreditRaw(a *auth.Auth, path string) (int64, string, error) {
 	data, err := c.billingJSON(a, http.MethodPost, path, map[string]any{})
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	var resp struct {
 		Credit int64 `json:"credit"`
 	}
 	_ = json.Unmarshal(data, &resp)
-	return resp.Credit, nil
+	return resp.Credit, truncate(string(data), 300), nil
 }

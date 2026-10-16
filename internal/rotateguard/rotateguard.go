@@ -138,6 +138,100 @@ func (g *WAFGate) NoteWaf(uid string) bool {
 	return false
 }
 
+// ModelBlockWindow 「模型名在上游不存在」（11102）的判定滑动窗与激活时长。
+// 按模型名分桶，故没有 WAFGate 那样的全局单例状态。var 仅供测试注入短窗
+// （生产恒 60s，与 WAFWindow 同量级："短时间内换个号再确认一次"的窗口）。
+var ModelBlockWindow = 60 * time.Second
+
+// ModelBlockThreshold 判定阈值：窗内**不同账号**数达到该值即判定「上游没有这个
+// 模型名」。取 2 —— 「多号」的最小定义。
+//
+// 为什么必须跨账号：单账号的 11102 只说明"这个号没有该模型"（账号维度，由
+// (账号,模型) 负缓存自己管）；**两个不同号**在窗内接连报 11102，才排除掉
+// "个别号权限缺失"，指向"模型名本身不存在"（模型维度）。
+//
+// 阈值 2 不会误伤"真模型但只有部分号有"：选号侧已按 (账号,模型) 负缓存过滤
+// （healthyForModel），上一轮撞到的号 6h 内不会再被选中 —— 能接连撞到两个报
+// 11102 的号，只可能是"池里对该模型可用的号已耗尽"；此时继续轮转只是把剩余
+// 账号挨个犁一遍（每个都白得一条 6h 负缓存）。
+const ModelBlockThreshold = 2
+
+// ModelBlockGate 「模型名上游不存在」的跨账号 fail-fast 状态机（零值可用）。
+//
+// 与 WAFGate 结构同源，但**按模型名分桶**，且激活只作用于该模型 —— 一个打错的
+// 模型名激活闸门之后，别的模型完全不受影响；反过来，一个模型名被判定不存在，
+// 也不会牵连任何账号（刻意的：11102 指向**模型名**，不指向账号）。
+//
+// 为什么需要它（2026-10-16 实测教训）：测速时用 `{"model":"x"}`（不存在的模型名）
+// 打了约 11 次请求，因 maxAttempts=3，**32/33 个账号**被写入了 6h 的 (账号,"x")
+// 负缓存 —— 也就是说**一个假模型名的请求会被放大成"犁全池"**。客户端自带重试、
+// 或爬虫随手发随机模型名，可以直接把它放大成出站风暴（本项目最贵的一类事故）。
+type ModelBlockGate struct {
+	mu  sync.Mutex
+	hit map[string]map[string]time.Time // model → (uid → 窗内最近命中时刻)
+	act map[string]time.Time            // model → 激活截止（缺席 = 未激活）
+}
+
+// NoteBlocked 记一次「账号 uid 对该模型报 11102」，返回该**模型名**当前是否已被
+// 判定为「上游不存在」（调用方据此立即终止轮转，不再换号）。
+//   - 已激活（now < act[model]）：不续期、不记账 → true（自然解除语义，同 WAFGate）；
+//   - 未激活：记 hit[model][uid]=now（同号重复命中**覆盖不累计** —— 判定口径是
+//     「不同号数」），惰性剪掉窗外的过期命中；不同 UID 数达 ModelBlockThreshold
+//     → 激活到 now+ModelBlockWindow（打一条 WARN 供观测），并清空该模型的判定窗
+//     （解除后需全新命中重新判定，不叠旧账）。
+func (g *ModelBlockGate) NoteBlocked(model, uid string) bool {
+	if model == "" || uid == "" {
+		return false
+	}
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if until, ok := g.act[model]; ok {
+		if now.Before(until) {
+			return true // 激活期内新命中：不续期（自然解除语义）
+		}
+		delete(g.act, model) // 已过期：清掉，避免 map 随"见过的模型名"无限增长
+	}
+	if g.hit == nil {
+		g.hit = map[string]map[string]time.Time{}
+	}
+	h := g.hit[model]
+	if h == nil {
+		h = map[string]time.Time{}
+		g.hit[model] = h
+	}
+	h[uid] = now
+	for u, t := range h {
+		if now.Sub(t) > ModelBlockWindow {
+			delete(h, u)
+		}
+	}
+	if len(h) == 0 {
+		// 只在窗口被注入成 0/负（测试极端值）时可达：连刚写入的命中都被剪掉了。
+		delete(g.hit, model)
+		return false
+	}
+	if len(h) >= ModelBlockThreshold {
+		if g.act == nil {
+			g.act = map[string]time.Time{}
+		}
+		g.act[model] = now.Add(ModelBlockWindow)
+		log.Printf("WARN: [rotateguard] model %q rejected by %d accounts within %s: upstream reports this model does not exist, rotate fail-fast until %s",
+			model, len(h), ModelBlockWindow, g.act[model].Format(time.RFC3339))
+		delete(g.hit, model)
+		return true
+	}
+	return false
+}
+
+// Active 该模型当前是否处于「判定为不存在」的激活期（观测/测试用）。
+func (g *ModelBlockGate) Active(model string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	until, ok := g.act[model]
+	return ok && time.Now().Before(until)
+}
+
 // Active 报告 IP 级拦截是否激活（末端错误文案区分 IP 级/账号级措辞用）。
 func (g *WAFGate) Active() bool {
 	g.mu.Lock()

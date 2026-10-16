@@ -2223,3 +2223,290 @@ function mountUiShell() {
   mountShortcuts();
   mountNavFilter();
 }
+
+// ---------------------------------------------------------------- ⑨ 插件中心（v0.31.16）
+//
+// 两端共用（admin / dashboard）：页面只提供
+//   <section class="pane" data-pane="plugins" data-plugin-scope="admin|user">
+// 其余（列表 / 启停 / 选号 / 执行 / 逐号结果）全部在这里。
+//
+// 这么分的好处：**加插件不用改前端**。后端注册表下发什么，这里就渲染什么；
+// 页面只声明"我是哪一端"，由服务端决定该端能看到哪些插件、能碰哪些账号。
+//
+// 两条硬纪律（服务端各还有一道，这里是前端侧）：
+//   1. **串行**：一次只发一个号的请求，号与号之间留间隔 —— 绝不并发轰上游。
+//      2026-10-13 的事故形态就是"59 个并发请求、同一出口 IP、几秒内打完"，
+//      直接换来上游风控。批量功能在这里必须比手动操作更保守，不能更激进。
+//   2. **不用原生 confirm/alert**：WebView 下会静默返回 null（"点了没反应也没报错"），
+//      统一走共享的 confirmAsk / toast。
+const PLUGIN_GAP_MS = 350; // 号与号之间的间隔（服务端另有 30s/号 的闸门）
+
+// pluginScope 当前页面属于哪一端（决定请求哪个前缀）。
+function pluginScope() {
+  const pane = document.querySelector('.pane[data-plugin-scope]');
+  return pane && pane.dataset.pluginScope === 'admin' ? 'admin' : 'user';
+}
+function pluginBase() {
+  return pluginScope() === 'admin' ? '/api/admin/plugins' : '/api/plugins';
+}
+
+// 每个插件的展开态与执行态（按插件 id 分开存，互不干扰）。
+const pluginState = {};
+
+// loadPlugins 插件页入口（nav 的 data-on 指向它）。
+async function loadPlugins() {
+  const box = document.getElementById('pluginCards');
+  if (!box) return;
+  box.textContent = '';
+  box.appendChild(el('div', 'sub', '正在读取插件列表…'));
+  let data;
+  try {
+    data = await api(pluginBase());
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'sub', '读取插件列表失败：' + (e && e.message ? e.message : e)));
+    return;
+  }
+  const list = (data && data.plugins) || [];
+  box.textContent = '';
+  if (!list.length) {
+    box.appendChild(el('div', 'sub', '当前没有可用的插件。'));
+    return;
+  }
+  for (const p of list) box.appendChild(pluginCard(p));
+}
+
+// pluginCard 一张插件卡：标题 + 状态 + 启用开关（仅管理端）+ 展开的执行面板。
+function pluginCard(p) {
+  const st = (pluginState[p.id] = pluginState[p.id] || {
+    open: false, targets: null, picked: null, running: false, rows: {},
+  });
+  const card = el('div', 'card');
+  card.style.marginBottom = '14px';
+
+  const head = el('div', 'section-head');
+  head.appendChild(el('h2', null, p.name));
+  const badge = el('span', p.enabled ? 'muted' : 'muted', p.enabled ? '已启用' : '已停用');
+  badge.style.fontSize = '12px';
+  badge.style.marginLeft = '8px';
+  head.appendChild(badge);
+  card.appendChild(head);
+
+  card.appendChild(el('div', 'sub', p.desc || ''));
+
+  const row = el('div', 'row');
+  row.style.flexWrap = 'wrap';
+  row.style.alignItems = 'center';
+  row.style.gap = '8px';
+
+  // 启用开关只在管理端出现：普通用户不该有权启停平台功能。
+  if (pluginScope() === 'admin') {
+    const lab = el('label', 'pick-all');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!p.enabled;
+    cb.addEventListener('change', async () => {
+      cb.disabled = true;
+      try {
+        await api(pluginBase() + '/' + encodeURIComponent(p.id) + '/enabled', {
+          method: 'POST', body: JSON.stringify({ enabled: cb.checked }),
+        });
+        toast(cb.checked ? '已启用' : '已停用', 'ok');
+        loadPlugins();
+      } catch (e) {
+        cb.checked = !cb.checked;
+        toast('切换失败：' + (e && e.message ? e.message : e), 'bad');
+      } finally {
+        cb.disabled = false;
+      }
+    });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(' 启用'));
+    row.appendChild(lab);
+  }
+
+  const btnToggle = el('button', 'ghost', st.open ? '收起' : '打开');
+  btnToggle.addEventListener('click', () => {
+    st.open = !st.open;
+    pluginRenderPanel(p, card);
+  });
+  row.appendChild(btnToggle);
+  card.appendChild(row);
+
+  const panel = el('div');
+  panel.dataset.panelFor = p.id;
+  card.appendChild(panel);
+  if (st.open) pluginFillPanel(p, card, panel);
+  return card;
+}
+
+// pluginRenderPanel 切换展开态（重画这一张卡的面板区）。
+function pluginRenderPanel(p, card) {
+  const panel = card.querySelector('[data-panel-for="' + p.id + '"]');
+  if (!panel) return;
+  panel.textContent = '';
+  const btn = card.querySelector('button.ghost');
+  if (btn) btn.textContent = p.id && pluginState[p.id] && pluginState[p.id].open ? '收起' : '打开';
+  if (pluginState[p.id] && pluginState[p.id].open) pluginFillPanel(p, card, panel);
+}
+
+// pluginFillPanel 填面板主体：选号 + 执行 + 结果。
+async function pluginFillPanel(p, card, panel) {
+  const st = pluginState[p.id];
+  panel.textContent = '';
+  panel.appendChild(el('div', 'sub', '正在读取可操作的账号…'));
+
+  let targets = st.targets;
+  if (!targets) {
+    try {
+      // dry_run 复用服务端的目标解析：**用户端会自动收窄到自己的号**，
+      // 前端因此不必关心"我的号从哪来"（admin 看全部、user 看自己的）。
+      const d = await api(pluginBase() + '/' + encodeURIComponent(p.id) + '/claim',
+        { method: 'POST', body: JSON.stringify({ all: true, dry_run: true }) });
+      targets = (d && d.targets) || [];
+      st.targets = targets;
+    } catch (e) {
+      panel.textContent = '';
+      panel.appendChild(el('div', 'sub', '读取账号失败：' + (e && e.message ? e.message : e)));
+      return;
+    }
+  }
+  if (!st.picked) st.picked = new Set(targets.map((t) => t.uid));
+
+  panel.textContent = '';
+  if (!targets.length) {
+    panel.appendChild(el('div', 'sub', '没有可操作的账号。'));
+    return;
+  }
+
+  const head = el('div', 'sub');
+  head.style.margin = '10px 0 8px';
+  head.appendChild(document.createTextNode('出站纪律：'));
+  const strong = el('b', null, '逐个串行');
+  head.appendChild(strong);
+  head.appendChild(document.createTextNode(
+    '执行（每次只发一个账号，间隔 ' + PLUGIN_GAP_MS + 'ms，服务端另有 30 秒/账号 的重复保护）。'
+    + '上游对「没有可领」的答复属正常态，不等于失败。'));
+  panel.appendChild(head);
+
+  const row = el('div', 'row');
+  row.style.flexWrap = 'wrap';
+  row.style.alignItems = 'center';
+  row.style.gap = '8px';
+
+  const all = el('label', 'pick-all');
+  const cbAll = document.createElement('input');
+  cbAll.type = 'checkbox';
+  cbAll.checked = st.picked.size === targets.length;
+  cbAll.addEventListener('change', () => {
+    st.picked = cbAll.checked ? new Set(targets.map((t) => t.uid)) : new Set();
+    pluginFillPanel(p, card, panel);
+  });
+  all.appendChild(cbAll);
+  all.appendChild(document.createTextNode(' 全选'));
+  row.appendChild(all);
+
+  const cnt = el('span', 'muted', '已选 ' + st.picked.size + ' / ' + targets.length);
+  cnt.style.fontSize = '12px';
+  row.appendChild(cnt);
+
+  const run = el('button', null, st.running ? '执行中…' : '开始领取');
+  run.disabled = st.running || st.picked.size === 0;
+  run.addEventListener('click', () => pluginRun(p, card, panel));
+  row.appendChild(run);
+
+  const refresh = el('button', 'ghost', '重新读取账号');
+  refresh.disabled = st.running;
+  refresh.addEventListener('click', () => {
+    st.targets = null; st.picked = null; st.rows = {};
+    pluginFillPanel(p, card, panel);
+  });
+  row.appendChild(refresh);
+  panel.appendChild(row);
+
+  const listBox = el('div');
+  listBox.style.marginTop = '10px';
+  for (const t of targets) {
+    const line = el('label');
+    line.style.display = 'flex';
+    line.style.alignItems = 'center';
+    line.style.gap = '8px';
+    line.style.padding = '4px 0';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = st.picked.has(t.uid);
+    cb.disabled = st.running;
+    cb.addEventListener('change', () => {
+      if (cb.checked) st.picked.add(t.uid); else st.picked.delete(t.uid);
+      pluginFillPanel(p, card, panel);
+    });
+    line.appendChild(cb);
+    line.appendChild(el('span', null, t.nickname || t.uid));
+    const r = st.rows[t.uid];
+    if (r) {
+      // 上游原文挂在 title 上（悬停可见）：这是区分「真的无可领」与「字段名猜错」
+      // 的唯一事实，但直接铺在行里会把布局撑坏。
+      if (r.detail) line.title = '上游返回原文：' + r.detail;
+      line.appendChild(pluginResultBadge(r));
+    }
+    listBox.appendChild(line);
+  }
+  panel.appendChild(listBox);
+}
+
+// pluginResultBadge 一行结果徽标（颜色 + 文字，逐号可见）。
+function pluginResultBadge(r) {
+  const map = {
+    ok: ['已到账 +' + (r.credit || 0), 'var(--ok, #2e7d32)'],
+    none: ['无可领', '#888'],
+    skip: ['已跳过' + (r.message ? '（' + r.message + '）' : ''), '#888'],
+    error: ['失败：' + (r.message || '未知错误'), 'var(--bad, #c62828)'],
+  };
+  const [text, color] = map[r.status] || [r.status, '#888'];
+  const b = el('span', null, text);
+  b.style.fontSize = '12px';
+  b.style.color = color;
+  b.style.marginLeft = 'auto';
+  return b;
+}
+
+// pluginRun **串行**执行：一个号一个请求，号与号之间留间隔；逐号刷新结果。
+async function pluginRun(p, card, panel) {
+  const st = pluginState[p.id];
+  if (st.running) return;
+  const uids = Array.from(st.picked);
+  if (!uids.length) return;
+
+  st.running = true;
+  st.rows = {};
+  pluginFillPanel(p, card, panel);
+
+  let ok = 0, none = 0, err = 0, credit = 0;
+  for (let i = 0; i < uids.length; i++) {
+    const uid = uids[i];
+    try {
+      const d = await api(pluginBase() + '/' + encodeURIComponent(p.id) + '/claim',
+        { method: 'POST', body: JSON.stringify({ uids: [uid] }) });
+      st.rows[uid] = d || { status: 'error', message: '空响应' };
+    } catch (e) {
+      st.rows[uid] = { status: 'error', message: (e && e.message ? e.message : String(e)) };
+    }
+    const r = st.rows[uid];
+    if (r.status === 'ok') { ok++; credit += (r.credit || 0); }
+    else if (r.status === 'none' || r.status === 'skip') none++;
+    else err++;
+    // 每完成一个就刷新这一行（而不是等全部跑完）——长任务里"看着它走"比结果重要。
+    pluginFillPanel(p, card, panel);
+    if (i < uids.length - 1) await new Promise((res) => setTimeout(res, PLUGIN_GAP_MS));
+  }
+
+  st.running = false;
+  pluginFillPanel(p, card, panel);
+  const msg = '完成：' + ok + ' 个到账（共 +' + credit + ' 积分），' + none + ' 个无可领，' + err + ' 个失败';
+  toast(msg, err ? 'bad' : 'ok');
+  // 汇总也写进面板（toast 会消失，汇总要留在页面上）。
+  const sum = el('div', 'sub', msg);
+  sum.style.marginTop = '8px';
+  panel.appendChild(sum);
+}
+

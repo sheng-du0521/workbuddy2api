@@ -165,3 +165,97 @@ func TestSleepCtxCancel(t *testing.T) {
 		t.Fatal("full wait must return true")
 	}
 }
+
+// withModelWindow 注入短「模型名不存在」判定窗（生产恒 60s）。
+func withModelWindow(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := ModelBlockWindow
+	ModelBlockWindow = d
+	t.Cleanup(func() { ModelBlockWindow = prev })
+}
+
+// TestModelBlockGateMultiAccountTriggers 单号反复命中永不触发；第二个**不同号**
+// 命中即激活；激活期内恒 true（不续期路径，同 WAFGate）。
+func TestModelBlockGateMultiAccountTriggers(t *testing.T) {
+	withModelWindow(t, time.Minute)
+	var g ModelBlockGate
+	for n := 0; n < 10; n++ {
+		if g.NoteBlocked("ghost-model", "u1") {
+			t.Fatalf("single account repeated hits must never trigger, iter=%d", n)
+		}
+	}
+	if g.Active("ghost-model") {
+		t.Fatal("single account must not activate")
+	}
+	if !g.NoteBlocked("ghost-model", "u2") {
+		t.Fatal("threshold crossing call must activate and return true")
+	}
+	if !g.Active("ghost-model") {
+		t.Fatal("two distinct accounts within window must activate")
+	}
+	if !g.NoteBlocked("ghost-model", "u3") || !g.NoteBlocked("ghost-model", "u4") {
+		t.Fatal("hits during active window must report active")
+	}
+}
+
+// TestModelBlockGatePerModelIsolation 分桶正确性：一个模型名被判定不存在，
+// **不得**牵连其它模型。这是本闸门与 WAFGate（全局单例）最本质的区别 ——
+// 一个打错的模型名不该让真模型也被快速失败。
+func TestModelBlockGatePerModelIsolation(t *testing.T) {
+	withModelWindow(t, time.Minute)
+	var g ModelBlockGate
+	g.NoteBlocked("ghost-a", "u1")
+	if !g.NoteBlocked("ghost-a", "u2") {
+		t.Fatal("ghost-a should activate")
+	}
+	// 另一个模型名必须完全不受影响：第一个号命中就该返回 false。
+	if g.NoteBlocked("real-model", "u1") {
+		t.Fatal("a different model must not inherit the active state")
+	}
+	if g.Active("real-model") {
+		t.Fatal("real-model must stay inactive")
+	}
+	// 空 model / uid 一律不参与判定（防御性：空模型名绝不能被激活）。
+	if g.NoteBlocked("", "u1") || g.NoteBlocked("m", "") {
+		t.Fatal("empty model/uid must never activate")
+	}
+	if g.Active("") {
+		t.Fatal("empty model must never be active")
+	}
+}
+
+// TestModelBlockGateExpiryAndReArm 过期自然解除；解除后需**重新攒够不同号**
+// 才再激活（激活时清窗：不叠旧账，否则一次偶然的双号命中会永久挡住该模型）。
+func TestModelBlockGateExpiryAndReArm(t *testing.T) {
+	withModelWindow(t, 120*time.Millisecond)
+	var g ModelBlockGate
+	g.NoteBlocked("ghost", "u1")
+	if !g.NoteBlocked("ghost", "u2") {
+		t.Fatal("should activate")
+	}
+	if !g.Active("ghost") {
+		t.Fatal("active right after crossing")
+	}
+	time.Sleep(180 * time.Millisecond)
+	if g.Active("ghost") {
+		t.Fatal("must expire naturally")
+	}
+	if g.NoteBlocked("ghost", "u1") {
+		t.Fatal("after expiry a single hit must not re-arm immediately")
+	}
+	if !g.NoteBlocked("ghost", "u2") {
+		t.Fatal("re-arm requires a fresh distinct account")
+	}
+}
+
+// TestModelBlockGateWindowPrune 窗外命中不参与判定：u1 命中后等过窗，再来 u2 时
+// u1 已被剪掉 → 单个有效命中不触发（口径恒为「窗内不同号数」）。
+func TestModelBlockGateWindowPrune(t *testing.T) {
+	withModelWindow(t, 100*time.Millisecond)
+	var g ModelBlockGate
+	g.NoteBlocked("ghost", "u1")
+	time.Sleep(150 * time.Millisecond)
+	if g.NoteBlocked("ghost", "u2") {
+		t.Fatal("stale hit outside the window must not count towards threshold")
+	}
+}

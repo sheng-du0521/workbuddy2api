@@ -127,6 +127,14 @@ type Proxy struct {
 	// 激活期内轮转遇 WAF 403 直接终止，不把一次客户端请求放大 N 倍打同一出口 IP。
 	// 进程内状态、重启清零（窗 60s，重建成本极低）。语义见 internal/rotateguard。
 	wafGate rotateguard.WAFGate
+	// modelGate 「模型名在上游不存在」（11102）的跨账号 fail-fast 状态机（v0.31.16）。
+	//
+	// 11102 指向**模型名**、不指向账号：一个不存在的模型名对全池每个号都会得到
+	// 同一个答案，换号重试纯属把一次请求放大 N 倍出站、并给每个号白记一条 6h
+	// 负缓存（实测：一次假模型名的测速请求犁掉了 32/33 个账号）。闸门按模型名
+	// 分桶，激活期内该模型的请求直接终止轮转，别的模型不受影响。
+	// 进程内状态、重启清零（窗 60s，重建成本极低）。语义见 internal/rotateguard。
+	modelGate rotateguard.ModelBlockGate
 	// degrade 降级提示词状态机（v0.31.4，从旧网关移植）。
 	//
 	// 请求被上游内容策略拦截（400 审核文案 / 11128 渠道拒绝）时，判定多为 system 来源的
@@ -1305,6 +1313,22 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	if !knownModelSet(known, model) {
 		noteUnknownModel(model, known)
 	}
+	// 「该模型名上游不存在」的快速失败（v0.31.16）：闸门激活期内的请求**零出站**
+	// 直接拒绝，不再去撞任何账号。见 rotateguard.ModelBlockGate 的"为什么"。
+	//
+	// 位置刻意放在归一化与未知模型告警**之后**：一是必须用**归一化后**的名字查
+	// 闸门（否则 `x` 与 ` X ` 各占一桶，等于绕过判定）；二是让"客户端模型名配错"
+	// 的线索（noteUnknownModel 的 WARN）照常留下。
+	//
+	// 回 404 而不是 5xx：这是**确定性**结论（上游明说没有这个模型），重发同样的
+	// 请求只会得到同样答案 —— 与 413 同理，"重发没用"的错误不许用可重试状态码。
+	if p.modelGate.Active(model) {
+		log.Printf("WARN: [proxy] model %q 已被判定为上游不存在（fail-fast 期内）→ 直接拒绝、零出站", model)
+		writeOpenAIErrorHint(w, http.StatusNotFound,
+			"model not available: upstream reports this model does not exist",
+			"the gateway already confirmed this model name is unavailable with multiple accounts in a row; check the model name (a typo or a stale model id is the most common cause) — re-sending will not help")
+		return
+	}
 	// 把 model 回填给实时面板的兜底层（liveCapture）：它在 ServeChat 返回**之后**
 	// 才知道结果，那时请求体早已读完，无法再解析一次。
 	setLiveModel(r, model)
@@ -1633,6 +1657,15 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			// 照常记账（单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」。与
 			// cmd/server 的 wafIP.noteWaf 同语义（逻辑见 internal/rotateguard）。
 			if kind == upstream.ErrWafBlock && p.wafGate.NoteWaf(au.UID) {
+				break
+			}
+			// 模型名不存在（11102）的跨账号 fail-fast（v0.31.16）：与账号无关的错误
+			// 不该把全池犁一遍。判定口径与阈值见 rotateguard.ModelBlockGate ——
+			// **两个不同号**在 60s 内接连报 11102 即判定"上游没有这个模型名"，
+			// 激活期内直接终止轮转（本次请求不再换号，后续请求也不再出站）。
+			// 注意：reportUpstreamError 已照常写入 (账号,模型) 负缓存 —— 那条
+			// 仍是必要的（避免下一个请求再撞同一个号），本条只管"是否继续换号"。
+			if kind == upstream.ErrModelBlocked && p.modelGate.NoteBlocked(model, au.UID) {
 				break
 			}
 			continue
