@@ -37,6 +37,8 @@
       <button class="nav-item" data-nav="docs" data-title="接入说明" data-sub="OpenAI 兼容接口对接方式"><span class="ico">📖</span>接入说明</button>
       <div class="nav-group">扩展</div>
       <button class="nav-item" data-nav="plugins" data-on="loadPlugins" data-title="插件" data-sub="可独立启停的功能扩展；停用只影响入口与执行，不改动任何数据"><span class="ico">🧩</span>插件</button>
+      <div class="nav-group">设置</div>
+      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="账户、接入信息、我的出口、提醒与关于"><span class="ico">⚙</span>设置</button>
     </nav>
     <div class="sidebar-foot">
       <div class="whoami" id="whoami">…</div>
@@ -97,6 +99,8 @@
           </div>
           <div id="ovChart"></div>
           <div class="chart-legend" id="ovChartLegend"></div>
+          <div class="section-head" style="margin:14px 0 8px;"><h2 style="font-size:12.5px;">消耗构成（近 14 天）</h2></div>
+          <div id="ovSplit"></div>
           <div class="section-head" style="margin:14px 0 8px;"><h2 style="font-size:12.5px;">按模型消耗 Top</h2></div>
           <div id="ovModels"></div>
         </div>
@@ -534,6 +538,57 @@ API Key : 在上方「API 密钥」页生成</pre>
           也可在「API 密钥」页点「获取模型 ID」直接查看。</div>
       </div>
     </section>
+    <!-- ==================== 设置（v0.31.20） ====================
+         这里只放**用户自己有权处置的事**：账户、接入信息、自己代挂号的出口、
+         提醒与关于。平台级配置（全局默认出口、计费倍率、线路池）不进来 ——
+         它们会牵动所有人，属于管理后台。 -->
+    <section class="pane" data-pane="settings">
+      <div class="section-head">
+        <h2>设置</h2>
+        <span class="slot-refresh" data-refresh="loadSettings" data-refresh-label="刷新"></span>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>账户</h2></div>
+        <div id="setAccount"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>接入信息</h2></div>
+        <div id="setAccess"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>我的出口（代挂号）</h2></div>
+        <div class="sub" style="margin:0 0 10px;">
+          这里配的是<b>你自己代挂账号</b>从哪个 IP 出去。<b>留空 = 跟随平台默认出口</b>；
+          填一个代理地址 = 你这些号固定走它。
+          <br>它<b>只作用于你自己的号</b>：不会改变平台号池的默认出口，也不会替别的用户做决定。
+          配好后管理员会在后台「代理」页看到这条线路，可收录进线路池、探活、再分配给别的号。
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;">
+          <input type="text" id="setEgrUrl" placeholder="http://1.2.3.4:8080 或 socks5://user:pass@host:1080（留空 = 跟随默认）" style="min-width:300px;flex:1;">
+          <button id="btnSetEgrAll">应用到全部代挂号</button>
+        </div>
+        <div id="setEgrList" class="cfg-list" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>外观</h2></div>
+        <div id="setAppearance"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>提醒</h2></div>
+        <div id="setAlerts"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>关于</h2></div>
+        <div id="setAbout"></div>
+      </div>
+    </section>
+
   </main>
 </div>
 
@@ -578,6 +633,51 @@ function nowSec() { return Math.floor(Date.now() / 1000); }
 // ======================================================================
 // 顶部 KPI
 // ======================================================================
+
+// loadOvSplit 概览「消耗构成」（v0.31.20）：号池计费 vs 代挂自用。
+//
+// 为什么要分：这两笔钱**性质完全不同** —— 号池计费扣余额，代挂自用一分不扣
+// （走你自己的号）。混成一个总数，用户没法回答"我这个月到底花了多少"。
+async function loadOvSplit() {
+  const box = $('ovSplit');
+  if (!box) return;
+  let d = null;
+  try {
+    d = await api('/api/me/usage-split?days=14');
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'muted', '读取消耗构成失败：' + e.message));
+    return;
+  }
+  const pool = (d && d.pool) || { requests: 0, credit: 0, charged: 0 };
+  const host = (d && d.host) || { requests: 0, credit: 0, charged: 0 };
+  const totalReq = ((d && d.total && d.total.requests) || 0);
+  box.textContent = '';
+  const row = (label, r, color) => {
+    const line = el('div');
+    line.style.margin = '4px 0';
+    const t = el('div');
+    t.style.cssText = 'display:flex;gap:8px;align-items:baseline;font-size:12.5px;';
+    t.appendChild(el('span', null, label));
+    const right = el('span');
+    right.appendChild(el('b', null, r.requests + ' 次'));
+    right.appendChild(el('span', 'muted', r.charged > 0 ? ('　收费 ' + fmtPointsU(r.charged) + ' 点') : '　不扣余额'));
+    t.appendChild(right);
+    t.style.justifyContent = 'space-between';
+    line.appendChild(t);
+    const bar = el('div');
+    bar.style.cssText = 'height:6px;border-radius:3px;background:rgba(127,127,127,.18);overflow:hidden;margin-top:3px;';
+    const fill = el('div');
+    const pct = totalReq ? Math.max(2, Math.round((r.requests / totalReq) * 100)) : 0;
+    fill.style.cssText = 'width:' + pct + '%;height:100%;background:' + color + ';';
+    bar.appendChild(fill);
+    line.appendChild(bar);
+    box.appendChild(line);
+  };
+  row('号池计费（走平台号池 · 扣余额）', pool, 'var(--accent, #4A6CF7)');
+  row('代挂自用（走你自己的号 · 不扣余额）', host, 'var(--ok, #2e7d32)');
+  if (!totalReq) box.appendChild(el('div', 'muted', '近 14 天还没有调用记录。'));
+}
 
 async function loadTop() {
   const d = await api('/api/usage?limit=1');
@@ -683,6 +783,7 @@ async function loadOverview() {
     if (s) s.textContent = '更新于 ' + fmtClock(Math.floor(Date.now() / 1000));
   });
   try {
+    loadOvSplit(); // 消耗构成：不阻塞主流程（失败只影响这一块）
     const [rep, bk] = await Promise.all([
       fetchReport(14),
       api('/api/usage/breakdown?days=14').catch(() => ({})),
@@ -2697,6 +2798,202 @@ window.paletteSources = (window.paletteSources || []).concat([
   },
 ]);
 
+// ======================================================================
+// 设置（v0.31.20）
+//
+// 放什么、不放什么：只放**用户自己有权处置的事**（账户、接入信息、自己代挂号的
+// 出口、外观、提醒、关于）。平台级配置（全局默认出口、计费倍率、线路池）不进来
+// —— 它们会牵动所有人，属于管理后台。
+// ======================================================================
+async function loadSettings() {
+  const host = document.querySelector('.pane[data-pane="settings"]');
+  try {
+    const [meResp, sys] = await Promise.all([
+      api('/api/auth/me').catch(() => null),
+      api('/api/system/info').catch(() => null),
+    ]);
+    renderSettingsAccount((meResp && meResp.user) || me || {});
+    renderSettingsAccess(sys);
+    renderSettingsAppearance();
+    renderSettingsAlerts();
+    renderSettingsAbout(sys);
+    await loadSettingsEgress();
+    clearLoadBanner(host, 'settings');
+  } catch (e) {
+    loadBanner(host, '设置加载失败（' + e.message + '）', loadSettings, 'settings');
+  }
+}
+
+function settingsLine(box, k, v, cls) {
+  const d = el('div', 'line');
+  d.appendChild(el('span', '', k));
+  d.appendChild(el('b', cls || '', v));
+  box.appendChild(d);
+  return d;
+}
+
+function renderSettingsAccount(u) {
+  const box = $('setAccount');
+  if (!box) return;
+  box.textContent = '';
+  settingsLine(box, '用户名', u.username || '—');
+  settingsLine(box, '角色', u.is_admin ? '管理员（可进入管理后台）' : '普通用户');
+  const row = el('div', 'row');
+  row.style.cssText = 'margin-top:10px;gap:8px;';
+  const pw = el('button', 'ghost', '修改密码');
+  pw.onclick = openChangePasswordModal;
+  row.appendChild(pw);
+  const out = el('button', 'ghost', '退出登录');
+  out.onclick = () => { if (typeof logout === 'function') logout(); };
+  row.appendChild(out);
+  box.appendChild(row);
+}
+
+function renderSettingsAccess(sys) {
+  const box = $('setAccess');
+  if (!box) return;
+  box.textContent = '';
+  const base = (sys && sys.base_url) || (location.origin + '/v1');
+  const d = el('div', 'line');
+  d.appendChild(el('span', '', 'Base URL'));
+  const code = el('b', 'mono', base);
+  d.appendChild(code);
+  box.appendChild(d);
+  const cp = copyBtn(() => base, '复制 Base URL');
+  cp.style.marginTop = '8px';
+  box.appendChild(cp);
+  const row = el('div', 'row');
+  row.style.cssText = 'margin-top:10px;gap:8px;flex-wrap:wrap;';
+  const gm = el('button', 'ghost', '查看可用模型 ID');
+  gm.onclick = () => openModelsModal();
+  row.appendChild(gm);
+  const keys = el('button', 'ghost', '去生成密钥');
+  keys.onclick = () => { const it = document.querySelector('.nav-item[data-nav="keys"]'); if (it) it.click(); };
+  row.appendChild(keys);
+  box.appendChild(row);
+  box.appendChild(el('div', 'sub', '把上面的 Base URL 与一把密钥填进任意 OpenAI 兼容客户端即可接入。'));
+}
+
+// loadSettingsEgress 我的出口：列出我的代挂号与它们当前的出口。
+async function loadSettingsEgress() {
+  const box = $('setEgrList');
+  if (!box) return;
+  box.textContent = '';
+  let list = [];
+  try {
+    const d = await api('/api/host/accounts');
+    list = d.accounts || [];
+  } catch (e) {
+    box.appendChild(el('div', 'hintbar', '读取代挂账号失败：' + e.message));
+    return;
+  }
+  if (!list.length) {
+    box.appendChild(el('div', 'hintbar', '还没有代挂账号。先到「账号代挂」页添加一个，再回来配出口。'));
+    return;
+  }
+  const tip = el('div', 'sub');
+  tip.style.marginBottom = '6px';
+  tip.textContent = '共 ' + list.length + ' 个代挂号（只列出已单独设过出口的，可按需清除）：';
+  box.appendChild(tip);
+  let shown = 0;
+  for (const h of list) {
+    const cur = h.egress || '';
+    if (!cur) continue;
+    shown++;
+    const row = el('div', 'group-row');
+    const txt = el('div', 'gr-txt');
+    txt.appendChild(el('div', 'gr-name', h.nickname || h.uid));
+    txt.appendChild(el('div', 'gr-sub', 'UID ' + maskUID(h.uid) + ' · 出口：'
+      + (cur === 'direct' ? '直连（不走代理）' : cur)));
+    row.appendChild(txt);
+    const clr = el('button', 'ghost sm', '清除');
+    clr.onclick = async () => {
+      try {
+        await post('/api/host/egress', { uids: [h.uid], proxy: '' });
+        toast('已清除 （该号改为跟随平台默认出口）', 'ok');
+        loadSettingsEgress();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+    row.appendChild(clr);
+    box.appendChild(row);
+  }
+  if (!shown) {
+    box.appendChild(el('div', 'hintbar', '当前所有代挂号都跟随平台默认出口（没有单独指定）。'));
+  }
+}
+
+$('btnSetEgrAll').onclick = async () => {
+  const v = ($('setEgrUrl').value || '').trim();
+  const btn = $('btnSetEgrAll');
+  btn.disabled = true;
+  try {
+    const d = await post('/api/host/egress', { all: true, proxy: v });
+    toast('已把 ' + d.updated + ' 个代挂号的出口设为：' + (v || '跟随平台默认'), 'ok');
+    await loadSettingsEgress();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; }
+};
+
+function renderSettingsAppearance() {
+  const box = $('setAppearance');
+  if (!box) return;
+  box.textContent = '';
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  settingsLine(box, '当前主题', dark ? '深色' : '浅色');
+  const row = el('div', 'row');
+  row.style.marginTop = '10px';
+  const th = el('button', 'ghost', dark ? '切换到浅色' : '切换到深色');
+  th.onclick = () => {
+    if (typeof window.setTheme === 'function') {
+      window.setTheme(dark ? 'light' : 'dark');
+      renderSettingsAppearance();
+    }
+  };
+  row.appendChild(th);
+  box.appendChild(row);
+}
+
+function renderSettingsAlerts() {
+  const box = $('setAlerts');
+  if (!box) return;
+  box.textContent = '';
+  const n = alertLoad().length;
+  settingsLine(box, '已记录提醒', n + ' 条');
+  box.appendChild(el('div', 'sub',
+    '提醒都收在右上角铃铛里：操作反馈（复制成功 / 失败等）、入池邀请、以及**页面脚本错误**。'
+    + '遇到"点了某个页面报错"时，把那里的原文复制出来发给我们即可定位 —— 不用再凭记忆描述。'));
+  const row = el('div', 'row');
+  row.style.cssText = 'margin-top:10px;gap:8px;';
+  const b1 = el('button', 'ghost', '查看提醒');
+  b1.onclick = () => { const bell = document.getElementById('alertBell'); if (bell) bell.click(); };
+  row.appendChild(b1);
+  const b2 = el('button', 'ghost', '清空提醒');
+  b2.onclick = () => {
+    _alerts = [];
+    _alertsSeen = Math.floor(Date.now() / 1000);
+    alertSave();
+    alertRefreshBadge();
+    renderSettingsAlerts();
+    toast('提醒已清空', 'ok');
+  };
+  row.appendChild(b2);
+  box.appendChild(row);
+}
+
+function renderSettingsAbout(sys) {
+  const box = $('setAbout');
+  if (!box) return;
+  box.textContent = '';
+  settingsLine(box, '版本', (sys && sys.version) || '（未取到）');
+  settingsLine(box, '服务地址', (sys && sys.origin) || location.origin);
+  const row = el('div', 'row');
+  row.style.marginTop = '10px';
+  const doc = el('button', 'ghost', '接入说明');
+  doc.onclick = () => { const it = document.querySelector('.nav-item[data-nav="docs"]'); if (it) it.click(); };
+  row.appendChild(doc);
+  box.appendChild(row);
+}
+
 (async function init() {
   me = await requireLogin();
   if (!me) return;
@@ -2717,6 +3014,7 @@ window.paletteSources = (window.paletteSources || []).concat([
   $('btnGetModels').replaceWith(gm);
   mountRefreshSlots();
   mountThemeToggle(); // 深色 / 浅色切换（偏好落 localStorage，刷新与重新登录均保持）
+  mountAlertCenter(); // v0.31.20：右上角提醒中心（操作反馈 / 待办 / 页面错误）
   mountAccountTools(); // 「改密码」入口
 
   loadWalletMethods();

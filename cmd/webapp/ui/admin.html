@@ -93,6 +93,8 @@
 
         <div class="card" style="margin:0;">
           <h2>号池健康</h2>
+          <div class="section-head" style="margin:12px 0 6px;"><h2 style="font-size:12.5px;">消耗归属（近 14 天 · 平台号 vs 代挂号）</h2></div>
+          <div id="ovSplit"></div>
           <div class="kpis" id="ovPool" style="grid-template-columns:repeat(2,1fr);"></div>
           <div class="sub" style="margin:12px 0 6px;" id="ovAlerts"></div>
           <div class="sub" style="margin:0;" id="ovRateLimit"></div>
@@ -1807,11 +1809,58 @@ function taskPanel(model, onApply) {
 // 实时仪表盘
 // ======================================================================
 
+// loadOvSplit 实时概览「消耗归属」（v0.31.20）：平台自持号 vs 用户代挂号。
+//
+// 为什么要在实时概览里体现：这两类号的**成本结构完全不同** —— 平台号是自己买的、
+// 代挂号要按分成返还给号主。混成一个总数看不出"这波消耗该不该按分成结"，
+// 也看不出"代挂这条路到底撑起了多少流量"。
+async function loadOvSplit() {
+  const box = $('ovSplit');
+  if (!box) return;
+  let d = null;
+  try {
+    d = await api('/api/admin/usage-split?days=14');
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'muted', '读取消耗归属失败：' + e.message));
+    return;
+  }
+  const plat = (d && d.plat) || { requests: 0, charged: 0, credit: 0 };
+  const host = (d && d.host) || { requests: 0, charged: 0, credit: 0 };
+  const totalReq = ((d && d.total && d.total.requests) || 0);
+  box.textContent = '';
+  const row = (label, r, color) => {
+    const line = el('div');
+    line.style.margin = '4px 0';
+    const t = el('div');
+    t.style.cssText = 'display:flex;gap:8px;align-items:baseline;font-size:12.5px;';
+    t.appendChild(el('span', null, label));
+    const right = el('span');
+    right.appendChild(el('b', null, fmtNum ? fmtNum(r.requests) + ' 次' : r.requests + ' 次'));
+    right.appendChild(el('span', 'muted', '（' + (totalReq ? Math.round((r.requests / totalReq) * 100) : 0) + '%）'));
+    t.appendChild(right);
+    t.style.justifyContent = 'space-between';
+    line.appendChild(t);
+    const bar = el('div');
+    bar.style.cssText = 'height:6px;border-radius:3px;background:rgba(127,127,127,.18);overflow:hidden;margin-top:3px;';
+    const fill = el('div');
+    const pct = totalReq ? Math.max(2, Math.round((r.requests / totalReq) * 100)) : 0;
+    fill.style.cssText = 'width:' + pct + '%;height:100%;background:' + color + ';';
+    bar.appendChild(fill);
+    line.appendChild(bar);
+    box.appendChild(line);
+  };
+  row('平台自持号', plat, 'var(--accent, #4A6CF7)');
+  row('用户代挂号（按分成结算）', host, 'var(--ok, #2e7d32)');
+  if (!totalReq) box.appendChild(el('div', 'muted', '近 14 天还没有计费用量。'));
+}
+
 async function loadLive() {
   // 实时接口失败**不能只 console.warn**（v0.26.6）：每 3 秒一个静默失败，页面上
   // 的数字会一直停在旧值，看起来"一切正常"，而实际上数据早就断了。
   // 改为常驻横幅：不刷屏、不自动消失，下一次成功自动清除。
   const host = $('ovKpis') ? $('ovKpis').parentNode : null;
+  loadOvSplit(); // 消耗归属：独立拉，失败不影响实时主流程
   try {
     const d = await api('/api/admin/live');
     renderLive(d);
@@ -7285,7 +7334,22 @@ function renderEgressCards() {
       l.appendChild(el('span', '', '账号数'));
       l.appendChild(el('b', v.over_threshold ? 'err' : '', v.account_count + ' 个' + (v.over_threshold ? '（超额）' : '')));
       b.appendChild(l);
-      c.appendChild(b);
+      // 这些线路多半是**用户自己在控制台配的出口**（v0.31.20 起用户可自助设置）。
+      // 此前它们只能"被看见"：不能探活、不能分配给别的号、也不参与失效策略。
+      // 收录进线路池即可获得这三样；**已绑它的账号不受影响**（只多一条台账）。
+      const foot = el('footer');
+      const imp = el('button', '', '收录到线路池');
+      imp.title = '登记为一条正式线路：之后可探活、可批量分配、可参与线路失效策略（已绑定它的账号不受影响）';
+      imp.onclick = async () => {
+        imp.disabled = true;
+        try {
+          await post('/api/admin/egress/proxies', { url: v.url, name: v.url, note: '来自账号的自定义出口（用户控制台配置）' });
+          toast('已收录进线路池', 'ok');
+          loadEgress();
+        } catch (e) { toast(e.message, 'err'); imp.disabled = false; }
+      };
+      foot.appendChild(imp);
+      c.appendChild(foot);
       box.appendChild(c);
     }
   }
@@ -8267,6 +8331,7 @@ window.paletteSources = (window.paletteSources || []).concat([
   $('btnPoolView').replaceWith(pv);
   mountRefreshSlots();
   mountThemeToggle(); // 深色 / 浅色切换（偏好落 localStorage，刷新与重新登录均保持）
+  mountAlertCenter(); // v0.31.20：右上角提醒中心（操作反馈 / 待办 / 页面错误）
   mountAccountTools(); // 「改密码」入口
   mountEgrTabs();      // 代理页子区（出口代理 / 账号代理 / 去哪弄代理）
 

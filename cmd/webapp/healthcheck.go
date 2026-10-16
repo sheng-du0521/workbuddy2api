@@ -236,11 +236,13 @@ const (
 	hcActClearedFault = "cleared_request_illegal" // 清了「请求非法」（11140）累计计数（v0.24.3）
 	hcActNoteDead     = "noted_session_dead"      // 记一次会话失效（累计阈值）
 	hcActNoteFault    = "noted_request_illegal"   // 记一次「请求非法」（11140，累计阈值，v0.24.3）
-	hcActDisabled     = "disabled"                // 已禁用
-	hcActDeleted      = "deleted"                 // 已删除（v0.24.5：11140 达阈值的默认动作）
-	hcActArchived     = "archived"                // 已归档到异常分组
-	hcActCooled       = "cooled"                  // 已冷却
-	hcActCreditsSync  = "credits_synced"          // 已同步余额
+	// hcActSkipUnpooledHost 未入池的代挂号：**只报告、不处置**（v0.31.20）。
+	hcActSkipUnpooledHost = "skipped_unpooled_host"
+	hcActDisabled         = "disabled"       // 已禁用
+	hcActDeleted          = "deleted"        // 已删除（v0.24.5：11140 达阈值的默认动作）
+	hcActArchived         = "archived"       // 已归档到异常分组
+	hcActCooled           = "cooled"         // 已冷却
+	hcActCreditsSync      = "credits_synced" // 已同步余额
 )
 
 // ---------- 结果结构 ----------
@@ -794,6 +796,19 @@ func (a *app) checkAccountHealth(uid string, allowDelete bool) *HealthCheckResul
 // 得到的是"账号没了"。把不可逆动作限定在显式体检路径上。
 func (a *app) applyHealthDisposition(uid, reasonCode string, cause error, allowDelete bool) []string {
 	var acts []string
+	// ⚠️ 未入池的代挂号：**只报告，不处置**（v0.31.20，审查发现的越权处置）。
+	//
+	// 代挂号只要凭证能解析就进池成员表，于是健康检测会连**没参与平台流量**的号
+	// 一起探活并按 11140 / 12153 阈值停用、甚至在 `pool_delete_on_11140=1` 时
+	// **不可逆删除**。这与两条既定语义直接冲突：
+	//   ① 「未入池 = 不参与平台反代」（`allowsSelection` 把它们排除在外）；
+	//   ② 「入池要号主同意」（v0.31.18 的 invited 态）—— 号主还没同意，号先被删了。
+	// 平台没有为这些号提供任何流量，也就没有立场对它们做不可逆处置。
+	// （用户自己的健康操作如「同步积分」是用户主动发起的，不经过这里。）
+	if a.isUnpooledHosted(uid) {
+		log.Printf("INFO: [health] %s 是未入池的代挂号，只报告不处置（code=%s）", uid, reasonCode)
+		return []string{hcActSkipUnpooledHost}
+	}
 	var ue *upstream.Error
 	_ = errors.As(cause, &ue)
 	retryAfter := time.Duration(0)
@@ -840,7 +855,12 @@ func (a *app) applyHealthDisposition(uid, reasonCode string, cause error, allowD
 			// 停用位（Disabled）与冷却位（cool_kind/until）是两件事，别用一个文案描述两个。
 			acts = append(acts, hcActNoteFault)
 		} else {
-			a.proxy.pool.Cooldown(uid, pool.CoolSoft, softCooldown,
+			// ⚠️ 用 `accountFaultCooldown`（2h）而**不是** `softCooldown`（60s）：
+			// 同一个 11140 在转发链（proxy.reportUpstreamError）用的就是 2h，且那里的
+			// 注释写明了理由 —— 60s 时"一个风控窗口内 3 次白撞"就能凑满阈值摘号，
+			// 2026-10-13 正是这么批量误杀 30 个健康号的。健康检测这条链路此前**没跟上**
+			// 那次修复，于是同一个错误码在两条链路上有两套阈值（v0.31.20 收敛）。
+			a.proxy.pool.Cooldown(uid, pool.CoolSoft, accountFaultCooldown,
 				"11140 request illegal（累计 "+itoa(fails)+"/"+itoa(pool.AccountFaultThreshold())+"，未超阈值仅软冷却）")
 			acts = append(acts, hcActNoteFault, hcActCooled)
 		}
@@ -916,6 +936,12 @@ func (a *app) healthCheckCandidates() []string {
 		if st.ManualDisabled {
 			continue
 		}
+		// 未入池的代挂号不进候选（v0.31.20）：它们不参与平台流量，探活是**白出站**
+		// （每号一次上游调用），而处置又是对用户资产的越权。号主想看自己的号，
+		// 用控制台上的主动操作（同步积分 / 查看全部）。
+		if a.isUnpooledHosted(st.UID) {
+			continue
+		}
 		if a.proxy.pool.AuthByUID(st.UID) == nil && !st.Disabled {
 			// 凭证取不到且未被禁用 → 无意义（禁用号仍要探，见文件头）。
 			continue
@@ -926,6 +952,19 @@ func (a *app) healthCheckCandidates() []string {
 		}
 	}
 	return out
+}
+
+// isUnpooledHosted 是否为「未入池的代挂号」。
+//
+// 判定只看两个库字段（不看池内状态）：`owner_user_id > 0` 且 `pool_state != "in"`。
+// 包括未申请（空）/ 待审（pending）/ 已邀请（invited）/ 已驳回（rejected）——
+// 它们的共同点是**此刻不参与平台反代**，因此平台不该对它们做不可逆处置。
+func (a *app) isUnpooledHosted(uid string) bool {
+	acc, err := a.store.GetAccount(uid)
+	if err != nil || acc == nil {
+		return false
+	}
+	return acc.OwnerUserID > 0 && acc.PoolState != "in"
 }
 
 // healthCheckMaxAccounts 单次批量检测的账号上限。

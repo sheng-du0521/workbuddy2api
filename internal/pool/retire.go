@@ -34,10 +34,15 @@ import (
 // kind 传该错误的上游分类（upstream.ErrKind）。返回 true = 已停用；
 // false = 未摘（该类型不足以作为摘除依据，已记 WARN 日志）。
 //
-// ⚠️ 一个容易踩的细节：`NoteAccountFault`（11140 计数）在**达阈值时自身就会 disableLocked**，
-// 并不经过这道门。也就是说调用它的前提必须是"这个错误类型允许摘除"（目前只有
-// ErrAccountFault，成立）。将来若给别的错误类型接计数原语，要么先过
-// upstream.MayRetireAccount，要么用不自动 disable 的计数变体 —— 否则会出现"绕过闸门"。
+// ⚠️ 已知暗道（**两条**，不止一条）：达阈值时自身就会 `disableLocked`、不经过这道门的计数原语是
+//
+//	`NoteAccountFault`（11140 计数，state.go）
+//	`NoteSessionDead`（12153 计数，state.go —— 2026-10-16 审查补记，此前只记了前者）
+//
+// 也就是说调用它们的前提必须是"这个错误类型允许摘除"。当前两个 kind
+// （ErrAccountFault / ErrSessionDead）都满足 `MayRetireAccount`，故暂无可观测漂移；
+// **但暗道客观存在**：将来若给别的错误类型接这两个计数原语，要么先过
+// `upstream.MayRetireAccount`，要么用不自动 disable 的计数变体 —— 否则会出现"绕过闸门"。
 //
 // 调用方约定：拿到 false 时**必须**退化为可逆处置。不要绕过本方法直接调 Disable ——
 // 那样这道门就白设了（`Disable` 仍保留给非错误驱动的场景：运维手工停用、账号级

@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.19"
+const version = "0.31.20"
 
 type app struct {
 	store  *Store
@@ -1388,6 +1388,7 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/usage", a.userGuard(a.handleUsage))
 	mux.HandleFunc("GET /api/usage/report", a.userGuard(a.handleUsageReport))
 	mux.HandleFunc("GET /api/usage/breakdown", a.userGuard(a.handleUsageBreakdown))
+	mux.HandleFunc("GET /api/me/usage-split", a.userGuard(a.handleMyUsageSplit))
 	// 消耗排行（v0.17.8）：控制台概览高频刷新榜单，故与 /api/usage 分开。
 	mux.HandleFunc("GET /api/usage/ranking", a.userGuard(a.handleUserUsageRanking))
 	mux.HandleFunc("GET /api/models", a.userGuard(a.handleUserModels))
@@ -1407,6 +1408,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/host/accounts/{uid}", a.userGuard(a.handleHostDeleteAccount))
 	mux.HandleFunc("GET /api/host/accounts/{uid}/resources", a.userGuard(a.handleHostResources))
 	mux.HandleFunc("GET /api/host/accounts/{uid}/task-status", a.userGuard(a.handleHostAccountTaskStatus))
+	mux.HandleFunc("POST /api/host/egress", a.userGuard(a.handleHostEgress))
+	mux.HandleFunc("GET /api/system/info", a.userGuard(a.handleSystemInfo))
 	mux.HandleFunc("GET /api/host/earnings", a.userGuard(a.handleHostEarnings))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/task", a.userGuard(a.handleHostSetTask))
 	mux.HandleFunc("POST /api/host/task-all", a.userGuard(a.handleHostSetTaskAll))
@@ -1502,6 +1505,7 @@ func (a *app) routes() *http.ServeMux {
 
 	// 实时运行态势：逐分钟序列 + 号池快照 + 告警 + 最近事件（实时仪表盘用）。
 	mux.HandleFunc("GET /api/admin/live", a.adminGuard(a.handleLive))
+	mux.HandleFunc("GET /api/admin/usage-split", a.adminGuard(a.handleAdminUsageSplit))
 	// 号池仪表盘聚合（v0.17.3）：与 /live 同频轮询；服务端算好，零额外上游出站。
 	mux.HandleFunc("GET /api/admin/pool-dashboard", a.adminGuard(a.handlePoolDashboard))
 

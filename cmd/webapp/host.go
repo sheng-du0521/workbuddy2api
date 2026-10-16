@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"workbuddy2api/internal/egress"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -388,6 +389,81 @@ func (a *app) handleHostPool(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"uid": uid, "pool_state": state})
 }
 
+// handleHostEgress 用户为自己名下的代挂号设置出口代理（v0.31.20）。
+//
+// 解决什么：「我的号从哪个 IP 出去」本该是我自己的事，此前只有管理员能在后台
+// 逐号设置。现在号主可以在控制台「设置 → 我的出口」自助完成，配好后
+// **该线路会自动出现在管理后台的代理页**（因为线路本就建在账号的 egress_proxy 上），
+// 管理员可收录进线路池、探活、再分配给别的号。
+//
+// ⚠️ 边界（很重要，别越）：
+//   - 只写 `accounts.egress_proxy`，**只动本人名下**的账号（逐个校验 owner）；
+//   - **不碰**平台全局默认出口（`egress_proxy_default`）—— 用户提供的代理是
+//     不可信第三方（我们无法担保其稳定性，且理论上能看到经过它的流量特征），
+//     它只能承载"号主自己的号"，绝不能成为平台号池的默认出口；
+//   - 不做任何账号状态改动（不禁用、不冷却）：出口配错只影响"能不能出去"，
+//     由既有的 `egressBad` / 线路失效策略去处理。
+func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r)
+	var req struct {
+		UIDs  []string `json:"uids"`
+		Proxy string   `json:"proxy"`
+		All   bool     `json:"all"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	norm, err := egress.ValidateAccountEgress(req.Proxy)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	owned, err := a.store.ListAccountsByOwner(u.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	alive := map[string]bool{}
+	for _, acc := range owned {
+		alive[acc.UID] = true
+	}
+	// 目标集：显式 uids（逐个校验归属）或全部本人代挂号。
+	var targets []string
+	if req.All {
+		for _, acc := range owned {
+			targets = append(targets, acc.UID)
+		}
+	} else {
+		for _, uid := range req.UIDs {
+			uid = strings.TrimSpace(uid)
+			if uid == "" {
+				continue
+			}
+			// 越权目标**静默剔除**（与插件同口径）：不报错、不泄露"这个 uid 存不存在"。
+			if alive[uid] {
+				targets = append(targets, uid)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "没有可设置的账号（请确认勾选的账号属于你）"})
+		return
+	}
+	changed := 0
+	for _, uid := range targets {
+		if err := a.store.SetAccountEgress(uid, norm); err != nil {
+			log.Printf("WARN: [host] 设置代挂出口失败 acct=%s: %v", uid, err)
+			continue
+		}
+		changed++
+	}
+	_ = a.proxy.SyncAccounts() // 出口是选号输入，改完必须重同步
+	log.Printf("INFO: [host] 用户 %s 把 %d 个代挂号的出口设为 %q", u.Username, changed, norm)
+	writeJSON(w, http.StatusOK, map[string]any{"updated": changed, "proxy": norm, "total": len(targets)})
+}
+
 // handleHostDeleteAccount 删除本人代挂账号。
 func (a *app) handleHostDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
@@ -412,6 +488,21 @@ func (a *app) handleHostResources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.writeCreditDetail(w, acc)
+}
+
+// handleSystemInfo GET /api/system/info —— 控制台「设置 · 关于」要用的最小信息集。
+//
+// 为什么单开一个接口而不是让前端拼：**版本号只有一个来源**（`const version`），
+// 前端硬编码版本号必然与二进制漂移，而"我到底跑的是哪一版"恰恰是排障第一问。
+// origin 由请求推导（挂隧道 / 反代后面时，服务端自己也推不准）。
+func (a *app) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
+	origin := requestOrigin(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":     "WorkBuddy2API",
+		"version":  version,
+		"origin":   origin,
+		"base_url": origin + "/v1",
+	})
 }
 
 // handleHostEarnings 我的代挂收益流水。

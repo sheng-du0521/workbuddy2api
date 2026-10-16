@@ -1539,6 +1539,208 @@ function prefersReduced() {
 // sticky = 不自动消失（失败类提示默认更久，但不是永久 —— 永久提示请用 loadBanner）。
 const TOAST_ICON = { ok: '✓', err: '!', warn: '!', info: 'i' };
 
+// ======================================================================
+// 提醒中心（v0.31.20）
+//
+// 为什么要有它：toast 几秒就消失、侧栏 badge 只覆盖单一事项。于是用户遇到
+// 「点了复制没反应」「点某个页面报错」这类事时，**过一会儿就再也拿不出痕迹**，
+// 只能凭记忆描述 —— 我们也只能靠猜。提醒中心把三类信息留在右上角：
+//
+//   · 操作反馈（复制 / 保存 / 失败…）—— 从 `toast()` 自动落一份，可回溯；
+//   · 待办（入池邀请等）—— 需要用户做决定的事；
+//   · **前端错误**（window.onerror / unhandledrejection）—— 这是"点进去报错"
+//     唯一能被复现的证据，可整段复制发出来。
+//
+// 存 localStorage（最近 50 条）：刷新后仍在，否则"关页面就没了"等于没有。
+// ======================================================================
+const ALERT_KEY = 'wb_alerts';
+const ALERT_MAX = 50;
+let _alerts = null;   // null = 尚未从盘上读过
+let _alertsSeen = 0;  // 已读游标（unix 秒）
+
+function alertLoad() {
+  if (_alerts) return _alerts;
+  _alerts = [];
+  try {
+    const d = JSON.parse(localStorage.getItem(ALERT_KEY) || '{}');
+    if (d && Array.isArray(d.items)) _alerts = d.items;
+    _alertsSeen = Number(d && d.seen) || 0;
+  } catch (e) { /* 解析失败当空处理，绝不因此让页面挂掉 */ }
+  return _alerts;
+}
+
+function alertSave() {
+  try {
+    localStorage.setItem(ALERT_KEY, JSON.stringify({ items: _alerts.slice(0, ALERT_MAX), seen: _alertsSeen }));
+  } catch (e) { /* 隐私模式：仅本次会话可见 */ }
+}
+
+// alertPush 记一条提醒。**绝不能在这里调 toast**（自激循环）。
+function alertPush(rec) {
+  alertLoad();
+  const text = String((rec && rec.text) || '').slice(0, 800);
+  const detail = String((rec && rec.detail) || '').slice(0, 4000);
+  if (!text && !detail) return;
+  const at = Math.floor(Date.now() / 1000);
+  // 同文去重（连点 5 次"复制失败"不该刷 5 条 —— 刷屏会让真正的那条被淹掉）。
+  const dup = _alerts.find((x) => x.text === text && x.kind === rec.kind && at - x.at < 10);
+  if (dup) {
+    dup.at = at;
+    if (detail) dup.detail = detail;
+  } else {
+    _alerts.unshift({ at, level: rec.level || 'info', kind: rec.kind || 'action', text, detail });
+  }
+  if (_alerts.length > ALERT_MAX) _alerts.length = ALERT_MAX;
+  alertSave();
+  alertRefreshBadge();
+}
+
+// alertRefreshBadge 刷新铃铛上的未读数。
+function alertRefreshBadge() {
+  const bell = document.getElementById('alertBell');
+  if (!bell) return;
+  alertLoad();
+  const unread = _alerts.filter((x) => x.at > _alertsSeen).length;
+  const badge = bell.querySelector('.alert-badge');
+  if (badge) {
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    badge.style.display = unread ? '' : 'none';
+  }
+}
+
+function alertLevelColor(level) {
+  if (level === 'err') return 'var(--bad, #c62828)';
+  if (level === 'warn') return '#e6a23c';
+  return '#888';
+}
+
+// alertFill 渲染面板内容。
+function alertFill(panel) {
+  alertLoad();
+  panel.textContent = '';
+  const head = el('div');
+  head.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:4px;';
+  head.appendChild(el('b', null, '提醒中心'));
+  head.appendChild(el('span', 'muted', _alerts.length ? '共 ' + _alerts.length + ' 条' : ''));
+  const clr = el('button', 'ghost sm', '清空');
+  clr.style.marginLeft = 'auto';
+  clr.onclick = () => {
+    _alerts = [];
+    _alertsSeen = Math.floor(Date.now() / 1000);
+    alertSave();
+    alertFill(panel);
+    alertRefreshBadge();
+  };
+  head.appendChild(clr);
+  panel.appendChild(head);
+
+  if (!_alerts.length) {
+    panel.appendChild(el('div', 'sub',
+      '暂无提醒。操作反馈（复制 / 保存等）、入池邀请、以及**页面脚本错误**都会记在这里 —— '
+      + '遇到"点进去报错"时，把这里的原文发出来即可定位。'));
+    return;
+  }
+  for (const it of _alerts) {
+    const row = el('div');
+    row.style.cssText = 'padding:6px 0;border-top:1px solid rgba(127,127,127,.15);';
+    const top = el('div');
+    top.style.cssText = 'display:flex;gap:6px;align-items:baseline;';
+    const ico = el('span', null, it.kind === 'error' ? '⚠' : (it.kind === 'todo' ? '📌' : '·'));
+    ico.style.color = alertLevelColor(it.level);
+    top.appendChild(ico);
+    const tx = el('span', null, it.text || '（无内容）');
+    tx.style.flex = '1';
+    tx.style.wordBreak = 'break-word';
+    top.appendChild(tx);
+    top.appendChild(el('span', 'muted', typeof fmtClock === 'function' ? fmtClock(it.at) : ''));
+    row.appendChild(top);
+    if (it.detail) {
+      const pre = el('div', 'sub');
+      pre.style.cssText = 'margin:4px 0 0;padding:6px 8px;background:rgba(127,127,127,.12);border-radius:6px;'
+        + 'font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:140px;overflow:auto;';
+      pre.textContent = it.detail;
+      row.appendChild(pre);
+      const cp = el('button', 'ghost sm', '复制这条');
+      cp.style.marginTop = '4px';
+      cp.onclick = async () => {
+        const ok = await writeClipboard(it.text + '\n' + it.detail);
+        toast(ok ? '已复制错误详情' : '复制失败，请手动选择', ok ? 'ok' : 'err');
+      };
+      row.appendChild(cp);
+    }
+    panel.appendChild(row);
+  }
+}
+
+// mountAlertCenter 在顶栏右侧挂上铃铛 + 面板（两端共用）。
+function mountAlertCenter() {
+  const bar = document.querySelector('.topbar .actions');
+  if (!bar || document.getElementById('alertBell')) return;
+  alertLoad();
+
+  const bell = el('button', 'icon-btn');
+  bell.id = 'alertBell';
+  bell.type = 'button';
+  bell.title = '提醒中心：操作反馈 / 待办 / 页面错误（可复制原文）';
+  bell.style.position = 'relative';
+  bell.appendChild(el('span', null, '🔔'));
+  const badge = el('span', 'alert-badge');
+  badge.style.cssText = 'position:absolute;top:-4px;right:-4px;min-width:16px;height:16px;border-radius:8px;'
+    + 'background:var(--bad,#c62828);color:#fff;font-size:10px;line-height:16px;text-align:center;padding:0 4px;display:none;';
+  bell.appendChild(badge);
+
+  const panel = el('div');
+  panel.id = 'alertPanel';
+  panel.style.cssText = 'display:none;position:fixed;top:56px;right:12px;z-index:80;width:min(430px,88vw);'
+    + 'max-height:62vh;overflow:auto;background:var(--bg,#fff);border:1px solid rgba(127,127,127,.3);'
+    + 'border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.18);padding:10px 12px;';
+
+  bell.onclick = (e) => {
+    e.stopPropagation();
+    if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+    _alertsSeen = Math.floor(Date.now() / 1000);
+    alertSave();
+    alertFill(panel);
+    panel.style.display = '';
+    alertRefreshBadge();
+  };
+  document.addEventListener('click', () => { panel.style.display = 'none'; });
+  panel.addEventListener('click', (e) => e.stopPropagation());
+
+  bar.appendChild(bell);
+  // panel 挂 body（`.topbar` 有 overflow 时会裁掉它）。
+  document.body.appendChild(panel);
+  alertRefreshBadge();
+
+  // ① 脚本错误 / 资源加载失败 → 提醒中心（"点进去报错"的可复现证据）。
+  window.addEventListener('error', (ev) => {
+    const t = ev.target;
+    if (t && t !== window && t.tagName && /^(SCRIPT|LINK|IMG)$/.test(t.tagName)) {
+      alertPush({
+        level: 'warn', kind: 'error',
+        text: '资源加载失败：' + (t.src || t.href || ''),
+        detail: '若反复出现，多半是浏览器缓存了旧版本前端 —— 强制刷新（Ctrl+F5）可恢复。',
+      });
+      return;
+    }
+    alertPush({
+      level: 'err', kind: 'error',
+      text: '页面脚本错误：' + (ev.message || '未知错误'),
+      detail: (ev.filename || '') + ':' + (ev.lineno || 0) + ':' + (ev.colno || 0)
+        + '\n' + ((ev.error && ev.error.stack) || '(无堆栈)'),
+    });
+  });
+  // ② 未处理的 Promise 拒绝（fetch 忘了 catch 时走这条）。
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev.reason;
+    alertPush({
+      level: 'err', kind: 'error',
+      text: '未处理的异步错误：' + ((r && r.message) || String(r)),
+      detail: (r && r.stack) || '',
+    });
+  });
+}
+
 function toast(msg, kind, opts) {
   opts = opts || {};
   let host = $('toastHost');
@@ -1561,6 +1763,16 @@ function toast(msg, kind, opts) {
   x.setAttribute('aria-label', '关闭通知');
   card.appendChild(x);
   host.appendChild(card);
+
+  // 落一份到提醒中心（v0.31.20）：toast 会消失、这里不会 —— 用户回头能查
+  // "刚才那步到底成没成"，我们也能拿到"复制失败"这类现场。
+  if (!opts.noAlert) {
+    alertPush({
+      level: (kind === 'err' || kind === 'bad') ? 'warn' : 'info',
+      kind: 'action',
+      text: String(msg == null ? '' : msg),
+    });
+  }
 
   // 上限 5 条：再多会把右上角糊住，而且旧的那几条已经没人在读。
   while (host.children.length > 5) host.removeChild(host.firstChild);
