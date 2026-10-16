@@ -1170,6 +1170,85 @@ func (p *Proxy) refreshIfNeeded(au *auth.Auth) error {
 	return nil
 }
 
+// chatBodyMax 单次 chat 请求体上限（8MB）。
+//
+// 为什么从 io.LimitReader 换成 http.MaxBytesReader（v0.31.14 修的真实缺陷）：
+// io.LimitReader 到上限后返回的是 **EOF 而不是错误** —— 于是 8MB 以上的请求体会被
+// **静默截断**，再交给 json.Unmarshal 解析，客户端看到的是
+// `invalid json: unexpected end of JSON input`。那是一条把「请求太大」说成
+// 「JSON 写坏了」的错误消息：开发者会去反复检查自己的序列化，而真正该做的是减量/分段。
+// MaxBytesReader 超限时返回 *http.MaxBytesError，可以据此回 413 并把上限写清楚。
+const chatBodyMax = 8 << 20
+
+// readCappedBody 读入站请求体（硬上限 max）。
+//
+// 用 io.Copy 到 buffer 而不是 io.ReadAll：**出错时也要拿到已读字节数**。
+// 「收到 0 字节就断」与「收到 7.9MB 才断」是两种完全不同的故障（前者是连接根本没
+// 传到/立刻被掐，后者是传输尾部被截断），而 io.ReadAll 在报错时把这个信息丢掉了 ——
+// 它只回一个 error，调用方无从判断请求体到底来了多少。
+func readCappedBody(w http.ResponseWriter, r *http.Request, max int64) ([]byte, error) {
+	var buf bytes.Buffer
+	_, err := io.Copy(&buf, http.MaxBytesReader(w, r.Body, max))
+	return buf.Bytes(), err
+}
+
+// bodyReadEvidence 组装读体失败的取证片段（纯函数，字段口径可被单测钉住）。
+//
+// 为什么这些字段缺一不可：这条 400 的成因**不在网关内部**，而在发送侧
+// （客户端库 / 反向代理 / 隧道 / 本机 http_proxy 都可能截断），
+// 网关既无法代客户端重发、也无法替它猜是哪一段网络。所以网关的责任只有两件：
+// 如实回报 + 把现场写下来。
+//
+//	· peer / xff —— 谁发来的（隧道场景 RemoteAddr 恒是回环，xff 才是线索）；
+//	· content_length / 已读 —— **声明了多少 vs 实际到了多少**，这一对是定性关键；
+//	· elapsed —— 立刻断（0ms）还是传了一会儿才断；
+//	· ua —— 哪个客户端库（不同客户端的截断 bug 形态不同）。
+func bodyReadEvidence(r *http.Request, n int, elapsed time.Duration) string {
+	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if xff == "" {
+		xff = "-"
+	}
+	ua := strings.TrimSpace(r.UserAgent())
+	if ua == "" {
+		ua = "-"
+	}
+	return fmt.Sprintf("peer=%s xff=%s content_length=%d 已读=%d 耗时=%s ua=%q",
+		r.RemoteAddr, xff, r.ContentLength, n, elapsed.Round(time.Millisecond), ua)
+}
+
+// reportBodyReadFailure 读入站请求体失败时的统一处置（v0.31.14）。
+//
+// 两类分开处置，因为**责任在谁、客户端该做什么**完全不同：
+//
+//	· 超限（*http.MaxBytesError）→ 413。这是"请求太大"，既不是客户端的 JSON 写错，
+//	  更不是账号/上游的问题；给 400 会让客户端以为请求格式非法。
+//	· 其余读错（unexpected EOF / connection reset / i/o timeout）→ 400。
+//	  Go 的 `unexpected EOF` 只有一种成因：**声明的长度与实际收到的字节不一致**
+//	  （Content-Length 写大了、chunked 尾块没到、连接中途断）。根因在发送侧，
+//	  但网关无从判断是哪一段网络 —— 所以只如实回报 + 落日志。
+//
+// 为什么必须打这条日志：v0.31.13 及以前，这条分支**一个字节的痕迹都不留** ——
+// /api/admin/live 只能看到"有一次 400 失败"（兜底层按响应码补记），
+// 台账里没有它（没有用量）、日志里没有它（没打），于是
+// 「客户端自己截断」与「中间层吃掉请求体」这两种根因**在本机无法区分**。
+//
+// ⚠️ 刻意**不写** consume_failures：那张表是"针对某个账号的上游消费失败"
+// （有 uid / attempt / stage 语义），把读体失败塞进去会污染账号维度的口径。
+func (p *Proxy) reportBodyReadFailure(w http.ResponseWriter, r *http.Request, err error, n int, elapsed time.Duration) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		log.Printf("WARN: [proxy] 请求体超限（上限 %d 字节）：%s", tooLarge.Limit, bodyReadEvidence(r, n, elapsed))
+		writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("read body: request body too large (limit %d bytes)", tooLarge.Limit),
+			fmt.Sprintf("request body exceeds the gateway limit of %d bytes; split or shrink the payload", tooLarge.Limit))
+		return
+	}
+	log.Printf("WARN: [proxy] 请求体读取失败：%v —— %s（成因在发送侧：声明的长度与实际到达的字节不一致，或被中间层截断；该请求未触达任何上游账号）",
+		err, bodyReadEvidence(r, n, elapsed))
+	writeOpenAIErrorHint(w, http.StatusBadRequest, "read body: "+err.Error(),
+		"gateway could not read the full request body: the connection ended before Content-Length bytes arrived (client aborted, or an intermediary/proxy truncated it); no upstream account was used")
+}
+
 // ServeChat 处理 OpenAI 兼容的 /v1/chat/completions。
 // 出站一律强制 stream=true，再按客户端要求原样转发 SSE 或聚合为单次响应。
 func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
@@ -1180,9 +1259,9 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	p.live.begin()
 	defer p.live.done()
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	raw, err := readCappedBody(w, r, chatBodyMax)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "read body: "+err.Error())
+		p.reportBodyReadFailure(w, r, err, len(raw), time.Since(start))
 		return
 	}
 	var payload map[string]any
