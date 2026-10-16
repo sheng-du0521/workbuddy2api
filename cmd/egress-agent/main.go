@@ -57,7 +57,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.2.0"
+const agentVersion = "0.3.0"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -238,10 +238,14 @@ func (a *agent) startTunnel(host string, tunnelPort, proxyPort int) error {
 	key := a.key
 	a.mu.Unlock()
 
+	// ⚠️ 监听地址**必须显式写 127.0.0.1**（v0.31.25）：服务端给用户密钥配了
+	// `permitlisten="127.0.0.1:12xxx"` 白名单，而不带地址的 `-R 12010:...`
+	// 请求的监听地址是"默认"（sshd 按 GatewayPorts 解析），与白名单里的显式
+	// 127.0.0.1 不匹配 → **隧道会被 sshd 拒绝**，现象只是"连不通"。
 	args := []string{
 		"-i", key,
 		"-N", // 不执行远程命令，只做转发
-		"-R", fmt.Sprintf("%d:127.0.0.1:%d", tunnelPort, proxyPort),
+		"-R", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", tunnelPort, proxyPort),
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "ExitOnForwardFailure=yes", // 转发建不起来就直接退出，别挂着一个空隧道
@@ -358,6 +362,88 @@ func agentMachineID(dir string) string {
 	return id
 }
 
+// agentConfig 本地配置文件（`-config egress.json`）。
+//
+// 为什么要支持配置文件：一键安装脚本是**用 echo 拼**出来的，命令行长参数
+// 在 cmd 里的转义（引号、`&`、空格）是个无底洞。把变量放进 JSON 文件，
+// 脚本就只剩"下载 + 起进程"两件事。
+type agentConfig struct {
+	Server string `json:"server"`
+	Token  string `json:"token"`
+	// User SSH 登录名（默认 root）。
+	User string `json:"user,omitempty"`
+	// KeyFile 私钥路径（默认同目录 key.pem；平台机器请放部署时那把并写这里）。
+	KeyFile string `json:"key_file,omitempty"`
+}
+
+// agentBootstrap 云端下发的自举配置（`GET /api/agent/config`）。
+type agentBootstrap struct {
+	Server     string `json:"server"`
+	Token      string `json:"token"`
+	PrivateKey string `json:"private_key,omitempty"`
+	User       string `json:"user"`
+	Note       string `json:"note,omitempty"`
+}
+
+// loadAgentConfig 读配置文件（不存在则返回零值，不算错误）。
+func loadAgentConfig(path string) (agentConfig, error) {
+	var c agentConfig
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return c, nil
+		}
+		return c, err
+	}
+	if err := json.Unmarshal(b, &c); err != nil {
+		return c, fmt.Errorf("配置文件 %s 不是合法 JSON：%w", path, err)
+	}
+	return c, nil
+}
+
+// bootstrapKey 凭令牌向云端取回自己的受限私钥，落盘到 dir/key.pem。
+//
+// 这是"一键安装"能不含任何密钥材料的关键：安装脚本只带服务地址与令牌，
+// 私钥由 agent 首次启动时自取。于是浏览器下载目录里不会留下一份私钥，
+// 而真的要作废时也只需在服务端重新生成（下一次启动又是新的）。
+//
+// 返回 keyPath 为空表示"云端没给私钥"（平台机器：管理员本机沿用部署密钥），
+// 这不是错误 —— 调用方据此决定要不要继续用 -key。
+func bootstrapKey(server, token, dir string) (keyPath, user, note string, err error) {
+	if strings.TrimSpace(token) == "" {
+		return "", "", "", fmt.Errorf("缺少令牌，无法自举")
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(server, "/")+"/api/agent/config", nil)
+	if err != nil {
+		return "", "", "", err
+	}
+	req.Header.Set("X-Agent-Token", token)
+	cl := &http.Client{Timeout: 20 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return "", "", "", fmt.Errorf("向云端取配置失败：%w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", fmt.Errorf("云端拒绝取配置（HTTP %d）：%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var bs agentBootstrap
+	if err := json.Unmarshal(body, &bs); err != nil {
+		return "", "", "", fmt.Errorf("云端返回的配置无法解析：%w", err)
+	}
+	user, note = bs.User, bs.Note
+	if strings.TrimSpace(bs.PrivateKey) == "" {
+		return "", user, note, nil // 平台机器：由 -key 提供
+	}
+	keyPath = filepath.Join(dir, "key.pem")
+	// 0600：私钥不该被同机其他用户读到。
+	if err := os.WriteFile(keyPath, []byte(bs.PrivateKey), 0o600); err != nil {
+		return "", user, note, fmt.Errorf("写入私钥失败（%s）：%w", keyPath, err)
+	}
+	return keyPath, user, note, nil
+}
+
 // sshHost 从 server 地址里取主机名（隧道连的就是这个主机）。
 func sshHost(server string) string {
 	u, err := url.Parse(server)
@@ -385,12 +471,35 @@ func main() {
 		user    = flag.String("user", "root", "SSH 用户名")
 		machine = flag.String("machine", "", "覆盖机器标识（默认同目录 machine.id）")
 		once    = flag.Bool("once", false, "只跑一轮就退出（自检用：验证令牌与网络是否可用）")
+		cfgPath = flag.String("config", "", "配置文件路径（一键安装会写 egress.json，含 server/token）")
 	)
 	flag.Parse()
 
+	// 配置文件里的值作为**缺省**被命令行覆盖（命令行优先，便于临时排查）。
+	if *cfgPath != "" {
+		c, err := loadAgentConfig(*cfgPath)
+		if err != nil {
+			fmt.Println("读取配置失败：" + err.Error())
+			os.Exit(2)
+		}
+		if *server == "" {
+			*server = c.Server
+		}
+		if *token == "" {
+			*token = c.Token
+		}
+		if *user == "root" && c.User != "" {
+			*user = c.User
+		}
+		if *key == "" && c.KeyFile != "" {
+			*key = c.KeyFile
+		}
+	}
+
 	if *server == "" || *token == "" {
 		fmt.Println("用法：wb2api-egress-agent.exe -server http://<服务地址> -token <令牌>")
-		fmt.Println("（这两个参数可直接从控制台「代理」页复制，不必手打）")
+		fmt.Println("      或：wb2api-egress-agent.exe -config egress.json")
+		fmt.Println("（控制台「代理」页的「一键安装」会把这些都准备好，不需要手填）")
 		os.Exit(2)
 	}
 	base := strings.TrimRight(*server, "/")
@@ -408,7 +517,29 @@ func main() {
 		*proxy = filepath.Join(dir, "wbproxy.exe")
 	}
 	if *key == "" {
-		*key = filepath.Join(dir, "ai.pem")
+		*key = filepath.Join(dir, "key.pem")
+	}
+	// 自举（v0.31.25）：私钥不存在就凭令牌向云端取一次，落盘后继续。
+	// 这样"一键安装"的脚本里不需要带任何密钥材料。
+	if _, statErr := os.Stat(*key); statErr != nil {
+		kp, bu, note, err := bootstrapKey(base, *token, dir)
+		switch {
+		case err != nil:
+			log.Printf("[agent] 自举失败：%v", err)
+			log.Printf("[agent] 请确认令牌有效（控制台「代理」页可重新下载安装包）")
+			os.Exit(3)
+		case kp != "":
+			*key = kp
+			if bu != "" {
+				*user = bu
+			}
+			log.Printf("[agent] 已自举隧道密钥：%s（%s）", kp, note)
+		default:
+			log.Printf("[agent] 云端未下发私钥（平台机器）——需要 -key 指向部署用的私钥文件")
+			if note != "" {
+				log.Printf("[agent] %s", note)
+			}
+		}
 	}
 	mid := strings.TrimSpace(*machine)
 	if mid == "" {

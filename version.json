@@ -1,17 +1,17 @@
 {
-  "version": "0.31.24",
+  "version": "0.31.25",
   "min_supported": "0.24.0",
-  "notes": "v0.31.24：**出口拉起的权限下沉** —— 每个用户都能在自己的控制台拉起「自己那台机器」的出口代理，且严格碰不到别人。① 问题：三个执行端点（pull / release / apply）此前挂 adminGuard + egressAdminOnly，普通用户点「一键拉起」只会得到 403，前端 `can_manage=false` 又把操作区整块隐藏 —— 于是\"出口\"这件事只能由管理员代劳，等于把每个用户的出站链路都挂在一个人手上。② **机器按 owner 命名空间隔离**：机器表的键由 `owner + machine id` 组成（`u12:abc` / `abc` / `default`）。机器 id 是 agent 自己生成、随查询参数上行的，构造成本为零 —— 不带前缀时，用户只要猜到或复用一个别人的 id 就能顶掉对方的桶；带上前缀后\"别人的 id\"落在自己命名空间内，物理上碰不到。③ **agent 令牌按用户签发**（`ag<uid>-<hex>`，服务端从中解析 uid 并只比对那一把）：全平台共用一把时，任何拿到它的人都能抢注 machine id、伪造别人的在线状态。令牌仍只授权 poll/report（读不到账号数据），但\"能冒充别人的机器\"已经越过了用户边界。④ **视图按 owner 过滤**：用户视角只列自己的机器（机器项带 hostname / 出口 IP / 隧道端口，看到别人的等于看到别人家里那台电脑的出口 IP 与在线规律）；`manage_scope` 字段（platform / self）驱动前端文案切换。⑤ ⚠️ **用户视角不设全局默认出口、不碰别人的号**：apply 时只绑自己名下的代挂号；全局默认出口是平台级决定（同时决定所有平台号与所有\"跟随默认\"的账号从哪出去），而用户提供的代理是我们控制不了的第三方，只应承载它主人的号。用户拉起的线路仍会进线路池（带 owner），管理员可显式分配给别人。⑥ **拒绝话术合并**：\"这台不存在\"与\"这台不是你的\"用同一句话 —— 分开说等于给出一个能枚举别人 machine id 的探针。pull 也不再凭空登记机器（只会让列表变脏），没有机器时明确指引\"先去目标电脑跑 agent\"。⑦ 前端：代理页按视角分流（用户视角不出现「全局默认出口」这行、绑定计数叫「我的代挂号绑定」、说明卡讲清\"只作用于你自己的号\"），agent 命令下发**用户自己的令牌**。⑧ 测试：新增 `egress_user_scope_test.go` 共 7 条（绝大多数是负向断言）——同 machine id 的两台机器不串、用户看不到/动不了别人的机器、用户 apply 不改全局默认且不碰别人的号、平台视角行为保持、令牌不可伪造、隧道不通仍拒绝应用；另加 uitest 行为守卫 `egress-self`。三处关键实现均做过**变异检验**（去掉归属过滤 / 让用户也设全局默认 / 去掉 hostBinding 归属过滤 → 用例立刻红）。全量 go test 全绿、uitest PASS、jscheck 0 错误。",
-  "released_at": 1792181242,
+  "notes": "v0.31.25：**「用户代理」按钮全自动化** —— 点一下就好，不再让用户复制粘贴任何参数或密钥。① 先修一个**上一版没解决的前提**：v0.31.24 把「拉起出口」开放给了普通用户，但 agent 建反向隧道需要一把能登录服务器的 SSH 私钥，而部署用的是 root 那把（ai.pem）——把 root 私钥分发给每个用户等于每人一个 root。**不分发，用户就拉不起来**。现在改为**每用户一把专属受限密钥**：服务端 ssh-keygen 生成，写进 authorized_keys 时带 `restrict,command=\"/bin/true\",port-forwarding,permitlisten=\"127.0.0.1:12xxx\" ×10`，agent 用 `-user` 登录。② ⚠️ **实测纠正了一个想当然**（隔离 sshd 实例上验的）：**`restrict` 并不禁止 exec** —— `ssh -i key host 'id'` 照样能跑（它只禁 pty / agent 转发 / X11 / user-rc）。所以必须再加 `command=\"/bin/true\"` 顶替 exec；实测顶替后 `ssh -N -R` 的转发**不受影响**，而 `permitlisten` 精确挡住段外端口（连平台自己的 11080 与别的用户的 12040 都被服务端拒绝：`remote port forwarding failed for listen port 11080`）。③ **端口分区**：平台 11080-11089；用户 `12000+(uid%1000)*10` .. `+9`（每用户 10 台机器）。老机器（v0.31.24 全局分配、可能落在 1108x）会在下次 poll 时**幂等迁回本段**并重新下发 start，否则它会被 permitlisten 拒而表现为「连不通」。段满时 poll 明确报 409，不静默溢出。④ **一键安装**：控制台新增「① 下载本机代理安装包」→ `GET /api/egress/home/install` 按当前用户动态生成一个 **.bat**（只含服务地址 + 他自己的令牌，**不含任何密钥材料**——脚本会进浏览器下载目录并长期留存，私钥不该躺在那儿）。用户双击运行即完成；页面随后进入「等待接入」轮询，检测到那台电脑就**自动接着拉起**，全程只需「点一下 + 双击一下」。⑤ **agent 自举**：新增 `GET /api/agent/config`（令牌鉴权）——agent 首次启动凭令牌取回自己的受限私钥落盘到 key.pem，因此安装包与安装脚本都不必携带密钥；新增 `-config egress.json`（避开命令行转义）；`-R` 改为显式 `127.0.0.1:port`（与 permitlisten 的显式地址匹配）。⑥ **异常与并发**：pull 加**去抖**（同机器 3s 内重复不刷新指令 At —— 否则 agent 会把隧道拆了又建，表现为「点了反而更慢」）；apply 加**单飞**（并发第二个 409「正在应用中」，且该检查刻意放在隧道检查**之前**，否则连点第二次会得到误导性的「隧道未就绪」）；前端的失败提示统一走 `egressErrHint()` 把原文翻译成下一步（令牌无效→重新下载安装包、端口被拒、密钥被拒、隧道被占…），**原文一律保留**，映射错了也有据可查。⑦ 交付：agent 升 **v0.3.0**；`GET /api/egress/agent/bundle?part=agent|proxy`（令牌鉴权，避免变成公开的 15MB 下载位）下发可执行文件；文件缺失时**点名目录**（部署最常见的遗漏）。⑧ 测试：新增 `egress_auto_test.go` 9 条 —— 端口段分配/不重叠/段满、老机器幂等迁移、**限制行必须含 command= 与 permitlisten**（两处均做过变异检验：去掉即红）、安装脚本不含密钥材料、自举形状与平台视角不下发私钥、bundle 缺文件报错、pull 去抖、apply 单飞与 409、段满 409；另加 uitest 行为守卫 `egress-setup`（未接入时必须有「下载安装包」入口）。全量 go test 全绿、uitest PASS、jscheck 0 错误。",
+  "released_at": 1792184000,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.24/webapp.exe",
-      "sha256": "82b089151e50fe358a52457fe10e7177e617c65062f0c1904f85f9260714319a",
-      "size": 15122944
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.25/webapp.exe",
+      "sha256": "c76ef9412647817b9e08e9a2dc9855558522b5cd60bec3258cc80054b1259557",
+      "size": 15166976
     }
   ],
-  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.24）；换版本时同步换 url 与 sha256。"
+  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

@@ -2324,11 +2324,91 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-self: 用户视角代理页可操作，且不出现「全局默认出口」等误导文案');
   }
 
+  // v0.31.25：**还没接入 agent 时，页面必须给出"下载安装包"这条路**。
+  //
+  // 这一版之前，这里的文案是"请先在目标电脑上运行下面那行命令" —— 用户要自己
+  // 复制命令、开终端、核对参数、还要搞到 SSH 密钥。现在整条链路是
+  // "点下载 → 双击 .bat → 页面自动检测并接着拉起"，所以这个按钮**必须存在**：
+  // 它不存在，整个自动化就没有入口。
+  const egrSetupBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const EMPTY_VIEW = {
+      machines: [], agent_online: false, tunnel_reachable: false, applied: false, ready: false,
+      default_egress: '', host_bound: 0, host_total: 0,
+      can_manage: true, manage_scope: 'self', poll_sec: 5, agent_command: '',
+    };
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/dashboard.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.__navs = [];
+        win.fetch = (url) => {
+          const u = String(url);
+          if (u.indexOf('/api/egress/home') >= 0) {
+            const body = JSON.stringify(EMPTY_VIEW);
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(body), json: () => Promise.resolve(EMPTY_VIEW) });
+          }
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve('{"user":{"id":2,"username":"u2","is_admin":false}}'),
+              json: () => Promise.resolve({ user: { id: 2, username: 'u2', is_admin: false } }) });
+          }
+          return Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve('{}'), json: () => Promise.resolve({}) });
+        };
+        win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+        win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+        win.navigator.clipboard = { writeText: () => Promise.resolve() };
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
+      },
+    });
+    const w = dom.window;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+    if (typeof w.navGo === 'function') w.navGo('egress');
+    await wait(700);
+    const box = w.document.getElementById('egressHomeBox');
+    const txt = box ? String(box.textContent) : '';
+    // 页面说明段（pane 顶部）也要看：安装引导有一半写在那里，
+    // 只查 #egressHomeBox 会漏掉"在目标电脑上双击运行"这句关键动作。
+    const page = w.document.body ? String(w.document.body.textContent) : '';
+    if (!box || !box.children.length) {
+      egrSetupBad.push('未接入时代理页应渲染出安装引导，实为空');
+    } else {
+      if (txt.indexOf('下载本机代理安装包') < 0) {
+        egrSetupBad.push('未接入 agent 时应出现「下载本机代理安装包」按钮（自动化入口）');
+      }
+      if (page.indexOf('双击') < 0) {
+        egrSetupBad.push('应说明"在目标电脑上双击运行"（这是唯一的用户动作）');
+      }
+      if (txt.indexOf('无需手动') < 0 && page.indexOf('不需要复制粘贴') < 0) {
+        egrSetupBad.push('应说明"无需复制粘贴任何参数"（这是本版要解决的问题）');
+      }
+      // ⚠️ 刻意**不**断言"没有复制命令"：bat 只适用于 Windows，
+      // macOS / Linux 用户仍需要那行命令作为 fallback（页面同时给两条路是对的）。
+    }
+    try { w.close(); } catch (e) {}
+  }
+  egrSetupBad.forEach((m) => console.log('  [FAIL] egress-setup: ' + m));
+  if (!egrSetupBad.length) {
+    console.log('  [ok] egress-setup: 未接入时有「下载安装包」入口（无需复制任何参数）');
+  }
+
   const c = await run('admin-login.html', null, []);
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
     && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
-    && egrBad.length === 0 && egrSelfBad.length === 0;
+    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

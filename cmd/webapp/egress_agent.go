@@ -65,6 +65,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -294,9 +295,23 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 	}
 	var ports egressAgentPorts
 	if isDefaultBucket {
+		// default 桶恒用全局默认端口（= 升级前行为，老 agent 不受影响）。
 		ports = a.egressAgentPortsOf()
 	} else {
-		ports = egressAllocPorts(m)
+		var ok bool
+		ports, ok = egressAllocPorts(m, owner)
+		if !ok {
+			// 段满：**如实返回 TunnelPort=0**，让调用方报明确错误 ——
+			// 溢出到段外只会让隧道静默建不起来（permitlisten 会拒）。
+			log.Printf("WARN: [egress] owner=%d 的隧道端口段 %s 已满，无法为新机器分配端口",
+				owner, egressPortSegText(owner))
+			mm = &egressMachine{
+				ID: rawID, Hostname: strings.TrimSpace(hostname),
+				OwnerUserID: owner, CreatedAt: time.Now().Unix(),
+			}
+			m[key] = mm
+			return mm, true
+		}
 	}
 	mm = &egressMachine{
 		ID: rawID, Hostname: strings.TrimSpace(hostname), Ports: ports,
@@ -306,24 +321,76 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 	return mm, true
 }
 
-// egressAllocPorts 给新机器分配一对端口：隧道端口从 11080 起找**第一个未被占用**的。
+// egressAllocPorts 给新机器分配一对端口：在**该 owner 的端口段内**找第一个未被占用的。
 //
-// 为什么必须避开已占用的：两台机器都 `ssh -R 11080` 时，后到的那台会失败
+// 为什么要避开已占用的：两台机器都 `ssh -R 11080` 时，后到的那台会失败
 // （`remote port forwarding failed for listen port 11080`），而这条错误**只出现在
 // 本机 agent 的日志里** —— 云端页面上只会看到"隧道未连通"，运维无从判断是
 // 网络问题还是端口被占了。错开端口让两台机器可以**并存**。
-func egressAllocPorts(m map[string]*egressMachine) egressAgentPorts {
+//
+// ⚠️ 为什么必须按 owner 分段（v0.31.25）：用户的 SSH 密钥带
+// `permitlisten=` 白名单（见 egress_ssh.go），白名单就是**它的段**。
+// 若把用户机器分配到段外端口，隧道会被 sshd 拒绝，而现象只是"连不通"。
+// 分段还顺带保证了"用户拿不到平台的隧道端口"，即无法接住本应发给平台的流量。
+//
+// 段满（每用户 10 台机器）时返回 ok=false，由调用方明确报错 ——
+// 悄悄溢出到段外只会让隧道建不起来。
+func egressAllocPorts(m map[string]*egressMachine, owner int64) (egressAgentPorts, bool) {
+	base, span := egressPortSegOf(owner)
 	used := map[int]bool{}
 	for _, v := range m {
 		if v != nil && v.Ports.TunnelPort > 0 {
 			used[v.Ports.TunnelPort] = true
 		}
 	}
-	p := egressBaseTunnelPort
-	for used[p] {
-		p++
+	for p := base; p < base+span; p++ {
+		if !used[p] {
+			return egressAgentPorts{ProxyPort: egressBaseProxyPort, TunnelPort: p}, true
+		}
 	}
-	return egressAgentPorts{ProxyPort: egressBaseProxyPort, TunnelPort: p}
+	return egressAgentPorts{}, false
+}
+
+// egressMachinePortInSeg 该机器的隧道端口是否落在 owner 的段内。
+func egressMachinePortInSeg(mm *egressMachine) bool {
+	if mm == nil || mm.Ports.TunnelPort <= 0 {
+		return false
+	}
+	base, span := egressPortSegOf(mm.OwnerUserID)
+	return mm.Ports.TunnelPort >= base && mm.Ports.TunnelPort < base+span
+}
+
+// egressMigratePortsToSeg 把**端口不在自己段内**的用户机器迁回段内。
+//
+// 为什么需要：v0.31.24 的机器端口是全局分配的（用户机器可能拿到 11081），
+// 而 v0.31.25 给用户密钥加了 `permitlisten=` 白名单（只允许 12xxx 段）——
+// 那台老机器再用旧端口建隧道会被 sshd 拒绝。迁移是幂等的：端口已在段内就什么都不做。
+//
+// 返回发生迁移的机器数（调用方打日志）。**只在 agent 主动联系时做**（poll/report），
+// 不在只读的视图里做 —— 读接口带写副作用是排障时最讨厌的东西。
+func (a *app) egressMigratePortsToSeg(m map[string]*egressMachine, owner int64) int {
+	if owner <= 0 {
+		return 0
+	}
+	moved := 0
+	for _, mm := range m {
+		if mm == nil || mm.OwnerUserID != owner || egressMachinePortInSeg(mm) {
+			continue
+		}
+		old := mm.Ports.TunnelPort
+		ports, ok := egressAllocPorts(m, owner)
+		if !ok {
+			log.Printf("WARN: [egress] machine=%s 端口迁移失败：段 %s 已满", mm.ID, egressPortSegText(owner))
+			continue
+		}
+		mm.Ports = ports
+		// 端口变了 → 让 agent 重建（清掉旧指令的 At，agent 才会重新执行 start）。
+		mm.Cmd, mm.CmdAt = "start", time.Now().Unix()
+		moved++
+		log.Printf("INFO: [egress] machine=%s 端口 %d → %d（迁入本账号段 %s）",
+			mm.ID, old, ports.TunnelPort, egressPortSegText(owner))
+	}
+	return moved
 }
 
 // ---------------------------------------------------------------------------
@@ -470,10 +537,24 @@ func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
 	host := strings.TrimSpace(r.URL.Query().Get("hostname"))
 	m := a.machinesLoad()
 	mm, created := a.machineEnsure(m, id, host, owner)
-	if created {
+	// 老机器端口可能不在本账号段内（v0.31.24 全局分配 → v0.31.25 分段），迁回来。
+	moved := a.egressMigratePortsToSeg(m, owner)
+	if created || moved > 0 {
 		_ = a.machinesSave(m)
+	}
+	if created {
 		log.Printf("INFO: [egress] 新 agent 已登记 machine=%s owner=%d host=%q tunnel_port=%d",
 			mm.ID, owner, mm.Hostname, mm.Ports.TunnelPort)
+	}
+	if mm.Ports.TunnelPort <= 0 {
+		// 段满：明确告诉 agent 与用户，而不是给一个 0 端口让它去建隧道。
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": fmt.Sprintf("本账号的隧道端口已用完（%s，最多 %d 台机器）"+
+				"——请先停用不再使用的机器，或联系管理员扩容",
+				egressPortSegText(owner), egressUserPortSpan),
+			"retryable": false,
+		})
+		return
 	}
 	cmd := egressAgentCmd{Action: "none", ProxyPort: mm.Ports.ProxyPort, TunnelPort: mm.Ports.TunnelPort}
 	if mm.Cmd != "" {
@@ -497,6 +578,7 @@ func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
 	st.At = time.Now().Unix()
 	m := a.machinesLoad()
 	mm, _ := a.machineEnsure(m, r.URL.Query().Get("machine"), st.Hostname, owner)
+	_ = a.egressMigratePortsToSeg(m, owner)
 	mm.State, mm.StateAt = st, st.At
 	if strings.TrimSpace(st.Hostname) != "" {
 		mm.Hostname = strings.TrimSpace(st.Hostname)
@@ -630,6 +712,66 @@ func requestOrigin(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + host
+}
+
+// ---------------------------------------------------------------------------
+// 并发防护（v0.31.25）
+//
+// 「一键拉起」是一个**会被连点**的按钮，而它背后是几十上百个账号的写入。
+// 前端禁用按钮只能防住同一个页面，防不住多标签页 / 手抖双击 / 脚本重放，
+// 所以后端必须自己兜底。
+// ---------------------------------------------------------------------------
+var (
+	egressDedupMu sync.Mutex
+	// egressPullAtMap machineKey → 上次下发 start 的时刻。
+	egressPullAtMap = map[string]int64{}
+	// egressApplyAtMap machineKey → 开始应用的时刻（应用完成即清）。
+	egressApplyAtMap = map[string]int64{}
+)
+
+const (
+	// egressPullDedupSec 重复下发指令的去抖窗口。
+	//
+	// 为什么值得去抖：重复下发会**刷新指令的 At**，而 agent 用 At 判断"这条指令
+	// 我执行过没有" —— At 一变它就会 stopAll 再重建一次代理与隧道。
+	// 连点三下 = 隧道被拆建三次，表现是"点了反而更慢、还一闪一闪"。
+	egressPullDedupSec = 3
+	// egressApplyGuardSec 应用动作的忙碌判定窗口（超时自动放行，防残留）。
+	//
+	// 用时间戳而不是 bool：若某次应用因异常路径提前返回而没清标志，
+	// 一个 bool 会让这台机器**永久卡在"正在应用中"**，只能重启服务。
+	egressApplyGuardSec = 120
+)
+
+// egressPullDeduped 判断本次 start 下发是否在去抖窗口内（是则不该重复写指令）。
+func egressPullDeduped(key string) bool {
+	now := time.Now().Unix()
+	egressDedupMu.Lock()
+	defer egressDedupMu.Unlock()
+	if at, ok := egressPullAtMap[key]; ok && now-at < egressPullDedupSec {
+		return true
+	}
+	egressPullAtMap[key] = now
+	return false
+}
+
+// egressApplyBegin 尝试开始一次应用；返回的函数用于结束时释放。
+//
+// busy=true 表示同一台机器已有一次应用在进行（或刚开始不到 guard 窗口）。
+func egressApplyBegin(key string) (release func(), busy bool) {
+	now := time.Now().Unix()
+	egressDedupMu.Lock()
+	if at, ok := egressApplyAtMap[key]; ok && now-at < egressApplyGuardSec {
+		egressDedupMu.Unlock()
+		return func() {}, true
+	}
+	egressApplyAtMap[key] = now
+	egressDedupMu.Unlock()
+	return func() {
+		egressDedupMu.Lock()
+		delete(egressApplyAtMap, key)
+		egressDedupMu.Unlock()
+	}, false
 }
 
 // egressScope 谁在执行这次出口动作 —— 决定"能看见哪些机器 / 能碰哪些账号"。
@@ -1092,6 +1234,16 @@ func (a *app) handleEgressHomePull(w http.ResponseWriter, r *http.Request, scope
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "该机器尚未登记，或不属于你"})
 		return
 	}
+	// 去抖（v0.31.25）：连点不该让 agent 把隧道拆了又建。
+	key := egressMachineKey(scope.hostOwner(), mm.ID)
+	if egressPullDeduped(key) {
+		log.Printf("INFO: [egress] machine=%s 在去抖窗口内重复下发 start，已合并（不刷新指令）", mm.ID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issued": true, "action": "start", "machine": mm.ID, "deduped": true,
+			"view": a.buildEgressHomeView(r, scope),
+		})
+		return
+	}
 	mm.Cmd, mm.CmdAt = "start", time.Now().Unix()
 	if err := a.machinesSave(m); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -1143,6 +1295,21 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scop
 		})
 		return
 	}
+	// 单飞（v0.31.25）：应用会写几十个账号的出口，两个请求同时跑会互相覆盖结果，
+	// 而用户看到的只是"绑定 N 个"里的 N 跳来跳去。
+	//
+	// ⚠️ **放在隧道检查之前**：若是先判隧道，连点两次的第二下会得到
+	// "隧道尚未就绪" —— 那句话把人引去查网络，而真实原因是"上一次还在跑"。
+	// 报错要指向真正的原因，顺序就得让更本质的状态先说话。
+	applyKey := egressMachineKey(scope.hostOwner(), mm.ID)
+	release, busy := egressApplyBegin(applyKey)
+	if busy {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "该机器的配置正在应用中，请稍候几秒再试", "busy": true,
+		})
+		return
+	}
+	defer release()
 	if !egressTunnelReachable(mm.Ports.TunnelPort) {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error": fmt.Sprintf("隧道尚未就绪（云端连不上本机代理端口 %d），请先完成「一键拉起」", mm.Ports.TunnelPort),

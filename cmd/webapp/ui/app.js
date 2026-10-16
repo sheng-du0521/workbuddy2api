@@ -2843,8 +2843,41 @@ async function pluginRun(p, card, panel) {
 //   ① 本机跑起 agent（一次，之后常驻）→ ② 点「一键拉起」→ ③ 就绪后自动应用配置
 const EGRESS_POLL_MS = 2000;   // 轮询状态间隔
 const EGRESS_WAIT_MAX_MS = 90000; // 一键拉起后的最长等待
+// EGRESS_INSTALL_WAIT_MS 下载安装包后等 agent 上线的最长时间（v0.31.25）。
+// 5 分钟：够"下载 → 双击 → 装完 → 起进程"，又不至于让页面一直挂着。
+const EGRESS_INSTALL_WAIT_MS = 300000;
 let egressTimer = null;
 let egressSince = 0;
+// egressWatchTimer 「等 agent 上线」的轮询（与 egressTimer 分开：那个是"等拉起完成"）。
+let egressWatchTimer = null;
+let egressWatchSince = 0;
+
+// egressErrHint 把失败原因翻译成"下一步该干什么"（v0.31.25）。
+//
+// 为什么值得单做一个映射：出口链路的失败几乎都不是用户能直接看懂的
+// （`remote port forwarding failed` / `publickey` / HTTP 409 业务错）。
+// 只把原文抛给用户，他唯一能做的就是来问；而这几条恰好都有明确的下一步。
+// **原文一律保留**（拼接而不是替换）—— 映射错了也有据可查。
+function egressErrHint(msg) {
+  const m = String(msg || '');
+  if (!m) return '';
+  if (/invalid agent token|令牌/.test(m)) return '令牌无效或已作废：请在本页重新下载安装包（会重新签发）';
+  if (/端口已用完|隧道端口已用完/.test(m)) return '本账号的机器数已达上限（10 台）：先停用不再使用的机器';
+  if (/隧道尚未就绪|连不上本机代理端口/.test(m)) return 'agent 还没连上云端：请确认那台电脑上的窗口最后显示 Done / READY';
+  if (/找不到代理程序/.test(m)) return '缺少 wbproxy.exe：请重新下载安装包（两个文件都要）';
+  if (/Permission denied|publickey|密钥/.test(m)) return '密钥被服务器拒绝：请重新下载安装包（会重新签发一把）';
+  if (/remote port forwarding failed/.test(m)) return '隧道端口被占用：等几秒重试；仍失败请换一台机器或联系管理员';
+  if (/正在应用中|busy/.test(m)) return '上一次应用还在进行：等几秒再点';
+  if (/尚未登记|不属于你/.test(m)) return '这台机器已不在列表中：请刷新页面重新选择';
+  if (/下载失败|download failed/.test(m)) return '下载失败：检查目标电脑的网络能否访问服务地址';
+  return '';
+}
+
+// egressMsg 组合"原文 + 下一步"（原文在前，便于报障时直接复制）。
+function egressMsg(msg) {
+  const h = egressErrHint(msg);
+  return h ? (msg + '\n→ ' + h) : msg;
+}
 // egressSelMachine 当前选中的**目标机器**（v0.31.18 多机）。
 // 指令按机器定向下发；这个变量就是“发给哪一台”的答案。
 let egressSelMachine = '';
@@ -3003,49 +3036,92 @@ function renderEgressHome(box, v) {
   const row = el('div', 'row');
   row.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;';
 
-  const pulling = !!egressTimer;
+  const pulling = !!egressTimer;      // 等"拉起完成"
+  const watching = !!egressWatchTimer; // 等"agent 上线"（安装后）
+  const busy = pulling || watching;
   const hasMachine = !!egressSelMachine;
-  const pull = el('button', null, pulling ? '等待中…' : (ready ? '重新拉起并应用' : '一键拉起'));
-  pull.disabled = pulling || !hasMachine;
-  if (!hasMachine) pull.title = '还没有任何 agent 连上来 —— 请先在目标电脑上运行下面那行命令';
-  pull.addEventListener('click', () => egressPull(v));
-  row.appendChild(pull);
 
-  const applyBtn = el('button', 'ghost', '仅重新应用配置');
-  applyBtn.disabled = pulling || !tunnel || !hasMachine;
-  applyBtn.addEventListener('click', async () => {
-    applyBtn.disabled = true;
-    try {
-      const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
-      // 结果文案按视角分开：用户视角没有"默认出口"这一步，说它等于报告一个
-      // 他无法理解的"未设置"。改成只报"我的号绑了几个"。
-      if (isPlatform) {
-        toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
-              '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
-      } else {
-        toast('已应用：你的代挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+  // ⚠️ 三态按钮的语义（v0.31.25）：**没有机器时主按钮是"下载安装包"**。
+  // 之前这里只给一句"请先在目标电脑上运行下面那行命令"—— 用户要自己复制命令、
+  // 自己开终端、自己核对参数。现在整条链路是：点下载 → 双击 .bat → 页面自己
+  // 检测到机器并自动拉起。用户只在两个地方动手：点一下、双击一下。
+  if (!hasMachine) {
+    const dl = el('button', null, '① 下载本机代理安装包');
+    dl.title = '下载一个 setup 文件：在目标电脑上双击运行即可（无需复制任何参数或密钥）';
+    dl.disabled = busy;
+    dl.addEventListener('click', () => {
+      // 必须用浏览器直接下载（fetch 拿不到附件流，且要触发"另存为"）。
+      window.location.href = '/api/egress/home/install';
+      egressWatchInstall();
+    });
+    row.appendChild(dl);
+
+    const refresh = el('button', 'ghost', '② 装好后点这里刷新');
+    refresh.disabled = busy;
+    refresh.addEventListener('click', () => loadEgressHome());
+    row.appendChild(refresh);
+
+    if (watching) {
+      const w = el('span', 'sub', '正在等待你的电脑接入…（装好后这里会自动继续）');
+      row.appendChild(w);
+    }
+  } else {
+    const pull = el('button', null,
+      pulling ? '正在拉起…' : (ready ? '重新拉起并应用' : '一键拉起'));
+    pull.disabled = busy;
+    pull.title = pulling
+      ? '已下发指令，正在等待 agent 完成（最长 90 秒）'
+      : '自动完成：下发指令 → 等 agent 起代理与隧道 → 就绪后自动应用配置';
+    pull.addEventListener('click', () => egressPull(v));
+    row.appendChild(pull);
+
+    const applyBtn = el('button', 'ghost', '仅重新应用配置');
+    applyBtn.disabled = busy || !tunnel || !hasMachine;
+    applyBtn.addEventListener('click', async () => {
+      applyBtn.disabled = true;
+      try {
+        const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
+        if (isPlatform) {
+          toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
+                '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+        } else {
+          toast('已应用：你的代挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+        }
+        loadEgressHome();
+      } catch (e) {
+        toast(egressMsg('应用失败：' + (e && e.message ? e.message : e)), 'bad');
+        applyBtn.disabled = false;
       }
-      loadEgressHome();
-    } catch (e) {
-      toast('应用失败：' + (e && e.message ? e.message : e), 'bad');
-      applyBtn.disabled = false;
-    }
-  });
-  row.appendChild(applyBtn);
+    });
+    row.appendChild(applyBtn);
 
-  const rel = el('button', 'ghost', '停止该机器代理');
-  rel.disabled = pulling || !hasMachine;
-  rel.addEventListener('click', async () => {
-    try {
-      await post('/api/egress/home/release', { machine: egressSelMachine });
-      toast('已向该机器下发停止指令（不会自动改动账号的出口配置）', 'ok');
-      loadEgressHome();
-    } catch (e) {
-      toast('停止失败：' + (e && e.message ? e.message : e), 'bad');
-    }
-  });
-  row.appendChild(rel);
+    const rel = el('button', 'ghost', '停止该机器代理');
+    rel.disabled = busy || !hasMachine;
+    rel.addEventListener('click', async () => {
+      try {
+        await post('/api/egress/home/release', { machine: egressSelMachine });
+        toast('已向该机器下发停止指令（不会自动改动账号的出口配置）', 'ok');
+        loadEgressHome();
+      } catch (e) {
+        toast(egressMsg('停止失败：' + (e && e.message ? e.message : e)), 'bad');
+      }
+    });
+    row.appendChild(rel);
+  }
   card.appendChild(row);
+
+  // 进行中的显式状态（用户要能一眼看出"在跑"而不是"没反应"）。
+  if (watching) {
+    const w = el('div', 'sub', '安装包已开始下载。在目标电脑上双击运行它 —— ' +
+      '装好后本页会自动检测到那台电脑并接着拉起代理，不需要你再操作。');
+    w.style.marginTop = '10px';
+    card.appendChild(w);
+  }
+  if (pulling) {
+    const w = el('div', 'sub', '已向目标机器下发拉起指令，正在等待它的 agent 响应…（最长 90 秒）');
+    w.style.marginTop = '10px';
+    card.appendChild(w);
+  }
 
   // ---- 首次使用：在目标电脑上跑一次 agent ----
   // 注意：**新机器是靠 agent 先 poll 才登记出来的** ——
@@ -3079,11 +3155,6 @@ function renderEgressHome(box, v) {
     card.appendChild(copy);
   }
 
-  if (egressTimer) {
-    const w = el('div', 'sub', '已向目标机器下发拉起指令，正在等待它的 agent 响应…（最长 90 秒）');
-    w.style.marginTop = '10px';
-    card.appendChild(w);
-  }
   box.appendChild(card);
 
   // ---- 链路说明（一次讲清，避免用户去猜）----
@@ -3124,6 +3195,45 @@ function renderEgressHome(box, v) {
   box.appendChild(help);
 }
 
+// egressWatchInstall 等"agent 上线"（v0.31.25）—— 一键安装的后半程。
+//
+// 下载安装包只是"把程序送到用户机器上"，真正的接入发生在用户双击之后。
+// 这一步**必须由页面自己接着走**：否则用户双击完回到页面看到的还是"没有机器"，
+// 于是他会以为失败、再点一次下载 —— 而我们想要的体验是"点一下，剩下它自己完成"。
+function egressWatchInstall() {
+  if (egressWatchTimer) return;
+  egressWatchSince = Date.now();
+  const box = document.getElementById('egressHomeBox');
+  toast('安装包已开始下载：在目标电脑上双击运行它，装好后本页会自动继续', 'ok');
+  if (box) loadEgressHome(); // 立刻把"等待中"渲染出来
+  const step = async () => {
+    let cur = null;
+    try {
+      cur = await api('/api/egress/home');
+    } catch (e) { /* 轮询失败不终止 */ }
+    const b = document.getElementById('egressHomeBox');
+    if (cur && b) renderEgressHome(b, cur);
+    const ms = (cur && cur.machines) || [];
+    if (ms.length) {
+      egressWatchTimer = null;
+      const label = egressMachineLabel(ms[0]);
+      toast('已检测到你的电脑（' + label + '），正在自动拉起出口代理…', 'ok');
+      // 交给 egressPull 完成剩下的（下发 → 就绪 → 自动应用）。
+      setTimeout(() => egressPull(cur), 300);
+      return;
+    }
+    if (Date.now() - egressWatchSince > EGRESS_INSTALL_WAIT_MS) {
+      egressWatchTimer = null;
+      toast('还没有等到 agent 上线。请确认安装包已在目标电脑上运行完成' +
+            '（窗口最后显示 Done），且那台电脑能访问服务地址', 'bad');
+      loadEgressHome();
+      return;
+    }
+    egressWatchTimer = setTimeout(step, 3000);
+  };
+  egressWatchTimer = setTimeout(step, 3000);
+}
+
 // egressPull 一键拉起：向**选中的那台机器**下发指令 → 轮询状态 → 就绪后自动应用配置。
 async function egressPull(v) {
   if (egressTimer) return;
@@ -3138,7 +3248,7 @@ async function egressPull(v) {
   try {
     await post('/api/egress/home/pull', { machine });
   } catch (e) {
-    toast('下发指令失败：' + (e && e.message ? e.message : e), 'bad');
+    toast(egressMsg('下发指令失败：' + (e && e.message ? e.message : e)), 'bad');
     return;
   }
   egressSince = Date.now();
@@ -3159,14 +3269,15 @@ async function egressPull(v) {
         const d = await post('/api/egress/home/apply', { machine });
         toast('已就绪并自动应用：自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
       } catch (e) {
-        toast('已就绪，但自动应用失败：' + (e && e.message ? e.message : e), 'bad');
+        toast(egressMsg('已就绪，但自动应用失败：' + (e && e.message ? e.message : e)), 'bad');
       }
       loadEgressHome();
       return;
     }
     if (Date.now() - egressSince > EGRESS_WAIT_MAX_MS) {
       egressTimer = null;
-      toast('等待超时：该机器的 agent 未响应。请确认它已启动，并检查 agent 窗口里的输出。', 'bad');
+      toast(egressMsg('等待超时：该机器的 agent 未响应。请确认安装包已在那台电脑上运行完成'
+        + '（窗口最后显示 Done），并检查 agent 窗口里的输出。'), 'bad');
       loadEgressHome();
       return;
     }

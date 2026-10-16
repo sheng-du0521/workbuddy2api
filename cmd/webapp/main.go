@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.24"
+const version = "0.31.25"
 
 type app struct {
 	store  *Store
@@ -98,6 +98,12 @@ type app struct {
 	// dataDir 数据目录（webapp.db / secret.key / admin.key 所在）。
 	// 导入白名单**永远**不允许覆盖到这里（v0.24.2，P3-8，见 resolveImportPath）。
 	dataDir string
+	// authKeysPath 覆盖 authorized_keys 的写入位置（v0.31.25，仅测试与特殊部署用）。
+	//
+	// 空 = 走 egressAuthorizedKeysPath() 的常规推导（/root/.ssh/authorized_keys）。
+	// 之所以做成可注入：写入 authorized_keys 是**高危操作**，而测试绝不能碰
+	// 开发者本机真实的 ~/.ssh/authorized_keys —— 那是在别人机器上留下后门。
+	authKeysPath string
 	// importRoots 「服务端路径导入」允许读取的目录白名单（-import-roots 追加，
 	// 默认含账号文件的规范目录 %USERPROFILE%\.wb-switch）。见 resolveImportPath。
 	importRoots []string
@@ -1368,6 +1374,9 @@ func (a *app) routes() *http.ServeMux {
 	// 钥匙，比把管理密钥抄到本机安全得多（它能做的只有"拉代理"，读不到任何号）。
 	mux.HandleFunc("GET /api/agent/poll", a.handleEgressAgentPoll)
 	mux.HandleFunc("POST /api/agent/report", a.handleEgressAgentReport)
+	// agent 自举（v0.31.25）：首次启动时凭令牌取回服务地址与自己的受限私钥，
+	// 于是"一键安装"的脚本里**不需要包含任何密钥材料**。
+	mux.HandleFunc("GET /api/agent/config", a.handleEgressAgentConfig)
 	// 控制台「代理」页：状态对登录用户开放（**只列他自己的机器**）。
 	mux.HandleFunc("GET /api/egress/home", a.userGuard(a.handleEgressHome))
 	// 三个**执行**端点挂 egressActorGuard（v0.31.24 取代 adminGuard）：
@@ -1381,6 +1390,12 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/egress/home/pull", a.egressActorGuard(a.handleEgressHomePull))
 	mux.HandleFunc("POST /api/egress/home/release", a.egressActorGuard(a.handleEgressHomeRelease))
 	mux.HandleFunc("POST /api/egress/home/apply", a.egressActorGuard(a.handleEgressHomeApply))
+	// 一键安装（v0.31.25）：下载一个可双击运行的 .bat —— 里面只有服务地址与
+	// **当前登录用户自己的**令牌。挂 userGuard（只认会话）：安装包是按"人"发的，
+	// 不该出现在共享的运维密钥通道里。
+	mux.HandleFunc("GET /api/egress/home/install", a.userGuard(a.handleEgressInstall))
+	// agent / wbproxy 可执行文件（令牌鉴权，避免变成公开的 15MB 下载位）。
+	mux.HandleFunc("GET /api/egress/agent/bundle", a.handleEgressAgentBundle)
 
 	// 插件中心（v0.31.16，用户侧）：只下发 audience 含 user 的插件。
 	// 执行接口内部按 owner_user_id 收窄 —— 用户只能领**自己的**代挂账号。
