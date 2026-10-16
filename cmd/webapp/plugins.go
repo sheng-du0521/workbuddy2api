@@ -74,6 +74,45 @@ func (a *app) pluginEnabled(id string) bool {
 	return strings.TrimSpace(v) != "0"
 }
 
+// pluginUserOffKV 用户级「我不启用这个插件」的存储前缀（v0.31.22）。
+//
+// 为什么必须与全局开关分开（`plugin_enabled_<id>`）：
+//
+//	· 全局那位是**平台级决定** —— 这个能力该不该提供给用户，只有管理员能动；
+//	· 「我自己的号要不要用这个插件」是**用户自己的事**。
+//
+// 合成一个键意味着任何一个用户点一下停用，全平台都跟着停 —— 权限与语义都不对。
+//
+// 键形如 `plugin_user_off_<userID>_<pluginID>`，值 "1" = 该用户停用。
+// **缺省启用**，与全局开关同一口径（新增插件不需要迁移，也不会因为忘了写 kv
+// 而"装上了却不生效"）。
+const pluginUserOffKV = "plugin_user_off_"
+
+func pluginUserOffKey(userID int64, id string) string {
+	return pluginUserOffKV + strconv.FormatInt(userID, 10) + "_" + id
+}
+
+// pluginUserEnabled 该用户是否启用此插件（无记录 = 启用）。
+func (a *app) pluginUserEnabled(userID int64, id string) bool {
+	if userID <= 0 {
+		return true
+	}
+	v, err := a.store.GetKV(pluginUserOffKey(userID, id))
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(v) != "1"
+}
+
+// setPluginUserEnabled 写该用户的插件偏好。**只写 kv**，与平台级开关同纪律。
+func (a *app) setPluginUserEnabled(userID int64, id string, on bool) error {
+	v := "0"
+	if !on {
+		v = "1"
+	}
+	return a.store.SetKV(pluginUserOffKey(userID, id), v)
+}
+
 // pluginByID 按 ID 取注册项。
 func pluginByID(id string) (pluginDef, bool) {
 	for _, p := range pluginRegistry {
@@ -91,7 +130,17 @@ type pluginView struct {
 	Desc     string `json:"desc"`
 	Audience string `json:"audience"`
 	Builtin  bool   `json:"builtin"`
-	Enabled  bool   `json:"enabled"`
+	// Enabled **平台级**开关：该插件是否由管理员提供给本端使用。
+	Enabled bool `json:"enabled"`
+	// UserEnabled **当前用户**是否启用（v0.31.22）。管理端看的是平台级，
+	// 故恒为 true（管理端没有"某个用户"这个上下文）。
+	UserEnabled bool `json:"user_enabled"`
+	// Active 实际生效 = 平台启用 && 用户启用。
+	//
+	// 为什么由服务端算好而不是让前端 `a && b`：这是**唯一**决定"能不能用"的口径，
+	// 散在两个前端文件里各拼一遍，迟早有一边忘了 && 另一边。服务端算一次，
+	// 前端只渲染。
+	Active bool `json:"active"`
 }
 
 // audienceVisible 该插件对某个端是否可见。
@@ -104,7 +153,7 @@ func audienceVisible(def pluginDef, want string) bool {
 // 管理端（wantAdmin=true）拿到 admin/both 的插件与**启停**信息；
 // 用户端只拿到 user/both 的插件，且**不下发 audience/builtin/enabled 以外的
 // 平台运维信息**（用户不需要知道平台还有哪些插件）。
-func (a *app) pluginListView(wantAdmin bool) []pluginView {
+func (a *app) pluginListView(wantAdmin bool, userID int64) []pluginView {
 	out := make([]pluginView, 0, len(pluginRegistry))
 	for _, def := range pluginRegistry {
 		if wantAdmin {
@@ -114,10 +163,16 @@ func (a *app) pluginListView(wantAdmin bool) []pluginView {
 		} else if !audienceVisible(def, "user") {
 			continue
 		}
+		globalOn := a.pluginEnabled(def.ID)
+		// 管理端没有"某个用户"这个上下文 → user_enabled 恒 true（见 pluginView 注释）。
+		userOn := true
+		if !wantAdmin {
+			userOn = a.pluginUserEnabled(userID, def.ID)
+		}
 		out = append(out, pluginView{
 			ID: def.ID, Name: def.Name, Desc: def.Desc,
 			Audience: def.Audience, Builtin: def.Builtin,
-			Enabled: a.pluginEnabled(def.ID),
+			Enabled: globalOn, UserEnabled: userOn, Active: globalOn && userOn,
 		})
 	}
 	return out
@@ -125,12 +180,16 @@ func (a *app) pluginListView(wantAdmin bool) []pluginView {
 
 // handleAdminPluginList GET /api/admin/plugins
 func (a *app) handleAdminPluginList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView(true)})
+	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView(true, 0)})
 }
 
 // handleUserPluginList GET /api/plugins （控制台）
 func (a *app) handleUserPluginList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView(false)})
+	var uid int64
+	if u := userFrom(r); u != nil {
+		uid = u.ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView(false, uid)})
 }
 
 // handlePluginToggle POST /api/admin/plugins/{id}/enabled  body {"enabled":bool}
@@ -161,6 +220,59 @@ func (a *app) handlePluginToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("INFO: [plugins] %s 已%s（管理端）", id, map[bool]string{true: "启用", false: "停用"}[*req.Enabled])
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": *req.Enabled})
+}
+
+// handlePluginUserToggle POST /api/plugins/{id}/enabled  body {"enabled":bool}
+//
+// 用户级「我这边启用 / 停用这个插件」（v0.31.22）。
+//
+// 为什么要有它：插件中心给两端各一个入口，但此前**只有管理端有开关** ——
+// 用户端卡片只能看不能动，"可安装 / 可不安装"这件事在用户侧根本不存在。
+// 而平台级开关不能让用户动（一个用户点一下会把所有人的功能关掉），
+// 所以这里落的是**按用户隔离**的偏好，与平台开关互不影响：
+//
+//	平台关 + 用户开 → 不可用（以平台为准）
+//	平台关 + 用户关 → 不可用
+//	平台开 + 用户关 → **仅该用户**不可用
+//	平台开 + 用户开 → 可用
+func (a *app) handlePluginUserToggle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	def, ok := pluginByID(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "插件不存在"})
+		return
+	}
+	if !audienceVisible(def, "user") {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "该插件对本端不可用"})
+		return
+	}
+	u := userFrom(r)
+	if u == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误（需要 enabled 布尔）"})
+		return
+	}
+	// 平台已停用时，用户点"启用"没有意义 —— 明确拒绝，而不是静默写一条永远不生效的
+	// 偏好（那会让用户以为"我点了启用"，下次仍然用不了，且没有任何提示）。
+	if *req.Enabled && !a.pluginEnabled(def.ID) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "该插件已被管理员停用，请先联系管理员"})
+		return
+	}
+	if err := a.setPluginUserEnabled(u.ID, def.ID, *req.Enabled); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	log.Printf("INFO: [plugins] 用户 %s 已%s插件 %s", u.Username,
+		map[bool]string{true: "启用", false: "停用"}[*req.Enabled], def.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": id, "enabled": *req.Enabled, "user_enabled": *req.Enabled,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +542,15 @@ func (a *app) handlePluginClaim(w http.ResponseWriter, r *http.Request, wantAdmi
 	if !a.pluginEnabled(def.ID) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "插件已停用，请先在「插件」页启用"})
 		return
+	}
+	// 用户级停用同样要拒绝执行（v0.31.22）—— 停用不是纯前端效果：
+	// 前端只是"不渲染入口"，真正的门槛必须在这里，否则一个直接调接口的客户端
+	// 就能绕过用户的停用意愿。
+	if !wantAdmin {
+		if u := userFrom(r); u != nil && !a.pluginUserEnabled(u.ID, def.ID) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "你已停用该插件，请先在「插件」页启用"})
+			return
+		}
 	}
 	var req claimRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

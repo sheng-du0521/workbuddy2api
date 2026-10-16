@@ -406,7 +406,10 @@ func (t *taskRunner) RunNow(kind string) (map[string]any, error) {
 // 因此这里立刻返回「已开始」，结果去执行台账看。
 func (t *taskRunner) RunGrowth(uids []string) (map[string]any, error) {
 	if !t.growthOK {
-		return nil, fmt.Errorf("成长任务脚本链路不可用（缺少 python 或 scripts/growth_run.py）")
+		// 透出**逐项诊断**而不是一句"缺 python 或脚本"（v0.31.22，真机教训）：
+		// 那种说法缺了"缺哪一项""去哪里找"，运维只能猜 —— 而真实原因往往是
+		// 部署时漏拷 scripts/（python 其实是好的）。
+		return nil, fmt.Errorf("成长任务脚本链路不可用：%s。修法：把 scripts/ 目录放到 webapp 同级（或用 WB2A_PYTHON 指定可用的 python）", scheduler.GrowthDiagnosis())
 	}
 	if len(uids) == 0 {
 		return nil, fmt.Errorf("请先选择要执行成长任务的账号")

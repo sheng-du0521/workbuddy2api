@@ -2472,6 +2472,33 @@ function mountUiShell() {
   mountNavFilter();
 }
 
+// ------------------------------------------------------- 开关兜底（v0.31.22）
+//
+// 本项目的 `.switch` 把真实 input 做成 0×0 透明（见 style.css 的
+// `.switch input { position:absolute; opacity:0; width:0; height:0 }`），
+// 于是**只有被 `<label>` 包裹时**点击才会落到 input 上。
+//
+// admin.html 里有三处是裸写的 ——「启用定时任务」「开放注册」「调试对话-流式」：
+// 它们**看起来是开关，实际点不动**（jsdom 实证：点 <i> 前后 checked 不变）。
+// 用户不会报"这个开关坏了"，只会觉得"设了没用"。
+//
+// 这里做一次事件委托，让"裸开关"与"label 包裹的开关"行为一致。
+//
+// ⚠️ 已被 label 包裹的直接 return：那种情况浏览器（label 激活行为）会处理，
+// 我们再翻一次等于**抵消**（翻两下回到原状）。
+document.addEventListener('click', (ev) => {
+  const t = ev.target;
+  if (!t || !t.closest) return;
+  const sw = t.closest('.switch');
+  if (!sw) return;
+  if (sw.closest('label')) return; // label 会自己激活，别抢
+  const cb = sw.querySelector('input[type="checkbox"]');
+  if (!cb || cb.disabled) return;
+  if (t === cb) return; // 直接点到 input：浏览器已处理
+  cb.checked = !cb.checked;
+  cb.dispatchEvent(new Event('change', { bubbles: true }));
+});
+
 // ---------------------------------------------------------------- ⑨ 插件中心（v0.31.16）
 //
 // 两端共用（admin / dashboard）：页面只提供
@@ -2524,7 +2551,38 @@ async function loadPlugins() {
   for (const p of list) box.appendChild(pluginCard(p));
 }
 
-// pluginCard 一张插件卡：标题 + 状态 + 启用开关（仅管理端）+ 展开的执行面板。
+// pluginToggleSwitch 一张卡上的启停开关（v0.31.22）。
+//
+// 复用共享的 `switchEl`，不自己拼 checkbox：
+//   · `switchEl` 是 **label 包裹**的 —— 本项目的 `.switch` 把 input 做成 0×0 透明，
+//     只有 label 能给它点击目标（裸写出来的开关点不动，见文件上方「开关兜底」）；
+//   · 它自带"异步期间禁用 + 失败回滚 + 报错 toast"，与全站其它开关行为一致。
+//
+// 路径由 `pluginBase()` 决定（管理端 /api/admin/plugins、用户端 /api/plugins），
+// 所以同一份渲染代码在两端各自打自己的接口 —— 这也是两端开关能共用一套 UI 的前提。
+function pluginToggleSwitch(p, on, disabled, text, title) {
+  const lab = switchEl(on, async (checked) => {
+    try {
+      await api(pluginBase() + '/' + encodeURIComponent(p.id) + '/enabled', {
+        method: 'POST', body: JSON.stringify({ enabled: checked }),
+      });
+    } catch (e) {
+      // 交回 switchEl 统一处理（回滚 + toast）：这里只负责把话说清。
+      throw new Error('切换失败：' + (e && e.message ? e.message : e));
+    }
+    toast(checked ? '已启用' : '已停用', 'ok');
+    loadPlugins();
+  });
+  lab.title = title || '';
+  if (disabled) {
+    const inp = lab.querySelector('input');
+    if (inp) inp.disabled = true;
+  }
+  lab.appendChild(el('span', 'muted', text));
+  return lab;
+}
+
+// pluginCard 一张插件卡：标题 + 状态 + 启用开关 + 展开的执行面板。
 function pluginCard(p) {
   const st = (pluginState[p.id] = pluginState[p.id] || {
     open: false, targets: null, picked: null, running: false, rows: {},
@@ -2532,45 +2590,40 @@ function pluginCard(p) {
   const card = el('div', 'card');
   card.style.marginBottom = '14px';
 
+  const isAdminScope = pluginScope() === 'admin';
+  // 生效口径由服务端算好（`active = 平台启用 && 用户启用`），前端只渲染 ——
+  // 两边各拼一遍 `a && b` 迟早有一边漏。
+  const active = isAdminScope ? !!p.enabled : !!p.active;
+
   const head = el('div', 'section-head');
   head.appendChild(el('h2', null, p.name));
-  const badge = el('span', p.enabled ? 'muted' : 'muted', p.enabled ? '已启用' : '已停用');
+  const badge = el('span', 'tag' + (active ? ' ok' : ''), active ? '已启用' : '已停用');
   badge.style.fontSize = '12px';
   badge.style.marginLeft = '8px';
   head.appendChild(badge);
   card.appendChild(head);
 
   card.appendChild(el('div', 'sub', p.desc || ''));
+  // 停用时把卡片压暗：一眼能看出"这条现在不生效"，不必去读徽标。
+  if (!active) card.style.opacity = '0.72';
 
   const row = el('div', 'row');
   row.style.flexWrap = 'wrap';
   row.style.alignItems = 'center';
   row.style.gap = '8px';
 
-  // 启用开关只在管理端出现：普通用户不该有权启停平台功能。
-  if (pluginScope() === 'admin') {
-    const lab = el('label', 'pick-all');
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = !!p.enabled;
-    cb.addEventListener('change', async () => {
-      cb.disabled = true;
-      try {
-        await api(pluginBase() + '/' + encodeURIComponent(p.id) + '/enabled', {
-          method: 'POST', body: JSON.stringify({ enabled: cb.checked }),
-        });
-        toast(cb.checked ? '已启用' : '已停用', 'ok');
-        loadPlugins();
-      } catch (e) {
-        cb.checked = !cb.checked;
-        toast('切换失败：' + (e && e.message ? e.message : e), 'bad');
-      } finally {
-        cb.disabled = false;
-      }
-    });
-    lab.appendChild(cb);
-    lab.appendChild(document.createTextNode(' 启用'));
-    row.appendChild(lab);
+  if (isAdminScope) {
+    // 平台级开关：动的是"要不要把这项能力提供给用户"，影响所有人。
+    row.appendChild(pluginToggleSwitch(p, !!p.enabled, false, '全局启用',
+      '平台级开关：影响所有用户。用户各自的启用偏好不受它影响（但平台停用时一律不可用）'));
+  } else {
+    // 用户级开关（v0.31.22）：只影响"我自己"，动不了平台开关。
+    const globallyOff = p.enabled === false;
+    row.appendChild(pluginToggleSwitch(p, active, globallyOff,
+      globallyOff ? '平台已停用' : '启用',
+      globallyOff
+        ? '该插件已被管理员停用，无法在此启用'
+        : '只影响你自己的入口与执行，不影响平台其他用户'));
   }
 
   const btnToggle = el('button', 'ghost', st.open ? '收起' : '打开');

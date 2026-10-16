@@ -2042,10 +2042,125 @@ function run(pageFile, meOverride, plan) {
   delBad.forEach((m) => console.log('  [FAIL] bulk-delete: ' + m));
   if (!delBad.length) console.log('  [ok] bulk-delete: 删除只作用于勾选项，失败号须同时证明"测过且失败"');
 
+  // v0.31.22：**开关必须真的能点**（行为级验证，不按源码文本验）。
+  //
+  // 本项目的 `.switch` 把真实 input 做成 0×0 透明（style.css：
+  // `.switch input { position:absolute; opacity:0; width:0; height:0 }`），
+  // 因此**只有被 `<label>` 包裹时**点击才会落到 input 上。admin/dashboard 里有
+  // 四处是裸写的 ——「启用定时任务」「开放注册」「调试对话-流式」×2：它们看起来
+  // 是开关、实际点不动；而用户不会报"开关坏了"，只会觉得"设了没用"。
+  //
+  // 这类问题**只有真的点一下**才看得见（源码里 `<span class="switch">` 完全正常），
+  // 所以这里按行为验。同一段顺带验插件卡上的开关能打到**本端**的接口
+  // （管理端 /api/admin/plugins、用户端 /api/plugins）—— 这是"用户也能自己
+  // 启用/停用插件"的最小闭环。
+  const switchBad = [];
+  {
+    const probe = async (pageFile, navs, sels, fx) => {
+      const html = fs.readFileSync(path.join(UI, pageFile), 'utf8')
+        .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+      const vc = new VirtualConsole();
+      vc.on('jsdomError', () => {}); // 这里只看下面的断言，运行噪音忽略
+      vc.on('error', () => {});
+      const dom = new JSDOM(html, {
+        runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+        url: 'http://127.0.0.1:8780/' + pageFile,
+        beforeParse(win) {
+          Object.assign(FX, fx || {});
+          win.__calls = [];
+          win.fetch = (url, opt) => {
+            win.__calls.push(String(url) + ' ' + String((opt && opt.method) || 'GET'));
+            return Promise.resolve({
+              ok: true, status: 200,
+              text: () => Promise.resolve(JSON.stringify(fixtureFor(url))),
+              json: () => Promise.resolve(fixtureFor(url)),
+            });
+          };
+          win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+          win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+          win.navigator.clipboard = { writeText: () => Promise.resolve() };
+          // ⚠️ 这两个必须与上面的 run() 保持一致：本项目的自定义弹窗
+          // （confirmAsk / promptDialog）会**等用户响应**，不预置就是永久等待 ——
+          // 表现是 init 永远走不完（`window.navGo` 一直不挂），而报错一片安静。
+          win.__autoConfirm = true;
+          win.__autoPrompt = null;
+          if (win.Element && !win.Element.prototype.scrollIntoView) {
+            win.Element.prototype.scrollIntoView = function () {};
+          }
+        },
+      });
+      const w = dom.window;
+      const doc = w.document;
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      // ⚠️ 必须先等页面把导航绑好：`setupNav` 是在 init（含若干 await）之后才跑的，
+      // 结束时才挂上 `window.navGo`。早于它的点击**静默无效**（`nav-item.onclick`
+      // 还是默认的 null），随后断言会报"找不到开关"—— 根因只是"点早了"。
+      for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+      for (const nav of (navs || [])) {
+        const it = Array.from(doc.querySelectorAll('.nav-item')).find((x) => x.dataset.nav === nav);
+        if (!it) { switchBad.push(`${pageFile} 没有导航 ${nav}`); continue; }
+        it.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        await wait(350);
+      }
+      for (const [sel, want] of sels) {
+        const cb = doc.querySelector(sel);
+        if (!cb) { switchBad.push(`${pageFile} 找不到开关 ${sel}`); continue; }
+        const sw = cb.closest('.switch');
+        if (!sw) { switchBad.push(`${pageFile} 的 ${sel} 不在 .switch 组件里`); continue; }
+        const before = cb.checked;
+        sw.querySelector('i').dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
+        if (cb.checked === before) {
+          switchBad.push(`${pageFile} 的开关 ${sel} 点不动（裸 .switch：没被 label 包裹，也没有兜底委托）`);
+          continue;
+        }
+        if (want) {
+          await wait(300);
+          if (!w.__calls.some((u) => u.indexOf(want) >= 0)) {
+            switchBad.push(`${pageFile} 的开关 ${sel} 切换后未请求 ${want}`);
+          }
+        }
+        cb.checked = before; // 复原，避免影响后续断言
+      }
+      try { w.close(); } catch (e) {}
+    };
+
+    const PLUGIN_ADMIN = { plugins: [{
+      id: 'claim-compensation', name: '多账号领取积分补偿', desc: '桩',
+      audience: 'both', builtin: true, enabled: true, user_enabled: true, active: true,
+    }] };
+    // 用户端刻意给「平台启用、但我停用」的组合：这条路径最容易写错
+    // （前端若只看 `enabled` 就会把开关画成"已启用"，与服务端口径不符）。
+    const PLUGIN_USER = { plugins: [{
+      id: 'claim-compensation', name: '多账号领取积分补偿', desc: '桩',
+      audience: 'both', builtin: true, enabled: true, user_enabled: false, active: false,
+    }] };
+    // ⚠️ 必须**显式**固定登录身份：上面的 run(pageFile, meOverride, ...) 会把
+    // FX['/api/auth/me'] 改成别的用户并留在那儿。管理员页的 init 第一句就是
+    // `if (!me) return;`（requireAdmin），身份不对 → init 直接早退、`window.navGo`
+    // 永不挂上，断言只会报一句"找不到开关"，看不出真实原因。
+    const fxOf = (k, v) => ({
+      '/api/auth/me': { user: { id: 1, username: 'admin', is_admin: true, status: 'active' } },
+      [k]: v,
+    });
+
+    await probe('admin.html', ['tasks', 'plugins'],
+      [['#tcEnabled', null], ['#setRegister', null], ['#stream', null],
+       ['#pluginCards .switch input', '/api/admin/plugins/claim-compensation/enabled POST']],
+      fxOf('/api/admin/plugins', PLUGIN_ADMIN));
+    await probe('dashboard.html', ['plugins'],
+      [['#testStream', null],
+       ['#pluginCards .switch input', '/api/plugins/claim-compensation/enabled POST']],
+      fxOf('/api/plugins', PLUGIN_USER));
+  }
+  switchBad.forEach((m) => console.log('  [FAIL] switch-clickable: ' + m));
+  if (!switchBad.length) {
+    console.log('  [ok] switch-clickable: 端上开关都能点（含裸 .switch），插件开关打到本端接口');
+  }
+
   const c = await run('admin-login.html', null, []);
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
-    && delBad.length === 0;
+    && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

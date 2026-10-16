@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.21"
+const version = "0.31.22"
 
 type app struct {
 	store  *Store
@@ -1382,6 +1382,8 @@ func (a *app) routes() *http.ServeMux {
 	// 插件中心（v0.31.16，用户侧）：只下发 audience 含 user 的插件。
 	// 执行接口内部按 owner_user_id 收窄 —— 用户只能领**自己的**代挂账号。
 	mux.HandleFunc("GET /api/plugins", a.userGuard(a.handleUserPluginList))
+	// 用户级启停（v0.31.22）：只写"我这个用户"的偏好，动不了平台开关。
+	mux.HandleFunc("POST /api/plugins/{id}/enabled", a.userGuard(a.handlePluginUserToggle))
 	mux.HandleFunc("POST /api/plugins/{id}/claim",
 		a.userGuard(func(w http.ResponseWriter, r *http.Request) { a.handlePluginClaim(w, r, false) }))
 	mux.HandleFunc("POST /api/keys/{id}/accounts", a.userGuard(a.handleSetKeyAccounts))

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"workbuddy2api/internal/egress"
+	"workbuddy2api/internal/scheduler"
 )
 
 // handleTaskConfig 读取/保存定时任务配置。保存后热重建调度器**即时生效**（无需重启）。
@@ -19,12 +20,19 @@ func (a *app) handleTaskConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet {
-		writeJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"config": a.tasks.Config(),
 			// 成长任务：只透出脚本可用性（是否能在前端给出「跑成长任务」入口）。
 			// 它不排程、无待跑队列，故没有「待跑数量」这类排程态信息。
 			"growth_available": a.tasks.growthOK,
-		})
+		}
+		// 不可用时**才**附逐项诊断（v0.31.22）：它要 spawn 一次 `python --version`
+		// 来判定解释器，可用时白跑一趟没意义；不可用时这串字恰恰是唯一能自助修的信息
+		// （真机教训：VPS 漏拷 scripts/ 时，页面只说"脚本链路不可用"，看不出缺哪一项）。
+		if !a.tasks.growthOK {
+			resp["growth_diag"] = scheduler.GrowthDiagnosis()
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	var tc TaskConfig

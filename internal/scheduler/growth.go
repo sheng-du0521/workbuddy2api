@@ -114,6 +114,37 @@ var growthScriptAvailableHook = func() bool {
 // 常有 Microsoft Store 的 python3.exe 存根，LookPath 找得到却跑不了）。
 func GrowthScriptAvailable() bool { return growthScriptAvailableHook() }
 
+// GrowthDiagnosis 逐项诊断成长任务脚本链路（脚本根 / 脚本存在性 / 解释器）。
+//
+// 为什么需要它（v0.31.22，真机踩过）：原错误只说「缺少 python 或 scripts/growth_run.py」，
+// 既不说**缺哪一项**，也不说它**去哪里找的** —— 运维只能猜。实际情形是 VPS 部署时
+// 漏拷了 `scripts/` 目录，而 python3 明明是好的；那句含糊的文案把排查方向引向了
+// 「装 python」，白走一圈。
+//
+// 判据与 growthScriptAvailableHook 完全一致（同一处 root、同一处脚本路径、
+// 同一个 pythonCmd），只是把每一项的中间结论说出来。
+func GrowthDiagnosis() string {
+	root := repoRoot()
+	script := filepath.Join(root, "scripts", "growth_run.py")
+	scriptTxt := "存在"
+	if _, err := os.Stat(script); err != nil {
+		scriptTxt = "缺失"
+	}
+	py := pythonCmd()
+	c := newScriptCmd(py, "--version")
+	c.SetDir(root)
+	pyTxt := "可用"
+	if c.Run() != nil {
+		pyTxt = "不可用"
+	}
+	diag := fmt.Sprintf("脚本根 %s；scripts/growth_run.py %s；解释器 %s %s", root, scriptTxt, py, pyTxt)
+	if pyTxt != "可用" {
+		// 只有在解释器真的跑不起来时才附上探测过程 —— 平时它是一串噪音。
+		diag += "（" + PythonDiagnosis() + "）"
+	}
+	return diag
+}
+
 // RunGrowthFor 手动执行入口：对指定账号逐个跑一轮成长任务（zero → talk）。
 //
 // 同步执行，调用方（HTTP handler）应放进 goroutine 异步跑并在入口立即返回：
