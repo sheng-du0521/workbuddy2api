@@ -1222,10 +1222,19 @@ func bodyReadEvidence(r *http.Request, n int, elapsed time.Duration) string {
 //
 //	· 超限（*http.MaxBytesError）→ 413。这是"请求太大"，既不是客户端的 JSON 写错，
 //	  更不是账号/上游的问题；给 400 会让客户端以为请求格式非法。
-//	· 其余读错（unexpected EOF / connection reset / i/o timeout）→ 400。
+//	· 其余读错（unexpected EOF / connection reset / i/o timeout）→ **408**（不是 400，见下）。
 //	  Go 的 `unexpected EOF` 只有一种成因：**声明的长度与实际收到的字节不一致**
 //	  （Content-Length 写大了、chunked 尾块没到、连接中途断）。根因在发送侧，
 //	  但网关无从判断是哪一段网络 —— 所以只如实回报 + 落日志。
+//
+// ⚠️ **为什么是 408 而不是 400**（v0.31.15，真机案例驱动）：
+// 400 的语义是"你的请求不合法"，而且**OpenAI 兼容 SDK 一律不对 400 重试**
+// （标准重试名单是 408 / 409 / 429 / 5xx）。但"上传被截断"是**瞬时传输故障**：
+// 同一条隧道上 45 万 token 的大请求平时都过（实测），重发通常就好了。
+// 回 400 等于明确告诉客户端"别重试" —— 本该自愈的故障就变成了用户看到的报错，
+// 每次都得手动重发。408（Request Timeout）语义正对「服务端没收到完整请求」，
+// 且在标准 SDK 的重试名单里，于是客户端会自动重发一次。
+// 413（超限）**刻意不用 408**：同一个超限请求重发多少次都还是超限，重试无意义。
 //
 // 为什么必须打这条日志：v0.31.13 及以前，这条分支**一个字节的痕迹都不留** ——
 // /api/admin/live 只能看到"有一次 400 失败"（兜底层按响应码补记），
@@ -1245,8 +1254,9 @@ func (p *Proxy) reportBodyReadFailure(w http.ResponseWriter, r *http.Request, er
 	}
 	log.Printf("WARN: [proxy] 请求体读取失败：%v —— %s（成因在发送侧：声明的长度与实际到达的字节不一致，或被中间层截断；该请求未触达任何上游账号）",
 		err, bodyReadEvidence(r, n, elapsed))
-	writeOpenAIErrorHint(w, http.StatusBadRequest, "read body: "+err.Error(),
-		"gateway could not read the full request body: the connection ended before Content-Length bytes arrived (client aborted, or an intermediary/proxy truncated it); no upstream account was used")
+	// 408 而不是 400：这是**可重试**的传输故障，标准 SDK 会对 408 自动重发（见函数注释）。
+	writeOpenAIErrorHint(w, http.StatusRequestTimeout, "read body: "+err.Error(),
+		"transient transport failure: the connection ended before Content-Length bytes arrived (client aborted, or an intermediary/proxy/tunnel truncated the upload); no upstream account was used and re-sending the same request usually succeeds")
 }
 
 // ServeChat 处理 OpenAI 兼容的 /v1/chat/completions。

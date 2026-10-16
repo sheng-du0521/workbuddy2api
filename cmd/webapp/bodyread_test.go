@@ -34,6 +34,9 @@ import (
 // 台账里没有（没有用量）、日志里没有（没打日志）。于是"客户端自己截断"与
 // "中间层吃掉请求体"在本机无法区分 —— 这正是本轮要修的**真实缺口**。
 //
+// 状态码取舍（v0.31.15）：截断回 **408（可重试）**，超限回 **413**，都不是 400 ——
+// 400 会让标准客户端放弃重试，而"传输被截断"重发一次通常就好了。
+//
 // ## 二、顺带修掉一个会把根因说反的缺陷：8MB 以上被静默截断
 //
 // 旧实现是 `io.ReadAll(io.LimitReader(r.Body, 8<<20))`。`io.LimitReader` 到上限后
@@ -205,11 +208,15 @@ func TestReportBodyReadFailureOversizeIs413(t *testing.T) {
 	}
 }
 
-// TestReportBodyReadFailureTruncatedIs400 传输中断 → 400 + 原文 message + 有 hint + 有日志。
+// TestReportBodyReadFailureTruncatedIsRetryable408 传输中断 → **408** + 原文 message + 有 hint + 有日志。
+//
+// ⚠️ 这条用例钉的是**状态码的语义**（v0.31.15）：截断是**瞬时传输故障**，不是"请求不合法"。
+// 400 会让 OpenAI 兼容 SDK **不重试**（它们的重试名单是 408/409/429/5xx），于是本该
+// 自动重发的故障变成用户每次都得手动重发的报错。所以这里必须是 408。
 //
 // message 里必须**逐字保留** Go 的原错（"read body: unexpected EOF"）：
 // 用户报障时贴的就是这一句，它也是搜索引擎里唯一能查到成因的字符串，不能改写。
-func TestReportBodyReadFailureTruncatedIs400(t *testing.T) {
+func TestReportBodyReadFailureTruncatedIsRetryable408(t *testing.T) {
 	store, px, _ := newTestApp(t)
 	defer store.Close()
 	logs := captureLog(t)
@@ -221,16 +228,20 @@ func TestReportBodyReadFailureTruncatedIs400(t *testing.T) {
 	rec := httptest.NewRecorder()
 	px.reportBodyReadFailure(rec, req, io.ErrUnexpectedEOF, 118, 300*time.Millisecond)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("传输中断应回 400，得 %d", rec.Code)
+	if rec.Code != http.StatusRequestTimeout {
+		t.Fatalf("传输中断应回 408（可重试），得 %d", rec.Code)
+	}
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("不得回 400：标准 SDK 不对 400 重试，会把可自愈的故障变成用户可见的报错")
 	}
 	msg, hint := parseOpenAIError(t, rec)
 	if msg != "read body: unexpected EOF" {
 		t.Fatalf("message 应逐字保留 Go 原错，得 %q", msg)
 	}
-	// hint 要说清"成因在发送侧 + 没有触达上游账号"——后者是运维最关心的
-	// （能据此断言"这次失败没有消耗任何账号、不必去查账号池"）。
-	for _, want := range []string{"Content-Length", "truncated", "no upstream account was used"} {
+	// hint 要说清"成因在发送侧 + 没有触达上游账号 + 可以重发"。
+	// "没有触达上游账号"是运维最关心的（据此断定不必去查账号池）；
+	// "可以重发"是给客户端/用户看的下一步动作。
+	for _, want := range []string{"Content-Length", "truncated", "no upstream account was used", "re-sending the same request"} {
 		if !strings.Contains(hint, want) {
 			t.Errorf("hint 缺 %q：%s", want, hint)
 		}
@@ -293,8 +304,9 @@ func TestChatTruncatedBodyEndToEnd(t *testing.T) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("截断的请求体应回 400，得 %d body=%.200s", resp.StatusCode, raw)
+	// 408 而不是 400：这是可重试的传输故障（见 reportBodyReadFailure 注释）。
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("截断的请求体应回 408（可重试），得 %d body=%.200s", resp.StatusCode, raw)
 	}
 	var payload struct {
 		Error struct {

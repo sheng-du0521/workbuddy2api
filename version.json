@@ -1,17 +1,17 @@
 {
-  "version": "0.31.14",
+  "version": "0.31.15",
   "min_supported": "0.24.0",
-  "notes": "v0.31.14：修 `HTTP 400 read body: unexpected EOF` 的可诊断性 + 一个会把根因说反的连带缺陷。① **先定性**：Go 的 `unexpected EOF` 只有一种成因 —— **声明的长度与实际收到的字节不一致**（Content-Length 写大了 / chunked 尾块没到 / 连接中途断）。根因在**发送侧**（客户端库 / 反向代理 / 隧道 / 本机 `http_proxy`），网关无从判断是哪一段网络，也不能代客户端重发；它该做的只有两件：**如实回报 + 留下现场**。② **真实缺口：这条分支此前一个字节的痕迹都不留** —— `/api/admin/live` 只能看到\"有一次 400 失败\"（兜底层按响应码补记），`consume_failures` 里没有它（没有账号维度）、日志里也没有它（没打日志），于是「客户端自己截断」与「中间层吃掉请求体」在本机**无法区分**。现在打一条 WARN，字段缺一不可：`peer`/`xff`（隧道场景 RemoteAddr 恒是回环，xff 才是线索）、`content_length`/`已读`（**声明了多少 vs 实际到了多少** —— 这一对是定性关键）、`耗时`、`ua`。真机实测：`content_length=200 已读=39 耗时=300ms ua=\"repro-truncated/1.0\"`。③ **连带修掉一个把根因说反的缺陷**：原实现是 `io.ReadAll(io.LimitReader(r.Body, 8<<20))` —— `io.LimitReader` 到上限返回的是 **EOF 而不是错误**，于是 8MB 以上的请求体被**静默截断**，再交给 `json.Unmarshal`，客户端看到的是 `invalid json: unexpected end of JSON input`：一条把「请求太大」说成「JSON 写坏了」的消息（开发者会去反复检查自己的序列化）。改用 `http.MaxBytesReader` → **413** 并写明上限（旧行为：8~16MB 回误导性的 invalid json，>16MB 回 400）。④ **兼容性纪律**：`error.message` **逐字保留** Go 原错（用户报障时贴的就是这一句，也是唯一能查到成因的字符串），补充说明走**并列**的 `gateway_hint`（v0.31.5 就为此设计）；`writeOpenAIError` 的 JSON 形状未动。⑤ **可复用手法**：用 `io.Copy` 到 buffer 而不是 `io.ReadAll` —— 前者报错时**仍能拿到已读字节数**，后者只回一个 error。测试里用**原始 TCP + `CloseWrite()`** 手工造\"声明 200 只发 40\"的截断请求体（`http.Client` 造不出这个形态：Transport 会按 Body 真实长度设置 Content-Length）。⑥ **新增 7 条用例 + 变异检验 5 处**：接线退回旧写法 / 读体退回 LimitReader / 超限改回 400 / 去掉取证日志 / hint 换空串 —— 每处都有对应用例变红（\"接线退回旧写法\"由端到端用例捕获，证明测的是**接线**而不是函数本身）。⑦ **诚实边界**：本刀**不修**发送侧（那是客户端/中间层的事）；日志刻意不写 `consume_failures`（污染账号维度口径）；**线上那条 400 的具体来源仍未确定** —— 本轮之前的失败没有任何痕迹，无法回溯。",
-  "released_at": 1792135685,
+  "notes": "v0.31.15：传输中断改回**可重试的 408** —— 由真机现场驱动的一刀，也是 v0.31.14 那条证据日志第一次派上用场。① **真机取证**：15:39:41 一条 `400 read body: unexpected EOF` 的现场是 `content_length=1308767 已读=312709 耗时=16.274s peer=127.0.0.1:55143 xff=2408:8215:46f:c3c0:ad3f:415a:e7c9:f024 ua=\"WorkBuddy/5.7.7 … CLI/2.156.0\"` —— 声明 1.28MB、只到 **312KB**、耗了 16 秒；**同一秒 cloudflared 自己的日志**写着 `Incoming request ended abruptly: context canceled`（`originService=http://127.0.0.1:8780`）。断点在**发送侧链路**（客户端 → Cloudflare 边缘 198.41.200.233 → 快速隧道 → 本机 8780），不是网关、更不是账号池（日志已注明\"未触达任何上游账号\"）。本机复核只有链路本地 IPv6、无公网 IPv6 出口 → 那台设备**不是本机**。② **纠错：400 是给错了信号**。Go 的 `unexpected EOF` 是**瞬时传输故障**，而 400 的语义是\"你的请求不合法\"，且 **OpenAI 兼容 SDK 一律不对 400 重试**（重试名单是 408/409/429/5xx）—— 本该自动重发的故障就变成了用户每次都得手动重发的报错。改为 **408 Request Timeout**（语义正对\"服务端没收到完整请求\"，且在重试名单里），`gateway_hint` 里明说\"re-sending the same request usually succeeds\"（依据：同一条隧道上 45 万 token 的大请求平时都成功，所以这是瞬时故障）。**413 刻意不改成 408** —— 同一个超限请求重发多少次都还是超限。③ `error.message` 仍**逐字保留** Go 原错（用户报障时贴的就是它）。④ **测试**：单测与端到端用例改钉 408（并显式断言\"不得回 400\"——因为 400 会让 SDK 放弃重试），hint 增加可重发指引断言；**变异检验 2 处**（改回 400 / 去掉可重发指引）全部命中。⑤ **顺带纠正一处配置漂移**：`dist/tunnel-url.txt` 记的 URL（`pets-goal-…`）与实际承载流量的那条（`greensboro-…`，隧道日志里 256 次全是它）**不是同一条**；两条都活着、且有 **3 个 cloudflared 进程**并存。文件已更正为实际在用的那条，**多余隧道未动**（可能有别的设备在用，收敛需人工确认）。⑥ **诚实边界**：本刀**只让故障可自愈，没有修根因** —— 根因是快速隧道在大请求体上传上的偶发中断，**根治要在网络层**（同局域网直连 / 改名隧道 / frp）；\"客户端 16s 超时后放弃\"与\"隧道丢掉上传\"两者在服务端现象完全相同，**仍不可分辨**。",
+  "released_at": 1792136995,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.14/webapp.exe",
-      "sha256": "8a25e0b1769ecb28973ad4699c053514a2d061af3b778c51bf81e9a2ef6d9527",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.15/webapp.exe",
+      "sha256": "3b96b5f813904bbaf53c34edff1da3f384b50947aec4b65335803a802c471f76",
       "size": 14917120
     }
   ],
-  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.14）；换版本时同步换 url 与 sha256。"
+  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填 —— 无法校验的二进制不会被下载。产物随 release 标签发布（本条目对应 tag v0.31.15）；换版本时同步换 url 与 sha256。"
 }
