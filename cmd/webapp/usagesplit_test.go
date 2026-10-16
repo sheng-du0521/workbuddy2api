@@ -83,3 +83,25 @@ func TestUsageSplitQueriesFilterOKOnly(t *testing.T) {
 		t.Fatal("UsageSplitByOwner 应排除 user_id=0（管理通道按设计不计费，混进来会让归属失真）")
 	}
 }
+
+// TestValueAsFloat 驱动返回值归一（v0.31.21）。
+//
+// 这条来自真机：upstream_credit 是 REAL 而 charged_micro 是 INTEGER，
+// 把两者都 Scan 进 int64 会让接口直接 500 —— 纯函数测试抓不到，
+// 所以至少把归一化本身钉住。
+func TestValueAsFloat(t *testing.T) {
+	cases := []struct {
+		in   any
+		want float64
+	}{
+		{int64(1000), 1000},
+		{float64(10196.29), 10196.29},
+		{nil, 0},
+		{"x", 0}, // 意外类型不 panic，退化为 0（宁可数字不准，也不要整个接口 500）
+	}
+	for _, c := range cases {
+		if got := valueAsFloat(c.in); got != c.want {
+			t.Errorf("valueAsFloat(%#v)=%v，期望 %v", c.in, got, c.want)
+		}
+	}
+}

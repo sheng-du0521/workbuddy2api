@@ -68,16 +68,39 @@ func (s *Store) usageSplitQuery(query string, args ...any) ([]usageSplitRow, err
 	out := []usageSplitRow{}
 	for rows.Next() {
 		var r usageSplitRow
-		var credit int64
-		var chargedMicro int64
-		if err := rows.Scan(&r.Kind, &r.Requests, &credit, &chargedMicro); err != nil {
+		var creditRaw, chargedRaw any
+		if err := rows.Scan(&r.Kind, &r.Requests, &creditRaw, &chargedRaw); err != nil {
 			return nil, err
 		}
-		r.Credit = MicroToPoint(credit)
-		r.Charged = MicroToPoint(chargedMicro)
+		// ⚠️ 按**真实列类型**取值，不假设整数（v0.31.21 真机抓到的 bug）：
+		//   `upstream_credit` 在库里是 **REAL**（历史遗留，存的就是积分，如 10196.29），
+		//   `charged_micro` 是 **INTEGER** 微点。
+		// 此前把两者都 Scan 进 int64，SQLite 遇到 REAL 直接报
+		// "converting driver.Value type float64 … to a int64" → 接口一律 500。
+		// 用 `any` + 归一化，既兼容既有库，也不怕将来有人把列改成 INTEGER。
+		r.Credit = valueAsFloat(creditRaw)                            // 单位：号池积分
+		r.Charged = valueAsFloat(chargedRaw) / float64(MicroPerPoint) // 微点 → 点
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// valueAsFloat 把驱动返回的数值归一成 float64（int64 / float64 / nil）。
+//
+// 存在的理由见上面的注释：**同一张表里两种列类型混用**是既有事实，
+// 硬编码 int64 会直接 500 —— 这种错在单测里看不出来（纯函数不碰驱动），
+// 只有真机（或带真实列类型的集成测试）才会暴露。
+func valueAsFloat(v any) float64 {
+	switch x := v.(type) {
+	case int64:
+		return float64(x)
+	case float64:
+		return x
+	case nil:
+		return 0
+	default:
+		return 0
+	}
 }
 
 // UsageSplitByKeyKind 用户维度：按「号池计费 Key / 代挂自用 Key」拆用量。

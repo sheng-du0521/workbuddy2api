@@ -1,17 +1,17 @@
 {
-  "version": "0.31.20",
+  "version": "0.31.21",
   "min_supported": "0.24.0",
-  "notes": "v0.31.20：用户「设置」页 + 右上角提醒中心 + 消耗归属拆分 + 自挂出口自助配置 + 冷却一致性审查换来的两处修复。① 用户控制台「设置」页：账户（改密码/登出）、接入信息（Base URL 一键复制、可用模型）、**我的出口**（为自己代挂账号配出口代理 —— 只写自己的号，不碰平台全局默认）、外观、提醒、关于。② 右上角提醒中心（两端共用）：操作反馈（复制成功/失败等，从 toast 自动落一份）、入池邀请待办、以及 **window.onerror / unhandledrejection** —— 遇到「点某个页面报错」时可直接复制错误原文与堆栈，不再靠记忆描述。存 localStorage（最近 50 条，同文 10 秒内去重）。③ 消耗归属拆分（新增 `/api/me/usage-split` 与 `/api/admin/usage-split`）：用户端概览看「号池计费（扣余额）vs 代挂自用（不扣余额）」；管理后台实时概览看「平台自持号 vs 用户代挂号（按分成结算）」。口径：只统计 status='ok'；窗口一律 localDayStart；管理端排除 user_id=0（管理通道不计费）；缺桶补 0（否则前端读到 undefined）。④ 自挂出口自助 + 管理后台闭环：用户配好出口后，该线路自动出现在管理后台「代理」页的「由账号单独指定（未登记进线路池）」区，新增「收录到线路池」按钮 —— 收录后即可探活、批量分配、参与失效策略（strict 暂停 / migrate 迁移）。⑤ 第 8 条审查结论 + 两处真修复（一次独立的 host vs 平台号 机制一致性审查）：三套机制（模型级冷却 / 账号级软冷却 / 风控摘号）在池层与 upstream 层均无 owner 分支，代挂号与平台号走同一套代码与阈值；但发现两处链路间漂移并修复：（a）同一个 11140，转发链软冷却 2h、健康检测链却只用 60s → 体检几分钟内重复触发 3 次就能凑满阈值摘掉健康号，已收敛为同源 accountFaultCooldown；（b）未入池的代挂号（pending/invited/rejected）不参与平台流量，却照样被探活并可能被停用/不可逆删除 —— 对用户资产的越权处置，且与「入池要号主同意」冲突；现在候选集排除它们，处置入口再加一道护栏（只报告不处置）。⑥ 测试：新增 `health_guard_test.go`（11140 冷却时长 ≥1h / 未入池代挂号零处置 / 候选集排除）与 `usagesplit_test.go`（桶补全 + 源码级 status='ok' 与 user_id>0 断言）。⚠️ 诚实边界：（第 7 条）「管理后台点某个导航报错」未能复现 —— 用服务器真实数据在 jsdom 里跑完全部 16 个导航，零 JS 错误；已加全局错误捕获，下次请把提醒中心里的原文发来。",
-  "released_at": 1792164859,
+  "notes": "v0.31.21：修 v0.31.20 引入的一个真机 500 —— 用量「归属」拆分接口。症状：`/api/admin/usage-split` 与 `/api/me/usage-split` 一律返回「内部错误」（日志原文：`sql: Scan error on column index 2, name COALESCE(SUM(u.upstream_credit), 0): converting driver.Value type float64 (10196.289999999999) to a int64`）。根因：`upstream_credit` 在这张表里是 **REAL**（历史遗留，存的就是积分），而 `charged_micro` 是 **INTEGER** 微点 —— 我把两列都 Scan 进 int64，SQLite 遇到 REAL 直接报错。修法：改用 `any` + `valueAsFloat` 归一化（int64 / float64 / nil 都吃），既兼容既有库，也不怕将来有人把列改成 INTEGER。**为什么上一版没测出来**：这一处只写了纯函数测试（桶补全）与源码级断言，而**纯函数不碰驱动** —— 列类型错只能在真机（或带真实列类型的集成测试）暴露。这条教训已写进测试注释。新增 `TestValueAsFloat`（含意外类型不 panic、退化为 0）。",
+  "released_at": 1792165400,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.20/webapp.exe",
-      "sha256": "43cd874c4401d8b32a255999d54527322edd358b3a8f9b70496b3ce9b2b5f163",
-      "size": 15085568
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.21/webapp.exe",
+      "sha256": "5517d1ad835c159e9635059fe1341bb26f893506c89bad22fd1afd5fec149971",
+      "size": 15086080
     }
   ],
-  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.20）；换版本时同步换 url 与 sha256。"
+  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.21）；换版本时同步换 url 与 sha256。"
 }
