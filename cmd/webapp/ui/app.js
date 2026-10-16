@@ -2482,7 +2482,13 @@ async function pluginFillPanel(p, card, panel) {
     if (r) {
       // 上游原文挂在 title 上（悬停可见）：这是区分「真的无可领」与「字段名猜错」
       // 的唯一事实，但直接铺在行里会把布局撑坏。
-      if (r.detail) line.title = '上游返回原文：' + r.detail;
+      // 上游答复（code + msg）与返回原文都挂在 title 上：悬停可见、不撑坏布局。
+      // v0.31.19 起 "已领取过" 有独立状态，但**证据仍然只有上游原文**——
+      // 把 code 一起摆出来，用户就不必来问"到底是已领过还是没活动"。
+      const tips = [];
+      if (r.upstream_msg) tips.push('上游答复：' + r.upstream_msg + (r.code ? '（code=' + r.code + '）' : ''));
+      if (r.detail) tips.push('上游返回原文：' + r.detail);
+      if (tips.length) line.title = tips.join('\n');
       line.appendChild(pluginResultBadge(r));
     }
     listBox.appendChild(line);
@@ -2494,6 +2500,9 @@ async function pluginFillPanel(p, card, panel) {
 function pluginResultBadge(r) {
   const map = {
     ok: ['已到账 +' + (r.credit || 0), 'var(--ok, #2e7d32)'],
+    // already（v0.31.19）：与 none 分开 —— "已经领过"是**结论**（不用再试），
+    // "无可领"是**现状**（等有活动再试）。上游原文见行 title。
+    already: ['已领取过', '#888'],
     none: ['无可领', '#888'],
     skip: ['已跳过' + (r.message ? '（' + r.message + '）' : ''), '#888'],
     error: ['失败：' + (r.message || '未知错误'), 'var(--bad, #c62828)'],
@@ -2517,7 +2526,7 @@ async function pluginRun(p, card, panel) {
   st.rows = {};
   pluginFillPanel(p, card, panel);
 
-  let ok = 0, none = 0, err = 0, credit = 0;
+  let ok = 0, already = 0, none = 0, err = 0, credit = 0;
   for (let i = 0; i < uids.length; i++) {
     const uid = uids[i];
     try {
@@ -2529,6 +2538,7 @@ async function pluginRun(p, card, panel) {
     }
     const r = st.rows[uid];
     if (r.status === 'ok') { ok++; credit += (r.credit || 0); }
+    else if (r.status === 'already') already++;
     else if (r.status === 'none' || r.status === 'skip') none++;
     else err++;
     // 每完成一个就刷新这一行（而不是等全部跑完）——长任务里"看着它走"比结果重要。
@@ -2538,7 +2548,9 @@ async function pluginRun(p, card, panel) {
 
   st.running = false;
   pluginFillPanel(p, card, panel);
-  const msg = '完成：' + ok + ' 个到账（共 +' + credit + ' 积分），' + none + ' 个无可领，' + err + ' 个失败';
+  const msg = '完成：' + ok + ' 个到账（共 +' + credit + ' 积分），'
+    + (already ? already + ' 个已领取过，' : '')
+    + none + ' 个无可领，' + err + ' 个失败';
   toast(msg, err ? 'bad' : 'ok');
   // 汇总也写进面板（toast 会消失，汇总要留在页面上）。
   const sum = el('div', 'sub', msg);

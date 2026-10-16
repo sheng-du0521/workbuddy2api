@@ -581,6 +581,7 @@
           </div>
         </div>
 
+        <div id="egrPoolHint" class="sub" style="margin:0 0 8px;"></div>
         <div class="cards" id="egrCards"></div>
 
         <div class="card" id="egressAssign">
@@ -609,6 +610,7 @@
             <button class="ghost" id="btnEgrDirect" title="把所选范围内的账号一键设为显式直连（不继承全局默认代理）。用于回退代理。">设为直连</button>
             <button class="ghost" id="btnEgrClear" title="清空出口配置 = 回到「未指定」，由全局默认代理决定实际出口。">清空出口</button>
           </div>
+          <div id="egrAssignHint" class="sub" style="margin:10px 0 0;"></div>
           <div id="egrPlan" class="sub" style="margin:12px 0 0;"></div>
         </div>
       </div>
@@ -6310,6 +6312,13 @@ $('btnSend').onclick = async () => {
 // ======================================================================
 
 let egrList = [];
+// egrBound / egrMachines（v0.31.19）：线路 → 绑定账号数 / 来源机器。
+// 来源机器只有本机 agent 拉起的线路才有 —— 它的失效语义与手填商业代理不同
+// （隧道断 = 整条线路一起失效），不标出来运维只会看到"探活失败"。
+let egrBound = {};
+let egrMachines = {};
+// egrAssignUrl 非空 = 只把**这一条**线路分配给目标范围（线路卡上的「分配」按钮）。
+let egrAssignUrl = '';
 let egrView = null;
 let egrEditingId = '';
 
@@ -7163,6 +7172,8 @@ async function loadEgress() {
     ]);
     egrView = ov;
     egrList = (pl && pl.proxies) || [];
+    egrBound = (pl && pl.bound) || {};
+    egrMachines = (pl && pl.machines) || {};
     if (ac) {
       egrAccounts = ac.accounts || [];
       egrAccSummary = ac.summary || {};
@@ -7171,6 +7182,7 @@ async function loadEgress() {
     mountEgrTabs();
     renderEgressAlert();
     renderEgressCards();
+    renderEgrAssignHint();
     renderEgrAccKpis();
     renderEgrAccCards();
 
@@ -7231,12 +7243,30 @@ function egrStatOf(url) {
   return list.find((p) => p.url === url) || null;
 }
 
+// renderEgrPoolHint 线路池上方的一句总览。
+//
+// 刻意挂在卡片区**外面**：`#egrCards` 的子元素数 = 线路数，既是 uitest 的断言口径，
+// 也是人眼读这张列表的口径 —— 往里面塞说明文字会让"有几条线路"变得说不清。
+function renderEgrPoolHint() {
+  const box = $('egrPoolHint');
+  if (!box) return;
+  box.textContent = '';
+  if (!egrList.length) return;
+  const fromCtl = egrList.filter((p) => egrMachines[p.url]).length;
+  box.appendChild(document.createTextNode('共 ' + egrList.length + ' 条线路'));
+  if (fromCtl) {
+    box.appendChild(document.createTextNode('，其中 ' + fromCtl + ' 条来自控制台「一键拉起」（卡片标注「本机 agent」）'));
+  }
+  box.appendChild(document.createTextNode('。每条卡片右侧可直接「分配」到指定范围。'));
+}
+
 function renderEgressCards() {
   const box = $('egrCards');
   box.textContent = '';
   if (!egrList.length) {
     box.appendChild(el('div', 'muted', '线路池为空。先在上面添加一条线路（如你的代理供应商地址），再回到账号池或这里批量分配。'));
   }
+  renderEgrPoolHint();
   for (const p of egrList) box.appendChild(egrCard(p));
 
   // 手填但不在池里的出口也要列出来，否则「某个出口上有 5 个账号」会凭空消失。
@@ -7512,6 +7542,15 @@ function egrCard(p) {
     d.appendChild(el('b', cls || '', v));
     body.appendChild(d);
   };
+  // 来源机器（若这条线路是本机 agent 拉起的）：一句话回答"谁把它接进来的、
+  // 现在活着吗"。手填的商业代理没有这一行 —— 它们也不该有。
+  const mach = egrMachines[p.url];
+  if (mach) {
+    const alive = !!mach.online && !!mach.tunnel_reachable;
+    line('来源', '本机 agent · ' + (mach.hostname || mach.id)
+      + (mach.online ? '（在线）' : '（离线）')
+      + (mach.tunnel_reachable ? ' · 隧道通' : ' · 隧道不通'), alive ? 'ok' : 'err');
+  }
   line('真实出口 IP', p.last_ip || '（未探到）', p.last_ip ? 'ok' : '');
   if (p.last_check) line('上次探活', fmtTime(p.last_check));
   if (p.fail_streak) line('连续失败', p.fail_streak + ' 次', 'err');
@@ -7520,6 +7559,19 @@ function egrCard(p) {
   card.appendChild(body);
 
   const foot = el('footer');
+  // 「分配」：把**这一条**线路发给指定范围的账号（服务端 proxy_url 参数）。
+  // 此前只能选"范围"、由服务端从整个池子里挑线路 —— 于是"我只想把这条本地
+  // 住宅线路给某几个号"做不到，只能先去停用其它线路（那又会牵动在用它们的号）。
+  const asg = el('button', '', '分配');
+  asg.title = '把这条线路分配给指定范围的账号（只在这一条线路上分配，不动其它线路）';
+  asg.onclick = () => {
+    egrAssignUrl = p.url;
+    renderEgrAssignHint();
+    const sec = document.getElementById('egressAssign');
+    if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+  foot.appendChild(asg);
+
   const chk = el('button', 'ghost', '探活');
   chk.onclick = async () => {
     chk.disabled = true;
@@ -7681,6 +7733,24 @@ $('btnEgrCheckAll').onclick = async () => {
   } catch (e) { $('egrCheckHint').textContent = ''; toast(e.message, 'err'); } finally { btn.disabled = false; }
 };
 
+// renderEgrAssignHint 分配区顶部："本次只在哪条线路上分配"。
+//
+// 必须显式显示并可以清除：这是个**粘性**选择（点过之后一直生效），
+// 不显示就会让下一次分配"莫名其妙只用了一条线路"。
+function renderEgrAssignHint() {
+  const box = $('egrAssignHint');
+  if (!box) return;
+  box.textContent = '';
+  if (!egrAssignUrl) return;
+  const name = (egrList.find((p) => p.url === egrAssignUrl) || {}).name || egrAssignUrl;
+  const tag = el('b', '', '仅分配到：' + name + '（' + egrAssignUrl + '）');
+  box.appendChild(tag);
+  box.appendChild(document.createTextNode(' '));
+  const clr = el('button', 'ghost sm', '清除');
+  clr.onclick = () => { egrAssignUrl = ''; renderEgrAssignHint(); };
+  box.appendChild(clr);
+}
+
 // egrAssignBody 组装分配请求体；返回 null 表示范围未选。
 async function egrAssignBody(dry) {
   const v = $('egrScope').value;
@@ -7690,6 +7760,8 @@ async function egrAssignBody(dry) {
     isolate_owner: $('egrIsolate').checked,
     dry_run: !!dry,
   };
+  // 指定了线路（从线路卡点「分配」进来）→ 只在这一条上分配。
+  if (egrAssignUrl) body.proxy_url = egrAssignUrl;
   if (v === 'all') {
     body.all = true;
   } else if (v === '__direct') {
@@ -7706,7 +7778,7 @@ $('btnEgrDry').onclick = async () => {
   try {
     const body = await egrAssignBody(true);
     if (!body) return;
-    const d = await post('/api/admin/egress/pool/assign', body);
+    const d = await post('/api/admin/egress/assign', body);
     renderEgressPlan(d, true);
   } catch (e) { toast(e.message, 'err'); }
 };
@@ -7716,7 +7788,7 @@ $('btnEgrApply').onclick = async () => {
     const body = await egrAssignBody(false);
     if (!body) return;
     if (!(await confirmAsk('确认执行分配？将改写 ' + (body.all ? '全部' : '所选范围') + '账号的出口，并立即重同步号池。'))) return;
-    const d = await post('/api/admin/egress/pool/assign', body);
+    const d = await post('/api/admin/egress/assign', body);
     renderEgressPlan(d, false);
     toast('已分配 ' + d.assigned + ' 个账号到 ' + d.proxies_used + ' 条线路', 'ok');
     loadEgress();

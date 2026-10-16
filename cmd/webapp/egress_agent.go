@@ -602,6 +602,11 @@ func (a *app) buildEgressHomeView(r *http.Request, canManage bool) egressHomeVie
 			active = mv
 		}
 	}
+	// 空表也要给**空数组**而不是 null：前端 `(v.machines || [])` 虽能兜住，
+	// 但 null 会让"没有任何 agent 连上来"和"接口没返回这个字段"长得一样。
+	if v.Machines == nil {
+		v.Machines = []egressMachineView{}
+	}
 	if active != nil {
 		v.ActiveMachine = active.ID
 		v.AgentOnline = active.Online
@@ -640,6 +645,52 @@ func (a *app) handleEgressHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.buildEgressHomeView(r, u.IsAdmin()))
+}
+
+// egressBoundByURL 每条线路 URL 被多少个账号绑定（**含平台号与自挂号**）。
+//
+// 与 egressHostBinding 的区别：那个只数自挂号（控制台要显示"我的号绑了几个"），
+// 这个数全部（管理后台要回答"这条线到底承载了多少号"）。
+func (a *app) egressBoundByURL(urls []string) map[string]int {
+	out := map[string]int{}
+	for _, u := range urls {
+		out[u] = 0
+	}
+	accs, err := a.store.ListAccounts()
+	if err != nil {
+		return out
+	}
+	for _, acc := range accs {
+		if u := strings.TrimSpace(acc.EgressProxy); u != "" {
+			if _, ok := out[u]; ok {
+				out[u]++
+			}
+		}
+	}
+	return out
+}
+
+// egressMachinesByURL 把"哪些线路是本机 agent 拉起来的"按线路 URL 索引出来。
+//
+// 管理后台的线路池需要这一行：一条 `http://127.0.0.1:11080` 在手填线路里毫无
+// 特殊之处，但它的**失效语义完全不同** —— 隧道断 / agent 离线，整条线路一起失效，
+// 而商业代理不会有"机器"这个概念。不标出来，运维只会看到"探活失败"。
+func (a *app) egressMachinesByURL() map[string]map[string]any {
+	out := map[string]map[string]any{}
+	now := time.Now().Unix()
+	for _, mm := range a.machinesLoad() {
+		url := egressHomeURL(mm.Ports.TunnelPort)
+		out[url] = map[string]any{
+			"id":               mm.ID,
+			"hostname":         mm.Hostname,
+			"online":           mm.online(now),
+			"tunnel_reachable": egressTunnelReachable(mm.Ports.TunnelPort),
+			"exit_ip":          mm.State.ExitIP,
+			"last_at":          mm.StateAt,
+			"is_default":       mm.ID == egressDefaultMachine,
+		}
+	}
+	return out
 }
 
 // egressPickMachine 从请求体里取目标机器；缺省取"最近上报的那台"。

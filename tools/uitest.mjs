@@ -1855,6 +1855,31 @@ function run(pageFile, meOverride, plan) {
   probeBad.forEach((m) => console.log('  [FAIL] probe-gate: ' + m));
   if (!probeBad.length) console.log('  [ok] probe-gate: 账号卡不再渲染即出站（改为点开才查）');
 
+  // v0.31.19：前端字面量里的 /api 路径必须都能在后端路由表里找到。
+  //
+  // 为什么要单做这条：`admin.html` 的「预览方案 / 执行分配」两个按钮打的是
+  // `/api/admin/egress/pool/assign`，而 `main.go` 里注册的是
+  // `/api/admin/egress/assign` —— 于是**批量分配整块功能一直是 404**，
+  // 而 jsdom 用例（桩 fetch 不看路径）与 Go 用例（直接调 handler）都照样全绿。
+  // 这类"前后端各写各的"漂移，只有把两边的路径**放在一起比**才算测过。
+  const routeBad = [];
+  {
+    const mainSrc = fs.readFileSync(path.join(path.dirname(UI), 'main.go'), 'utf8');
+    const norm = (x) => x.replace(/\{[^}]+\}/g, '*');
+    const routes = new Set(
+      Array.from(mainSrc.matchAll(/HandleFunc\("(\w+) ([^"]+)"/g)).map((m) => norm(m[2])));
+    for (const f of ['admin.html', 'dashboard.html', 'app.js']) {
+      const src = fs.readFileSync(path.join(UI, f), 'utf8');
+      for (const m of src.matchAll(/['"](\/api\/[A-Za-z0-9_\-/]+)['"]/g)) {
+        const url = m[1];
+        if (url.endsWith('/')) continue; // 拼接前缀（如 '/api/keys/' + id），静态判不了
+        if (!routes.has(norm(url))) routeBad.push(`${f} 引用了未注册的接口：${url}`);
+      }
+    }
+  }
+  routeBad.forEach((m) => console.log('  [FAIL] route-drift: ' + m));
+  if (!routeBad.length) console.log('  [ok] route-drift: 前端引用的 /api 路径都能在后端路由表里找到');
+
   // v0.24.9：明细展示必须来自**列表接口下发的缓存**，不得为了"恢复明细"把出站改回来。
   //
   // 上面那条 probe-gate 守卫的是「不要渲染即出站」；这条守卫的是它的**反面陷阱**：

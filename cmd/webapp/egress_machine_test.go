@@ -181,3 +181,51 @@ func TestEgressHomeApplyTargetsMachine(t *testing.T) {
 		t.Fatalf("只该注册 mid-2 那一条线路，得 %+v", proxies)
 	}
 }
+
+// TestEgressAssignToSpecificProxy 指定线路的批量分配（v0.31.19）。
+//
+// 线路卡右侧的「分配」按钮走的就是这条路：只把**这一条**线路发给目标账号，
+// 不动其它线路。此前分配只能选「范围」、线路由服务端从整个池子里挑 ——
+// 于是"我只想把这条本地住宅线路给某几个号"做不到，只能先去停用其它线路，
+// 而那又会牵动正在用它们的账号。
+func TestEgressAssignToSpecificProxy(t *testing.T) {
+	store, _, mux, adminCookie, _ := eaApp(t)
+	for _, p := range []*EgressProxy{
+		{ID: "p1", Name: "线路1", URL: "http://127.0.0.1:11080", Enabled: true},
+		{ID: "p2", Name: "线路2", URL: "http://127.0.0.1:1088", Enabled: true},
+	} {
+		if err := store.UpsertEgressProxy(p); err != nil {
+			t.Fatalf("UpsertEgressProxy: %v", err)
+		}
+	}
+	for _, uid := range []string{"ea-spec-1", "ea-spec-2"} {
+		if err := store.UpsertAccount(&Account{UID: uid, Nickname: uid, Realm: "cn", AccessToken: "t"}); err != nil {
+			t.Fatalf("UpsertAccount: %v", err)
+		}
+	}
+
+	code, raw := eaReq(t, mux, "POST", "/api/admin/egress/assign",
+		`{"uids":["ea-spec-1","ea-spec-2"],"proxy_url":"http://127.0.0.1:11080","dry_run":false}`,
+		adminCookie, "")
+	if code != http.StatusOK {
+		t.Fatalf("指定线路分配应成功，得 %d %s", code, raw)
+	}
+	accs, err := store.ListAccounts()
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	for _, acc := range accs {
+		if acc.EgressProxy != "http://127.0.0.1:11080" {
+			t.Fatalf("账号 %s 应绑到**指定**线路，得 %q（说明分配挑了别的线路）", acc.UID, acc.EgressProxy)
+		}
+	}
+
+	// 指定一条不在池里 / 被停用的线路 → 400，且措辞要指向"这条线路"。
+	// （笼统回"池子空了"会把运维引到错误的排查方向：去加线路，而不是去查这条。）
+	code2, raw2 := eaReq(t, mux, "POST", "/api/admin/egress/assign",
+		`{"uids":["ea-spec-1"],"proxy_url":"http://10.0.0.9:3128","dry_run":true}`,
+		adminCookie, "")
+	if code2 != http.StatusBadRequest || !strings.Contains(raw2, "指定的线路") {
+		t.Fatalf("指定不可用线路应 400 且说明是【指定的线路】，得 %d %s", code2, raw2)
+	}
+}

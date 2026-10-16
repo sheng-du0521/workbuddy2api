@@ -169,10 +169,11 @@ func (a *app) handlePluginToggle(w http.ResponseWriter, r *http.Request) {
 
 // claimStatus 单号领取的结果分类（前端据此分色展示，不猜）。
 const (
-	claimOK    = "ok"    // 到账
-	claimNone  = "none"  // 无可领（**正常态**：绝大多数号早就领过了）
-	claimSkip  = "skip"  // 不适用（国际版账号）
-	claimError = "error" // 真失败（网络 / 鉴权 / 5xx）
+	claimOK      = "ok"      // 到账
+	claimAlready = "already" // **已领取过**（上游明确答复"限领一次 / 已领取"）
+	claimNone    = "none"    // 无可领（当前没有这个活动 / 上游没给可领的东西）
+	claimSkip    = "skip"    // 不适用（国际版账号）
+	claimError   = "error"   // 真失败（网络 / 鉴权 / 5xx）
 )
 
 // claimResult 单号结果。逐号如实回报 —— 这个插件的价值全在"哪几个号失败了"上。
@@ -186,6 +187,16 @@ type claimResult struct {
 	// 这时"真的无可领"与"我们字段名猜错了"从 credit 上看一模一样，
 	// 原文是唯一能区分的事实。
 	Detail string `json:"detail,omitempty"`
+	// Code 上游业务码（能从答复里解析出来时填，如 10001）。
+	//
+	// 为什么要把它单独拎出来（v0.31.19，用户要求"按补偿领取反馈区分"）：
+	// "已领取过"与"当前无活动"此前共用一个 none 状态、一句笼统文案
+	// （"已领过或当前无活动"）—— 于是用户看到"无可领"就来问"到底是哪个"，
+	// 而这两个结论的下一步动作完全不同（前者不用再试，后者等有活动再试）。
+	Code int `json:"code,omitempty"`
+	// UpstreamMsg 上游 msg 的**原文**（未加工）。message 是我们对它的人话转述，
+	// 转述可能错，原文不会 —— 这也是排障时唯一能确认"上游到底说了什么"的依据。
+	UpstreamMsg string `json:"upstream_msg,omitempty"`
 }
 
 // claimCompensationOne 领取单个账号的活动补偿。
@@ -237,18 +248,80 @@ func (a *app) claimCompensationOne(uid string) claimResult {
 		res.Message = "无到账积分（多为已领过）"
 		res.Detail = detail
 	default:
+		text := claimErrText(err)
+		res.Code, res.UpstreamMsg = claimBizReply(text)
 		if isClaimNormalState(err) {
-			res.Status = claimNone
-			res.Message = "无可领补偿（已领过或当前无活动）"
+			// **再分一层**（v0.31.19）：把"已领取过"从"当前无活动"里摘出来。
+			// 两者都是正常态、都不该报红，但给用户的结论不一样。
+			if claimAlreadyReply(res.Code, res.UpstreamMsg) {
+				res.Status = claimAlready
+				res.Message = "已领取过"
+				if res.UpstreamMsg != "" {
+					res.Message = "已领取过（上游：" + res.UpstreamMsg + "）"
+				}
+			} else {
+				res.Status = claimNone
+				res.Message = "无可领补偿（当前无此活动）"
+			}
 			// 上游错答原文（含 code / msg）：排障时这是唯一能确认"上游到底说了什么"的
 			// 依据 —— 上面的 message 是我对它的人话转述，转述可能错，原文不会。
-			res.Detail = claimErrText(err)
+			res.Detail = text
 		} else {
 			res.Status = claimError
-			res.Message = claimErrText(err)
+			res.Message = text
 		}
 	}
 	return res
+}
+
+// claimBizReply 从上游错误文本里抽出业务信封 `{"code":N,"msg":"…"}`。
+//
+// 文本形态是 `upstream client (http 400): {"code":10001,"msg":"…","requestId":"…"}`，
+// 所以先定位第一个 `{`，再用 Decoder 只解**第一个** JSON 值（尾部还跟着
+// requestId 等字段，`json.Unmarshal` 会因"多余内容"直接失败）。
+// 解不出来就返回 0/""，调用方据此退回笼统文案 —— 绝不猜。
+func claimBizReply(raw string) (int, string) {
+	i := strings.Index(raw, "{")
+	if i < 0 {
+		return 0, ""
+	}
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if json.NewDecoder(strings.NewReader(raw[i:])).Decode(&env) != nil {
+		return 0, ""
+	}
+	return env.Code, strings.TrimSpace(env.Msg)
+}
+
+// claimAlreadyCodes 上游"已经领过"的业务码。**只放实测确认过的**。
+//
+// 10001 = 2026-10-16 真机：`{"code":10001,"msg":"每人限领一次，您已领取过无法重复领取"}`。
+var claimAlreadyCodes = map[int]bool{10001: true}
+
+// claimAlreadyWords 上游"已领过"的措辞（中文 / 英文双通道）。
+//
+// ⚠️ 这里按文案判定是**可接受的**，因为结论只用于**展示分类**（把"已领过"和
+// "当前无活动"分开说清），不产生任何账号处置 —— 与「按文案给账号定罪」那条
+// 红线不冲突。反过来说：**将来若要用它触发任何不可逆动作，必须改成只看业务码。**
+var claimAlreadyWords = []string{
+	"已领取", "已领过", "已经领取", "限领一次", "重复领取", "不可重复",
+	"already claimed", "already received", "already got", "only once",
+}
+
+// claimAlreadyReply 上游答复是否表示"这个号已经领过了"。
+func claimAlreadyReply(code int, msg string) bool {
+	if claimAlreadyCodes[code] {
+		return true
+	}
+	low := strings.ToLower(strings.TrimSpace(msg))
+	for _, w := range claimAlreadyWords {
+		if strings.Contains(low, strings.ToLower(w)) {
+			return true
+		}
+	}
+	return false
 }
 
 // isClaimNormalState 上游的**业务拒绝**（"没有可领的"）属于正常态，不该报红。

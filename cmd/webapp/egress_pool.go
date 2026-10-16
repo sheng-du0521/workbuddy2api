@@ -214,6 +214,12 @@ type assignRequest struct {
 	// Clear 把目标账号的出口**清空**（回到「未指定」，跟随全局默认代理）。
 	// 与 Direct 的区别：Direct 是不管全局默认都直连；Clear 是交回给全局默认决定。
 	Clear bool `json:"clear"`
+	// ProxyURL（v0.31.19）只在指定的**这一条**线路上分配（空 = 从整个线路池里挑）。
+	//
+	// 为什么需要它：此前分配只能选「范围」，线路由服务端自己挑 —— 于是
+	// "我只想把这条本地住宅线路给某几个号"这件事**做不到**（只能先停用其它线路，
+	// 那又会影响已在用它们的号）。线路卡上的「分配」按钮走的就是这个字段。
+	ProxyURL string `json:"proxy_url"`
 	// DryRun 只算不写，用于预览分配方案。
 	DryRun bool `json:"dry_run"`
 }
@@ -292,12 +298,25 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usable := make([]*EgressProxy, 0, len(proxies))
+	wantURL := strings.TrimSpace(req.ProxyURL)
 	for _, p := range proxies {
-		if p.Enabled {
-			usable = append(usable, p)
+		if !p.Enabled {
+			continue
 		}
+		if wantURL != "" && strings.TrimSpace(p.URL) != wantURL {
+			continue // 指定了线路 → 只用它
+		}
+		usable = append(usable, p)
 	}
 	if len(usable) == 0 {
+		if wantURL != "" {
+			// 指定线路时把话说清：是"这条不在池里/被停用"，不是"池子空了"
+			// —— 两者的下一步动作完全不同（去线路池找它 vs 去加线路）。
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "指定的线路不在可用线路池里（未登记或被停用）：" + wantURL,
+			})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "出口代理池为空（或全部已停用）。请先添加线路；若只想让账号直连，请改用「设为直连」模式。",
 		})
@@ -697,7 +716,22 @@ func (a *app) handleEgressProxies(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"proxies": list, "max_per_proxy": a.store.egressMaxPerProxy()})
+		// 绑定数与来源机器（v0.31.19）：线路池此前只报"这条线路本身"，管理员
+		// 看不出「这条线是谁拉起来的、现在被几个号用着」—— 而这两个事实恰好
+		// 决定了"能不能下线它 / 要不要分配"。
+		//
+		// 挂在 GET 的**附加键**上（而不是塞进 EgressProxy 结构）：既有形状
+		// （Go 字段名序列化）被前端大量引用，改形状等于把这一页全部重写。
+		urls := make([]string, 0, len(list))
+		for _, p := range list {
+			urls = append(urls, p.URL)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"proxies":       list,
+			"max_per_proxy": a.store.egressMaxPerProxy(),
+			"bound":         a.egressBoundByURL(urls),
+			"machines":      a.egressMachinesByURL(),
+		})
 
 	case http.MethodPost:
 		var req struct {
