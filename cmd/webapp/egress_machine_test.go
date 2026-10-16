@@ -1,0 +1,183 @@
+// WorkBuddy2API —— 禁止商用倒卖（完整声明与法律边界见仓库根目录 NOTICE）
+// 允许：个人学习 / 研究 / 自用部署 / 非营利分享与二次开发。
+// 禁止：以本源码或其衍生版本为标的的商业转售、倒卖、付费分发。
+
+// 出口代理「多机并存」的回归测试（v0.31.18）。
+//
+// 用户现场：在**第二台电脑**上跑 agent 时，v0.31.17 的三处全局单例同时撞车 ——
+//
+//	① 指令单例 → "我在 A 机点的拉起，被 B 机执行了"（页面看不出这件事）；
+//	② 状态单例 → 两台每 5 秒互相覆盖，页面上的 hostname / 出口 IP 随机跳；
+//	③ 端口单例 → 两台都 `ssh -R 11080`，**后到的那台必然失败**
+//	   （`remote port forwarding failed`），而错误只在该机 agent 日志里。
+//
+// 本用例钉住修好后的三件事：端口自动错开、指令定向、状态分桶。
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// TestEgressMachineMultiHost 两台机器并存：端口错开 + 指令定向 + 状态分桶。
+func TestEgressMachineMultiHost(t *testing.T) {
+	store, a, _, _, _ := eaApp(t)
+	tok, err := a.egressAgentTokenGet()
+	if err != nil {
+		t.Fatalf("egressAgentTokenGet: %v", err)
+	}
+	_ = store
+
+	poll := func(machine, host string) egressAgentCmd {
+		t.Helper()
+		u := "/api/agent/poll"
+		var q []string
+		if machine != "" {
+			q = append(q, "machine="+machine)
+		}
+		if host != "" {
+			q = append(q, "hostname="+host)
+		}
+		if len(q) > 0 {
+			u += "?" + strings.Join(q, "&")
+		}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, u, nil)
+		req.Header.Set("X-Agent-Token", tok)
+		a.handleEgressAgentPoll(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("poll(%q) 应 200，得 %d %s", machine, rec.Code, rec.Body.String())
+		}
+		var c egressAgentCmd
+		if err := json.Unmarshal(rec.Body.Bytes(), &c); err != nil {
+			t.Fatalf("poll 响应不是合法 JSON: %v", err)
+		}
+		return c
+	}
+	report := func(machine string, st egressAgentState) {
+		t.Helper()
+		raw, _ := json.Marshal(st)
+		rec := httptest.NewRecorder()
+		u := "/api/agent/report"
+		if machine != "" {
+			u += "?machine=" + machine
+		}
+		req := httptest.NewRequest(http.MethodPost, u, strings.NewReader(string(raw)))
+		req.Header.Set("X-Agent-Token", tok)
+		a.handleEgressAgentReport(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("report(%q) 应 200，得 %d %s", machine, rec.Code, rec.Body.String())
+		}
+	}
+	findMachine := func(v egressHomeView, id string) *egressMachineView {
+		for i := range v.Machines {
+			if v.Machines[i].ID == id {
+				return &v.Machines[i]
+			}
+		}
+		return nil
+	}
+
+	// ---- 1) 老 agent（不带 machine）占 default 桶，端口保持 11080 ----
+	c1 := poll("", "")
+	if c1.TunnelPort != egressBaseTunnelPort {
+		t.Fatalf("老 agent（default 桶）应保持 %d，得 %d —— 升级不该改变已跑着的这台",
+			egressBaseTunnelPort, c1.TunnelPort)
+	}
+	// ---- 2) 第二台机器必须拿到**不同**端口 ----
+	c2 := poll("mid-2", "pc-2")
+	if c2.TunnelPort == c1.TunnelPort {
+		t.Fatalf("两台机器的隧道端口必须错开，否则后到的那台 ssh -R 必然失败（都得 %d）", c2.TunnelPort)
+	}
+	if c2.TunnelPort != egressBaseTunnelPort+1 {
+		t.Fatalf("第二台应拿到 %d，得 %d", egressBaseTunnelPort+1, c2.TunnelPort)
+	}
+
+	// ---- 3) 指令必须定向：给 mid-2 的 start 不能被 default 桶取走 ----
+	m := a.machinesLoad()
+	if mm, ok := m["mid-2"]; !ok {
+		t.Fatal("poll 之后 mid-2 应已登记")
+	} else {
+		mm.Cmd, mm.CmdAt = "start", 1234567
+	}
+	if err := a.machinesSave(m); err != nil {
+		t.Fatalf("machinesSave: %v", err)
+	}
+	if got := poll("mid-2", "pc-2").Action; got != "start" {
+		t.Fatalf("mid-2 应取到自己的 start 指令，得 %q", got)
+	}
+	if got := poll("", "").Action; got != "none" {
+		t.Fatalf("指令必须定向：给 mid-2 的 start 不该被老 agent 取走，得 %q", got)
+	}
+
+	// ---- 4) 状态分桶：两台各报各的，互不覆盖 ----
+	report("", egressAgentState{Hostname: "pc-old", ProxyOK: true, TunnelOK: true, ExitIP: "1.1.1.1"})
+	report("mid-2", egressAgentState{Hostname: "pc-2", ProxyOK: true, TunnelOK: true, ExitIP: "2.2.2.2"})
+
+	v := a.buildEgressHomeView(httptest.NewRequest(http.MethodGet, "/api/egress/home", nil), true)
+	if len(v.Machines) != 2 {
+		t.Fatalf("应看到 2 台机器，得 %d: %+v", len(v.Machines), v.Machines)
+	}
+	m1, m2 := findMachine(v, egressDefaultMachine), findMachine(v, "mid-2")
+	if m1 == nil || m2 == nil {
+		t.Fatalf("两台机器都该在列表里，得 %+v", v.Machines)
+	}
+	if m1.ExitIP != "1.1.1.1" || m2.ExitIP != "2.2.2.2" {
+		t.Fatalf("状态被互相覆盖了：default=%q mid-2=%q", m1.ExitIP, m2.ExitIP)
+	}
+	if m1.Hostname != "pc-old" || m2.Hostname != "pc-2" {
+		t.Fatalf("hostname 串了：default=%q mid-2=%q", m1.Hostname, m2.Hostname)
+	}
+	// 两台各自的线路 URL 必须不同（否则"第二台接进来"等于没接）。
+	if m1.ProxyURL == m2.ProxyURL {
+		t.Fatalf("不同机器的线路 URL 不该相同，得 %q", m1.ProxyURL)
+	}
+	if !strings.HasSuffix(m2.ProxyURL, fmt.Sprintf(":%d", c2.TunnelPort)) {
+		t.Fatalf("mid-2 的线路 URL 应指向它自己的隧道端口，得 %q", m2.ProxyURL)
+	}
+}
+
+// TestEgressHomeApplyTargetsMachine 应用动作只影响**被指定的那台**机器的线路。
+//
+// 这条防的是："在 B 机页面上点应用，结果把 A 机的线路设成了全局默认" ——
+// 多机之后这是最容易发生的越界（默认出口是全局唯一的，选错机器就选错了链路）。
+func TestEgressHomeApplyTargetsMachine(t *testing.T) {
+	store, a, mux, adminCookie, _ := eaApp(t)
+
+	// 造两台已登记的机器（不跑真实隧道，直接写机器表）。
+	m := map[string]*egressMachine{
+		egressDefaultMachine: {ID: egressDefaultMachine, Hostname: "pc-old",
+			Ports: egressAgentPorts{ProxyPort: 1080, TunnelPort: 11080}, StateAt: 100},
+		"mid-2": {ID: "mid-2", Hostname: "pc-2",
+			Ports: egressAgentPorts{ProxyPort: 1080, TunnelPort: 11081}, StateAt: 200},
+	}
+	if err := a.machinesSave(m); err != nil {
+		t.Fatalf("machinesSave: %v", err)
+	}
+	// 起一个真的监听在 11081 上，让 egressTunnelReachable 判为"通"。
+	ln, err := net.Listen("tcp", "127.0.0.1:11081")
+	if err != nil {
+		t.Skipf("11081 被占用，跳过本用例: %v", err)
+	}
+	defer ln.Close()
+
+	// 必须走**真 mux**：应用动作挂的是 adminGuard + 会话级二层校验，
+	// 直接调 handler 会 403（而这正是这条用例想验证的鉴权面之一）。
+	code, raw := eaReq(t, mux, "POST", "/api/egress/home/apply", `{"machine":"mid-2"}`, adminCookie, "")
+	if code != http.StatusOK {
+		t.Fatalf("应用 mid-2 应成功，得 %d %s", code, raw)
+	}
+	def, _ := store.GetKV(kvEgressDefault)
+	if def != "http://127.0.0.1:11081" {
+		t.Fatalf("默认出口应指向**被指定**的 mid-2 线路，得 %q", def)
+	}
+	proxies, _ := store.ListEgressProxies()
+	if len(proxies) != 1 || proxies[0].URL != "http://127.0.0.1:11081" {
+		t.Fatalf("只该注册 mid-2 那一条线路，得 %+v", proxies)
+	}
+}

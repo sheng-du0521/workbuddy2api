@@ -173,13 +173,44 @@ function fmtUptime(sec) {
   return sec + ' 秒';
 }
 
-async function copyText(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast('已复制到剪贴板', 'ok');
-  } catch (e) {
-    toast('复制失败，请手动选择', 'err');
+// writeClipboard 把文本写进系统剪贴板；返回是否成功。
+//
+// 为什么要显式降级（v0.31.18，用户现场驱动）：navigator.clipboard 只在
+// **安全上下文**（HTTPS / localhost）里存在。本服务常部署为
+// http://<公网IP>:8780 —— 那里它是 undefined，直接调用抛错，用户只看到
+// 「复制失败，请手动选择」；而密钥卡片默认**只渲染掩码**，
+// “手动选择”选到的就是掩码 → 粘到客户端里报 key 无效。
+// 复制按钮坏掉 = 用户拿不到密钥，这是整条链路上最贵的一个小故障。
+// 降级路径（隐藏 textarea + execCommand('copy')）在 http 下可用。
+function writeClipboard(text) {
+  const s = String(text == null ? '' : text);
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    return navigator.clipboard.writeText(s).then(() => true, () => legacyCopy(s));
   }
+  return Promise.resolve(legacyCopy(s));
+}
+
+// legacyCopy 非安全上下文下的复制兜底（execCommand 已废弃，但仍是 http 下唯一可用手段）。
+function legacyCopy(s) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, s.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function copyText(text) {
+  if (await writeClipboard(text)) toast('已复制到剪贴板', 'ok');
+  else toast('复制失败，请手动选择', 'err');
 }
 
 // ---------------- DOM 小工具 ----------------
@@ -236,8 +267,15 @@ function maskUID(uid) {
 
 // hostStateTag 代挂账号的入池状态标签（in / pending / rejected / 其它=未入池）。
 // 文案统一取「待审核」（此前管理端写「待审」、用户端写「待审核」，本次对齐为后者）。
+// hostStateTag 代挂账号的入池状态标签。
+// 五态（v0.31.18 起）：in 已入池 / pending 已申请待审 / invited **收到邀请待你确认** /
+// rejected 已驳回 / 其它 未入池。
+// 拆出 invited 这一态是刻意的：它与 pending 的**行动方**相反**
+// （pending = 等管理员 ； invited = 等你自己），合成一个“待审”会让号主
+// 一直等一个永远不会到的审核。
 function hostStateTag(ps) {
   if (ps === 'in') return el('span', 'tag ok', '已入池');
+  if (ps === 'invited') return el('span', 'tag warn', '邀请你入池');
   if (ps === 'pending') return el('span', 'tag warn', '待审核');
   if (ps === 'rejected') return el('span', 'tag err', '已驳回');
   return el('span', 'tag', '未入池');
@@ -913,9 +951,7 @@ function copyBtn(getText, label, cls) {
   };
   b.onclick = async () => {
     const val = typeof getText === 'function' ? getText() : getText;
-    try {
-      await navigator.clipboard.writeText(String(val == null ? '' : val));
-    } catch (e) {
+    if (!(await writeClipboard(val))) {
       toast('复制失败，请手动选择', 'err');
       return;
     }
@@ -2525,6 +2561,9 @@ const EGRESS_POLL_MS = 2000;   // 轮询状态间隔
 const EGRESS_WAIT_MAX_MS = 90000; // 一键拉起后的最长等待
 let egressTimer = null;
 let egressSince = 0;
+// egressSelMachine 当前选中的**目标机器**（v0.31.18 多机）。
+// 指令按机器定向下发；这个变量就是“发给哪一台”的答案。
+let egressSelMachine = '';
 
 function egressDot(ok, text) {
   const s = el('span', null, (ok ? '● ' : '○ ') + text);
@@ -2546,29 +2585,80 @@ async function loadEgressHome() {
   }
 }
 
+// egressMachineLabel 一台机器的显示名（hostname 优先；没有就用 id）。
+function egressMachineLabel(m) {
+  const h = String((m && m.hostname) || '').trim();
+  if (h) return h;
+  return m && m.is_default ? '（未报主机名的 agent）' : String((m && m.id) || '?');
+}
+
+// egressCurMachine 从状态里取当前选中的机器（并保证选中项有效）。
+function egressCurMachine(v) {
+  const machines = (v && v.machines) || [];
+  if (!egressSelMachine || !machines.some((m) => m.id === egressSelMachine)) {
+    egressSelMachine = (v && v.active_machine) || (machines.length ? machines[0].id : '');
+  }
+  return { machines, cur: machines.find((m) => m.id === egressSelMachine) || null };
+}
+
 function renderEgressHome(box, v) {
   box.textContent = '';
+  const { machines, cur } = egressCurMachine(v);
 
-  // ---- 状态行 ----
   const card = el('div', 'card');
   const head = el('div', 'section-head');
   head.appendChild(el('h2', null, '出口状态'));
   card.appendChild(head);
 
+  // ---- 目标机器选择（v0.31.18 多机）----
+  // 为什么要有这一档：指令是**按机器定向**下发的。没有选择器时，
+  // 用户在 A 机页面上点「拉起」可能发给了 B 机（"谁最近说过话就命令谁"），
+  // 而页面上完全看不出这件事 —— 于是表现为"点了没反应"。
+  if (machines.length) {
+    const selRow = el('div', 'row');
+    selRow.style.cssText = 'margin:4px 0 10px;gap:8px;align-items:center;flex-wrap:wrap;';
+    selRow.appendChild(el('span', 'muted', '目标机器'));
+    const sel = el('select');
+    sel.id = 'egressMachineSel';
+    sel.style.minWidth = '260px';
+    for (const m of machines) {
+      const o = el('option', null, egressMachineLabel(m) + (m.online ? ' · 在线' : ' · 离线')
+        + ' · 隧道:' + m.tunnel_port + (m.id === v.active_machine ? ' · 最近上报' : ''));
+      o.value = m.id;
+      sel.appendChild(o);
+    }
+    sel.value = egressSelMachine;
+    sel.onchange = () => { egressSelMachine = sel.value; renderEgressHome(box, v); };
+    selRow.appendChild(sel);
+    card.appendChild(selRow);
+  }
+
+  // ---- 状态行（针对**选中的那台**）----
+  const online = cur ? cur.online : v.agent_online;
+  const tunnel = cur ? cur.tunnel_reachable : v.tunnel_reachable;
+  const applied = cur ? cur.applied : v.applied;
+  const ready = cur ? cur.ready : v.ready;
+  const ports = cur ? { proxy_port: cur.proxy_port, tunnel_port: cur.tunnel_port } : (v.ports || {});
+  const bound = cur ? cur.host_bound : v.host_bound;
+  const total = cur ? cur.host_total : v.host_total;
+  const exitIP = (cur && cur.exit_ip) || (v.agent_state && v.agent_state.exit_ip) || '（未知 —— agent 尚未上报）';
+  const curMsg = (cur && cur.message) || (v.agent_state && v.agent_state.message) || '';
+
   const status = el('div');
   status.style.margin = '6px 0 10px';
-  status.appendChild(egressDot(v.agent_online, '本机 agent ' + (v.agent_online ? '在线' : '离线')));
-  status.appendChild(egressDot(v.tunnel_reachable, '反向隧道 ' + (v.tunnel_reachable ? '已连通' : '未连通')));
-  status.appendChild(egressDot(v.applied, '配置' + (v.applied ? '已应用' : '未应用')));
+  status.appendChild(egressDot(online, 'agent ' + (online ? '在线' : '离线')));
+  status.appendChild(egressDot(tunnel, '反向隧道 ' + (tunnel ? '已连通' : '未连通')));
+  status.appendChild(egressDot(applied, '配置' + (applied ? '已应用' : '未应用')));
   card.appendChild(status);
 
   const rows = [
-    ['出口 IP', (v.agent_state && v.agent_state.exit_ip) || '（未知 —— agent 尚未上报）'],
+    ['目标机器', cur ? (egressMachineLabel(cur) + ' · ' + cur.id) : '（还没有任何 agent 连上来）'],
+    ['出口 IP', exitIP],
     ['全局默认出口', v.default_egress || '（空 = 直连）'],
-    ['自挂号绑定', (v.host_bound || 0) + ' / ' + (v.host_total || 0) + ' 个'],
-    ['隧道端口', '127.0.0.1:' + (v.ports ? v.ports.tunnel_port : '?') + '（本机代理端口 ' + (v.ports ? v.ports.proxy_port : '?') + '）'],
+    ['自挂号绑定', (bound || 0) + ' / ' + (total || 0) + ' 个'],
+    ['隧道端口', '127.0.0.1:' + (ports.tunnel_port || '?') + '（本机代理端口 ' + (ports.proxy_port || '?') + '）'],
   ];
-  if (v.agent_state && v.agent_state.message) rows.push(['最近状态', v.agent_state.message]);
+  if (curMsg) rows.push(['最近状态', curMsg]);
   const tbl = el('div', 'sub');
   for (const [k, val] of rows) {
     const line = el('div');
@@ -2581,6 +2671,26 @@ function renderEgressHome(box, v) {
   }
   card.appendChild(tbl);
 
+  // ---- 全部机器一览（多机时）----
+  if (machines.length > 1) {
+    const mt = el('div', 'sub');
+    mt.style.marginTop = '10px';
+    mt.appendChild(el('div', null, '已接入的机器（每台一条独立隧道，端口不同，可同时在线）：'));
+    for (const m of machines) {
+      const line = el('div');
+      line.style.padding = '2px 0';
+      line.appendChild(el('b', null, egressMachineLabel(m) + ' '));
+      line.appendChild(el('span', null,
+        (m.online ? '● 在线' : '○ 离线')
+        + ' · 隧道' + (m.tunnel_reachable ? '通' : '不通')
+        + ' · 端口 ' + m.tunnel_port
+        + (m.exit_ip ? ' · 出口 ' + m.exit_ip : '')
+        + (m.applied ? ' · 已应用' : '')));
+      mt.appendChild(line);
+    }
+    card.appendChild(mt);
+  }
+
   // ---- 操作区 ----
   if (!v.can_manage) {
     const tip = el('div', 'sub', '出口链路的改动会影响全平台（全局默认出口 + 自挂号绑定），因此仅管理员可执行；上面是只读状态。');
@@ -2591,23 +2701,22 @@ function renderEgressHome(box, v) {
   }
 
   const row = el('div', 'row');
-  row.style.flexWrap = 'wrap';
-  row.style.alignItems = 'center';
-  row.style.gap = '8px';
-  row.style.marginTop = '10px';
+  row.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;';
 
   const pulling = !!egressTimer;
-  const pull = el('button', null, pulling ? '等待中…' : (v.ready ? '重新拉起并应用' : '一键拉起'));
-  pull.disabled = pulling;
+  const hasMachine = !!egressSelMachine;
+  const pull = el('button', null, pulling ? '等待中…' : (ready ? '重新拉起并应用' : '一键拉起'));
+  pull.disabled = pulling || !hasMachine;
+  if (!hasMachine) pull.title = '还没有任何 agent 连上来 —— 请先在目标电脑上运行下面那行命令';
   pull.addEventListener('click', () => egressPull(v));
   row.appendChild(pull);
 
   const applyBtn = el('button', 'ghost', '仅重新应用配置');
-  applyBtn.disabled = pulling || !v.tunnel_reachable;
+  applyBtn.disabled = pulling || !tunnel || !hasMachine;
   applyBtn.addEventListener('click', async () => {
     applyBtn.disabled = true;
     try {
-      const d = await api('/api/egress/home/apply', { method: 'POST' });
+      const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
       toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
             '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
       loadEgressHome();
@@ -2618,12 +2727,12 @@ function renderEgressHome(box, v) {
   });
   row.appendChild(applyBtn);
 
-  const rel = el('button', 'ghost', '停止本机代理');
-  rel.disabled = pulling;
+  const rel = el('button', 'ghost', '停止该机器代理');
+  rel.disabled = pulling || !hasMachine;
   rel.addEventListener('click', async () => {
     try {
-      await api('/api/egress/home/release', { method: 'POST' });
-      toast('已下发停止指令（不会自动改动账号的出口配置）', 'ok');
+      await post('/api/egress/home/release', { machine: egressSelMachine });
+      toast('已向该机器下发停止指令（不会自动改动账号的出口配置）', 'ok');
       loadEgressHome();
     } catch (e) {
       toast('停止失败：' + (e && e.message ? e.message : e), 'bad');
@@ -2632,14 +2741,16 @@ function renderEgressHome(box, v) {
   row.appendChild(rel);
   card.appendChild(row);
 
-  // ---- 首次使用：在本机跑一次 agent ----
-  if (!v.agent_online && v.agent_command) {
+  // ---- 首次使用：在目标电脑上跑一次 agent ----
+  // 注意：**新机器是靠 agent 先 poll 才登记出来的** ——
+  // 所以这段不能只在"没在线时"显示，而是**没有 machine 时就要显示**；
+  // 否则用户在第二台电脑上永远看不到"该怎么让它出现在列表里"。
+  if (v.agent_command && (machines.length === 0 || (!online && cur && !cur.is_default) || !machines.some((m) => m.online))) {
     const note = el('div', 'sub');
     note.style.marginTop = '12px';
-    note.appendChild(document.createTextNode('本机 agent 还没跑起来。'));
-    note.appendChild(el('b', null, '在你家里那台电脑上'));
+    note.appendChild(document.createTextNode('在**目标电脑**上'));
     note.appendChild(document.createTextNode(
-      '（与 wbproxy.exe、ai.pem 放在同一目录）运行下面这行 —— 只需一次，之后它常驻：'));
+      '（与 wbproxy.exe、ai.pem 放在同一目录）运行下面这行 —— 每台电脑各跑一份，它会自动登记到上面的目标机器列表：'));
     card.appendChild(note);
 
     const cmd = el('div', 'sub');
@@ -2651,23 +2762,19 @@ function renderEgressHome(box, v) {
     const copy = el('button', 'ghost', '复制命令');
     copy.style.marginTop = '8px';
     copy.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(v.agent_command);
-        toast('已复制', 'ok');
-      } catch (e) {
-        // 剪贴板 API 在非 https 下不可用 → 退化成"选中让用户自己复制"
-        const r = document.createRange();
-        r.selectNodeContents(cmd);
-        const sel = window.getSelection();
-        sel.removeAllRanges(); sel.addRange(r);
-        toast('已选中，请按 Ctrl+C 复制', 'ok');
-      }
+      if (await writeClipboard(v.agent_command)) { toast('已复制', 'ok'); return; }
+      // 两条复制路径都失败（极少数环境）→ 退化成"选中让用户自己复制"。
+      const r = document.createRange();
+      r.selectNodeContents(cmd);
+      const sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(r);
+      toast('已选中，请按 Ctrl+C 复制', 'ok');
     });
     card.appendChild(copy);
   }
 
   if (egressTimer) {
-    const w = el('div', 'sub', '已下发拉起指令，正在等待本机 agent 响应…（最长 90 秒）');
+    const w = el('div', 'sub', '已向目标机器下发拉起指令，正在等待它的 agent 响应…（最长 90 秒）');
     w.style.marginTop = '10px';
     card.appendChild(w);
   }
@@ -2680,34 +2787,43 @@ function renderEgressHome(box, v) {
   h2.appendChild(el('h2', null, '这条链路是什么'));
   help.appendChild(h2);
   help.appendChild(el('div', 'sub',
-    '本机 agent 在你家里那台电脑上跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
+    '目标机器上的 agent 跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
     '于是平台访问上游时，流量会从「你家的宽带」出去 —— 住宅 IP 比机房 IP 友好得多。' +
     '拉起并应用后：全局默认出口指向这条线路（跟随默认的号自动生效），' +
     '所有自挂号被显式绑定到它（不随默认出口漂移）。'));
   const warn = el('div', 'sub');
   warn.style.marginTop = '8px';
-  warn.appendChild(document.createTextNode('⚠️ 两点要知道：'));
+  warn.appendChild(document.createTextNode('⚠️ 三点要知道：'));
   warn.appendChild(el('br'));
   warn.appendChild(document.createTextNode(
-    '① 只有这一个出口 IP —— 全部账号共用它，会保留"同一 IP 出站"的特征；'));
+    '① **全局默认出口只有一个**：多台机器时，最后应用的那台决定它；要让部分号走另一台，用管理后台的「批量分配」显式绑定；'));
   warn.appendChild(el('br'));
   warn.appendChild(document.createTextNode(
-    '② 家宽上行带宽是全平台瓶颈，且本机断网/关机时这条链路会一起断（隧道断开后 agent 会自动重连）。'));
+    '② 同一条线路只有一个出口 IP —— 绑它的账号共用这个 IP，会保留"同一 IP 出站"的特征；'));
+  warn.appendChild(el('br'));
+  warn.appendChild(document.createTextNode(
+    '③ 家宽上行带宽是瓶颈，且该机器断网/关机时这条链路会一起断（agent 会自动重连）。'));
   help.appendChild(warn);
   box.appendChild(help);
 }
 
 // egressPull 一键拉起：下发指令 → 轮询状态 → 就绪后**自动应用**配置。
+// egressPull 一键拉起：向**选中的那台机器**下发指令 → 轮询状态 → 就绪后自动应用配置。
 async function egressPull(v) {
   if (egressTimer) return;
+  const machine = egressSelMachine;
+  if (!machine) {
+    toast('还没有已登记的机器：请先在目标电脑上运行 agent', 'bad');
+    return;
+  }
   try {
-    await api('/api/egress/home/pull', { method: 'POST' });
+    await post('/api/egress/home/pull', { machine });
   } catch (e) {
     toast('下发指令失败：' + (e && e.message ? e.message : e), 'bad');
     return;
   }
   egressSince = Date.now();
-  toast('已下发拉起指令，正在等待本机 agent…', 'ok');
+  toast('已向 ' + machine + ' 下发拉起指令，正在等待它的 agent…', 'ok');
   const box = document.getElementById('egressHomeBox');
   const step = async () => {
     let cur = null;
@@ -2715,10 +2831,13 @@ async function egressPull(v) {
       cur = await api('/api/egress/home');
     } catch (e) { /* 轮询失败不终止，下一轮再试 */ }
     if (cur && box) renderEgressHome(box, cur);
-    if (cur && cur.ready) {
+    // 就绪判据看**目标机器**（不是汇总场）——
+    // 多机时汇总场取的是"最近上报的那台"，可能不是你点的那台。
+    const target = (cur && (cur.machines || []).find((m) => m.id === machine)) || null;
+    if (target && target.ready) {
       egressTimer = null;
       try {
-        const d = await api('/api/egress/home/apply', { method: 'POST' });
+        const d = await post('/api/egress/home/apply', { machine });
         toast('已就绪并自动应用：自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
       } catch (e) {
         toast('已就绪，但自动应用失败：' + (e && e.message ? e.message : e), 'bad');
@@ -2728,7 +2847,7 @@ async function egressPull(v) {
     }
     if (Date.now() - egressSince > EGRESS_WAIT_MAX_MS) {
       egressTimer = null;
-      toast('等待超时：本机 agent 未响应。请确认它已启动，并检查 agent 窗口里的输出。', 'bad');
+      toast('等待超时：该机器的 agent 未响应。请确认它已启动，并检查 agent 窗口里的输出。', 'bad');
       loadEgressHome();
       return;
     }

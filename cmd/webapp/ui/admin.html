@@ -2032,7 +2032,10 @@ function consumeTone(g) {
 //   · 冷却中 = a.cooling
 //   · 已停用 = a.disabled || a.manual_off（与仪表盘「停用」计数同口径）
 //   · 异常组 = 生效消耗分组 = abnormal（含系统自动归档）
-//   · 未入池 = 代挂号还没通过入池审批（平台自持号恒为 in，不会命中）
+//   · 未入池（代挂）= 代挂号 pool_state 不是 'in'（平台自持号恒为 in，不会命中）。
+//     ⚠ 这一档**同时包含**未申请 / 待审 / 已邀请 / 已驳回 ——
+//     它们的“下一步”各不相同，所以卡片上仍需逐个标出真实状态
+//     （见下方 pool_state 标签），**不能只靠这个筛选档做判断**。
 //   · 积分未获取 = 从未拉到权威余额（新号在首次签到/检测前）
 //   · 零积分 = 拉到过但为 0（真的花光了，与"还没拉过"是两回事）
 //   · 限模 = 有 **模型级**冷却（rate_limited_models > 0）
@@ -2047,7 +2050,7 @@ const ACC_STATES = [
   ['cooling', '冷却中'],
   ['off', '已停用'],
   ['abnormal', '异常组'],
-  ['pending', '未入池'],
+  ['pending', '未入池（代挂）'],
   ['credit_unknown', '积分未获取'],
   ['credit_zero', '零积分'],
 ];
@@ -2485,8 +2488,10 @@ function accountCard(a) {
   else chips.appendChild(el('span', 'tag ok', '可用'));
   if (a.owner_id > 0) {
     const ps = a.pool_state;
-    const txt = ps === 'in' ? '已入池' : (ps === 'pending' ? '待审' : (ps === 'rejected' ? '已驳回' : '未入池'));
-    chips.appendChild(el('span', 'tag ' + (ps === 'in' ? 'ok' : (ps === 'pending' ? 'warn' : '')), txt));
+    const txt = ps === 'in' ? '已入池'
+      : (ps === 'invited' ? '已邀请待确认'
+        : (ps === 'pending' ? '待审' : (ps === 'rejected' ? '已驳回' : '未入池')));
+    chips.appendChild(el('span', 'tag ' + (ps === 'in' ? 'ok' : (ps === 'pending' || ps === 'invited' ? 'warn' : '')), txt));
     // 收益＝返点 → 以「钱」为主展示（v0.17.7）。
     if (a.earned > 0) {
       const t = el('span', 'tag', '累计收益 ' + fmtMoney(a.earned_cny));
@@ -3384,8 +3389,14 @@ async function reviewHost(uid, action) {
     reason = r.reason;
   }
   try {
-    await post('/api/admin/host/accounts/' + encodeURIComponent(uid) + '/review', { action, reason });
-    toast(action === 'approve' ? '已批准入池' : '已移出 / 驳回', 'ok');
+    const d = await post('/api/admin/host/accounts/' + encodeURIComponent(uid) + '/review', { action, reason });
+    // 文案按**服务端最终落的状态**说（而不是按我们点了哪个按钮）：
+    // 同一个“批准”按钮在不同状态下会落不同结果（审批 / 邀请）。
+    const ps = (d && d.account && d.account.pool_state) || '';
+    toast(action === 'approve'
+      ? (ps === 'invited' ? '已发出入池邀请（等待号主确认）' : '已批准入池')
+      : (ps === '' ? '已撤回邀请 / 移出号池' : '已驳回'),
+      'ok');
     loadHost();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -3394,10 +3405,15 @@ function renderPending() {
   const box = $('hostPending');
   box.textContent = '';
   const list = allHost.filter((h) => h.pool_state === 'pending');
-  setTxt('hostPendingHint', list.length ? ('共 ' + list.length + ' 个待审申请') : '用户申请将代挂账号接入平台反代后在此审批');
+  // 已邀请待确认的一批（v0.31.18）：方向与待审**相反**（这边等号主），
+  // 所以单独列一段——混在一起会让运维反复点“批准”却没反应。
+  const invited = allHost.filter((h) => h.pool_state === 'invited');
+  setTxt('hostPendingHint', list.length || invited.length
+    ? ('待审 ' + list.length + ' 个' + (invited.length ? ' · 已邀请待确认 ' + invited.length + ' 个' : ''))
+    : '用户申请将代挂账号接入平台反代后在此审批');
   const badge = $('hostBadge');
   if (badge) { badge.textContent = list.length; badge.classList.toggle('hidden', !list.length); }
-  if (!list.length) { box.appendChild(el('div', 'muted', '当前没有待审申请')); return; }
+  if (!list.length && !invited.length) { box.appendChild(el('div', 'muted', '当前没有待审申请')); return; }
   for (const h of list) {
     const row = el('div', 'pending-row');
     const grow = el('div', 'grow');
@@ -3411,6 +3427,19 @@ function renderPending() {
     no.onclick = () => reviewHost(h.uid, 'reject');
     acts.appendChild(ok);
     acts.appendChild(no);
+    row.appendChild(acts);
+    box.appendChild(row);
+  }
+  for (const h of invited) {
+    const row = el('div', 'pending-row');
+    const grow = el('div', 'grow');
+    grow.appendChild(el('div', 'who', (h.nickname || h.uid) + ' · ' + (h.owner_name || '')));
+    grow.appendChild(el('div', 'meta', 'UID ' + maskUID(h.uid) + ' · 已发出入池邀请，等待号主确认'));
+    row.appendChild(grow);
+    const acts = el('div', 'acts');
+    const undo = el('button', 'ghost sm', '撤回邀请');
+    undo.onclick = () => reviewHost(h.uid, 'reject');
+    acts.appendChild(undo);
     row.appendChild(acts);
     box.appendChild(row);
   }
@@ -3492,12 +3521,31 @@ function hostAccountCard(h) {
   }));
 
   const foot = el('footer');
+  // 入池按钮按状态分流（v0.31.18）：
+  //   · in      → 移出号池
+  //   · pending → **批准**（号主已申请，等管理员）
+  //   · invited → 已邀请，**等号主确认**（不能再点“批准” —— 决定权不在这里）
+  //   · 其它    → **邀请入池**（不再是“批准”：号主从未申请，没有东西可批）
   if (h.pool_state === 'in') {
     const out = el('button', 'ghost', '移出号池');
     out.onclick = () => reviewHost(h.uid, 'reject');
     foot.appendChild(out);
-  } else {
+  } else if (h.pool_state === 'invited') {
+    foot.appendChild(el('span', 'muted', '已邀请，等待号主确认'));
+    const undo = el('button', 'ghost', '撤回邀请');
+    undo.onclick = () => reviewHost(h.uid, 'reject');
+    foot.appendChild(undo);
+  } else if (h.pool_state === 'pending') {
     const ap = el('button', '', '批准入池');
+    ap.title = '该号主已申请，点击审核通过';
+    ap.onclick = () => reviewHost(h.uid, 'approve');
+    foot.appendChild(ap);
+    const rj = el('button', 'ghost', '驳回');
+    rj.onclick = () => reviewHost(h.uid, 'reject');
+    foot.appendChild(rj);
+  } else {
+    const ap = el('button', '', '邀请入池');
+    ap.title = '该账号未申请入池；点击后**发出邀请**，由号主自己确认后才会进池';
     ap.onclick = () => reviewHost(h.uid, 'approve');
     foot.appendChild(ap);
   }
@@ -3669,7 +3717,9 @@ async function openUserDetail(id, name) {
       kv(id5, (a.nickname || a.uid.slice(0, 8)),
         (a.realm === 'global' ? '国际版' : '国内版') + ' · ' + (a.consume_group || '—') +
         ' · 积分 ' + fmtCredit(a.credits || 0) +
-        (a.pool_state === 'in' ? ' · 已入池' : (a.pool_state === 'pending' ? ' · 待审' : '')) +
+        (a.pool_state === 'in' ? ' · 已入池'
+          : (a.pool_state === 'pending' ? ' · 待审'
+            : (a.pool_state === 'invited' ? ' · 已邀请' : ''))) +
         (a.disabled ? ' · 已禁用' : '') + (a.cooling ? ' · 冷却中' : ''));
     }
   }

@@ -219,7 +219,7 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		res, err := a.applyHomeEgress()
+		res, err := a.applyHomeEgress(egressBaseTunnelPort)
 		if err != nil {
 			t.Fatalf("第 %d 次 apply: %v", i+1, err)
 		}
@@ -287,6 +287,15 @@ func TestEgressHomeApplyRefusedWhenTunnelDown(t *testing.T) {
 	_, a, mux, adminCookie, _ := eaApp(t)
 	// 换成一个没人监听的隧道端口。
 	_ = a.store.SetKV(kvEgressAgentPorts, `{"proxy_port":1080,"tunnel_port":1}`)
+	// 先让 agent 登记一次（v0.31.18 起 apply 要求"该机器已登记"，
+	// 否则会先被 400「机器尚未登记」挡掉，测不到"隧道不通"这条路径）。
+	tok, err := a.egressAgentTokenGet()
+	if err != nil {
+		t.Fatalf("egressAgentTokenGet: %v", err)
+	}
+	if c, raw := eaReq(t, mux, "GET", "/api/agent/poll", "", "", tok); c != http.StatusOK {
+		t.Fatalf("agent poll 应 200，得 %d %s", c, raw)
+	}
 
 	code, raw := eaReq(t, mux, "POST", "/api/egress/home/apply", "", adminCookie, "")
 	if code != http.StatusConflict {

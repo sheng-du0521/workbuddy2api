@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -330,8 +331,44 @@ func (a *app) handleHostPool(w http.ResponseWriter, r *http.Request) {
 	case "leave":
 		state = ""
 		note = ""
+	case "accept":
+		// 接受管理员的入池邀请（v0.31.18）。
+		//
+		// 为什么需要它：入池的**发起方**可以有两边 —— 号主自己申请（apply）
+		// 或管理员邀请（见 handleAdminHostReview）。被邀请时账号停在 "invited"，
+		// 只有号主自己点「接受」才会真正进池。这条链路存在的意义就是
+		// **不让管理员单方面把一个人的号拉进平台号池去消耗他的积分**。
+		if acc.PoolState != "invited" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前没有待确认的入池邀请"})
+			return
+		}
+		// 与 apply 同门槛：接受前再复核一次积分。
+		if credits, known := a.poolCredits(uid); !known {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "尚未获取到该账号的积分。请在卡片上点一次「查看全部」（积分区块会自动同步最新积分），然后再确认",
+			})
+			return
+		} else if credits < poolApplyMinCredits {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":     fmt.Sprintf("账号积分不足 %d（当前 %d），暂不能入池", poolApplyMinCredits, credits),
+				"credits":   credits,
+				"min_apply": poolApplyMinCredits,
+			})
+			return
+		}
+		state = "in"
+		note = "号主已接受入池邀请"
+	case "decline":
+		// 谢绝邀请：退回未入池，并把邀请痕迹留在 note 里
+		// —— 管理端能看出“邀请过、被拒了”，而不是“从没邀请过”。
+		if acc.PoolState != "invited" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前没有待确认的入池邀请"})
+			return
+		}
+		state = ""
+		note = "号主谢绝了入池邀请"
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "未知动作（apply/cancel/leave）"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "未知动作（apply/cancel/leave/accept/decline）"})
 		return
 	}
 	if err := a.store.SetAccountPoolState(uid, state, note); err != nil {
@@ -427,6 +464,10 @@ func (a *app) handleAdminHostAccounts(w http.ResponseWriter, r *http.Request) {
 	views := make([]hostAccountView, 0, len(list))
 	byOwner := map[int64][]hostAccountView{}
 	pending := make([]hostAccountView, 0)
+	// invited（v0.31.18）：管理员已发出邀请、等号主确认的一批。
+	// 与 pending（号主申请、等管理员审批）**方向相反**，必须分开报 ——
+	// 合成一个"待处理"队列会让两种动作（批准 / 催确认）混在一起。
+	invited := make([]hostAccountView, 0)
 	for _, acc := range list {
 		v := a.hostViewP(acc, creditByUID[acc.UID])
 		if us, ok := usageByUID[acc.UID]; ok {
@@ -442,6 +483,9 @@ func (a *app) handleAdminHostAccounts(w http.ResponseWriter, r *http.Request) {
 		byOwner[acc.OwnerUserID] = append(byOwner[acc.OwnerUserID], v)
 		if acc.PoolState == "pending" {
 			pending = append(pending, v)
+		}
+		if acc.PoolState == "invited" {
+			invited = append(invited, v)
 		}
 	}
 	// 稳定排序：按号主名升序，便于管理后台扫读。
@@ -468,6 +512,7 @@ func (a *app) handleAdminHostAccounts(w http.ResponseWriter, r *http.Request) {
 		"accounts": views,
 		"owners":   owners,
 		"pending":  pending,
+		"invited":  invited,
 	})
 }
 
@@ -494,14 +539,38 @@ func (a *app) handleAdminHostReview(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if err := a.store.SetAccountPoolState(uid, "in", "已通过审核"); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
+		// ⚠️ 语义分流（v0.31.18，用户现场驱动）：这个按钮此前对**任何**代挂号
+		// 都直接落 "in"，于是管理员能把一个**号主从未同意入池**的号拉进平台号池
+		// —— 号主的积分会被消耗，而界面上写的还是“批准入池”（听起来像“同意了他的申请”）。
+		// 现在按**来源**分流：
+		//   · 号主申请过（pool_state == "pending"）→ 这是**审批**，落 "in"；
+		//   · 号主没申请过（其它值）→ 这是**邀请**，落 "invited"，等号主自己确认。
+		// 号池只会选中 pool_state == "in" 的号，所以 "invited" 期间零消耗、零出站。
+		if acc.PoolState == "pending" {
+			if err := a.store.SetAccountPoolState(uid, "in", "已通过审核"); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		} else {
+			if err := a.store.SetAccountPoolState(uid, "invited", "管理员邀请入池，等待号主确认"); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			log.Printf("INFO: [host] 已向代挂号 %s 发出入池邀请（等待号主确认）", uid)
 		}
 	case "reject":
 		reason := strings.TrimSpace(req.Reason)
 		if reason == "" {
 			reason = "未通过审核"
+		}
+		// 已邀请但尚未确认的号，管理员“驳回”= 撤回邀请（不是驳回申请）：
+		// 落回未入池，并在 note 里留下痕迹。
+		if acc.PoolState == "invited" {
+			if err := a.store.SetAccountPoolState(uid, "", "管理员撤回了入池邀请"); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			break
 		}
 		if err := a.store.SetAccountPoolState(uid, "rejected", reason); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})

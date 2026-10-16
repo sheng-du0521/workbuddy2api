@@ -27,7 +27,7 @@
       <button class="nav-item" data-nav="usage" data-on="loadUsageLive" data-title="用量账单" data-sub="三类消耗 + 实时态势 + 逐笔流水"><span class="ico">📊</span>用量账单</button>
       <button class="nav-item" data-nav="wallet" data-on="loadWallet" data-title="充值提现" data-sub="充值码兑换、提现申请与流水"><span class="ico">💳</span>充值提现</button>
       <div class="nav-group">代挂</div>
-      <button class="nav-item" data-nav="host" data-on="loadHostAccounts" data-title="账号代挂" data-sub="把你的账号挂到平台：自用反代 / 申请进号池赚收益"><span class="ico">🔗</span>账号代挂</button>
+      <button class="nav-item" data-nav="host" data-on="loadHostAccounts" data-title="账号代挂" data-sub="把你的账号挂到平台：自用反代 / 申请进号池赚收益"><span class="ico">🔗</span>账号代挂<span class="badge hidden" id="hostInviteBadge">0</span></button>
       <button class="nav-item" data-nav="egress" data-on="loadEgressHome" data-title="代理" data-sub="把本机住宅出口（家里的宽带）接进平台出站链路：一键拉起、自动应用"><span class="ico">🛡</span>代理</button>
       <button class="nav-item" data-nav="market" data-on="loadMarket" data-title="账号市场" data-sub="买断在售账号，转入你的代挂序列"><span class="ico">🏷</span>账号市场</button>
       <button class="nav-item" data-nav="growth" data-on="loadHostGrowth" data-title="成长任务" data-sub="手动选号做官方成长计划，查看完成进度"><span class="ico">🌱</span>成长任务</button>
@@ -390,6 +390,9 @@
     </section>
 
     <section class="pane" data-pane="host">
+      <!-- 入池邀请提醒（v0.31.18）：邀请是**别人发起的**，
+           不在这里突出显示就等于号主永远不会知道。 -->
+      <div id="hostInviteBox"></div>
       <div class="card">
         <div class="section-head">
           <h2>添加代挂账号（扫码授权）</h2>
@@ -1090,6 +1093,40 @@ let newKeyKind = 'host';      // 'host' = 代挂自用；'pool' = 号池计费
 let newKeyBind = new Set();   // 新密钥勾选的账号 uid
 let keyKindSegEl = null;
 
+// ---- 勾选持久化（v0.31.18）----
+// 现场需求：“勾好账号范围 → 一生成密钥 / 一刷新就全没了”。
+// 勾选是用户已表达的**意图**，不该被一次刷新丢掉——
+// 丢掉之后用户下一步往往是“重新勾一遍”，而更坏的是：
+// 勾选丢了但用户没发现 → 生成出一把范围不对的 key。
+// 按当前登录用户名隔离（同一浏览器多账号不串）；读写失败一律当空
+// （隐私模式下 localStorage 会抛，不能让它把页面搞挂）。
+const KEY_BIND_LS_PREFIX = 'wb2api.keyBind.';
+let keyBindRestored = false;
+
+function keyBindLSKey() {
+  let who = 'anon';
+  try { if (typeof me !== 'undefined' && me && me.username) who = String(me.username); } catch (e) { who = 'anon'; }
+  return KEY_BIND_LS_PREFIX + who;
+}
+
+function keyBindSave() {
+  try {
+    localStorage.setItem(keyBindLSKey(), JSON.stringify({
+      kind: newKeyKind, uids: Array.from(newKeyBind),
+    }));
+  } catch (e) { /* 隐私模式 / 禁用存储：仅本次会话生效 */ }
+}
+
+function keyBindRestoreOnce() {
+  if (keyBindRestored) return;
+  keyBindRestored = true;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(keyBindLSKey()) || 'null'); } catch (e) { saved = null; }
+  if (!saved || typeof saved !== 'object') return;
+  if (saved.kind === 'pool' || saved.kind === 'host') newKeyKind = saved.kind;
+  if (Array.isArray(saved.uids)) for (const uid of saved.uids) if (uid) newKeyBind.add(String(uid));
+}
+
 // keyScopeLabel 一把密钥的作用域文案。
 function keyScopeLabel(k) {
   if (k.kind === 'host') {
@@ -1152,6 +1189,7 @@ function renderKeyBindList() {
     box.textContent = '';
     box.appendChild(bindBoxes(hostAccountsCache, newKeyBind, (uid, v) => {
       if (v) newKeyBind.add(uid); else newKeyBind.delete(uid);
+      keyBindSave();
       rebuild();
     }));
   };
@@ -1166,7 +1204,7 @@ function renderKeyKindSeg() {
   keyKindSegEl = segmented([
     { value: 'host', label: '代挂自用' },
     { value: 'pool', label: '号池计费' },
-  ], newKeyKind, (v) => { newKeyKind = v; renderKeyKindSeg(); renderKeyBindList(); });
+  ], newKeyKind, (v) => { newKeyKind = v; keyBindSave(); renderKeyKindSeg(); renderKeyBindList(); });
   host.appendChild(keyKindSegEl);
 }
 
@@ -1176,9 +1214,12 @@ async function loadKeyForm() {
     const d = await api('/api/host/accounts');
     hostAccountsCache = d.accounts || [];
   } catch (e) { hostAccountsCache = []; }
+  // 首次进入本页：恢复上次勾选（刷新 / 切页不再丢）。
+  keyBindRestoreOnce();
   // 已删除账号从勾选集合里剔除。
   const alive = new Set(hostAccountsCache.map((a) => a.uid));
   for (const uid of Array.from(newKeyBind)) if (!alive.has(uid)) newKeyBind.delete(uid);
+  keyBindSave();
   renderKeyKindSeg();
   renderKeyBindList();
 }
@@ -1307,8 +1348,7 @@ function renderKeyCards() {
       cp.onclick = async () => {
         let val = k._plain;
         try { if (!val) val = await reveal(); } catch (e) { toast(e.message, 'err'); return; }
-        try { await navigator.clipboard.writeText(String(val || '')); }
-        catch (e) { toast('复制失败，请手动选择', 'err'); return; }
+        if (!(await writeClipboard(val))) { toast('复制失败，请手动选择', 'err'); return; }
         toast('已复制完整密钥', 'ok');
       };
       btnRow.appendChild(cp);
@@ -1374,18 +1414,19 @@ $('btnNewKey').onclick = async () => {
     }
     const d = await post('/api/keys', body);
     $('keyName').value = '';
-    newKeyBind = new Set();
+    // 勾选**不清空**（v0.31.18）：连续生成同类密钥时不必重勾；要改范围就改勾选，
+    // 而不是“先发现它被清空了再重勾一遍”。
+    keyBindSave();
     const created = d.keys || (d.key ? [d.key] : []);
     await loadKeys();
-    if (created.length > 1) {
-      // 多把：弹窗逐条列出、各自可复制（单把静默复制到剪贴板）。
-      toast(`已生成 ${created.length} 把密钥`, 'ok');
-      showNewKeys(created);
-    } else {
-      toast('已生成，密钥已复制到剪贴板', 'ok');
-      if (created[0] && created[0].key) {
-        try { await navigator.clipboard.writeText(created[0].key); } catch (e) { /* 剪贴板不可用时忽略 */ }
-      }
+    // 不管几把，**一律弹窗展示完整密钥**：剪贴板在
+    // http 下可能不可用，而列表默认只渲染掩码——
+    // 不弹窗就等于用户**永远看不到自己刚生成的密钥**。
+    if (created.length) {
+      toast(created.length > 1 ? `已生成 ${created.length} 把密钥` : '已生成密钥', 'ok');
+      let copied = false;
+      if (created[0] && created[0].key) copied = await writeClipboard(created[0].key);
+      showNewKeys(created, copied);
     }
   } catch (e) {
     toast(e.message, 'err');
@@ -1395,8 +1436,12 @@ $('btnNewKey').onclick = async () => {
 };
 
 // showNewKeys 批量生成的密钥清单弹窗（每条可单独复制）。
-function showNewKeys(keys) {
-  const m = openModal('已生成 ' + keys.length + ' 把密钥', '密钥仅在此处完整展示，请及时保存；每条可单独复制。');
+function showNewKeys(keys, copied) {
+  const sub = copied
+    ? '密钥仅在此处完整展示，请及时保存；每条可单独复制。'
+    : '⚠ 浏览器未能自动写入剪贴板（本页通过 http 访问时剪贴板受限）——'
+      + '请在此窗口里手动选中复制，关掉就看不到了。';
+  const m = openModal('已生成 ' + keys.length + ' 把密钥', sub);
   const list = el('div', 'cfg-list');
   for (const k of keys) {
     list.appendChild(cfgRow(k.name || '未命名', k.key || '', copyBtn(() => k.key || '', '')));
@@ -1422,7 +1467,14 @@ let hostUnified = { enabled: true, disabled: new Set() };
 async function hostPoolAction(uid, action) {
   try {
     await post('/api/host/accounts/' + encodeURIComponent(uid) + '/pool', { action });
-    toast(action === 'apply' ? '已提交入池申请，等待管理员审核' : (action === 'cancel' ? '已撤回申请' : '已退出号池'), 'ok');
+    const msg = {
+      apply: '已提交入池申请，等待管理员审核',
+      cancel: '已撤回申请',
+      accept: '已接受入池邀请，该账号已进入号池',
+      decline: '已谢绝入池邀请',
+      leave: '已退出号池',
+    }[action] || '已处理';
+    toast(msg, 'ok');
     loadHostAccounts();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -1608,6 +1660,20 @@ function hostCard(h) {
     const cancel = el('button', 'ghost', '撤回申请');
     cancel.onclick = () => hostPoolAction(h.uid, 'cancel');
     foot.appendChild(cancel);
+  } else if (h.pool_state === 'invited') {
+    // 收到管理员的入池邀请（v0.31.18）：**由号主自己决定**要不要入池。
+    // 这里刻意不自动接受 —— 入池意味着你的号会被平台用来服务别人的请求、
+    // 并消耗你的积分（按分成返还），这个决定只能由号主做。
+    const yes = el('button', '', '接受邀请');
+    yes.title = '接受后该账号进入平台号池，按用量消耗积分并按分成返还收益';
+    yes.onclick = async () => {
+      if (await confirmAsk('接受入池邀请？\n\n接受后平台会用它服务其他用户的请求，按用量消耗该账号积分，并按分成比例把收益折算进你的余额。随时可以「退出号池」。')) hostPoolAction(h.uid, 'accept');
+    };
+    foot.appendChild(yes);
+    const no = el('button', 'ghost', '谢绝');
+    no.onclick = () => hostPoolAction(h.uid, 'decline');
+    foot.appendChild(no);
+    foot.appendChild(el('span', 'muted', '管理员邀请你把这个号放进平台号池（消耗你的积分、按分成返还收益）'));
   } else {
     // 入池积分门槛（v0.20.0）：账号积分需 ≥ 2000，页面先给出提示，后端仍会复核。
     //
@@ -1658,6 +1724,47 @@ function hostCard(h) {
   foot.appendChild(del);
   card.appendChild(foot);
   return card;
+}
+
+// renderHostInvites 入池邀请提醒条（v0.31.18）。
+//
+// 为什么要在顶部单独提醒：邀请是**别人发起的**，号主不看代挂页就
+// 永远不会知道；而它与“申请”最大的区别是：**申请是你发起的，邀请不是**。
+// 顺便把左侧导航的 badge 一并更新。
+function renderHostInvites() {
+  const box = $('hostInviteBox');
+  const list = hostAll.filter((h) => h.pool_state === 'invited');
+  const badge = $('hostInviteBadge');
+  if (badge) {
+    badge.textContent = String(list.length);
+    badge.classList.toggle('hidden', !list.length);
+  }
+  if (!box) return;
+  box.textContent = '';
+  if (!list.length) return;
+  const card = el('div', 'card');
+  card.style.borderLeft = '3px solid #e6a23c';
+  const head = el('div', 'section-head');
+  head.appendChild(el('h2', null, '⏳ 收到 ' + list.length + ' 个入池邀请'));
+  card.appendChild(head);
+  card.appendChild(el('div', 'sub', '平台邀请你把下面这些代挂账号放进号池：入池后平台会用它服务其他用户，按用量消耗该账号积分，并按分成比例把收益折算进你的余额。是否同意由你决定。'));
+  const list_ = el('div', 'cfg-list');
+  for (const h of list) {
+    const row = el('div', 'group-row');
+    const txt = el('div', 'gr-txt');
+    txt.appendChild(el('div', 'gr-name', h.nickname || h.uid));
+    txt.appendChild(el('div', 'gr-sub', 'UID ' + maskUID(h.uid) + (h.host_note ? ' · ' + h.host_note : '')));
+    row.appendChild(txt);
+    const yes = el('button', '', '接受');
+    yes.onclick = () => hostPoolAction(h.uid, 'accept');
+    const no = el('button', 'ghost', '谢绝');
+    no.onclick = () => hostPoolAction(h.uid, 'decline');
+    row.appendChild(yes);
+    row.appendChild(no);
+    list_.appendChild(row);
+  }
+  card.appendChild(list_);
+  box.appendChild(card);
 }
 
 function renderHostGroupBar(groups) {
@@ -1901,7 +2008,11 @@ async function loadHostAccounts() {
     const d = await api('/api/host/accounts');
     hostAll = d.accounts || [];
     const s = d.summary || {};
-    setTxt('hostSummary', `共 ${s.total || 0} 个 · 已入池 ${s.in_pool || 0} · 待审 ${s.pending || 0} · 累计收益 ${fmtMoney(d.summary && d.summary.earned_cny)}`);
+    const invitedN = hostAll.filter((h) => h.pool_state === 'invited').length;
+    setTxt('hostSummary', `共 ${s.total || 0} 个 · 已入池 ${s.in_pool || 0} · 待审 ${s.pending || 0}`
+      + (invitedN ? ` · 邀请待确认 ${invitedN}` : '')
+      + ` · 累计收益 ${fmtMoney(d.summary && d.summary.earned_cny)}`);
+    renderHostInvites();
     renderHostGroupBar(d.groups);
     // 统一开关的初始值取「全部账号都启用 → 启用」，逐项取「全部账号都关闭 → 关闭」。
     if (hostAll.length) {
