@@ -1,17 +1,17 @@
 {
-  "version": "0.31.22",
+  "version": "0.31.23",
   "min_supported": "0.24.0",
-  "notes": "v0.31.22：修「成长任务脚本链路不可用」+ 用户控制台插件开关（可安装/可不安装）+ 开关点不动。① **成长任务脚本链路不可用**：根因是部署时**漏拷了 scripts/ 目录**（python3 是好的）—— VPS `/opt/wb2api` 与发布包 `dist/linux-deploy/` 里都没有它。已补：把闭包（growth_run.py + task_runner.py + task_common.py + school_open_day_2026.py）纳入 linux-deploy 并部署到服务器；启动日志现打出「脚本任务链路：python3（可用）；脚本根 /opt/wb2api；成长任务 可用」，`growth_available` 已为 true。② **文案可自助诊断**：原来只说「缺少 python 或 scripts/growth_run.py」，不说缺哪一项、去哪找。现在 `scheduler.GrowthDiagnosis()` 逐项报「脚本根 / 脚本存在性 / 解释器可用性」，并透出到管理后台（`/api/admin/tasks` 的 `growth_diag`，仅在不可用时计算）；部署文档也补了「scripts/ 必须与 webapp 同级」的显式警示。③ **用户控制台插件开关**（用户端此前**没有**开关 —— 「可安装/可不安装」在用户侧不存在）：新增**用户级**启停（kv `plugin_user_off_<userID>_<pluginID>`，缺省启用），新接口 `POST /api/plugins/{id}/enabled`；平台级开关仍归管理员，两层互不影响（平台关 → 一律不可用；用户关 → 仅该用户不可用）。用户停用后**执行接口真的拒绝**（不是只藏入口）。④ **修「开关点不动」**：`.switch` 把 input 做成 0×0 透明，**只有被 `<label>` 包裹时**才能点 —— admin/dashboard 里四处裸写的开关（启用定时任务 / 开放注册 / 调试对话-流式 ×2）因此**一直是坏的**。已加事件委托兜底，并补 uitest 的**行为级**守卫 `switch-clickable`（真点一下看 checked 变不变 + 插件开关是否打到本端接口）。⑤ 测试：新增 `plugins_user_test.go`（用户隔离 / 动不了平台开关 / 平台停用时明确报错 / 形状契约双向断言），全量 go test 全绿、uitest PASS、jscheck 0 错误。",
-  "released_at": 1792166816,
+  "notes": "v0.31.23：线路池「归属」+ 用户配置出口自动入池 + 代理页实时可视化，并把一条**安全边界**写进代码与用例。① **线路池此前没有归属**：`egress_proxies` 只有「有哪些 URL」，看不出某条线是平台手填、agent 拉起还是**某个用户自己配的**。新增 `owner_user_id` 列（老库幂等 ALTER 补齐），且归属**粘性** —— 只允许从 0 变成非 0 一次，后来者（管理员手工登记同一条 URL）不得抹掉它。② **用户配置的出口自动成为一条线路**：此前用户在控制台「设置 → 我的出口」配好只写 `accounts.egress_proxy`，管理后台线路池里**看不到它** —— 于是「统一查看 / 选择 / 分配」全部无从谈起。现在自动入池（名称=「<用户名> 的出口」、地区=代理主机、备注标来源），边界不变：**只登记台账，绝不碰全局默认出口**（用户提供的是不可信第三方）。③ **代理页实时刷新**：此前只有概览/报表轮询，代理页得手工刷 —— 「我配好了，后台看不到」会反复成为对话开头。现在 5 秒轮询（切走即停、失败不弹 toast）。④ **归属可视化**：线路卡新增「来源」三态（本机 agent / 用户「X」配置 / 管理员手工录入）与「在用归属」（谁的号正跑在这条线上）；用户线路单独打标说明其受限规则。未登记线路卡新增「**收录并分配**」一步到位（此前要收藏→刷新→再找卡片点分配三步）。⑤ ⚠️ **安全边界（本版最重要的一条）**：用户提供的线路**只能被显式指名分配**，**不进自动选线、也不当自动迁移落点**。理由不是「配置问题」而是**泄露**：自动迁移是「把坏线路上的号搬到最闲的好线路上」，若用户线路在候选里，别人的号会被自动搬到一条我们控制不了的第三方出口上，而那些请求带着 access_token（bearer 凭证）。两条路径都已加排除，并各配一条**决定性**用例（池里只留用户线路 → 正确行为是拒绝/保留原状，而不是「反正有位置就搬」）；已做**变异检验**：移除排除逻辑后两条用例立刻失败。⑥ 测试：新增 `cmd/webapp/egress_owner_test.go`（归属粘性 / 自动入池与归属下发 / 自动选线排除 / 自动迁移排除）；全量 go test 全绿、uitest PASS、jscheck 0 错误。 ⑦ ⚠️ 诚实边界：本版**上线时踩了一次真实停机** —— migrateEgressProxy 调 ensureColumn 时传了整条 ALTER（该 helper 自己会拼 ADD COLUMN），拼出 ADD COLUMN ALTER TABLE… → 启动即 near \"ALTER\": syntax error、服务反复重启，约 1 分钟后回滚恢复；修好后**用新增的老库迁移用例先复现再验证**（那条用例完整体现了线上报错，是本版最有价值的一条测试）。教训：**增量列迁移只在老库上跑，而测试此前只测了新库。** ⑧ 另修一个**既有严重 bug**（页面级）：线路池接口下发的 `EgressProxy` **没有 json tag**，Go 用字段名（Name/URL/LastIP）序列化，而前端读 p.name/p.url → (p.name||p.url).charAt(0) 抛 TypeError，**代理页线路卡一张都渲染不出来**，异常又被 loadEgress 的 try/catch 吞成一句 toast → 页面只剩空白。这正是此前「管理后台代理页面未显示代理路线」的**真正底层原因**（v0.31.19 修的 404 只是其中一半）。已补 json tag，并配**双向断言**（snake_case 键必须有、Go 字段名键必须无）+ uitest 的 egr-cards 行为守卫（两边合起来才闭环）。",
+  "released_at": 1792171354,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.22/webapp.exe",
-      "sha256": "114f9776c6a88486faaa84249ed4682f1d8056521a74f8a4dc25d2059847d332",
-      "size": 15097856
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.23/webapp.exe",
+      "sha256": "03a7370210358f7777f2bde24dcc71c3c075ab6b04a87f80874b5ea1db9562e6",
+      "size": 15111680
     }
   ],
-  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.22）；换版本时同步换 url 与 sha256。"
+  "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.23）；换版本时同步换 url 与 sha256。"
 }

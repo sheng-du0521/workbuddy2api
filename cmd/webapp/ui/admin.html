@@ -2017,6 +2017,9 @@ window.onNavChange = (name) => {
   } else {
     stopTasksPoll();
   }
+  // 代理页轮询（v0.31.23）：用户在**自己的控制台**拉起/配好后，管理员这一页
+  // 要自己出现那条线路 —— 否则"我配好了，后台看不到"会反复成为对话的开头。
+  if (name === 'egress') startEgressPoll(); else stopEgressPoll();
 };
 
 $('liveAuto').onchange = () => {
@@ -6370,6 +6373,12 @@ let egrBound = {};
 let egrMachines = {};
 // egrAssignUrl 非空 = 只把**这一条**线路分配给目标范围（线路卡上的「分配」按钮）。
 let egrAssignUrl = '';
+// egrOwners 线路 URL → **声明者**用户名（v0.31.23）；egrBoundNames = 正在用它的号主。
+// 两个都要有：「这条线是谁接进来的」用于追责/联系，「谁的号在用它」用于判断下线影响面。
+let egrOwners = {};
+let egrBoundNames = {};
+// stopEgress 代理页的轮询停表（切走即停）。
+let stopEgress = null;
 let egrView = null;
 let egrEditingId = '';
 
@@ -7210,7 +7219,11 @@ function showEgrSub(name) {
   try { location.hash = 'egress'; } catch (e) { /* 忽略 */ }
 }
 
-async function loadEgress() {
+// loadEgress 拉代理页三份数据并渲染。
+//
+// silent=true 时失败**不弹 toast**：这个函数现在会被 5 秒轮询调用，
+// 一次网络抖动就会把右上角刷满 —— 而轮询的意义恰恰是"自己会好"。
+async function loadEgress(silent) {
   loadEgressPolicy(); // R1：线路失效处置策略（独立拉，失败不影响主流程）
   try {
     // 三个接口并行：overview 负责风控视角（谁跟谁共用出口、谁在裸奔），
@@ -7225,6 +7238,8 @@ async function loadEgress() {
     egrList = (pl && pl.proxies) || [];
     egrBound = (pl && pl.bound) || {};
     egrMachines = (pl && pl.machines) || {};
+    egrOwners = (pl && pl.owners) || {};
+    egrBoundNames = (pl && pl.bound_names) || {};
     if (ac) {
       egrAccounts = ac.accounts || [];
       egrAccSummary = ac.summary || {};
@@ -7237,7 +7252,22 @@ async function loadEgress() {
     renderEgrAccKpis();
     renderEgrAccCards();
 
-  } catch (e) { toast(e.message, 'err'); }
+  } catch (e) { if (!silent) toast(e.message, 'err'); }
+}
+
+// startEgressPoll / stopEgressPoll 代理页轮询（v0.31.23）。
+//
+// 为什么这一页必须轮询：用户在**自己的控制台**点一次「拉起 / 保存出口」，
+// 结果要出现在管理员这一页上。此前只有概览与报表页轮询，代理页得手工刷新 ——
+// 于是"我配好了，但后台看不到"变成一句反复出现的对话。
+//
+// 5 秒而不是 3 秒：这一页要并发探活（出站），比概览的纯本地读贵得多。
+function startEgressPoll() {
+  if (stopEgress) return;
+  stopEgress = poll(5000, () => loadEgress(true), 'egress');
+}
+function stopEgressPoll() {
+  if (stopEgress) { stopEgress(); stopEgress = null; }
 }
 
 // renderEgressAlert 顶部「防封体检」结论。
@@ -7304,9 +7334,13 @@ function renderEgrPoolHint() {
   box.textContent = '';
   if (!egrList.length) return;
   const fromCtl = egrList.filter((p) => egrMachines[p.url]).length;
+  const fromUser = egrList.filter((p) => p.owner_user_id > 0).length;
   box.appendChild(document.createTextNode('共 ' + egrList.length + ' 条线路'));
   if (fromCtl) {
     box.appendChild(document.createTextNode('，其中 ' + fromCtl + ' 条来自控制台「一键拉起」（卡片标注「本机 agent」）'));
+  }
+  if (fromUser) {
+    box.appendChild(document.createTextNode((fromCtl ? '；' : '，其中 ') + fromUser + ' 条由用户自己配置（卡片标注「用户线路」）'));
   }
   box.appendChild(document.createTextNode('。每条卡片右侧可直接「分配」到指定范围。'));
 }
@@ -7324,7 +7358,9 @@ function renderEgressCards() {
   const inPool = new Set(egrList.map((p) => p.url));
   const extra = ((egrView && egrView.proxies) || []).filter((v) => !inPool.has(v.url) && v.account_count > 0);
   if (extra.length) {
-    box.appendChild(el('div', 'sub', '以下出口由账号单独指定（未登记进线路池），仅作统计：'));
+      box.appendChild(el('div', 'sub',
+        '以下出口由账号单独指定、尚未登记进线路池（v0.31.23 起用户在控制台配的出口会自动入池，'
+        + '这里多为历史数据）——点「收录并分配」即可先登记再直接分配：'));
     for (const v of extra) {
       const c = el('article', 'ecard dim');
       const h = el('header');
@@ -7336,9 +7372,15 @@ function renderEgressCards() {
       l.appendChild(el('span', '', '账号数'));
       l.appendChild(el('b', v.over_threshold ? 'err' : '', v.account_count + ' 个' + (v.over_threshold ? '（超额）' : '')));
       b.appendChild(l);
-      // 这些线路多半是**用户自己在控制台配的出口**（v0.31.20 起用户可自助设置）。
-      // 此前它们只能"被看见"：不能探活、不能分配给别的号、也不参与失效策略。
-      // 收录进线路池即可获得这三样；**已绑它的账号不受影响**（只多一条台账）。
+      // 这些出口只能"被看见"是历史遗留（v0.31.20 之前）：不能探活、不能分配、
+      // 也不参与失效策略。收录进线路池即可获得这三样；**已绑它的账号不受影响**。
+      const owner = egrOwners[v.url];
+      if (owner) {
+        const lo = el('div', 'line');
+        lo.appendChild(el('span', '', '归属'));
+        lo.appendChild(el('b', 'ok', '用户「' + owner + '」'));
+        b.appendChild(lo);
+      }
       const foot = el('footer');
       const imp = el('button', '', '收录到线路池');
       imp.title = '登记为一条正式线路：之后可探活、可批量分配、可参与线路失效策略（已绑定它的账号不受影响）';
@@ -7351,6 +7393,23 @@ function renderEgressCards() {
         } catch (e) { toast(e.message, 'err'); imp.disabled = false; }
       };
       foot.appendChild(imp);
+      // 「收录并分配」：一步到位。此前要"先收录、再刷新、再找卡片点分配"三步，
+      // 而这三步里最容易被跳过的是第一步 —— 结果分配报"指定的线路不在可用线路池里"。
+      const impAsg = el('button', 'ghost', '收录并分配');
+      impAsg.title = '先登记进线路池，然后直接在这一条线路上进入分配（只作用于这条线路）';
+      impAsg.onclick = async () => {
+        impAsg.disabled = true;
+        try {
+          await post('/api/admin/egress/proxies', { url: v.url, name: v.url, note: '来自账号的自定义出口（用户控制台配置）' });
+          await loadEgress(true);
+          egrAssignUrl = v.url;
+          renderEgrAssignHint();
+          const sec = document.getElementById('egressAssign');
+          if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          toast('已收录，请在下方选范围后点「预览方案」', 'ok');
+        } catch (e) { toast(e.message, 'err'); impAsg.disabled = false; }
+      };
+      foot.appendChild(impAsg);
       c.appendChild(foot);
       box.appendChild(c);
     }
@@ -7599,6 +7658,12 @@ function egrCard(p) {
   chips.appendChild(el('span', 'tag ' + (p.last_ok ? 'ok' : (p.fail_streak ? 'err' : '')), egrProbeText(p)));
   chips.appendChild(el('span', 'tag ' + (over ? 'err' : (count ? 'ok' : '')), '账号数 ' + count + (over ? ' · 超额' : '')));
   if (conflict) chips.appendChild(chipWithTitle('同号主多账号', 'warn', '号主 #' + (stat.owner_conflict || []).join(' / #') + ' 在该出口上有多个账号'));
+  // 用户线路单独打标（v0.31.23）：它的**失效语义与风险等级**都和平台线路不同 ——
+  // 不受我们控制的第三方出口，只能被显式指名分配（不进自动选线与自动迁移）。
+  if (p.owner_user_id > 0) {
+    chips.appendChild(chipWithTitle('用户线路', 'warn',
+      '这条出口由用户在控制台配置，不受平台控制：只能被**显式指名**分配，不参与自动选线与自动迁移'));
+  }
   card.appendChild(chips);
 
   const body = el('div', 'body');
@@ -7610,13 +7675,24 @@ function egrCard(p) {
   };
   // 来源机器（若这条线路是本机 agent 拉起的）：一句话回答"谁把它接进来的、
   // 现在活着吗"。手填的商业代理没有这一行 —— 它们也不该有。
+  // 「来源」一行回答「这条线是谁接进来的」——三种来源的**处理方式完全不同**：
+  // 本机 agent（隧道断即整条失效）/ 用户自配（第三方，只可显式指名）/ 管理员手填。
   const mach = egrMachines[p.url];
+  const owner = egrOwners[p.url];
   if (mach) {
     const alive = !!mach.online && !!mach.tunnel_reachable;
     line('来源', '本机 agent · ' + (mach.hostname || mach.id)
       + (mach.online ? '（在线）' : '（离线）')
       + (mach.tunnel_reachable ? ' · 隧道通' : ' · 隧道不通'), alive ? 'ok' : 'err');
+  } else if (owner) {
+    line('来源', '用户「' + owner + '」在控制台配置', 'ok');
+  } else {
+    line('来源', '管理员手工录入', '');
   }
+  // 「在用归属」= 谁的号正跑在这条线上。与「来源」是两件事：
+  // 一条用户线路上出现**别人的号**是最该被一眼看见的状态（正常路径不会出现）。
+  const bn = egrBoundNames[p.url] || [];
+  if (bn.length) line('在用归属', bn.join(' · '), '');
   line('真实出口 IP', p.last_ip || '（未探到）', p.last_ip ? 'ok' : '');
   if (p.last_check) line('上次探活', fmtTime(p.last_check));
   if (p.fail_streak) line('连续失败', p.fail_streak + ' 次', 'err');

@@ -41,26 +41,51 @@ const kvEgressMaxPerProxy = "egress_max_per_proxy"
 const defaultMaxPerProxy = 0
 
 // EgressProxy 池中的一个出站代理。
+// ⚠️ **必须有 json tag**（v0.31.23 补）：这个结构体直接下发给前端
+// （`GET /api/admin/egress/proxies` 的 `proxies` 数组）。没有 tag 时 Go 会用
+// **字段名**（`Name` / `URL` / `LastIP`）序列化，而前端读的是 `p.name` / `p.url`
+// —— 于是 `(p.name || p.url).charAt(0)` 直接抛
+// 「Cannot read properties of undefined」，**整块线路池渲染不出来**；
+// 更坏的是异常被调用方（loadEgress）的 try/catch 吞成一句 toast，
+// 页面上只留下"什么都没有"，看不出是前端 bug 还是真没数据。
+// 同类结构（egressOverviewProxy / egressMachineView）一直是有 tag 的，
+// 所以此前表现为"统计与探活文案正常、线路卡全空"。
 type EgressProxy struct {
-	ID        string
-	Name      string
-	URL       string
-	Region    string
-	Note      string
-	Enabled   bool
-	LastOK    bool
-	LastIP    string
-	LastCheck int64
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Region string `json:"region"`
+	Note   string `json:"note"`
+	// Enabled 是否启用（停用的线路不参与分配，但已分配的账号仍照原样路由）。
+	Enabled bool `json:"enabled"`
+	// LastOK/LastIP/LastCheck/FailStreak 最近一次探活结果。
+	LastOK    bool   `json:"last_ok"`
+	LastIP    string `json:"last_ip"`
+	LastCheck int64  `json:"last_check"`
 	// FailStreak 连续探活失败次数（成功清零）。达阈值自动停用，见 egressProbe。
-	FailStreak int64
+	FailStreak int64 `json:"fail_streak"`
 	// CreatedAt/UpdatedAt 便于人工核对「这条线路配了多久」。
-	CreatedAt int64
-	UpdatedAt int64
+	CreatedAt int64 `json:"created_at"`
+	UpdatedAt int64 `json:"updated_at"`
+	// OwnerUserID 这条线路「由谁接进来」的归属（v0.31.23）。
+	//
+	//	0  = 平台（手填 / 管理员用 agent 拉起的本机线路）
+	//	>0 = 该用户在控制台「设置 → 我的出口」里配置的线路
+	//
+	// 为什么要单独一位而不是只看 note：多个用户各有一条线路时，
+	// 管理后台要回答的是「这条线是谁的、现在被谁的号用着」——
+	// note 是给人看的自由文本，判不出这个。
+	//
+	// ⚠️ 归属**不改变可用范围**，改变的是**自动/显式**的差别：
+	// 用户提供的线路只能被管理员**显式指名**分配（见 handleEgressAssign 与
+	// rehomeAccountsFromDeadProxies 的排除逻辑）—— 它是不受我们控制的第三方出口，
+	// 把别人的 access_token 从它送出去是明确的错误。
+	OwnerUserID int64 `json:"owner_user_id"`
 }
 
 // egressProxyCols 列清单（与 scanEgressProxy 顺序严格对应）。
 const egressProxyCols = `id, name, url, region, note, enabled, last_ok, last_ip,
-	last_check, fail_streak, created_at, updated_at`
+	last_check, fail_streak, created_at, updated_at, owner_user_id`
 
 func (s *Store) migrateEgressProxy() error {
 	stmts := []string{
@@ -76,7 +101,8 @@ func (s *Store) migrateEgressProxy() error {
 			last_check  INTEGER NOT NULL DEFAULT 0,
 			fail_streak INTEGER NOT NULL DEFAULT 0,
 			created_at  INTEGER NOT NULL DEFAULT 0,
-			updated_at  INTEGER NOT NULL DEFAULT 0
+			updated_at  INTEGER NOT NULL DEFAULT 0,
+			owner_user_id INTEGER NOT NULL DEFAULT 0
 		)`,
 		// URL 唯一：同一条线路重复录入只会让分配结果出现「分配了但其实是同一个出口」。
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_proxy_url ON egress_proxies(url)`,
@@ -86,6 +112,17 @@ func (s *Store) migrateEgressProxy() error {
 			return fmt.Errorf("migrate egress_proxies: %w", err)
 		}
 	}
+	// 增量列（v0.31.23）：老库没有 owner_user_id，补上；已有线路一律 0 = 平台。
+	//
+	// ⚠️ 传的是**列定义**、不是整条 ALTER —— `ensureColumn` 自己会拼
+	// `ALTER TABLE <table> ADD COLUMN <ddl>`。写成整条 ALTER 会拼出
+	// `ADD COLUMN ALTER TABLE …`，启动即 `near "ALTER": syntax error`、
+	// **服务直接起不来**（2026-10-17 真实停机一次，见
+	// TestEgressProxyOwnerMigrationOnOldDB 的说明）。
+	if err := s.ensureColumn("egress_proxies", "owner_user_id",
+		"owner_user_id INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate egress_proxies(owner): %w", err)
+	}
 	return nil
 }
 
@@ -93,7 +130,7 @@ func (s *Store) scanEgressProxy(row interface{ Scan(dest ...any) error }) (*Egre
 	var p EgressProxy
 	var enabled, lastOK int
 	err := row.Scan(&p.ID, &p.Name, &p.URL, &p.Region, &p.Note, &enabled, &lastOK,
-		&p.LastIP, &p.LastCheck, &p.FailStreak, &p.CreatedAt, &p.UpdatedAt)
+		&p.LastIP, &p.LastCheck, &p.FailStreak, &p.CreatedAt, &p.UpdatedAt, &p.OwnerUserID)
 	if err != nil {
 		return nil, err
 	}
@@ -144,12 +181,18 @@ func (s *Store) UpsertEgressProxy(p *EgressProxy) error {
 	}
 	p.UpdatedAt = now
 	_, err := s.db.Exec(`INSERT INTO egress_proxies (`+egressProxyCols+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, url=excluded.url, region=excluded.region, note=excluded.note,
-			enabled=excluded.enabled, updated_at=excluded.updated_at`,
+			enabled=excluded.enabled, updated_at=excluded.updated_at,
+			-- ⚠️ 归属**粘性**：一旦有人认领过就不再被后续写入覆盖（v0.31.23）。
+			-- 否则「管理员手工登记同一条 URL」或「另一个用户恰好用同一个出口」
+			-- 会把原来的归属抹掉 —— 而归属恰恰是事后追责时唯一能查的东西。
+			-- 只允许「从 0 变成非 0」这一次。
+			owner_user_id=CASE WHEN egress_proxies.owner_user_id = 0
+				THEN excluded.owner_user_id ELSE egress_proxies.owner_user_id END`,
 		p.ID, p.Name, p.URL, p.Region, p.Note, boolToInt(p.Enabled), boolToInt(p.LastOK),
-		p.LastIP, p.LastCheck, p.FailStreak, p.CreatedAt, p.UpdatedAt)
+		p.LastIP, p.LastCheck, p.FailStreak, p.CreatedAt, p.UpdatedAt, p.OwnerUserID)
 	return err
 }
 
@@ -305,6 +348,15 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		}
 		if wantURL != "" && strings.TrimSpace(p.URL) != wantURL {
 			continue // 指定了线路 → 只用它
+		}
+		// ⚠️ 用户提供的线路（owner>0）**只能被显式指名**，不进自动候选（v0.31.23）。
+		//
+		// 理由与风险等级：那条出口不在我们控制之下（是用户自己的代理）。
+		// 「自动挑一条最闲的」会把**别人的 access_token** 从它送出去 ——
+		// 而 access_token 是 bearer 凭证，谁看到谁就能冒充那个号。
+		// 要让它承载平台账号，必须由管理员明确指定（卡片上点「分配」）。
+		if wantURL == "" && p.OwnerUserID > 0 {
+			continue
 		}
 		usable = append(usable, p)
 	}
@@ -730,6 +782,8 @@ func (a *app) handleEgressProxies(w http.ResponseWriter, r *http.Request) {
 			"proxies":       list,
 			"max_per_proxy": a.store.egressMaxPerProxy(),
 			"bound":         a.egressBoundByURL(urls),
+			"bound_names":   a.egressBoundNamesByURL(urls),
+			"owners":        a.egressOwnerNames(list),
 			"machines":      a.egressMachinesByURL(),
 		})
 

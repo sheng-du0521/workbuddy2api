@@ -110,6 +110,15 @@ func (a *app) rehomeAccountsFromDeadProxies() rehomeReport {
 			dead[p.URL] = true
 			continue
 		}
+		// ⚠️ 用户提供的线路（owner>0）**不当迁移落点**（v0.31.23）。
+		//
+		// 自动迁移是"把坏线路上的号搬到最闲的好线路上"—— 如果用户线路在候选里，
+		// 别人的号会被**自动**搬到一条我们控制不了的第三方出口上，
+		// 而那些号带着 access_token（bearer 凭证）。这不是配置问题，是泄露。
+		// 要让它承载谁的号，只能由管理员在卡片上**显式分配**。
+		if p.OwnerUserID > 0 {
+			continue
+		}
 		healthy[p.URL] = true
 	}
 	// 号主在某条健康线路上的占用：迁移时必须维持「同号主的账号不共用出口」

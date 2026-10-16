@@ -670,6 +670,103 @@ func (a *app) egressBoundByURL(urls []string) map[string]int {
 	return out
 }
 
+// egressOwnerNames 线路 URL → **声明者**用户名（v0.31.23）。
+//
+// 「谁把它接进来的」与「现在谁的号在用它」是两件事，管理后台两个都要看：
+// 前者用于追责/联系（这条线是某个用户给的），后者用于判断下线它会影响谁。
+// 这里算前者（`EgressProxy.OwnerUserID`）；后者见 egressBoundNamesByURL。
+//
+// 用户已删时回落成 "用户#<id>"：宁可显示一个可追溯的 id，也不要显示空 ——
+// 空会让"平台手填"与"用户已注销"长得一样，而这两件事的处理完全不同。
+func (a *app) egressOwnerNames(list []*EgressProxy) map[string]string {
+	out := map[string]string{}
+	need := map[int64]bool{}
+	for _, p := range list {
+		if p.OwnerUserID > 0 {
+			need[p.OwnerUserID] = true
+		}
+	}
+	if len(need) == 0 {
+		return out
+	}
+	users, err := a.store.ListUsers()
+	if err != nil {
+		log.Printf("WARN: [egress] 读取用户名失败（归属将显示为用户#id）：%v", err)
+	}
+	nameOf := map[int64]string{}
+	for _, u := range users {
+		nameOf[u.ID] = u.Username
+	}
+	for _, p := range list {
+		if p.OwnerUserID <= 0 {
+			continue
+		}
+		if n := nameOf[p.OwnerUserID]; n != "" {
+			out[strings.TrimSpace(p.URL)] = n
+		} else {
+			out[strings.TrimSpace(p.URL)] = fmt.Sprintf("用户#%d", p.OwnerUserID)
+		}
+	}
+	return out
+}
+
+// egressBoundNamesByURL 线路 URL → **正在用它**的账号归属用户名列表（去重、稳定排序）。
+//
+// 与 egressBoundByURL 的分工：那个给"几个号"，这个给"哪几个人的号"。
+// 「一条用户提供的线路上挂着别人的号」是最需要被一眼看见的状态（见
+// handleEgressAssign 的排除逻辑 —— 正常路径下不该出现，出现即意味着人工显式分配过）。
+func (a *app) egressBoundNamesByURL(urls []string) map[string][]string {
+	out := map[string][]string{}
+	want := map[string]bool{}
+	for _, u := range urls {
+		want[u] = true
+		out[u] = []string{}
+	}
+	accs, err := a.store.ListAccounts()
+	if err != nil {
+		return out
+	}
+	ids := map[int64]bool{}
+	for _, acc := range accs {
+		if u := strings.TrimSpace(acc.EgressProxy); u != "" && want[u] && acc.OwnerUserID > 0 {
+			ids[acc.OwnerUserID] = true
+		}
+	}
+	if len(ids) == 0 {
+		return out
+	}
+	nameOf := map[int64]string{}
+	if users, err := a.store.ListUsers(); err == nil {
+		for _, u := range users {
+			nameOf[u.ID] = u.Username
+		}
+	}
+	for _, acc := range accs {
+		u := strings.TrimSpace(acc.EgressProxy)
+		if u == "" || !want[u] || acc.OwnerUserID <= 0 {
+			continue
+		}
+		n := nameOf[acc.OwnerUserID]
+		if n == "" {
+			n = fmt.Sprintf("用户#%d", acc.OwnerUserID)
+		}
+		dup := false
+		for _, x := range out[u] {
+			if x == n {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out[u] = append(out[u], n)
+		}
+	}
+	for u := range out {
+		sort.Strings(out[u])
+	}
+	return out
+}
+
 // egressMachinesByURL 把"哪些线路是本机 agent 拉起来的"按线路 URL 索引出来。
 //
 // 管理后台的线路池需要这一行：一条 `http://127.0.0.1:11080` 在手填线路里毫无

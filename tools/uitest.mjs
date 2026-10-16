@@ -2157,10 +2157,85 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] switch-clickable: 端上开关都能点（含裸 .switch），插件开关打到本端接口');
   }
 
+  // v0.31.23：**代理页的线路卡必须真的渲染出来**。
+  //
+  // 换来这条的是一次"整块页面全空"：`GET /api/admin/egress/proxies` 当时下发的是
+  // **Go 字段名**（`Name`/`URL`/`LastIP`），而前端读 `p.name`/`p.url` ——
+  // `(p.name || p.url).charAt(0)` 抛 TypeError，一张卡都画不出来；
+  // 而异常被 `loadEgress` 自己的 try/catch **吞成一句 toast**，
+  // 页面上只剩空白：既看不出是前端 bug，也看不出是真没数据。
+  //
+  // 这条按**行为**验：喂一份 snake_case 的线路数据，断言 #egrCards 里**有卡片**。
+  // 后端那一侧另有 `TestEgressProxiesShape` 做键名双向断言 —— 两边合起来才闭环。
+  const egrBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/admin.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.fetch = (url) => {
+          const u = String(url);
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve('{"user":{"id":1,"username":"admin","is_admin":true}}'),
+              json: () => Promise.resolve({ user: { id: 1, username: 'admin', is_admin: true } }) });
+          }
+          if (u.indexOf('/api/admin/egress/proxies') >= 0) {
+            const body = JSON.stringify({
+              proxies: [{
+                id: 'p1', name: '线路甲', url: 'http://10.1.1.1:8080', region: '某地', note: '备注',
+                enabled: true, last_ok: true, last_ip: '9.9.9.9', last_check: now,
+                fail_streak: 0, created_at: now, updated_at: now, owner_user_id: 0,
+              }],
+              bound: { 'http://10.1.1.1:8080': 3 },
+              bound_names: { 'http://10.1.1.1:8080': ['甲'] },
+              owners: {},
+              machines: {},
+            });
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(body), json: () => Promise.resolve(JSON.parse(body)) });
+          }
+          return Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve('{}'), json: () => Promise.resolve({}) });
+        };
+        win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+        win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+        win.navigator.clipboard = { writeText: () => Promise.resolve() };
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
+      },
+    });
+    const w = dom.window;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+    if (typeof w.navGo === 'function') w.navGo('egress');
+    await wait(600);
+    const box = w.document.getElementById('egrCards');
+    const n = box ? box.children.length : -1;
+    if (n !== 1) {
+      egrBad.push(`代理页线路卡应渲染 1 张，实得 ${n}（0 = 卡构造时抛错被 try/catch 吞掉）`);
+    }
+    if (box && String(box.textContent).indexOf('线路甲') < 0) {
+      egrBad.push('线路卡里没有线路名 —— 前端读的键与服务端下发的不一致');
+    }
+    try { w.close(); } catch (e) {}
+  }
+  egrBad.forEach((m) => console.log('  [FAIL] egr-cards: ' + m));
+  if (!egrBad.length) console.log('  [ok] egr-cards: 代理页线路卡能渲染（键名与前端读取一致）');
+
   const c = await run('admin-login.html', null, []);
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
-    && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0;
+    && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
+    && egrBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

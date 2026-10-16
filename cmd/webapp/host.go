@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -460,8 +461,87 @@ func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
 		changed++
 	}
 	_ = a.proxy.SyncAccounts() // 出口是选号输入，改完必须重同步
-	log.Printf("INFO: [host] 用户 %s 把 %d 个代挂号的出口设为 %q", u.Username, changed, norm)
-	writeJSON(w, http.StatusOK, map[string]any{"updated": changed, "proxy": norm, "total": len(targets)})
+	// 线路池同步（v0.31.23）：用户配的这条出口要**自动成为线路池里的一条线路**，
+	// 否则管理员在后台看不到它，也就没法"统一查看、选择、分配"。
+	// ⚠️ 只登记台账，**不碰全局默认出口**（见函数头注释的边界）。
+	proxyID := a.ensureUserEgressLine(u, norm)
+	log.Printf("INFO: [host] 用户 %s 把 %d 个代挂号的出口设为 %q（线路 %s）",
+		u.Username, changed, norm, proxyID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated": changed, "proxy": norm, "total": len(targets), "proxy_id": proxyID,
+	})
+}
+
+// ensureUserEgressLine 把用户配置的出口登记为线路池里的一条线路（幂等）。
+//
+// 返回线路 id（空串 = 本次没有需要登记的线路，如"留空跟随默认"或"直连"）。
+//
+// 为什么必须做这一步：线路的**身份是 URL**，而在此之前只有"管理员手工录入"与
+// "agent 一键拉起"两条路径会写 `egress_proxies` —— 用户在控制台配的出口
+// 只落在 `accounts.egress_proxy`，管理后台的线路池里看不见它，
+// 于是「统一查看 / 选择 / 分配」全部无从谈起。
+//
+// 三条边界（都在这里写死，不靠调用方自觉）：
+//  1. 空串 / direct **不登记**（它们不是线路，是"不出代理"这一决定）；
+//  2. 名称与来源如实标注（`<用户名> 的出口`），管理员一眼知道这是谁的；
+//  3. 归属**只有从 0 变非 0 这一次**（UpsertEgressProxy 的 ON CONFLICT 里做），
+//     不让后写的把先认领的挤掉。
+func (a *app) ensureUserEgressLine(u *User, rawURL string) string {
+	url := strings.TrimSpace(rawURL)
+	if url == "" || egress.IsDirect(url) || u == nil {
+		return ""
+	}
+	if _, err := egress.Validate(url); err != nil {
+		// 走不到这里（调用方已校验过），但多一层防御：绝不把非法 URL 写进池。
+		return ""
+	}
+	now := time.Now().Unix()
+	note := fmt.Sprintf("由用户「%s」在控制台「设置 → 我的出口」配置", u.Username)
+	var hit *EgressProxy
+	if list, err := a.store.ListEgressProxies(); err == nil {
+		for _, p := range list {
+			if strings.TrimSpace(p.URL) == url {
+				hit = p
+				break
+			}
+		}
+	}
+	if hit == nil {
+		hit = &EgressProxy{
+			ID:        newEgressProxyID(url),
+			Name:      u.Username + " 的出口",
+			URL:       url,
+			Region:    egressHostOf(url),
+			Note:      note,
+			Enabled:   true,
+			CreatedAt: now,
+		}
+	} else if strings.TrimSpace(hit.Note) == "" || hit.OwnerUserID == 0 {
+		// 已存在（可能是管理员手工录入过）：补上来源说明，但**不动**已有的名字/地区。
+		hit.Note = note
+	}
+	hit.Enabled = true
+	hit.UpdatedAt = now
+	if hit.OwnerUserID == 0 {
+		hit.OwnerUserID = u.ID
+	}
+	if err := a.store.UpsertEgressProxy(hit); err != nil {
+		log.Printf("WARN: [host] 登记用户出口线路失败 url=%s：%v", url, err)
+		return ""
+	}
+	return hit.ID
+}
+
+// egressHostOf 从代理 URL 里取 host:port，用于线路的「地区 / 出口」展示位。
+//
+// 不解析失败就回落原串：这一格是给人看的**线索**，不是判据 ——
+// 为了它去拒绝一条合法代理是本末倒置。
+func egressHostOf(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(rawURL)
+	}
+	return u.Host
 }
 
 // handleHostDeleteAccount 删除本人代挂账号。
