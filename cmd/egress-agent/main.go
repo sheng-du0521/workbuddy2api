@@ -108,7 +108,10 @@ func (a *agent) setMsg(f string, args ...any) {
 	a.msg = fmt.Sprintf(f, args...)
 	msg := a.msg
 	a.mu.Unlock()
-	log.Printf(msg)
+	// 用 Print 而不是 Printf：msg 是**已经格式化过**的文本，
+	// 再走一遍 Printf 会把文本里偶然出现的 % 当成格式动词（且 go vet 会报
+	// non-constant format string）。
+	log.Print(msg)
 }
 
 // ---------- 与云端的两次调用 ----------
