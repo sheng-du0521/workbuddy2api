@@ -384,11 +384,13 @@
         <span class="slot-refresh" data-refresh="loadEgressHome" data-refresh-label="刷新状态"></span>
       </div>
       <div class="sub" style="margin:0 0 14px;">
-        把「<b>你家里的网络出口</b>」接进平台的出站链路：本机 agent 跑一个本地代理，
-        再用 SSH 反向隧道把它接到云端 —— 于是平台访问上游时是从<b>你家宽带</b>出去
-        （住宅 IP 比机房 IP 友好得多）。
+        把你自己的电脑做成<b>出口代理</b>：本机 agent 跑一个本地代理，
+        再用 SSH 反向隧道把它接到云端 —— 于是<b>你名下的代挂账号</b>访问上游时
+        是从<b>你家宽带</b>出去（住宅 IP 比机房 IP 友好得多）。
         <br><b>只需在本机启动一次 agent</b>（页面会给命令），之后在下面点一次就好；
         <b>无需手工填写任何地址、端口或绑定关系</b>。
+        <br>这条线路<b>只作用于你自己的号</b>：平台的全局默认出口不会被动，
+        也不会影响任何其他用户。管理员可在后台看到这条线路并显式分配给别的号。
       </div>
       <div id="egressHomeBox"></div>
     </section>

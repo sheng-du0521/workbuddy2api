@@ -119,7 +119,8 @@ func TestEgressMachineMultiHost(t *testing.T) {
 	report("", egressAgentState{Hostname: "pc-old", ProxyOK: true, TunnelOK: true, ExitIP: "1.1.1.1"})
 	report("mid-2", egressAgentState{Hostname: "pc-2", ProxyOK: true, TunnelOK: true, ExitIP: "2.2.2.2"})
 
-	v := a.buildEgressHomeView(httptest.NewRequest(http.MethodGet, "/api/egress/home", nil), true)
+	v := a.buildEgressHomeView(httptest.NewRequest(http.MethodGet, "/api/egress/home", nil),
+		egressScope{Platform: true})
 	if len(v.Machines) != 2 {
 		t.Fatalf("应看到 2 台机器，得 %d: %+v", len(v.Machines), v.Machines)
 	}

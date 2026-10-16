@@ -2231,11 +2231,104 @@ function run(pageFile, meOverride, plan) {
   egrBad.forEach((m) => console.log('  [FAIL] egr-cards: ' + m));
   if (!egrBad.length) console.log('  [ok] egr-cards: 代理页线路卡能渲染（键名与前端读取一致）');
 
+  // v0.31.24：**用户视角的代理页必须能操作，且文案不误导**。
+  //
+  // 这一版把出口的三个执行端点从 adminGuard 放开给登录用户
+  // （在此之前普通用户点「一键拉起」只会拿到 403）。前端是配套的一半：
+  // 服务端开好了权限，页面若仍按"只读"渲染，用户看到的还是那句
+  // "仅管理员可执行" —— 权限下沉就白做了。
+  //
+  // 同时钉住**另一半**：用户视角**不能出现「全局默认出口」**。
+  // 对一个没有这个开关的人讲它，只会让他以为页面坏了，
+  // 更坏的是让他以为"我改了什么会影响全平台"。
+  const egrSelfBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const SELF_VIEW = {
+      machines: [{
+        id: 'u2:pc-a', hostname: 'host-a', online: true, tunnel_reachable: true, ready: true,
+        proxy_ok: true, tunnel_ok: true, exit_ip: '1.2.3.4（山东）',
+        proxy_port: 1080, tunnel_port: 11081, proxy_url: 'http://127.0.0.1:11081',
+        applied: true, host_bound: 2, host_total: 2, last_at: now, is_default: false,
+      }],
+      agent_online: true, tunnel_reachable: true, applied: true, ready: true,
+      default_egress: '', host_bound: 2, host_total: 2,
+      can_manage: true, manage_scope: 'self', poll_sec: 5,
+      agent_command: 'wb2api-egress-agent.exe -server http://x -token ag2-stub',
+      active_machine: 'u2:pc-a',
+    };
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/dashboard.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.fetch = (url) => {
+          const u = String(url);
+          if (u.indexOf('/api/egress/home') >= 0) {
+            const body = JSON.stringify(SELF_VIEW);
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(body), json: () => Promise.resolve(SELF_VIEW) });
+          }
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve('{"user":{"id":2,"username":"u2","is_admin":false}}'),
+              json: () => Promise.resolve({ user: { id: 2, username: 'u2', is_admin: false } }) });
+          }
+          return Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve('{}'), json: () => Promise.resolve({}) });
+        };
+        win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+        win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+        win.navigator.clipboard = { writeText: () => Promise.resolve() };
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
+      },
+    });
+    const w = dom.window;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+    if (typeof w.navGo === 'function') w.navGo('egress');
+    await wait(700);
+    const box = w.document.getElementById('egressHomeBox');
+    const txt = box ? String(box.textContent) : '';
+    if (!box || !box.children.length) {
+      egrSelfBad.push('用户视角的代理页没渲染出任何内容（应能看到自己的机器与操作区）');
+    } else {
+      if (txt.indexOf('拉起') < 0) {
+        egrSelfBad.push('用户视角应出现「一键拉起」按钮（权限已下沉，前端不能仍按只读渲染）');
+      }
+      if (txt.indexOf('仅管理员') >= 0) {
+        egrSelfBad.push('用户视角不该再出现「仅管理员可执行」的旧文案');
+      }
+      // ⚠️ 断言的是**配置行**形态（`全局默认出口：…`），不是这个词本身：
+      // 用户视角的说明文案里**允许**出现"平台的全局默认出口不会被动" ——
+      // 那是一句安抚，不是给了一个开关。真正要禁的是把它**列成一行配置**，
+      // 那会让人以为"这是我的设置项"。
+      if (txt.indexOf('全局默认出口：') >= 0) {
+        egrSelfBad.push('用户视角不该把「全局默认出口」列成配置行（那不是他有的开关）');
+      }
+      if (txt.indexOf('我的代挂号绑定') < 0) {
+        egrSelfBad.push('用户视角的绑定计数应叫「我的代挂号绑定」（而不是「自挂号绑定」）');
+      }
+    }
+    try { w.close(); } catch (e) {}
+  }
+  egrSelfBad.forEach((m) => console.log('  [FAIL] egress-self: ' + m));
+  if (!egrSelfBad.length) {
+    console.log('  [ok] egress-self: 用户视角代理页可操作，且不出现「全局默认出口」等误导文案');
+  }
+
   const c = await run('admin-login.html', null, []);
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
     && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
-    && egrBad.length === 0;
+    && egrBad.length === 0 && egrSelfBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

@@ -39,9 +39,19 @@
 // （第一台仍是 11080，与升级前完全一致）。**向后兼容**：老 agent 不带 machine 参数时
 // 归入 "default" 桶，行为不变（它拿到的一直是 11080）。
 //
-// ⚠️ **权限边界（刻意的）**：状态查询对登录用户开放；但「拉起 / 停止 /
-// 应用出口」会**改变全平台的出站链路**（全局默认出口 + 自挂号绑定），
-// 因此**只有管理员**能执行。普通用户看到的是只读状态 + 一句说明。
+// ⚠️ **权限边界（v0.31.24 起按「谁的机器 / 谁的号」切）**：
+//
+//	平台视角（管理员会话 / X-Admin-Key）→ 看全部机器；应用出口时注册线路 +
+//	**设全局默认出口** + 绑**全部**自挂号；
+//	用户视角（普通登录用户）→ 只看得到**自己名下的机器**；应用出口时注册线路
+//	（带上归属）+ **只绑自己名下的号**，**绝不碰全局默认出口**。
+//
+// 为什么用户侧必须能操作：出口是"我的号从哪个 IP 出去"，这件事本来就该由号主
+// 自己决定；此前只能由管理员代劳，等于把每个用户的出站链路都挂在一个人的手工操作上。
+//
+// 为什么用户侧**不能**设全局默认出口：那是平台级决定 —— 它同时决定所有平台号与
+// 所有"跟随默认"的账号从哪出去。用户提供的代理是不可信第三方（我们无法担保其
+// 稳定性，且理论上能看到经过它的流量特征），只应承载它主人的号。
 package main
 
 import (
@@ -53,6 +63,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -60,7 +71,13 @@ import (
 const (
 	// kvEgressAgentToken agent 的认证令牌（`X-Agent-Token`）。
 	kvEgressAgentToken = "egress_agent_token"
-	// kvEgressAgentMachines 所有已知机器的指令与状态（JSON：map[machineID]egressMachine）。
+	// kvEgressAgentTokenUserFmt 按用户签发的 agent 令牌（v0.31.24）。
+	//
+	// `%d` 是该用户的 id。用户令牌与平台令牌**互不通用**：用户令牌解析出的 uid
+	// 决定"这台机器归谁"，也正是视图过滤与 apply 范围的依据。
+	kvEgressAgentTokenUserFmt = "egress_agent_token_u%d"
+
+	// kvEgressAgentMachines 所有已知机器的指令与状态（JSON：map[machineKey]egressMachine）。
 	//
 	// 这是 v0.31.18 的**唯一事实来源**：指令与状态同存一处，
 	// 免得"机器 A 的指令配机器 B 的状态"这种半截状态出现。
@@ -145,10 +162,20 @@ type egressAgentState struct {
 }
 
 // egressMachine 一台跑过 agent 的机器（指令 + 状态 + 端口）。
+//
+// ⚠️ 机器表以 **machineKey**（见 `egressMachineKey`）为键，而 `ID` 存的是
+// **agent 自报的原始 id**：两者在用户视角下不相同（`u12:abc` vs `abc`）。
+// 页面上的 `id` 一律用 key（它是这个表里的唯一句柄），agent 那边只用原始 id。
 type egressMachine struct {
-	ID       string           `json:"id"`
-	Hostname string           `json:"hostname,omitempty"`
-	Ports    egressAgentPorts `json:"ports"`
+	ID       string `json:"id"`
+	Hostname string `json:"hostname,omitempty"`
+	// OwnerUserID 认领这台机器的用户（0 = 平台：管理员 / 运维 / 老 agent）。
+	//
+	// 归属**由认领它的 agent 令牌决定**，且是**粘性**的 —— 机器一旦被某个用户
+	// 认领，别人就不能再操作它（视图里看不到、pull/apply 也拒），
+	// 与线路池 `EgressProxy.OwnerUserID` 同一条原则：归属是事后唯一的追责线索。
+	OwnerUserID int64            `json:"owner_user_id,omitempty"`
+	Ports       egressAgentPorts `json:"ports"`
 	// Cmd / CmdAt 待执行（或最近一条）指令。空串 = none。
 	Cmd   string `json:"cmd,omitempty"`
 	CmdAt int64  `json:"cmd_at,omitempty"`
@@ -157,6 +184,26 @@ type egressMachine struct {
 	StateAt int64            `json:"state_at,omitempty"`
 	// CreatedAt 首次出现时刻（用于列表稳定排序 + "这台什么时候接入的"）。
 	CreatedAt int64 `json:"created_at,omitempty"`
+}
+
+// egressMachineKey 机器表的键：owner + agent 自报的 machine id。
+//
+//	owner <= 0 → "abc" / "default"（平台：与升级前完全一致，老 agent 不受影响）
+//	owner >  0 → "u12:abc"       （用户：自己的命名空间）
+//
+// 为什么要带 owner 前缀（而不是只在表里记一个 owner 字段就够）：不带前缀时，
+// 用户只要**猜到或复用一个别人的 machine id**，就能把对方的桶顶掉（或者被对方
+// 顶掉）—— 而 machine id 是 agent 自己生成、随参数上行的，构造成本为零。
+// 加了前缀，"别人的 id" 落到自己的命名空间里，物理上碰不到对方。
+func egressMachineKey(owner int64, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = egressDefaultMachine
+	}
+	if owner > 0 {
+		return fmt.Sprintf("u%d:%s", owner, id)
+	}
+	return id
 }
 
 // online 该机器最近是否上报过。
@@ -205,16 +252,22 @@ func (a *app) machinesSave(m map[string]*egressMachine) error {
 }
 
 // machineEnsure 取一台机器；不存在则登记并**分配端口**。返回值 created 表示本次新建。
-func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string) (mm *egressMachine, created bool) {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		id = egressDefaultMachine
+//
+// owner 来自 agent 令牌（见 egressAgentAuth）：0 = 平台，>0 = 该用户。
+func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, owner int64) (mm *egressMachine, created bool) {
+	rawID := strings.TrimSpace(id)
+	if rawID == "" {
+		rawID = egressDefaultMachine
 	}
-	if id == egressDefaultMachine {
-		// default 桶恒用全局默认端口（= 升级前行为，老 agent 不受影响）。
-		hostname = "" // default 的 hostname 只由上报填充，避免被 query 里的空值覆盖
+	// default 桶 = "没报自己是谁的那台"，它是**平台**的（老 agent 不带 machine 参数）。
+	// 用户令牌永远不会落到这里：它的 rawID 为空时键是 `u12:default`，与 default 分开。
+	isDefaultBucket := owner <= 0 && rawID == egressDefaultMachine
+	if isDefaultBucket {
+		// default 的 hostname 只由上报填充，避免被 query 里的空值覆盖。
+		hostname = ""
 	}
-	if exist, ok := m[id]; ok {
+	key := egressMachineKey(owner, rawID)
+	if exist, ok := m[key]; ok {
 		if strings.TrimSpace(hostname) != "" {
 			exist.Hostname = hostname
 		}
@@ -223,26 +276,33 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string) (m
 	// 幽灵机器防护（v0.31.18）：老 agent（default 桶）升级到带 machine id 的新 agent 后，
 	// hostname 不变但 id 有了。若不处理，列表里会多出一台"离线机器"占着 11080，
 	// 而真正在跑的那台落在 11081 上 —— 用户看到的是“我明明只有一台电脑”。
-	// 故：hostname 相同时，把 default 桶**改名**为新 id（端口、状态、指令全部继承，11080 不变）。
-	if hn := strings.TrimSpace(hostname); hn != "" && id != egressDefaultMachine {
-		if old, ok := m[egressDefaultMachine]; ok && old.Hostname != "" && strings.EqualFold(old.Hostname, hn) {
-			delete(m, egressDefaultMachine)
-			old.ID = id
-			old.Hostname = hn
-			m[id] = old
-			log.Printf("INFO: [egress] default 桶已改名为 machine=%s（hostname %s 相同，端口保持 %d）",
-				id, hn, old.Ports.TunnelPort)
-			return old, true
+	// ⚠️ **只在平台视角生效**（v0.31.24）：这条判断的依据是 hostname 相同，而
+	// 家用 Windows 的默认主机名（DESKTOP-xxxx）撞车并不罕见 —— 若让用户视角也参与，
+	// 一个普通用户就能把平台那台改名带走。
+	if owner <= 0 && !isDefaultBucket {
+		if hn := strings.TrimSpace(hostname); hn != "" {
+			if old, ok := m[egressDefaultMachine]; ok && old.Hostname != "" && strings.EqualFold(old.Hostname, hn) {
+				delete(m, egressDefaultMachine)
+				old.ID = rawID
+				old.Hostname = hn
+				m[key] = old
+				log.Printf("INFO: [egress] default 桶已改名为 machine=%s（hostname %s 相同，端口保持 %d）",
+					rawID, hn, old.Ports.TunnelPort)
+				return old, true
+			}
 		}
 	}
 	var ports egressAgentPorts
-	if id == egressDefaultMachine {
+	if isDefaultBucket {
 		ports = a.egressAgentPortsOf()
 	} else {
 		ports = egressAllocPorts(m)
 	}
-	mm = &egressMachine{ID: id, Hostname: strings.TrimSpace(hostname), Ports: ports, CreatedAt: time.Now().Unix()}
-	m[id] = mm
+	mm = &egressMachine{
+		ID: rawID, Hostname: strings.TrimSpace(hostname), Ports: ports,
+		OwnerUserID: owner, CreatedAt: time.Now().Unix(),
+	}
+	m[key] = mm
 	return mm, true
 }
 
@@ -292,15 +352,73 @@ func (a *app) egressAgentTokenGet() (string, error) {
 	return t, nil
 }
 
-// egressAgentAuth agent 请求的令牌校验。
-func (a *app) egressAgentAuth(r *http.Request) bool {
-	want, err := a.egressAgentTokenGet()
-	if err != nil || want == "" {
-		return false
+// egressAgentTokenFor 取（必要时生成）某个 owner 的 agent 令牌。
+//
+//	uid <= 0 → 平台令牌（kv egress_agent_token，前缀 "ag-"）
+//	uid >  0 → 该用户自己的令牌（kv egress_agent_token_u<uid>，前缀 "ag<uid>-"）
+//
+// 为什么按用户分：令牌是"能往这台云端投喂指令与状态"的凭证。全平台共用一把时，
+// 任何拿到它的人都能**抢注 machine id、伪造别人的在线状态、替别人拉起/停止代理**。
+// 令牌本身只授权 poll/report（读不到任何账号数据），但"能冒充别人的机器"已经
+// 越过了用户之间的边界 —— 而划这条边界正是为了不让 D 类问题（见包注释）扩散。
+func (a *app) egressAgentTokenFor(uid int64) (string, error) {
+	key, prefix := kvEgressAgentToken, "ag-"
+	if uid > 0 {
+		key = fmt.Sprintf(kvEgressAgentTokenUserFmt, uid)
+		prefix = fmt.Sprintf("ag%d-", uid)
 	}
-	got := strings.TrimSpace(r.Header.Get("X-Agent-Token"))
-	// 定长比较（长度相同才比内容），避免把令牌长度也变成可观测信号。
-	if len(got) != len(want) {
+	if v, err := a.store.GetKV(key); err == nil {
+		if t := strings.TrimSpace(v); t != "" {
+			return t, nil
+		}
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	t := prefix + hex.EncodeToString(buf)
+	if err := a.store.SetKV(key, t); err != nil {
+		return "", err
+	}
+	return t, nil
+}
+
+// egressAgentTokenPeek 只读某 owner 的令牌（**不生成**）。
+//
+// 校验路径必须用它的原因：若用 egressAgentTokenFor，一个伪造的 uid 会让服务端
+// **顺手创建一把没人用的令牌**（写放大 + 无意义的 kv 增长）。
+func (a *app) egressAgentTokenPeek(uid int64) string {
+	key := kvEgressAgentToken
+	if uid > 0 {
+		key = fmt.Sprintf(kvEgressAgentTokenUserFmt, uid)
+	}
+	v, _ := a.store.GetKV(key)
+	return strings.TrimSpace(v)
+}
+
+// egressAgentTokenParse 从用户令牌里解析出 uid（形如 "ag12-<hex>"）。
+//
+// 平台令牌（"ag-<hex>"）在第 3 个字符就是 '-'，解析器自然拒绝 ——
+// 两者的前缀形态互不重叠，不需要额外判别分支。
+func egressAgentTokenParse(tok string) (int64, bool) {
+	if !strings.HasPrefix(tok, "ag") {
+		return 0, false
+	}
+	rest := tok[2:]
+	i := strings.IndexByte(rest, '-')
+	if i <= 0 {
+		return 0, false
+	}
+	uid, err := strconv.ParseInt(rest[:i], 10, 64)
+	if err != nil || uid <= 0 {
+		return 0, false
+	}
+	return uid, true
+}
+
+// tokensEqual 定长比较（长度相同才比内容），避免把令牌长度也变成可观测信号。
+func tokensEqual(got, want string) bool {
+	if want == "" || len(got) != len(want) {
 		return false
 	}
 	var diff byte
@@ -308,6 +426,27 @@ func (a *app) egressAgentAuth(r *http.Request) bool {
 		diff |= got[i] ^ want[i]
 	}
 	return diff == 0
+}
+
+// egressAgentAuth agent 请求的令牌校验，返回**这台机器归谁**（0 = 平台）。
+//
+// 两条通道：平台令牌（管理员 / 运维 / 老 agent）与用户令牌（每用户一把）。
+// 顺序上先试平台令牌再解析用户令牌 —— 平台令牌不含 uid 段，解析器本来也会拒绝它，
+// 这里显式排前面只是为了读起来更直白。
+func (a *app) egressAgentAuth(r *http.Request) (int64, bool) {
+	got := strings.TrimSpace(r.Header.Get("X-Agent-Token"))
+	if got == "" {
+		return 0, false
+	}
+	if want, err := a.egressAgentTokenGet(); err == nil && tokensEqual(got, want) {
+		return 0, true
+	}
+	if uid, ok := egressAgentTokenParse(got); ok {
+		if tokensEqual(got, a.egressAgentTokenPeek(uid)) {
+			return uid, true
+		}
+	}
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------
@@ -322,17 +461,19 @@ func (a *app) egressAgentAuth(r *http.Request) bool {
 //
 // machine 参数可省（老 agent 不带）→ 归入 "default" 桶，行为与 v0.31.17 一致。
 func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
-	if !a.egressAgentAuth(r) {
+	owner, ok := a.egressAgentAuth(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
 		return
 	}
 	id := strings.TrimSpace(r.URL.Query().Get("machine"))
 	host := strings.TrimSpace(r.URL.Query().Get("hostname"))
 	m := a.machinesLoad()
-	mm, created := a.machineEnsure(m, id, host)
+	mm, created := a.machineEnsure(m, id, host, owner)
 	if created {
 		_ = a.machinesSave(m)
-		log.Printf("INFO: [egress] 新 agent 已登记 machine=%s host=%q tunnel_port=%d", mm.ID, mm.Hostname, mm.Ports.TunnelPort)
+		log.Printf("INFO: [egress] 新 agent 已登记 machine=%s owner=%d host=%q tunnel_port=%d",
+			mm.ID, owner, mm.Hostname, mm.Ports.TunnelPort)
 	}
 	cmd := egressAgentCmd{Action: "none", ProxyPort: mm.Ports.ProxyPort, TunnelPort: mm.Ports.TunnelPort}
 	if mm.Cmd != "" {
@@ -343,7 +484,8 @@ func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
 
 // handleEgressAgentReport POST /api/agent/report?machine=<id>
 func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
-	if !a.egressAgentAuth(r) {
+	owner, ok := a.egressAgentAuth(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
 		return
 	}
@@ -354,7 +496,7 @@ func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
 	}
 	st.At = time.Now().Unix()
 	m := a.machinesLoad()
-	mm, _ := a.machineEnsure(m, r.URL.Query().Get("machine"), st.Hostname)
+	mm, _ := a.machineEnsure(m, r.URL.Query().Get("machine"), st.Hostname, owner)
 	mm.State, mm.StateAt = st, st.At
 	if strings.TrimSpace(st.Hostname) != "" {
 		mm.Hostname = strings.TrimSpace(st.Hostname)
@@ -445,8 +587,17 @@ type egressHomeView struct {
 	Ready         bool             `json:"ready"`
 	// ActiveMachine 上面那批汇总字段属于哪台机器（无则空）。
 	ActiveMachine string `json:"active_machine,omitempty"`
-	CanManage     bool   `json:"can_manage"`
-	PollSec       int    `json:"poll_sec"`
+	// CanManage 当前视角能否执行操作。v0.31.24 起**两种视角都为 true** ——
+	// 区别不在"能不能操作"，而在"能操作谁"（见 ManageScope）。
+	CanManage bool `json:"can_manage"`
+	// ManageScope 当前视角的操作范围（v0.31.24）：
+	//
+	//	"platform" 平台视角（管理员 / 运维密钥）—— 全部机器；应用出口时会设全局默认；
+	//	"self"     用户视角 —— 只有自己的机器；应用出口只绑自己名下的号。
+	//
+	// 前端据此切换文案：对用户说「全局默认出口」是误导（他没有这个开关）。
+	ManageScope string `json:"manage_scope"`
+	PollSec     int    `json:"poll_sec"`
 	// AgentCommand 在本机启动 agent 的命令（一键复制用）。
 	AgentCommand string `json:"agent_command,omitempty"`
 }
@@ -481,20 +632,90 @@ func requestOrigin(r *http.Request) string {
 	return scheme + "://" + host
 }
 
-// egressAdminOnly 管理员动作的入口校验（**二层防线**）。
+// egressScope 谁在执行这次出口动作 —— 决定"能看见哪些机器 / 能碰哪些账号"。
 //
-// 路由本身已挂 adminGuard（管理员会话 或 X-Admin-Key 运维通道）。这里再判一次
-// **会话级**管理员，是为了收紧"运维密钥"这条通道在这几个端点上的语义：
-// 拉起/停止本机代理会**实质改变全平台出站链路**，希望执行者是一个具体的、
-// 可追责的管理员会话而不是一把共享密钥。
-func (a *app) egressAdminOnly(w http.ResponseWriter, r *http.Request) bool {
-	if a.isAdminSession(r) || a.authorized(r) {
-		return true // 管理员会话，或 X-Admin-Key 运维通道
+// 两类主体（v0.31.24）：
+//
+//	平台视角 Platform=true（管理员会话 / X-Admin-Key 运维通道）
+//	    → 全部机器；apply 时设**全局默认出口** + 绑**全部**自挂号（升级前行为）。
+//	用户视角 UserID>0
+//	    → 只有 owner == 自己的机器；apply 只绑**自己名下**的号，
+//	      **不设全局默认出口**（那是平台级决定，会牵动所有人的出站链路）。
+type egressScope struct {
+	UserID   int64
+	Platform bool
+}
+
+// kind 前端判据（"platform" / "self"）。
+func (s egressScope) kind() string {
+	if s.Platform {
+		return "platform"
 	}
-	writeJSON(w, http.StatusForbidden, map[string]any{
-		"error": "该操作会改变全平台的出站链路（全局默认出口 + 自挂号绑定），仅管理员可执行",
-	})
-	return false
+	return "self"
+}
+
+// hostOwner 该视角下要统计 / 绑定的自挂号属于谁：平台 = 全部（0），用户 = 自己。
+func (s egressScope) hostOwner() int64 {
+	if s.Platform {
+		return 0
+	}
+	return s.UserID
+}
+
+// seesMachine 该视角能否看见（并操作）这台机器。
+func (s egressScope) seesMachine(mm *egressMachine) bool {
+	if mm == nil {
+		return false
+	}
+	if s.Platform {
+		return true
+	}
+	return mm.OwnerUserID == s.UserID
+}
+
+func (s egressScope) label() string {
+	if s.Platform {
+		return "platform"
+	}
+	return fmt.Sprintf("user#%d", s.UserID)
+}
+
+// egressActorGuard 出口执行端点的入口守卫（v0.31.24 取代 adminGuard）。
+//
+// 与 adminGuard 的区别只有一条，但它正是本版的目的：**普通用户也能过** ——
+// 只不过他能操作的只有自己名下的机器与账号（由 egressScope 一路带下去）。
+//
+// 顺序仍是"运维密钥优先"：X-Admin-Key 通道没有会话，但它代表运维，
+// 语义上等同于平台视角（否则脚本化运维会突然失去这条通道）。
+func (a *app) egressActorGuard(next func(http.ResponseWriter, *http.Request, egressScope)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.authorized(r) { // X-Admin-Key 通道（运维 / 脚本）
+			next(w, r, egressScope{Platform: true})
+			return
+		}
+		u := a.currentUser(r)
+		if u == nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
+			return
+		}
+		if u.Status != StatusActive {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "账号已被停用"})
+			return
+		}
+		next(w, withUser(r, u), egressScope{UserID: u.ID, Platform: u.IsAdmin()})
+	}
+}
+
+// egressMachineFor 取一台机器并按视角校验归属。
+//
+// ⚠️ 拒绝时**不区分**"这台不存在"与"这台不是你的"：分开说等于给了一个
+// 能枚举别人 machine id 的探针（"这个 id 存在 → 是别人的机器"）。
+func (a *app) egressMachineFor(m map[string]*egressMachine, id string, scope egressScope) (*egressMachine, bool) {
+	mm, ok := m[strings.TrimSpace(id)]
+	if !ok || !scope.seesMachine(mm) {
+		return nil, false
+	}
+	return mm, true
 }
 
 // defaultEgress 当前全局默认出口。
@@ -508,7 +729,11 @@ func (a *app) defaultEgress() string {
 // egressHostBinding 统计自挂号对若干线路 URL 的绑定数量。
 //
 // 一次遍历算出所有机器需要的计数（每台机器一条 URL），避免 N 台机器扫 N 遍账号表。
-func (a *app) egressHostBinding(urls []string) (bound map[string]int, total int) {
+//
+// owner（v0.31.24）：0 = 全部自挂号（平台视角）；>0 = 只统计该用户名下的。
+// 用户视角必须按 owner 收紧 —— 否则他会从"已绑/总数"里读出**全平台**的规模，
+// 而那既不是他的信息，也会让他误以为"这台机器在给平台供流量"。
+func (a *app) egressHostBinding(urls []string, owner int64) (bound map[string]int, total int) {
 	bound = map[string]int{}
 	for _, u := range urls {
 		bound[u] = 0
@@ -521,6 +746,9 @@ func (a *app) egressHostBinding(urls []string) (bound map[string]int, total int)
 		if acc.OwnerUserID <= 0 {
 			continue // 只统计自挂号（平台号跟随全局默认即可）
 		}
+		if owner > 0 && acc.OwnerUserID != owner {
+			continue // 用户视角：别人的号不进他的统计
+		}
 		total++
 		if u := strings.TrimSpace(acc.EgressProxy); u != "" {
 			if _, ok := bound[u]; ok {
@@ -532,11 +760,19 @@ func (a *app) egressHostBinding(urls []string) (bound map[string]int, total int)
 }
 
 // buildEgressHomeView 组装状态（只读，不做任何写操作）。
-func (a *app) buildEgressHomeView(r *http.Request, canManage bool) egressHomeView {
+//
+// scope（v0.31.24）：平台视角看全部机器、并显示全局默认出口；
+// 用户视角**只列自己的机器**，且不给全局默认出口（那个开关不属于他）。
+func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHomeView {
 	now := time.Now().Unix()
 	m := a.machinesLoad()
 	def := a.defaultEgress()
-	v := egressHomeView{PollSec: egressAgentPollSec, CanManage: canManage, DefaultEgress: def}
+	v := egressHomeView{
+		PollSec: egressAgentPollSec, CanManage: true, ManageScope: scope.kind(),
+	}
+	if scope.Platform {
+		v.DefaultEgress = def
+	}
 
 	// 线路池：按 URL 认线路（名字是给人看的、可改，URL 才是身份）。
 	proxyIDByURL := map[string]string{}
@@ -546,21 +782,35 @@ func (a *app) buildEgressHomeView(r *http.Request, canManage bool) egressHomeVie
 		}
 	}
 
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
+	// ⚠️ 列表用**机器表的键**（而非 mm.ID）作为页面句柄：用户视角下键是
+	// `u12:abc`，两个不同 owner 的机器各自独立命名空间，前端回传什么我们就查什么。
+	keys := make([]string, 0, len(m))
+	for key, mm := range m {
+		if !scope.seesMachine(mm) {
+			continue
+		}
+		keys = append(keys, key)
 	}
-	urls := make([]string, 0, len(ids))
-	for _, id := range ids {
-		urls = append(urls, egressHomeURL(m[id].Ports.TunnelPort))
+	urls := make([]string, 0, len(keys))
+	for _, key := range keys {
+		urls = append(urls, egressHomeURL(m[key].Ports.TunnelPort))
 	}
-	bound, hostTotal := a.egressHostBinding(urls)
+	bound, hostTotal := a.egressHostBinding(urls, scope.hostOwner())
 
-	for _, id := range ids {
-		mm := m[id]
+	for _, key := range keys {
+		mm := m[key]
 		url := egressHomeURL(mm.Ports.TunnelPort)
+		// Applied 的口径按视角分开：
+		//   平台 → "这条线路就是当前的全局默认出口"；
+		//   用户 → "我名下的号**全部**已绑到这条线路"（用户视角没有"全局默认"可判）。
+		// 用 bound == hostTotal 而不是 bound > 0：部分绑定（新挂了一个号、或换了线路）
+		// 是最容易被忽略的中间状态，报"已应用"会让人以为没事了。
+		applied := def == url && url != ""
+		if !scope.Platform {
+			applied = hostTotal > 0 && bound[url] == hostTotal
+		}
 		mv := egressMachineView{
-			ID: mm.ID, Hostname: mm.Hostname,
+			ID: key, Hostname: mm.Hostname,
 			Online:  mm.online(now),
 			ProxyOK: mm.State.ProxyOK, TunnelOK: mm.State.TunnelOK,
 			AgentVersion: mm.State.Version, Message: mm.State.Message,
@@ -568,11 +818,11 @@ func (a *app) buildEgressHomeView(r *http.Request, canManage bool) egressHomeVie
 			ProxyPort: mm.Ports.ProxyPort, TunnelPort: mm.Ports.TunnelPort,
 			ProxyURL:  url,
 			ProxyID:   proxyIDByURL[url],
-			Applied:   def == url && url != "",
+			Applied:   applied,
 			HostBound: bound[url], HostTotal: hostTotal,
 			CurrentCmd: mm.Cmd,
 			LastAt:     mm.StateAt,
-			IsDefault:  mm.ID == egressDefaultMachine,
+			IsDefault:  key == egressDefaultMachine,
 		}
 		mv.Tunnel = egressTunnelReachable(mm.Ports.TunnelPort)
 		mv.Ready = mv.Online && mv.Tunnel
@@ -622,17 +872,18 @@ func (a *app) buildEgressHomeView(r *http.Request, canManage bool) egressHomeVie
 		v.HostBound, v.HostTotal = active.HostBound, active.HostTotal
 		v.Ready = active.Ready
 	}
-	if kv, err := a.store.GetKV(kvEgressAppliedAt); err == nil {
-		if n, err2 := parseI64(kv); err2 == nil {
-			v.AppliedAt = n
+	if scope.Platform {
+		if kv, err := a.store.GetKV(kvEgressAppliedAt); err == nil {
+			if n, err2 := parseI64(kv); err2 == nil {
+				v.AppliedAt = n
+			}
 		}
 	}
-	// 命令只给有权限的人看（它是能拉起整机代理的凭证）。
-	if canManage {
-		if tok, err := a.egressAgentTokenGet(); err == nil {
-			v.AgentCommand = fmt.Sprintf(
-				"wb2api-egress-agent.exe -server %s -token %s", requestOrigin(r), tok)
-		}
+	// 命令用**当前视角自己的令牌**：用户拿到的命令里必须是他的那把
+	// （用它启动的 agent 上报的机器才会归属他自己），而管理员的仍是平台令牌。
+	if tok, err := a.egressAgentTokenFor(scope.hostOwner()); err == nil {
+		v.AgentCommand = fmt.Sprintf(
+			"wb2api-egress-agent.exe -server %s -token %s", requestOrigin(r), tok)
 	}
 	return v
 }
@@ -644,7 +895,9 @@ func (a *app) handleEgressHome(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
 		return
 	}
-	writeJSON(w, http.StatusOK, a.buildEgressHomeView(r, u.IsAdmin()))
+	writeJSON(w, http.StatusOK, a.buildEgressHomeView(r, egressScope{
+		UserID: u.ID, Platform: u.IsAdmin(),
+	}))
 }
 
 // egressBoundByURL 每条线路 URL 被多少个账号绑定（**含平台号与自挂号**）。
@@ -794,7 +1047,7 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 //
 // 为什么要能指定：不指定就只能"谁最近说过话就命令谁"，两台机器并存时
 // 用户在 A 机页面上点一下，可能恰好发给了 B 机 —— 而用户**看不出**这件事。
-func (a *app) egressPickMachine(r *http.Request) string {
+func (a *app) egressPickMachine(r *http.Request, m map[string]*egressMachine, scope egressScope) string {
 	var body struct {
 		Machine string `json:"machine"`
 	}
@@ -802,53 +1055,70 @@ func (a *app) egressPickMachine(r *http.Request) string {
 	if id := strings.TrimSpace(body.Machine); id != "" {
 		return id
 	}
-	m := a.machinesLoad()
+	// 缺省取"最近上报的那台" —— **只在该视角可见的机器里挑**（v0.31.24）：
+	// 否则管理员的机器会成为某个用户"没说指定哪台"时的默认目标。
 	best, bestAt := "", int64(-1)
-	for id, mm := range m {
+	for key, mm := range m {
+		if !scope.seesMachine(mm) {
+			continue
+		}
 		if mm.StateAt > bestAt {
-			best, bestAt = id, mm.StateAt
+			best, bestAt = key, mm.StateAt
 		}
 	}
 	return best
 }
 
-// handleEgressHomePull POST /api/egress/home/pull body {"machine":"<id>"}（仅管理员）
+// handleEgressHomePull POST /api/egress/home/pull body {"machine":"<key>"}
 //
 // 下发 start 指令。**不等结果就返回**：真正的进度由前端轮询 GET 得到
 // —— 一个 HTTP 请求里等 30 秒会同时考验反向代理超时、浏览器超时和用户耐心，
 // 而这件事实在没什么需要"等"的（agent 是独立进程，会自己完成）。
-func (a *app) handleEgressHomePull(w http.ResponseWriter, r *http.Request) {
-	if !a.egressAdminOnly(w, r) {
+//
+// v0.31.24：普通用户可执行，但目标只能是**自己的机器**；**不再凭空登记机器**
+// —— 一台永远不上线的机器只会让列表变脏，而"没有可选机器"的正确指引是
+// "先去目标电脑把 agent 跑起来"（页面下方就有那行命令）。
+func (a *app) handleEgressHomePull(w http.ResponseWriter, r *http.Request, scope egressScope) {
+	m := a.machinesLoad()
+	id := a.egressPickMachine(r, m, scope)
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "还没有已接入的机器：请先在目标电脑上运行 agent 命令（本页下方有）",
+		})
 		return
 	}
-	id := a.egressPickMachine(r)
-	m := a.machinesLoad()
-	mm, _ := a.machineEnsure(m, id, "")
+	mm, ok := a.egressMachineFor(m, id, scope)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "该机器尚未登记，或不属于你"})
+		return
+	}
 	mm.Cmd, mm.CmdAt = "start", time.Now().Unix()
 	if err := a.machinesSave(m); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	log.Printf("INFO: [egress] 已向 machine=%s 下发 start 指令（等待 agent 拉起本机出口代理）", mm.ID)
+	log.Printf("INFO: [egress] 已向 machine=%s（scope=%s）下发 start 指令（等待 agent 拉起本机出口代理）",
+		mm.ID, scope.label())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issued": true, "action": "start", "machine": mm.ID,
-		"view": a.buildEgressHomeView(r, true),
+		"view": a.buildEgressHomeView(r, scope),
 	})
 }
 
-// handleEgressHomeRelease POST /api/egress/home/release body {"machine":"<id>"}（仅管理员）
+// handleEgressHomeRelease POST /api/egress/home/release body {"machine":"<key>"}
 //
 // 下发 stop。**刻意不自动清掉已应用的出口配置**：停代理只是"不再从家宽出"，
 // 而"账号该走哪条线"是另一个决定（可能已经有人手工调过）。要改回去，
 // 用管理后台的「代理」页显式操作 —— 一键停代理顺手改几十个账号的出口，
 // 是那种"点一下才发现改错了"的操作。
-func (a *app) handleEgressHomeRelease(w http.ResponseWriter, r *http.Request) {
-	if !a.egressAdminOnly(w, r) {
+func (a *app) handleEgressHomeRelease(w http.ResponseWriter, r *http.Request, scope egressScope) {
+	m := a.machinesLoad()
+	id := a.egressPickMachine(r, m, scope)
+	mm, ok := a.egressMachineFor(m, id, scope)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "该机器尚未登记，或不属于你"})
 		return
 	}
-	id := a.egressPickMachine(r)
-	m := a.machinesLoad()
-	mm, _ := a.machineEnsure(m, id, "")
 	mm.Cmd, mm.CmdAt = "stop", time.Now().Unix()
 	if err := a.machinesSave(m); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -857,20 +1127,19 @@ func (a *app) handleEgressHomeRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"issued": true, "action": "stop", "machine": mm.ID})
 }
 
-// handleEgressHomeApply POST /api/egress/home/apply body {"machine":"<id>"}（仅管理员）
+// handleEgressHomeApply POST /api/egress/home/apply body {"machine":"<key>"}
 //
 // 显式应用。前端在"就绪"后调用它（而不是让 GET 顺手写）——
 // 读接口带副作用是排障时最讨厌的东西之一。
-func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request) {
-	if !a.egressAdminOnly(w, r) {
-		return
-	}
-	id := a.egressPickMachine(r)
+//
+// v0.31.24：普通用户可执行，但范围严格是"他自己的机器 + 他自己名下的号"。
+func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scope egressScope) {
 	m := a.machinesLoad()
-	mm, ok := m[id]
+	id := a.egressPickMachine(r, m, scope)
+	mm, ok := a.egressMachineFor(m, id, scope)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "该机器尚未登记（本机 agent 还没连上来过）",
+			"error": "该机器尚未登记（本机 agent 还没连上来过），或不属于你",
 		})
 		return
 	}
@@ -880,13 +1149,13 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	res, err := a.applyHomeEgress(mm.Ports.TunnelPort)
+	res, err := a.applyHomeEgress(mm.Ports.TunnelPort, scope)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"applied": res, "machine": mm.ID, "view": a.buildEgressHomeView(r, true),
+		"applied": res, "machine": mm.ID, "view": a.buildEgressHomeView(r, scope),
 	})
 }
 
@@ -914,7 +1183,12 @@ type egressHomeApplyResult struct {
 // 这是有意为之 —— 保留"一个全局默认"这个简单模型，而不是让每台机器各自为政
 // （那会让"我的号到底从哪出去"变成一个需要逐台推演的问题）。
 // 要让某些号走另一台机器的线路，用管理后台的「批量分配」显式绑定。
-func (a *app) applyHomeEgress(tunnelPort int) (egressHomeApplyResult, error) {
+//
+// ⚠️ scope（v0.31.24）：**用户视角不做第 2 步**，且第 1、3 步都收窄到自己。
+// 理由：全局默认出口是平台级决定（它同时决定所有平台号与所有"跟随默认"的账号
+// 从哪出去），而用户提供的代理是不可信第三方 —— 它只应承载它主人的号。
+// 用户拉起的线路仍会进线路池（带 owner），管理员据此可显式分配给别人。
+func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeApplyResult, error) {
 	url := egressHomeURL(tunnelPort)
 	var res egressHomeApplyResult
 	res.ProxyURL = url
@@ -933,14 +1207,27 @@ func (a *app) applyHomeEgress(tunnelPort int) (egressHomeApplyResult, error) {
 	}
 	now := time.Now().Unix()
 	if hit == nil {
+		// 名称按视角区分：平台叫"本地住宅出口"，用户叫"<用户名> 的出口" ——
+		// 管理后台的线路池一眼就能看出这条线是谁接进来的（归属由 owner_user_id
+		// 承载，名字只是给人读的第一眼线索）。
+		name, region := "本地住宅出口", "本机所在网络"
+		if !scope.Platform {
+			name = a.userNameByID(scope.UserID) + " 的出口"
+			region = "用户自建（本机代理 + 反向隧道）"
+		}
 		hit = &EgressProxy{
 			ID:        newEgressProxyID(url),
-			Name:      "本地住宅出口",
+			Name:      name,
 			URL:       url,
-			Region:    "本机所在网络",
+			Region:    region,
 			Note:      "由「一键拉起」自动注册（本机代理 + 反向隧道）",
 			Enabled:   true,
 			CreatedAt: now,
+		}
+		if !scope.Platform {
+			// 归属**只在新建时写**；已存在的线路由 UpsertEgressProxy 的粘性规则
+			// 处理（只允许 0 → 非 0 一次），不在这里覆盖别人已认领的线路。
+			hit.OwnerUserID = scope.UserID
 		}
 	}
 	hit.UpdatedAt = now
@@ -950,13 +1237,16 @@ func (a *app) applyHomeEgress(tunnelPort int) (egressHomeApplyResult, error) {
 	}
 	res.ProxyID = hit.ID
 
-	// 2) 全局默认出口。
-	if err := a.store.SetKV(kvEgressDefault, url); err != nil {
-		return res, err
+	// 2) 全局默认出口 —— **仅平台视角**。用户视角下这一步不是"少做了"，
+	// 而是"本来就不该做"：他要的只是自己那几十个号从家里出去。
+	if scope.Platform {
+		if err := a.store.SetKV(kvEgressDefault, url); err != nil {
+			return res, err
+		}
+		res.DefaultOK = true
 	}
-	res.DefaultOK = true
 
-	// 3) 显式绑定自挂号（只改 egress_proxy 一个字段）。
+	// 3) 显式绑定自挂号（只改 egress_proxy 一个字段）。按视角收窄到自己的号。
 	accs, err := a.store.ListAccounts()
 	if err != nil {
 		return res, err
@@ -964,6 +1254,9 @@ func (a *app) applyHomeEgress(tunnelPort int) (egressHomeApplyResult, error) {
 	for _, acc := range accs {
 		if acc.OwnerUserID <= 0 {
 			continue
+		}
+		if !scope.Platform && acc.OwnerUserID != scope.UserID {
+			continue // 别人的号一个都不碰
 		}
 		res.HostTotal++
 		if strings.TrimSpace(acc.EgressProxy) == url {
@@ -978,12 +1271,28 @@ func (a *app) applyHomeEgress(tunnelPort int) (egressHomeApplyResult, error) {
 		}
 		res.HostBound++
 	}
-	_ = a.store.SetKV(kvEgressAppliedAt, fmt.Sprintf("%d", now))
-	// 池以库为准重建（否则选号仍按旧出口）。
+	if scope.Platform {
+		_ = a.store.SetKV(kvEgressAppliedAt, fmt.Sprintf("%d", now))
+	}
+	// 池以库为准重建（否则选号仍按旧出口）。**两种视角都要重建** ——
+	// 用户视角改的是他自己名下账号的出口，同样是选号输入。
 	_ = a.proxy.SyncAccounts()
-	log.Printf("INFO: [egress] 本地出口已应用 proxy=%s url=%s host_bound=%d/%d",
-		hit.ID, url, res.HostBound, res.HostTotal)
+	log.Printf("INFO: [egress] 本地出口已应用 scope=%s proxy=%s url=%s host_bound=%d/%d",
+		scope.label(), hit.ID, url, res.HostBound, res.HostTotal)
 	return res, nil
+}
+
+// userNameByID 用户名（缺失时退回 "用户#<id>"）—— 仅用于给人读的线路名/日志。
+func (a *app) userNameByID(uid int64) string {
+	if uid <= 0 {
+		return "平台"
+	}
+	if u, err := a.store.GetUserByID(uid); err == nil && u != nil {
+		if n := strings.TrimSpace(u.Username); n != "" {
+			return n
+		}
+	}
+	return fmt.Sprintf("用户#%d", uid)
 }
 
 // newEgressProxyID 线路 id（与既有线路池同风格：稳定短 id，按 url 派生）。

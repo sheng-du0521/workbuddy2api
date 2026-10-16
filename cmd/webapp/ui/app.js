@@ -2829,8 +2829,15 @@ async function pluginRun(p, card, panel) {
 // 控制台「代理」页：把「本机的网络出口」接进平台的出站链路。
 //
 // 为什么把它放控制台而不是只有管理后台：出口是**用户自己能感知**的东西
-// （"我的号从哪出去"），把它藏起来只会让人去猜。但**执行**仍然只有管理员能做
-// —— 它改的是全平台的链路，不是单个用户的选择（见服务端 egressAdminOnly）。
+// （"我的号从哪出去"），把它藏起来只会让人去猜。
+//
+// v0.31.24：**执行权也下沉到用户**（此前只有管理员能做，普通用户点「一键拉起」
+// 只会拿到 403）。服务端把"能碰谁"编码成 `manage_scope`：
+//   · platform（管理员 / 运维）→ 全部机器；应用时设全局默认出口 + 绑全部自挂号；
+//   · self（普通用户）→ 只有自己的机器；应用时只绑自己名下的号，
+//     **不设全局默认出口**。
+// 本页的所有文案与概览行都跟着它切 —— 对一个没有"全局默认出口"这个开关的人
+// 讲它，只会让他以为页面坏了。
 //
 // 三步闭环（页面上一句话讲清，用户不必理解隧道）：
 //   ① 本机跑起 agent（一次，之后常驻）→ ② 点「一键拉起」→ ③ 就绪后自动应用配置
@@ -2869,6 +2876,13 @@ function egressMachineLabel(m) {
   return m && m.is_default ? '（未报主机名的 agent）' : String((m && m.id) || '?');
 }
 
+// egressLabels 机器 id → 显示名（v0.31.24）。
+//
+// 为什么需要：页面上的机器 id 现在是**机器表的键**（用户视角形如 `u12:abc123`，
+// 因为它带了 owner 命名空间）。把这种串直接写进 toast 对用户毫无意义 ——
+// 用户在页面上看到的是主机名，提示里就该是同一个词。
+const egressLabels = {};
+
 // egressCurMachine 从状态里取当前选中的机器（并保证选中项有效）。
 function egressCurMachine(v) {
   const machines = (v && v.machines) || [];
@@ -2881,6 +2895,11 @@ function egressCurMachine(v) {
 function renderEgressHome(box, v) {
   box.textContent = '';
   const { machines, cur } = egressCurMachine(v);
+  // manage_scope（v0.31.24）：平台视角 = 管理员/运维（能设全局默认出口、看全部机器）；
+  // 用户视角 = 普通用户（只有自己的机器，只绑自己名下的号）。**文案必须跟着切**：
+  // 对一个没有"全局默认出口"这个开关的人讲它，只会让他以为页面坏了。
+  const isPlatform = (v.manage_scope || 'platform') === 'platform';
+  for (const m of machines) egressLabels[m.id] = egressMachineLabel(m);
 
   const card = el('div', 'card');
   const head = el('div', 'section-head');
@@ -2931,10 +2950,14 @@ function renderEgressHome(box, v) {
   const rows = [
     ['目标机器', cur ? (egressMachineLabel(cur) + ' · ' + cur.id) : '（还没有任何 agent 连上来）'],
     ['出口 IP', exitIP],
-    ['全局默认出口', v.default_egress || '（空 = 直连）'],
-    ['自挂号绑定', (bound || 0) + ' / ' + (total || 0) + ' 个'],
-    ['隧道端口', '127.0.0.1:' + (ports.tunnel_port || '?') + '（本机代理端口 ' + (ports.proxy_port || '?') + '）'],
   ];
+  // 用户视角**不显示全局默认出口**：它不属于这个用户（那是平台级开关），
+  // 显示出来只会让他以为"我能不能改它"，而答案是不能。
+  if (isPlatform) rows.push(['全局默认出口', v.default_egress || '（空 = 直连）']);
+  rows.push([isPlatform ? '自挂号绑定' : '我的代挂号绑定',
+    (bound || 0) + ' / ' + (total || 0) + ' 个']);
+  rows.push(['隧道端口', '127.0.0.1:' + (ports.tunnel_port || '?')
+    + '（本机代理端口 ' + (ports.proxy_port || '?') + '）']);
   if (curMsg) rows.push(['最近状态', curMsg]);
   const tbl = el('div', 'sub');
   for (const [k, val] of rows) {
@@ -2970,7 +2993,7 @@ function renderEgressHome(box, v) {
 
   // ---- 操作区 ----
   if (!v.can_manage) {
-    const tip = el('div', 'sub', '出口链路的改动会影响全平台（全局默认出口 + 自挂号绑定），因此仅管理员可执行；上面是只读状态。');
+    const tip = el('div', 'sub', '当前账号没有执行出口操作的权限；上面是只读状态。');
     tip.style.marginTop = '10px';
     card.appendChild(tip);
     box.appendChild(card);
@@ -2994,8 +3017,14 @@ function renderEgressHome(box, v) {
     applyBtn.disabled = true;
     try {
       const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
-      toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
-            '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+      // 结果文案按视角分开：用户视角没有"默认出口"这一步，说它等于报告一个
+      // 他无法理解的"未设置"。改成只报"我的号绑了几个"。
+      if (isPlatform) {
+        toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
+              '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+      } else {
+        toast('已应用：你的代挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+      }
       loadEgressHome();
     } catch (e) {
       toast('应用失败：' + (e && e.message ? e.message : e), 'bad');
@@ -3063,18 +3092,29 @@ function renderEgressHome(box, v) {
   const h2 = el('div', 'section-head');
   h2.appendChild(el('h2', null, '这条链路是什么'));
   help.appendChild(h2);
-  help.appendChild(el('div', 'sub',
-    '目标机器上的 agent 跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
-    '于是平台访问上游时，流量会从「你家的宽带」出去 —— 住宅 IP 比机房 IP 友好得多。' +
-    '拉起并应用后：全局默认出口指向这条线路（跟随默认的号自动生效），' +
-    '所有自挂号被显式绑定到它（不随默认出口漂移）。'));
+  help.appendChild(el('div', 'sub', isPlatform
+    ? ('目标机器上的 agent 跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
+       '于是平台访问上游时，流量会从「你家的宽带」出去 —— 住宅 IP 比机房 IP 友好得多。' +
+       '拉起并应用后：全局默认出口指向这条线路（跟随默认的号自动生效），' +
+       '所有自挂号被显式绑定到它（不随默认出口漂移）。')
+    : ('你自己电脑上的 agent 跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
+       '于是**你自己的代挂账号**访问上游时，流量会从「你家的宽带」出去 —— ' +
+       '住宅 IP 比机房 IP 友好得多，也更像正常用户。' +
+       '拉起并应用后：**只把你名下的代挂号**绑到这条线路；' +
+       '平台的全局默认出口**不会**被改动（那不是你的号该决定的事）。')));
   const warn = el('div', 'sub');
   warn.style.marginTop = '8px';
   warn.appendChild(document.createTextNode('⚠️ 三点要知道：'));
   warn.appendChild(el('br'));
-  warn.appendChild(document.createTextNode(
-    '① **全局默认出口只有一个**：多台机器时，最后应用的那台决定它；要让部分号走另一台，用管理后台的「批量分配」显式绑定；'));
-  warn.appendChild(el('br'));
+  if (isPlatform) {
+    warn.appendChild(document.createTextNode(
+      '① **全局默认出口只有一个**：多台机器时，最后应用的那台决定它；要让部分号走另一台，用管理后台的「批量分配」显式绑定；'));
+    warn.appendChild(el('br'));
+  } else {
+    warn.appendChild(document.createTextNode(
+      '① 这条线路**只作用于你自己的代挂号**：不会改变平台默认出口，也不会影响任何其他用户的号；'));
+    warn.appendChild(el('br'));
+  }
   warn.appendChild(document.createTextNode(
     '② 同一条线路只有一个出口 IP —— 绑它的账号共用这个 IP，会保留"同一 IP 出站"的特征；'));
   warn.appendChild(el('br'));
@@ -3084,15 +3124,17 @@ function renderEgressHome(box, v) {
   box.appendChild(help);
 }
 
-// egressPull 一键拉起：下发指令 → 轮询状态 → 就绪后**自动应用**配置。
 // egressPull 一键拉起：向**选中的那台机器**下发指令 → 轮询状态 → 就绪后自动应用配置。
 async function egressPull(v) {
   if (egressTimer) return;
   const machine = egressSelMachine;
   if (!machine) {
-    toast('还没有已登记的机器：请先在目标电脑上运行 agent', 'bad');
+    toast('还没有已接入的机器：请先在目标电脑上运行 agent（本页下方有命令）', 'bad');
     return;
   }
+  // 提示里用**主机名**而不是机器 id：用户视角的 id 是 `u12:abc…` 这种内部键，
+  // 对用户毫无意义（他在页面上看到的是主机名，提示里就该是同一个词）。
+  const label = egressLabels[machine] || machine;
   try {
     await post('/api/egress/home/pull', { machine });
   } catch (e) {
@@ -3100,7 +3142,7 @@ async function egressPull(v) {
     return;
   }
   egressSince = Date.now();
-  toast('已向 ' + machine + ' 下发拉起指令，正在等待它的 agent…', 'ok');
+  toast('已向 ' + label + ' 下发拉起指令，正在等待它的 agent…', 'ok');
   const box = document.getElementById('egressHomeBox');
   const step = async () => {
     let cur = null;

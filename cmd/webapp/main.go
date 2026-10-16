@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.23"
+const version = "0.31.24"
 
 type app struct {
 	store  *Store
@@ -1368,16 +1368,19 @@ func (a *app) routes() *http.ServeMux {
 	// 钥匙，比把管理密钥抄到本机安全得多（它能做的只有"拉代理"，读不到任何号）。
 	mux.HandleFunc("GET /api/agent/poll", a.handleEgressAgentPoll)
 	mux.HandleFunc("POST /api/agent/report", a.handleEgressAgentReport)
-	// 控制台「代理」页：状态对登录用户只读开放；拉起/停止/应用是**管理员**动作
-	// （它们会改变全平台的出站链路，不是单个用户的选择）。
+	// 控制台「代理」页：状态对登录用户开放（**只列他自己的机器**）。
 	mux.HandleFunc("GET /api/egress/home", a.userGuard(a.handleEgressHome))
-	// 三个**执行**端点挂 adminGuard（而不是 userGuard + 自己判管理员）：
-	// 管理员会话与**运维密钥（X-Admin-Key）**两条通道都能用 —— 与项目其它管理接口
-	// 一致。出口是平台级配置，脚本化运维（部署时拉起、巡检时重应用）是真实场景，
+	// 三个**执行**端点挂 egressActorGuard（v0.31.24 取代 adminGuard）：
+	// **普通用户也能过** —— 出口本该是"我的号从哪个 IP 出去"，由号主自己决定；
+	// 此前只能管理员代劳，等于把每个人的出站链路都挂在一个人手上。
+	// 守卫把"能碰谁"编码成 egressScope 一路带下去：
+	//   · 管理员会话 / 运维密钥（X-Admin-Key）→ 平台视角（全部机器 + 可设全局默认）
+	//   · 普通登录用户 → 自己视角（只有自己的机器、自己的号，不碰全局默认）
+	// 运维密钥这条通道保留，因为脚本化运维（部署时拉起、巡检时重应用）是真实场景，
 	// 不该只剩"必须开浏览器点一下"这一条路。
-	mux.HandleFunc("POST /api/egress/home/pull", a.adminGuard(a.handleEgressHomePull))
-	mux.HandleFunc("POST /api/egress/home/release", a.adminGuard(a.handleEgressHomeRelease))
-	mux.HandleFunc("POST /api/egress/home/apply", a.adminGuard(a.handleEgressHomeApply))
+	mux.HandleFunc("POST /api/egress/home/pull", a.egressActorGuard(a.handleEgressHomePull))
+	mux.HandleFunc("POST /api/egress/home/release", a.egressActorGuard(a.handleEgressHomeRelease))
+	mux.HandleFunc("POST /api/egress/home/apply", a.egressActorGuard(a.handleEgressHomeApply))
 
 	// 插件中心（v0.31.16，用户侧）：只下发 audience 含 user 的插件。
 	// 执行接口内部按 owner_user_id 收窄 —— 用户只能领**自己的**代挂账号。

@@ -164,34 +164,73 @@ func TestEgressAgentReportMakesOnline(t *testing.T) {
 	}
 }
 
-// TestEgressHomeAccessControl 状态查询要登录；执行动作要管理员。
+// TestEgressHomeAccessControl 状态查询要登录；执行动作对登录用户开放，
+// 但范围严格按"谁的机器 / 谁的号"切（v0.31.24）。
+//
+// 升级前这里是"普通用户一律 403"。现在**刻意不再断言 403** —— 那正是本版要改掉的
+// 行为；取而代之的是断言"权限放行了，但范围没跟着放开"（见 egress_user_scope_test.go
+// 的负向用例）。这里只钉住两端：认证边界（未登录 401）与两种视角的判据字段。
 func TestEgressHomeAccessControl(t *testing.T) {
-	_, _, mux, adminCookie, memberCookie := eaApp(t)
+	_, a, mux, adminCookie, memberCookie := eaApp(t)
 
 	if code, _ := eaReq(t, mux, "GET", "/api/egress/home", "", "", ""); code != http.StatusUnauthorized {
 		t.Fatalf("未登录读状态应 401，得 %d", code)
 	}
 	if code, _ := eaReq(t, mux, "GET", "/api/egress/home", "", memberCookie, ""); code != http.StatusOK {
-		t.Fatalf("普通用户读状态应 200（只读），得 %d", code)
+		t.Fatalf("普通用户读状态应 200，得 %d", code)
 	}
-	// 普通用户看到的状态里**不该有** agent 命令（那是能拉起整机代理的凭证）。
+	// 普通用户拿到的 agent 命令必须是**他自己的令牌**（用它启动的 agent 才归属他）。
+	// ⚠️ 这条是一个真实的越权面：命令若下发平台令牌，任何人都能拿它注册机器、
+	// 伪造在线状态 —— 而"给我一行命令"恰恰是最不设防的功能。
+	platformTok, err := a.egressAgentTokenGet()
+	if err != nil {
+		t.Fatalf("egressAgentTokenGet: %v", err)
+	}
 	_, raw := eaReq(t, mux, "GET", "/api/egress/home", "", memberCookie, "")
-	if cmd, _ := eaJSON(t, raw)["agent_command"].(string); cmd != "" {
-		t.Fatalf("普通用户不该拿到 agent 命令，得 %q", cmd)
+	v := eaJSON(t, raw)
+	cmd, _ := v["agent_command"].(string)
+	if cmd == "" {
+		t.Fatal("普通用户应拿到 agent 命令（否则他无法把自己的机器接进来）")
 	}
-	if eaJSON(t, raw)["can_manage"] != false {
-		t.Fatal("普通用户 can_manage 应为 false")
+	if strings.Contains(cmd, platformTok) {
+		t.Fatalf("普通用户的命令**不该**含平台令牌，得 %q", cmd)
+	}
+	if v["can_manage"] != true {
+		t.Fatal("普通用户应能管理自己的出口（can_manage=true）")
+	}
+	if v["manage_scope"] != "self" {
+		t.Fatalf("普通用户视角应为 self，得 %v", v["manage_scope"])
 	}
 
-	// 三个执行动作对普通用户一律 403。
-	for _, act := range []string{"pull", "release", "apply"} {
-		code, _ := eaReq(t, mux, "POST", "/api/egress/home/"+act, "", memberCookie, "")
-		if code != http.StatusForbidden {
-			t.Errorf("普通用户 %s 应 403，得 %d", act, code)
-		}
+	// 管理员：平台视角，且命令里必须仍是平台令牌（他管的是平台那台机器）。
+	_, rawAdmin := eaReq(t, mux, "GET", "/api/egress/home", "", adminCookie, "")
+	va := eaJSON(t, rawAdmin)
+	if va["manage_scope"] != "platform" {
+		t.Fatalf("管理员视角应为 platform，得 %v", va["manage_scope"])
 	}
-	if code, _ := eaReq(t, mux, "POST", "/api/egress/home/pull", "", adminCookie, ""); code != http.StatusOK {
-		t.Fatalf("管理员 pull 应 200，得 %d", code)
+	if cmdA, _ := va["agent_command"].(string); !strings.Contains(cmdA, platformTok) {
+		t.Fatalf("管理员的命令应用平台令牌，得 %q", cmdA)
+	}
+
+	// 执行动作：未登录 → 401（先过认证）；普通用户 → 不再 403，
+	// 但"没有已接入的机器"是 400（引导他去跑 agent，而不是告诉他没权限）。
+	if code, _ := eaReq(t, mux, "POST", "/api/egress/home/pull", "", "", ""); code != http.StatusUnauthorized {
+		t.Fatalf("未登录执行应 401，得 %d", code)
+	}
+	code, body := eaReq(t, mux, "POST", "/api/egress/home/pull", "", memberCookie, "")
+	if code == http.StatusForbidden {
+		t.Fatalf("普通用户执行出口动作不该再 403，得 %d %s", code, body)
+	}
+	if code != http.StatusBadRequest {
+		t.Fatalf("没有已接入的机器时应 400，得 %d %s", code, body)
+	}
+
+	// 管理员：先让平台 agent 上线，再下发指令 → 200。
+	if code, _ := eaReq(t, mux, "GET", "/api/agent/poll", "", "", platformTok); code != http.StatusOK {
+		t.Fatalf("平台 agent poll 应 200，得 %d", code)
+	}
+	if code, body := eaReq(t, mux, "POST", "/api/egress/home/pull", "", adminCookie, ""); code != http.StatusOK {
+		t.Fatalf("管理员 pull 应 200，得 %d %s", code, body)
 	}
 }
 
@@ -219,7 +258,7 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		res, err := a.applyHomeEgress(egressBaseTunnelPort)
+		res, err := a.applyHomeEgress(egressBaseTunnelPort, egressScope{Platform: true})
 		if err != nil {
 			t.Fatalf("第 %d 次 apply: %v", i+1, err)
 		}
