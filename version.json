@@ -8,9 +8,9 @@
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.36/webapp.exe",
-      "sha256": "1b927ad2637bd2d9dc1d86bd92bad0a5ed82cf77616e90db0f48b19a44347475",
-      "size": 15413760
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.37/webapp.exe",
+      "sha256": "43dd348830c1c5d1e8c240dcb88a1afaa4fcd277a345a59f023663b7db62c10e",
+      "size": 15441920
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
