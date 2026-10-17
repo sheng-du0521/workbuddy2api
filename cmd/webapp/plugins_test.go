@@ -113,12 +113,12 @@ func TestPluginListAndToggle(t *testing.T) {
 		t.Fatalf("列表应 200，得 %d", code)
 	}
 	list, _ := out["plugins"].([]any)
-	if len(list) != 1 {
-		t.Fatalf("当前应只有 1 个插件，得 %d", len(list))
-	}
-	first, _ := list[0].(map[string]any)
-	if first["id"] != "claim-compensation" {
-		t.Fatalf("插件 id 应为 claim-compensation，得 %v", first["id"])
+	// ⚠️ 断言"包含"而不是"数量恰好等于 N"（v0.31.31）：插件层存在的意义就是
+	// 持续加插件，把数量写死会让每加一个插件都红一次，然后有人图省事把断言删掉。
+	// 这里真正要守的是两件事：目标插件在列表里、且缺省为启用。
+	first := findPlugin(list, "claim-compensation")
+	if first == nil {
+		t.Fatalf("插件列表里应包含 claim-compensation，得 %v", list)
 	}
 	if first["enabled"] != true {
 		t.Fatalf("缺省应为启用，得 %v", first["enabled"])
@@ -332,4 +332,14 @@ func TestPluginClaimNoCreditExposesRawData(t *testing.T) {
 	if !strings.Contains(d, "points") {
 		t.Fatalf("必须透出上游原文（区分「无可领」与「字段名猜错」的唯一事实），得 %q", d)
 	}
+}
+
+// findPlugin 在插件列表里按 id 找一条（找不到返回 nil）。
+func findPlugin(list []any, id string) map[string]any {
+	for _, x := range list {
+		if m, ok := x.(map[string]any); ok && m["id"] == id {
+			return m
+		}
+	}
+	return nil
 }

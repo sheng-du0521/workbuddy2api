@@ -45,6 +45,15 @@ type pluginDef struct {
 	// Builtin 内置插件（随二进制分发）。保留该字段是为了列表里的分组展示，
 	// 目前恒 true。
 	Builtin bool
+	// Kind 插件的**面板形态**（v0.31.31）：决定前端展开后渲染哪一种面板。
+	//
+	//	"claim"  选号 → 逐个串行执行 → 逐行结果（领取类插件）
+	//	"health" 选号 → 发起检测 → 展示每号的检测结论（健康检测）
+	//
+	// 为什么要显式区分而不是让前端按 id 猜：面板的交互与文案完全不同
+	// （领取的语义是"执行一次写操作"，检测的语义是"读一次状态"）。
+	// 让前端按 id 硬编码分支，加第二个同类插件时就得改前端 —— 那就白抽插件层了。
+	Kind string
 }
 
 // pluginRegistry 插件注册表。加插件 = 在这里加一条 + 在 handlePluginClaim 里
@@ -57,7 +66,25 @@ var pluginRegistry = []pluginDef{
 		Audience: "both",
 		Builtin:  true,
 	},
+	{
+		ID:   pluginIDHealthCheck,
+		Name: "账号健康检测",
+		Desc: "逐个检查你名下的代挂账号：凭证是否还有效、余额是否读得到、对话通道是否通、" +
+			"出口是否正常。只读检查，**不会**停用/删除任何账号。",
+		Audience: "both",
+		Builtin:  true,
+		Kind:     "health",
+	},
 }
+
+// pluginIDHealthCheck 健康检测插件的 id。
+//
+// 检测逻辑早就有了（管理后台「健康检测」页），这一版是把它**插件化**：
+// 用户也能在控制台里对自己的号做体检，而不必请管理员代跑。
+// 与后台的差别只有两条（都在 host_health.go 里写死）：
+//   - 只检测本人名下的号；
+//   - **不允许任何不可逆处置**（allowDelete=false）—— 用户的号是用户的资产。
+const pluginIDHealthCheck = "health-check"
 
 const pluginIDClaimCompensation = "claim-compensation"
 
@@ -130,6 +157,8 @@ type pluginView struct {
 	Desc     string `json:"desc"`
 	Audience string `json:"audience"`
 	Builtin  bool   `json:"builtin"`
+	// Kind 面板形态（见 pluginDef.Kind）。后端下发，前端只认它，不认 id。
+	Kind string `json:"kind"`
 	// Enabled **平台级**开关：该插件是否由管理员提供给本端使用。
 	Enabled bool `json:"enabled"`
 	// UserEnabled **当前用户**是否启用（v0.31.22）。管理端看的是平台级，
@@ -171,7 +200,7 @@ func (a *app) pluginListView(wantAdmin bool, userID int64) []pluginView {
 		}
 		out = append(out, pluginView{
 			ID: def.ID, Name: def.Name, Desc: def.Desc,
-			Audience: def.Audience, Builtin: def.Builtin,
+			Audience: def.Audience, Builtin: def.Builtin, Kind: def.Kind,
 			Enabled: globalOn, UserEnabled: userOn, Active: globalOn && userOn,
 		})
 	}

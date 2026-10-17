@@ -142,23 +142,27 @@ func TestEgressMachineMultiHost(t *testing.T) {
 		t.Fatalf("mid-2 的线路 URL 应指向它自己的隧道端口，得 %q", m2.ProxyURL)
 	}
 
-	// ---- 5) 同指纹 = 同一台机器（v0.31.26）：必须点出来，别让人以为有两条线 ----
+	// ---- 5) 同指纹 = 同一台机器（v0.31.26 起识别；v0.31.31 起**合并**）----
 	//
 	// 现场原型：本机先后跑了 v0.1.0（占 default 桶）与 v0.3.0（用户令牌），
 	// 两个 key、两个端口、两条线路，出口都是 39.91.80.16。
+	//
+	// v0.31.31 之前这里只是"标出来"（两条记录 + SameMachineOf 互指），于是：
+	// 两条线路各自分号 → 看起来"有两个出口"，实际是同一台机器的同一个 IP。
+	// 现在改成**物理合并**：同指纹只保留一条记录，另一个 agent id 记进 AltIDs，
+	// 页面据此提示"停掉多余的那份"。一台机器 = 一条线路，这是唯一不会自欺的口径。
 	report("", egressAgentState{Hostname: "DESKTOP-AQO1QE4", ExitIP: "39.91.80.16（山东 济南 联通）", Fingerprint: "fp-same"})
 	report("mid-2", egressAgentState{Hostname: "DESKTOP-AQO1QE4", ExitIP: "39.91.80.16", Fingerprint: "fp-same"})
 	v2 := a.buildEgressHomeView(httptest.NewRequest(http.MethodGet, "/api/egress/home", nil), egressScope{Platform: true})
-	x1, x2 := findMachine(v2, egressDefaultMachine), findMachine(v2, "mid-2")
-	if len(x1.SameMachineOf) != 1 || x1.SameMachineOf[0] != "mid-2" {
-		t.Fatalf("default 应指出与自己同指纹的 mid-2，得 %v", x1.SameMachineOf)
+	if n := len(v2.Machines); n != 1 {
+		t.Fatalf("同指纹的两份 agent 应合并成一条机器记录，得 %d 条：%+v", n, v2.Machines)
 	}
-	if len(x2.SameMachineOf) != 1 || x2.SameMachineOf[0] != egressDefaultMachine {
-		t.Fatalf("mid-2 应反过来指出 default，得 %v", x2.SameMachineOf)
+	x1 := v2.Machines[0]
+	if len(x1.AltIDs) != 1 || x1.AltIDs[0] != "mid-2" {
+		t.Fatalf("AltIDs 应记录同一台机器上的另一个 agent id（mid-2），得 %v", x1.AltIDs)
 	}
-	// 同指纹的也同出口，但不要再重复报一次 SameExitOf（一个事实说一遍）。
-	if len(x1.SameExitOf) != 0 {
-		t.Fatalf("同指纹机器不该再进 SameExitOf，得 %v", x1.SameExitOf)
+	if len(x1.SameMachineOf) != 0 {
+		t.Fatalf("合并之后不该再有 SameMachineOf（那两条记录已经不存在），得 %v", x1.SameMachineOf)
 	}
 
 	// 复合串与纯 IP 必须被认成同一个出口（老 agent 报的就是复合串）。

@@ -2684,8 +2684,201 @@ function pluginRenderPanel(p, card) {
   if (pluginState[p.id] && pluginState[p.id].open) pluginFillPanel(p, card, panel);
 }
 
-// pluginFillPanel 填面板主体：选号 + 执行 + 结果。
+// pluginHealthPanel 健康检测面板（v0.31.31）。
+//
+// 语义与"领取"完全不同，所以是另一套渲染：
+//   · 检测是**读**操作（不会改账号状态），所以没有"执行中逐行返回"；
+//   · 结果是**异步**产出的（服务端逐号串行探活，几十秒到几分钟），
+//     所以给的是"发起 → 轮询刷新"，而不是同步等。
+//   · 用户视角**只读**：不提供停用/删除/复活按钮（那是管理员的权力）。
+async function pluginHealthPanel(p, card, panel) {
+  const st = (pluginState[p.id] = pluginState[p.id] || { healthOpen: true });
+  panel.textContent = '';
+  panel.appendChild(el('div', 'sub', '正在读取检测结果…'));
+
+  const isAdmin = pluginScope() === 'admin';
+  const base = isAdmin ? '/api/admin/accounts/health' : '/api/host/accounts/health';
+  let d;
+  try {
+    d = await api(base + '/last');
+  } catch (e) {
+    panel.textContent = '';
+    panel.appendChild(el('div', 'sub', '读取检测结果失败：' + (e && e.message ? e.message : e)));
+    return;
+  }
+
+  // 两端返回形状不同（后台 results[]，用户端 accounts[]），在这里归一。
+  // 统一成 {uid, nickname, tokenDead, checked, result}，后面只按这个渲染。
+  let rows = [];
+  if (Array.isArray(d.accounts)) {
+    rows = d.accounts.map((a) => ({
+      uid: a.uid, nickname: a.nickname, tokenDead: !!a.token_dead,
+      checked: !!a.checked, result: a.result || null,
+    }));
+  } else if (Array.isArray(d.results)) {
+    rows = d.results.map((r) => ({
+      uid: r.uid, nickname: r.nickname, tokenDead: false, checked: true, result: r,
+    }));
+  }
+  if (!st.picked) st.picked = new Set(rows.map((r) => r.uid));
+  // 刷新后收敛勾选集合（只保留还存在的号）。
+  const alive = new Set(rows.map((r) => r.uid));
+  st.picked = new Set(Array.from(st.picked).filter((u) => alive.has(u)));
+
+  panel.textContent = '';
+  if (!rows.length) {
+    panel.appendChild(el('div', 'sub', isAdmin
+      ? '还没有可检测的账号。先到「账号池」导入账号。'
+      : '你还没有代挂账号。先到「账号代挂」页添加一个，再回来体检。'));
+    return;
+  }
+
+  const sum = d.summary || {};
+  const head = el('div', 'sub');
+  head.style.margin = '8px 0';
+  head.appendChild(document.createTextNode(
+    '检测内容：凭证是否还有效 · 余额能否读到 · 对话通道是否通 · 出口是否正常。' +
+    '每号 1~3 秒、逐个串行，**只读**，不会停用或删除任何账号。'));
+  if (isAdmin) {
+    head.appendChild(document.createElement('br'));
+    head.appendChild(document.createTextNode(
+      '需要按策略处置（停用/复活/删除）请到左侧「健康检测」页 —— 那里才有写操作。'));
+  }
+  panel.appendChild(head);
+
+  // 汇总（只算本次能看到的号）
+  const kpi = el('div', 'sub');
+  kpi.style.margin = '6px 0 10px';
+  const stamp = sum.ended_at ? (' · 最近一次 ' + fmtClock(sum.ended_at)) : '';
+  kpi.textContent = '共 ' + (sum.total || rows.length) + ' 个号 · 已检测 ' + (sum.checked || 0)
+    + ' · 确定性异常 ' + (sum.definite || 0) + stamp;
+  panel.appendChild(kpi);
+
+  const row = el('div', 'row');
+  row.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;';
+  const all = el('label', 'pick-all');
+  const cbAll = document.createElement('input');
+  cbAll.type = 'checkbox';
+  cbAll.checked = st.picked.size === rows.length;
+  cbAll.onchange = () => {
+    st.picked = cbAll.checked ? new Set(rows.map((r) => r.uid)) : new Set();
+    pluginHealthPanel(p, card, panel);
+  };
+  all.appendChild(cbAll);
+  all.appendChild(document.createTextNode(' 全选'));
+  row.appendChild(all);
+
+  const cnt = el('span', 'muted', '已选 ' + st.picked.size + ' / ' + rows.length);
+  cnt.style.fontSize = '12px';
+  row.appendChild(cnt);
+
+  const runBtn = el('button', null, '开始检测');
+  runBtn.disabled = st.picked.size === 0;
+  runBtn.onclick = async () => {
+    const uids = Array.from(st.picked);
+    runBtn.disabled = true;
+    runBtn.textContent = '已发起…';
+    try {
+      const r = await post(base, { uids });
+      toast('已开始检测 ' + (r.count || uids.length) + ' 个号（逐个串行，约几十秒）', 'ok');
+      // 轮询刷新：检测是后台跑的，页面要自己把结果接回来。
+      // 15 秒一次、最多 20 次（5 分钟）—— 超过就停下并提示手动刷新，
+      // 不做无限轮询（用户切走标签页时那只会白烧请求）。
+      let n = 0;
+      const tick = async () => {
+        n++;
+        try {
+          const nd = await api(base + '/last');
+          const s2 = nd.summary || {};
+          if ((s2.checked || 0) >= (r.count || uids.length) || n >= 20) {
+            pluginHealthPanel(p, card, panel);
+            return;
+          }
+        } catch (e) { /* 轮询失败不终止 */ }
+        if (n < 20) setTimeout(tick, 15000);
+        else pluginHealthPanel(p, card, panel);
+      };
+      setTimeout(tick, 8000);
+    } catch (e) {
+      toast('发起检测失败：' + (e && e.message ? e.message : e), 'err');
+      runBtn.disabled = false;
+      runBtn.textContent = '开始检测';
+    }
+  };
+  row.appendChild(runBtn);
+
+  const refresh = el('button', 'ghost', '刷新结果');
+  refresh.onclick = () => pluginHealthPanel(p, card, panel);
+  row.appendChild(refresh);
+  panel.appendChild(row);
+
+  // 逐号结果
+  const list = el('div', 'cfg-list');
+  list.style.marginTop = '10px';
+  for (const r of rows) {
+    const line = el('div');
+    line.style.cssText = 'display:flex;gap:8px;align-items:flex-start;padding:6px 0;'
+      + 'border-top:1px solid rgba(127,127,127,.15);';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = st.picked.has(r.uid);
+    cb.onchange = () => {
+      if (cb.checked) st.picked.add(r.uid); else st.picked.delete(r.uid);
+      pluginHealthPanel(p, card, panel);
+    };
+    line.appendChild(cb);
+
+    const body = el('div');
+    body.style.flex = '1';
+    const title = el('div');
+    title.appendChild(el('b', null, r.nickname || maskUID(r.uid) + ' '));
+    const res = r.result;
+    if (r.tokenDead) {
+      const t = el('span', 'tag err', '登录失效');
+      t.title = 'refresh token 已被上游作废（12153）：只能重新登录导入，等下去不会好';
+      title.appendChild(t);
+      title.appendChild(document.createTextNode(' '));
+    }
+    if (!r.checked) {
+      title.appendChild(el('span', 'tag', '未检测'));
+    } else {
+      const okState = res && (res.state === 'ok' || res.state === 'healthy');
+      title.appendChild(el('span', 'tag ' + (okState ? 'ok' : 'warn'), (res && res.state_label) || (res && res.state) || '—'));
+      if (res && res.chat_probed) {
+        title.appendChild(document.createTextNode(' '));
+        const ct = el('span', 'tag ' + (res.chat_ok ? 'ok' : 'err'),
+          '对话' + (res.chat_ok ? '通' : '不通'));
+        if (res.chat_note) ct.title = res.chat_note;
+        title.appendChild(ct);
+      }
+    }
+    body.appendChild(title);
+
+    if (res) {
+      const detail = el('div', 'muted');
+      detail.style.fontSize = '11px';
+      const bits = [];
+      if (res.reason) bits.push(res.reason);
+      if (res.credits_known) bits.push('余额 ' + res.credits);
+      if (res.egress) bits.push('出口 ' + res.egress);
+      if (res.latency_ms) bits.push(res.latency_ms + 'ms');
+      detail.textContent = bits.join(' · ');
+      if (bits.length) body.appendChild(detail);
+    }
+    line.appendChild(body);
+    list.appendChild(line);
+  }
+  panel.appendChild(list);
+}
+
+// pluginFillPanel 填面板主体：按插件形态分流。
+//
+// `kind` 由**服务端**下发（pluginDef.Kind），前端不按 id 猜 ——
+// 否则加第二个同类插件时又得回来改前端，插件层就白抽了。
 async function pluginFillPanel(p, card, panel) {
+  if (p.kind === 'health') {
+    return pluginHealthPanel(p, card, panel);
+  }
   const st = pluginState[p.id];
   panel.textContent = '';
   panel.appendChild(el('div', 'sub', '正在读取可操作的账号…'));
@@ -2926,6 +3119,9 @@ function egressDot(ok, text) {
 async function loadEgressHome() {
   const box = document.getElementById('egressHomeBox');
   if (!box) return;
+  // 两张卡一起刷：出口状态（机器/隧道）+ 我的账号出口（逐号线路）。
+  // 它们回答的是两个不同问题："隧道通不通" 与 "每个号到底从哪个 IP 出去"。
+  loadHostEgressLines();
   try {
     const v = await api('/api/egress/home');
     renderEgressHome(box, v);
@@ -2933,6 +3129,256 @@ async function loadEgressHome() {
     box.textContent = '';
     box.appendChild(el('div', 'sub', '读取出口状态失败：' + (e && e.message ? e.message : e)));
   }
+}
+
+// ======================================================================
+// 我的账号出口（v0.31.31）
+//
+// 用户端的"逐号指定出口"。在它之前，用户只有两个全量动作：
+//   · 设置页「我的出口」填一个 URL → 应用到全部；
+//   · 代理页「一键拉起」→ 应用 = 把我名下所有号绑到刚拉起的那条线路。
+// 两台电脑接进来时，后者的效果是"在 B 机上点一下，A 机上的号全搬过来"，
+// 于是两台机器最后只有一台在承重 —— 用户看到的就是"两个 IP 却是同一个出口"。
+// ======================================================================
+
+let heLines = [];       // 可用线路
+let heAccounts = [];    // 我的号 + 当前出口
+let hePicked = new Set();
+
+async function loadHostEgressLines() {
+  const box = document.getElementById('egrAccBox');
+  if (!box) return;
+  try {
+    const d = await api('/api/host/egress/lines');
+    heLines = d.lines || [];
+    heAccounts = d.accounts || [];
+    // 勾选集合随刷新收敛：只保留仍然存在的号，避免"删了号还勾着"。
+    const alive = new Set(heAccounts.map((a) => a.uid));
+    hePicked = new Set(Array.from(hePicked).filter((u) => alive.has(u)));
+    renderHostEgress(d);
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'sub', '读取账号出口失败：' + (e && e.message ? e.message : e)));
+  }
+}
+
+// heLineOptions 可选线路（跳过"不可选"的：停用的、别人的）。
+function heUsableLines() {
+  return heLines.filter((l) => !l.note);
+}
+
+function renderHostEgress(d) {
+  const box = document.getElementById('egrAccBox');
+  if (!box) return;
+  box.textContent = '';
+
+  const usable = heUsableLines();
+  const hint = document.getElementById('egrAccHint');
+  if (hint) {
+    hint.textContent = heAccounts.length
+      ? ('共 ' + heLines.length + ' 条线路 · 可用 ' + usable.length + ' 条 · 实际 '
+        + (d.distinct_exit_ips || 0) + ' 个不同出口 IP')
+      : '';
+  }
+
+  if (!heAccounts.length) {
+    box.appendChild(el('div', 'hintbar', '还没有代挂账号。先到「账号代挂」页添加一个，再回来配出口。'));
+    return;
+  }
+
+  // ---- 顶部：口径说明 + 批量动作 ----
+  const bar = el('div', 'row');
+  bar.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px;';
+
+  const rebal = el('button', null, '按出口 IP 均衡');
+  rebal.title = '把（勾选的）号轮流分到不同出口 IP 的线路上；同一 IP 的多条线路只算一个出口';
+  rebal.onclick = async () => {
+    const uids = Array.from(hePicked);
+    const scope = uids.length ? ('勾选的 ' + uids.length + ' 个号') : '全部代挂号';
+    if (!(await confirmAsk('把 ' + scope + '按出口 IP 均衡分配？\n\n'
+      + '· 我会按「不同出口 IP」分组，把号轮流分上去；\n'
+      + '· 同一个 IP 上的多条线路只算一个出口（不会假装更分散）；\n'
+      + '· 只会动你名下的号。'))) return;
+    rebal.disabled = true;
+    try {
+      const r = await post('/api/host/egress/rebalance', uids.length ? { uids } : {});
+      const desc = (r.exits || []).map((x) => (x.exit_ip || '未知') + ' × ' + x.count).join('、');
+      toast('已分配 ' + r.assigned + ' 个号到 ' + r.distinct_exit_ips + ' 个出口：' + desc, 'ok');
+      for (const w of (r.warnings || [])) toast(w, 'warn');
+      loadHostEgressLines();
+    } catch (e) { toast('均衡失败：' + e.message, 'err'); }
+    finally { rebal.disabled = false; }
+  };
+  bar.appendChild(rebal);
+
+  // 批量指定：把勾选的号统一指到某条线路（或直连 / 跟随默认）。
+  const sel = el('select');
+  sel.style.minWidth = '240px';
+  const opt = (v, t) => { const o = el('option', null, t); o.value = v; sel.appendChild(o); };
+  opt('', '— 批量设为… —');
+  opt('__direct', '直连（不走任何代理）');
+  opt('__clear', '跟随默认（清空本号出口配置）');
+  for (const l of usable) {
+    opt(l.url, '线路：' + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : '（出口未知）'));
+  }
+  bar.appendChild(sel);
+  const apply = el('button', 'ghost', '应用到勾选');
+  apply.onclick = async () => {
+    const v = sel.value;
+    if (!v) { toast('先选一个目标', 'err'); return; }
+    const uids = Array.from(hePicked);
+    if (!uids.length) { toast('先勾选账号', 'err'); return; }
+    const proxy = v === '__direct' ? 'direct' : (v === '__clear' ? '' : v);
+    apply.disabled = true;
+    try {
+      const r = await post('/api/host/egress/assign', { uids, proxy });
+      toast('已设置 ' + r.updated + ' 个号' + (r.exit_ip ? '，该线路出口 ' + r.exit_ip : ''), 'ok');
+      if (r.note) toast(r.note, 'warn');
+      loadHostEgressLines();
+    } catch (e) { toast('设置失败：' + e.message, 'err'); }
+    finally { apply.disabled = false; }
+  };
+  bar.appendChild(apply);
+
+  const cnt = el('span', 'muted', '已选 ' + hePicked.size + ' / ' + heAccounts.length);
+  cnt.style.fontSize = '12px';
+  bar.appendChild(cnt);
+  box.appendChild(bar);
+
+  // ---- 线路一览（每条线路一个出口 IP；同 IP 的会合并提示）----
+  const byIP = {};
+  for (const l of usable) (byIP[l.exit_ip || '未知'] = byIP[l.exit_ip || '未知'] || []).push(l);
+  const lineRow = el('div', 'sub');
+  lineRow.style.margin = '0 0 10px';
+  for (const ip of Object.keys(byIP)) {
+    const arr = byIP[ip];
+    const txt = el('div');
+    txt.style.padding = '2px 0';
+    txt.appendChild(el('b', null, ip + '  '));
+    txt.appendChild(el('span', null, arr.map((l) => (l.name || l.url) + '（' + l.url + '）').join('、')));
+    if (arr.length > 1) {
+      txt.appendChild(el('span', null, '  ⚠ 这几条线路共用同一个出口，只会算 1 个 IP'));
+      txt.lastChild.style.color = '#b9770e';
+    }
+    if (!arr[0].last_ok) {
+      txt.appendChild(el('span', null, '  · 最近探活未成功'));
+      txt.lastChild.style.color = '#b9770e';
+    }
+    lineRow.appendChild(txt);
+  }
+  if (!Object.keys(byIP).length) {
+    lineRow.appendChild(el('div', 'sub', '还没有可用线路：先在上面「一键拉起」，或等管理员加线路。'));
+  }
+  // 诊断结论（v0.31.31）：把"几条线路 / 几个 IP / 号怎么分布的"一句话说清。
+  // 用户问的"两台电脑两个 IP 却同一个出口"，答案就在这里。
+  if (usable.length) {
+    const distinct = d.distinct_exit_ips || 0;
+    const diag = el('div', 'sub');
+    diag.style.margin = '0 0 10px';
+    const perIP = {};
+    for (const a of heAccounts) {
+      const key = a.exit_ip || '未知';
+      perIP[key] = (perIP[key] || 0) + 1;
+    }
+    const dist = Object.keys(perIP).map((k) => k + ' × ' + perIP[k] + ' 个号').join('、');
+    diag.textContent = '账号分布：' + (dist || '（没有号）');
+    if (usable.length > 1 && distinct < usable.length) {
+      const w = el('div', null, '⚠ 你有 ' + usable.length + ' 条可用线路，但**只有 ' + distinct
+        + ' 个不同出口 IP**：同 IP 的线路再多也只算一个出口。'
+        + '要真正多出 IP，需要另一台电脑（另一条宽带）接入，或换一条不同出口的线路。');
+      w.style.cssText = 'margin-top:6px;color:#b9770e;font-size:12px;';
+      diag.appendChild(w);
+    } else if (distinct === 1 && usable.length === 1) {
+      const w = el('div', null, '当前只有 1 条线路：所有号都从这一个 IP 出去。再接一台电脑（另一条宽带）就能分散。');
+      w.style.cssText = 'margin-top:6px;color:#888;font-size:12px;';
+      diag.appendChild(w);
+    }
+    lineRow.appendChild(diag);
+  }
+  box.appendChild(lineRow);
+
+  // ---- 逐号表格 ----
+  const tbl = el('div', 'cfg-list');
+  const head = el('div', 'gr-sub');
+  head.style.cssText = 'display:flex;gap:8px;align-items:center;padding:6px 0;font-size:12px;color:#888;';
+  const cbAll = document.createElement('input');
+  cbAll.type = 'checkbox';
+  cbAll.checked = hePicked.size === heAccounts.length && heAccounts.length > 0;
+  cbAll.onchange = () => {
+    hePicked = cbAll.checked ? new Set(heAccounts.map((a) => a.uid)) : new Set();
+    renderHostEgress(d);
+  };
+  head.appendChild(cbAll);
+  head.appendChild(el('span', null, '账号'));
+  head.appendChild(el('span', null, '当前出口'));
+  tbl.appendChild(head);
+
+  for (const a of heAccounts) {
+    const row = el('div');
+    row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:6px 0;border-top:1px solid rgba(127,127,127,.15);';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = hePicked.has(a.uid);
+    cb.onchange = () => {
+      if (cb.checked) hePicked.add(a.uid); else hePicked.delete(a.uid);
+      const c = document.getElementById('egrAccBox');
+      if (c) renderHostEgress(d);
+    };
+    row.appendChild(cb);
+
+    const who = el('div');
+    who.style.cssText = 'min-width:140px;flex:0 0 160px;';
+    who.appendChild(el('div', null, a.nickname || maskUID(a.uid)));
+    const sub = el('div', 'muted', a.configured ? ('已指定：' + (a.configured === 'direct' ? '直连' : a.configured)) : '未指定（跟随默认）');
+    sub.style.fontSize = '11px';
+    who.appendChild(sub);
+    row.appendChild(who);
+
+    const exitTxt = el('div');
+    exitTxt.style.cssText = 'flex:1;min-width:160px;';
+    const src = a.exit_source === 'direct'
+      ? '平台本机 IP 直连'
+      : (a.resolved_name || a.resolved || '（未知）');
+    exitTxt.appendChild(el('div', null, src));
+    const ipLine = el('div', 'muted', a.exit_ip ? ('出口 IP ' + a.exit_ip) : '出口 IP 未知（该线路还没探活）');
+    ipLine.style.fontSize = '11px';
+    if (!a.exit_ip) ipLine.style.color = '#b9770e';
+    exitTxt.appendChild(ipLine);
+    if (a.token_dead) {
+      const dead = el('div', null, '⚠ 登录已失效，改出口无效 —— 请先重新登录');
+      dead.style.fontSize = '11px';
+      dead.style.color = '#c0392b';
+      exitTxt.appendChild(dead);
+    }
+    row.appendChild(exitTxt);
+
+    // 逐号改：选线路即生效（不必再点保存）。
+    const one = el('select');
+    one.style.minWidth = '180px';
+    const o0 = el('option', null, '— 改到… —'); o0.value = ''; one.appendChild(o0);
+    const od = el('option', null, '直连'); od.value = 'direct'; one.appendChild(od);
+    const oc = el('option', null, '跟随默认'); oc.value = '__clear'; one.appendChild(oc);
+    for (const l of usable) {
+      const o = el('option', null, (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : ''));
+      o.value = l.url;
+      one.appendChild(o);
+    }
+    one.onchange = async () => {
+      const v = one.value;
+      if (!v) return;
+      const proxy = v === '__clear' ? '' : v;
+      one.disabled = true;
+      try {
+        const r = await post('/api/host/egress/assign', { uids: [a.uid], proxy });
+        toast('已更新' + (r.exit_ip ? '，出口 ' + r.exit_ip : ''), 'ok');
+        loadHostEgressLines();
+      } catch (e) { toast('设置失败：' + e.message, 'err'); one.disabled = false; }
+    };
+    row.appendChild(one);
+
+    tbl.appendChild(row);
+  }
+  box.appendChild(tbl);
 }
 
 // egressMachineLabel 一台机器的显示名（hostname 优先；没有就用 id）。
@@ -3017,6 +3463,13 @@ function renderEgressHome(box, v) {
     ['目标机器', cur ? (egressMachineLabel(cur) + ' · ' + cur.id) : '（还没有任何 agent 连上来）'],
     ['出口 IP', exitIP],
   ];
+  // 隧道实测出口（v0.31.31）：这是**平台从这条隧道出去时真正看到的 IP**，
+  // 与上面那行（agent 自己直出时看到的 IP）是两条不同链路。
+  // 两者不一致 = 这条隧道没落到这台机器上（端口被占 / 转发没建起来），
+  // 而页面上会同时挂着两条"线路" —— 那正是"两个 IP 却同一个出口"的样子。
+  if (cur) {
+    rows.push(['隧道实测出口', cur.tunnel_exit_ip || '（还没探活）']);
+  }
   // 用户视角**不显示全局默认出口**：它不属于这个用户（那是平台级开关），
   // 显示出来只会让他以为"我能不能改它"，而答案是不能。
   if (isPlatform) rows.push(['全局默认出口', v.default_egress || '（空 = 直连）']);
@@ -3036,6 +3489,25 @@ function renderEgressHome(box, v) {
     tbl.appendChild(line);
   }
   card.appendChild(tbl);
+
+  // 诊断结论（v0.31.31）：把"为什么两条线路是同一个 IP"直接写在页面上，
+  // 而不是让用户自己去猜。
+  if (cur && cur.exit_mismatch) {
+    const w = el('div', null, '⚠ 这条隧道的实测出口（' + (cur.tunnel_exit_ip || '?') +
+      '）与这台机器自报的出口（' + (cur.exit_ip || '?') + '）不一致：' +
+      '说明隧道没有落到这台电脑上（端口被另一台占用，或转发没建起来）。' +
+      '点下面的「修复出口」会自动换一个端口并让它重建。');
+    w.style.cssText = 'margin-top:8px;padding:8px 10px;border-left:3px solid #c0392b;' +
+      'background:rgba(192,57,43,.08);font-size:12px;';
+    card.appendChild(w);
+  }
+  if (cur && (cur.alt_ids || []).length) {
+    const w = el('div', null, '⚠ 这台电脑上还跑着另一份 agent（' + cur.alt_ids.join('、') + '）：' +
+      '两份会抢同一个隧道端口，出口 IP 不会因此多出来。请关掉多余的那份。');
+    w.style.cssText = 'margin-top:8px;padding:8px 10px;border-left:3px solid #c0392b;' +
+      'background:rgba(192,57,43,.08);font-size:12px;';
+    card.appendChild(w);
+  }
 
   // ---- 全部机器一览（多机时，或存在重复接入/同出口时）----
   //
@@ -3063,6 +3535,13 @@ function renderEgressHome(box, v) {
       for (const k of (m.same_machine_of || [])) {
         const w = el('div', null, '⚠ 与「' + lab(k) + '」是同一台机器（重复接入）：两条线路必然同一个出口 IP，'
           + '还会互相抢隧道端口 —— 请停掉多余的那份 agent。');
+        w.style.color = '#c0392b';
+        w.style.paddingLeft = '12px';
+        mt.appendChild(w);
+      }
+      if (m.exit_mismatch) {
+        const w = el('div', null, '⚠ 隧道实测出口 ' + (m.tunnel_exit_ip || '?') +
+          ' ≠ 本机自报 ' + (m.exit_ip || '?') + '：这条隧道没落到这台机器上');
         w.style.color = '#c0392b';
         w.style.paddingLeft = '12px';
         mt.appendChild(w);
@@ -3129,17 +3608,26 @@ function renderEgressHome(box, v) {
     pull.addEventListener('click', () => egressPull(v));
     row.appendChild(pull);
 
-    const applyBtn = el('button', 'ghost', '仅重新应用配置');
+    // 应用（v0.31.31 改为**非破坏式**）：只接管"还没指定出口"的号。
+    //
+    // 旧行为是"把我名下所有号改绑到这条线路"，于是第二台电脑点一次拉起，
+    // 第一台的号全被静默搬过来 —— 两台机器只有一个在承重。
+    // 想整体改绑是另一个显式动作（下面的「全部改绑」），文案会说清代价。
+    const applyBtn = el('button', 'ghost', '应用（只绑未指定的号）');
     applyBtn.disabled = busy || !tunnel || !hasMachine;
+    applyBtn.title = '把这条线路登记进线路池，并把**还没指定出口**的号绑上来；' +
+      '已绑到别的线路的号不动（避免在 B 机上点一下就把 A 机上的号搬走）';
     applyBtn.addEventListener('click', async () => {
       applyBtn.disabled = true;
       try {
         const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
-        if (isPlatform) {
-          toast('已应用：默认出口 ' + (d.applied && d.applied.default_ok ? '已设置' : '未设置') +
-                '，自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
-        } else {
-          toast('已应用：你的代挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+        const ap = (d && d.applied) || {};
+        let msg = '已应用：绑定 ' + (ap.host_bound || 0) + ' 个号';
+        if (ap.skipped) msg += '，跳过 ' + ap.skipped + ' 个（已显式绑在别的线路上）';
+        if (isPlatform) msg += '；默认出口 ' + (ap.default_ok ? '已设置' : '未设置');
+        toast(msg, 'ok');
+        if (ap.skipped) {
+          toast('跳过的号仍走原来的线路。要把它们全部搬到这条线路上，用「全部改绑」', 'warn');
         }
         loadEgressHome();
       } catch (e) {
@@ -3148,6 +3636,51 @@ function renderEgressHome(box, v) {
       }
     });
     row.appendChild(applyBtn);
+
+    // 全部改绑：旧行为，显式二次确认（这一步会覆盖"每台机器各管一部分号"的分配）。
+    const rebind = el('button', 'ghost', '全部改绑');
+    rebind.disabled = busy || !tunnel || !hasMachine;
+    rebind.title = '把**我名下所有号**都改绑到这条线路（会覆盖你之前为不同机器做的分配）';
+    rebind.addEventListener('click', async () => {
+      if (!(await confirmAsk('把' + (isPlatform ? '所有自挂号' : '你名下所有代挂号') +
+        '都改绑到这条线路？\n\n⚠ 这会覆盖你之前「让 A 机管一部分、B 机管另一部分」的分配，' +
+        '所有号都会从这一条线路出去（同一个出口 IP）。'))) return;
+      rebind.disabled = true;
+      try {
+        const d = await post('/api/egress/home/apply', { machine: egressSelMachine, rebind_all: true });
+        const ap = (d && d.applied) || {};
+        toast('已全部改绑：' + (ap.host_bound || 0) + ' 个号', 'ok');
+        loadEgressHome();
+      } catch (e) {
+        toast(egressMsg('改绑失败：' + (e && e.message ? e.message : e)), 'bad');
+        rebind.disabled = false;
+      }
+    });
+    row.appendChild(rebind);
+
+    // 修复出口（v0.31.31）：端口冲突 / 隧道没落到本机 → 换端口重建。
+    // 只碰 ports 与 cmd，不动任何账号的出口配置。
+    const fix = el('button', 'ghost', '修复出口');
+    fix.title = '检查端口冲突与隧道指向：发现问题就换一个端口并让这台机器重建隧道（不改任何账号配置）';
+    fix.disabled = busy;
+    fix.addEventListener('click', async () => {
+      fix.disabled = true;
+      try {
+        const d = await post('/api/egress/home/repair', {});
+        if (!d.repaired) {
+          toast('没有发现需要修复的机器（端口无冲突、隧道指向正常）', 'ok');
+        } else {
+          for (const a of (d.actions || [])) {
+            toast('已修 ' + (a.hostname || a.machine) + '：' + a.detail, 'ok');
+          }
+          setTimeout(() => loadEgressHome(), 6000);
+        }
+      } catch (e) {
+        toast(egressMsg('修复失败：' + (e && e.message ? e.message : e)), 'bad');
+      }
+      fix.disabled = false;
+    });
+    row.appendChild(fix);
 
     const rel = el('button', 'ghost', '停止该机器代理');
     rel.disabled = busy || !hasMachine;

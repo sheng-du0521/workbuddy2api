@@ -101,10 +101,15 @@ func puFirstPlugin(t *testing.T, mux *http.ServeMux, cookie string) map[string]a
 		t.Fatalf("插件列表应 200，得 %d %v", code, out)
 	}
 	list, _ := out["plugins"].([]any)
-	if len(list) != 1 {
-		t.Fatalf("当前应只有 1 个插件，得 %d", len(list))
+	if len(list) == 0 {
+		t.Fatalf("插件列表为空，得 %v", list)
 	}
-	return list[0].(map[string]any)
+	// 断言"领取补偿插件在列表里"，不写死总数：插件会越加越多（v0.31.31 加了健康检测）。
+	if one := findPlugin(list, "claim-compensation"); one != nil {
+		return one
+	}
+	t.Fatalf("插件列表里应包含 claim-compensation，得 %v", list)
+	return nil
 }
 
 // TestPluginUserToggleIsolated 用户停用只影响自己，且动不了平台开关。

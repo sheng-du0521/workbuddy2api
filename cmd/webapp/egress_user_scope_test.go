@@ -246,7 +246,7 @@ func TestUserApplyDoesNotSetGlobalDefault(t *testing.T) {
 	keyA := egressMachineKey(f.userA.ID, "pc-a")
 	mm := f.app.machinesLoad()[keyA]
 
-	res, err := f.app.applyHomeEgress(mm.Ports.TunnelPort, egressScope{UserID: f.userA.ID})
+	res, err := f.app.applyHomeEgress(mm.Ports.TunnelPort, egressScope{UserID: f.userA.ID}, false)
 	if err != nil {
 		t.Fatalf("用户 apply: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestPlatformApplyStillSetsGlobalDefault(t *testing.T) {
 		t.Fatal("平台机器应落 default 桶")
 	}
 
-	res, err := f.app.applyHomeEgress(mm.Ports.TunnelPort, egressScope{Platform: true})
+	res, err := f.app.applyHomeEgress(mm.Ports.TunnelPort, egressScope{Platform: true}, false)
 	if err != nil {
 		t.Fatalf("管理员 apply: %v", err)
 	}

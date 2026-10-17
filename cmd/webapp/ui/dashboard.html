@@ -394,6 +394,24 @@
         也不会影响任何其他用户。管理员可在后台看到这条线路并显式分配给别的号。
       </div>
       <div id="egressHomeBox"></div>
+
+      <!-- 我的账号出口（v0.31.31）：逐号把号分到不同出口 IP 上。
+           在此之前用户端只有"一个 URL 应用到全部"与"一键拉起=全部改绑"两种全量动作，
+           于是两台电脑接进来也只有一个出口在承重 —— 这正是"两个 IP 却是同一个出口"
+           的用户侧根因。 -->
+      <div class="card" style="margin-top:14px;">
+        <div class="section-head">
+          <h2>我的账号出口</h2>
+          <span class="muted" style="font-size:12px;" id="egrAccHint"></span>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          这里决定<b>每个代挂号从哪个 IP 出去</b>。有两条（或更多）线路时，
+          点<b>「按出口 IP 均衡」</b>即可把号均分到<b>不同出口</b>上 ——
+          同一个 IP 的多条线路只算一个出口，不会自欺。
+          <br>⚠️ <b>线路条数 ≠ 出口 IP 数</b>：下面会分别报出来。
+        </div>
+        <div id="egrAccBox"></div>
+      </div>
     </section>
 
     <section class="pane" data-pane="host">

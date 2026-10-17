@@ -59,7 +59,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.1"
+const agentVersion = "0.3.2"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -176,7 +176,12 @@ func (a *agent) do(req *http.Request, out any) error {
 // 老版本服务端不认这两个参数也不受影响（多余的 query 会被忽略）。
 func (a *agent) poll() (cmdSpec, error) {
 	var spec cmdSpec
-	err := a.get("/api/agent/poll?machine="+url.QueryEscape(a.machine)+"&hostname="+url.QueryEscape(hostname()), &spec)
+	// 带上指纹（v0.3.2）：云端在**第一次** poll 就能分清"这是哪台机器"。
+	// 不带的话，复制安装目录的第二台电脑会先用同一个 machine.id 登记一次，
+	// 直到下一次 report 才被指纹纠正 —— 那一小段时间里它拿的是别人的端口。
+	err := a.get("/api/agent/poll?machine="+url.QueryEscape(a.machine)+
+		"&hostname="+url.QueryEscape(hostname())+
+		"&fingerprint="+url.QueryEscape(a.fp), &spec)
 	return spec, err
 }
 

@@ -588,6 +588,13 @@
         </div>
 
         <div id="egrPoolHint" class="sub" style="margin:0 0 8px;"></div>
+        <!-- 出口体检（v0.31.31）：排查"多条线路却同一个出口 IP"里的端口冲突与
+             隧道指向错误。只改机器端口与指令，不动账号/线路/默认出口。 -->
+        <div class="row" style="margin:0 0 10px;gap:8px;align-items:center;">
+          <button class="ghost sm" id="btnEgrRepair"
+            title="检查所有 agent 机器的隧道端口是否冲突、隧道实测出口与自报是否一致；发现问题就换端口并让那台机器重建隧道">修复出口端口冲突</button>
+          <span class="muted" style="font-size:12px;" id="egrRepairHint"></span>
+        </div>
         <div class="cards" id="egrCards"></div>
 
         <div class="card" id="egressAssign">
@@ -7454,6 +7461,22 @@ function renderEgrPoolHint() {
   if (fromUser) {
     box.appendChild(document.createTextNode((fromCtl ? '；' : '，其中 ') + fromUser + ' 条由用户自己配置（卡片标注「用户线路」）'));
   }
+  // 出口体检结论（v0.31.31）：这两种情况都会让"两条线路"其实是同一个出口。
+  const mism = egrList.filter((p) => {
+    const m = egrMachines[p.url];
+    return m && m.exit_mismatch;
+  });
+  if (mism.length) {
+    box.appendChild(el('b', 'err', '；有 ' + mism.length + ' 条线路的隧道实测出口与本机自报不一致'
+      + '（隧道没落到那台机器上 —— 点「修复出口端口冲突」）'));
+  }
+  const dups = egrList.filter((p) => {
+    const m = egrMachines[p.url];
+    return m && (m.alt_ids || []).length;
+  });
+  if (dups.length) {
+    box.appendChild(el('b', 'err', '；有 ' + dups.length + ' 台机器上跑着多份 agent（同一台电脑，出口不会变多）'));
+  }
   box.appendChild(document.createTextNode('。每条卡片右侧可直接「分配」到指定范围。'));
 }
 
@@ -7818,6 +7841,21 @@ function egrCard(p) {
   const bn = egrBoundNames[p.url] || [];
   if (bn.length) line('在用归属', bn.join(' · '), '');
   line('真实出口 IP', p.last_ip || '（未探到）', p.last_ip ? 'ok' : '');
+  // 隧道指向校验（v0.31.31）：last_ip 是**云端经隧道**实测的出口；
+  // 机器的 exit_ip 是 agent 自己直出的结果。两者不一致 = 这条隧道没落到那台机器。
+  {
+    const mm = egrMachines[p.url];
+    if (mm && mm.exit_mismatch) {
+      line('⚠ 隧道指向错误', '实测出口 ' + (mm.tunnel_exit_ip || '?') + ' ≠ 本机自报 '
+        + (mm.exit_ip || '?') + '：端口被别的机器占着（点上方「修复出口端口冲突」）', 'err');
+    } else if (mm && mm.tunnel_exit_ip && mm.exit_ip) {
+      line('隧道校验', '实测 ' + mm.tunnel_exit_ip + ' = 自报 ' + mm.exit_ip + '（一致）');
+    }
+    if (mm && (mm.alt_ids || []).length) {
+      line('⚠ 多份 agent', '同一台机器上还有 agent id：' + mm.alt_ids.join('、')
+        + '（抢同一个端口，不会多出出口 IP）', 'err');
+    }
+  }
   // 同一出口 IP 上还有别的线路（v0.31.26）：必须写在卡片上，
   // 否则"我又加了一条线"会一直是错觉。
   const shared = egrSharedExit[p.url] || [];
@@ -8094,6 +8132,29 @@ async function egrSetDirect(mode) {
     toast('已' + label + '：' + d.assigned + ' 个账号', 'ok');
     loadEgress();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+if ($('btnEgrRepair')) {
+  $('btnEgrRepair').onclick = async () => {
+    const btn = $('btnEgrRepair');
+    const hint = $('egrRepairHint');
+    btn.disabled = true;
+    try {
+      const d = await post('/api/egress/home/repair', {});
+      if (!d.repaired) {
+        if (hint) hint.textContent = '没有发现端口冲突或隧道指向错误';
+        toast('没有发现需要修复的机器', 'ok');
+      } else {
+        if (hint) hint.textContent = '已修 ' + d.repaired + ' 台：' + (d.actions || [])
+          .map((a) => (a.hostname || a.machine) + ' ' + a.from_port + '→' + a.to_port).join('、');
+        toast(d.note || ('已修复 ' + d.repaired + ' 台'), 'ok');
+        setTimeout(() => loadEgress(), 6000);
+      }
+    } catch (e) {
+      toast('修复失败：' + e.message, 'err');
+    }
+    btn.disabled = false;
+  };
 }
 
 $('btnEgrDirect').onclick = () => egrSetDirect('direct');

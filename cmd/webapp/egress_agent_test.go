@@ -258,7 +258,7 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		res, err := a.applyHomeEgress(egressBaseTunnelPort, egressScope{Platform: true})
+		res, err := a.applyHomeEgress(egressBaseTunnelPort, egressScope{Platform: true}, false)
 		if err != nil {
 			t.Fatalf("第 %d 次 apply: %v", i+1, err)
 		}

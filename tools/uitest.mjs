@@ -2331,6 +2331,32 @@ function run(pageFile, meOverride, plan) {
             return Promise.resolve({ ok: true, status: 200,
               text: () => Promise.resolve(body), json: () => Promise.resolve(SELF_VIEW) });
           }
+          // 我的账号出口（v0.31.31）：两条线路、两个不同出口 IP、两个号。
+          // 页面必须按 IP 报数，并且逐号给出"从哪出去"。
+          if (u.indexOf('/api/host/egress/lines') >= 0) {
+            const LINES = {
+              lines: [
+                { url: 'http://127.0.0.1:12070', name: '家里', owner_user_id: 2, mine: true,
+                  platform: false, enabled: true, last_ok: true, exit_ip: '1.1.1.1',
+                  bound_mine: 1, bound_total: 1, note: '' },
+                { url: 'http://127.0.0.1:12071', name: '公司', owner_user_id: 2, mine: true,
+                  platform: false, enabled: true, last_ok: true, exit_ip: '2.2.2.2',
+                  bound_mine: 1, bound_total: 1, note: '' },
+              ],
+              accounts: [
+                { uid: 'hx-1', nickname: '甲', configured: 'http://127.0.0.1:12070',
+                  resolved: 'http://127.0.0.1:12070', resolved_name: '家里', exit_ip: '1.1.1.1',
+                  exit_source: 'line' },
+                { uid: 'hx-2', nickname: '乙', configured: '',
+                  resolved: 'http://127.0.0.1:12071', resolved_name: '公司', exit_ip: '2.2.2.2',
+                  exit_source: 'line' },
+              ],
+              default_egress: '', distinct_exit_ips: 2,
+            };
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(JSON.stringify(LINES)),
+              json: () => Promise.resolve(LINES) });
+          }
           if (u.indexOf('/api/auth/me') >= 0) {
             return Promise.resolve({ ok: true, status: 200,
               text: () => Promise.resolve('{"user":{"id":2,"username":"u2","is_admin":false}}'),
@@ -2372,6 +2398,26 @@ function run(pageFile, meOverride, plan) {
       }
       if (txt.indexOf('我的代挂号绑定') < 0) {
         egrSelfBad.push('用户视角的绑定计数应叫「我的代挂号绑定」（而不是「自挂号绑定」）');
+      }
+    }
+
+    // v0.31.31：**逐号出口分配**必须真的渲染出来（这是"两台电脑各出各的 IP"的落地动作）。
+    const accBox = w.document.getElementById('egrAccBox');
+    const accTxt = accBox ? String(accBox.textContent) : '';
+    if (!accBox || !accBox.children.length) {
+      egrSelfBad.push('#egrAccBox 没渲染 —— 用户端仍无法逐号指定出口');
+    } else {
+      // 条数口径写在卡片标题旁（#egrAccHint）：那里才是"共 N 条线路、实际 M 个 IP"。
+      const accHint = w.document.getElementById('egrAccHint');
+      const hintTxt = accHint ? String(accHint.textContent) : '';
+      if (hintTxt.indexOf('2 个不同出口 IP') < 0) {
+        egrSelfBad.push(`我的账号出口应按 IP 报数（期望含「2 个不同出口 IP」），实得「${hintTxt.slice(0, 120)}」`);
+      }
+      if (accTxt.indexOf('出口 IP 1.1.1.1') < 0 || accTxt.indexOf('出口 IP 2.2.2.2') < 0) {
+        egrSelfBad.push('逐号列表应显示每个号的实际出口 IP（两个 IP 都要出现）');
+      }
+      if (accTxt.indexOf('按出口 IP 均衡') < 0) {
+        egrSelfBad.push('缺少「按出口 IP 均衡」按钮 —— 用户没有办法一键把号分散到不同出口');
       }
     }
     try { w.close(); } catch (e) {}

@@ -192,8 +192,14 @@ type egressMachine struct {
 	OwnerUserID int64 `json:"owner_user_id,omitempty"`
 	// Fingerprint 最近一次上报的机器指纹（v0.31.26）。
 	// 与 agent 自报的 machine id 并存：id 用来分桶，指纹用来识破"同一个 id/同一台机器"。
-	Fingerprint string           `json:"fingerprint,omitempty"`
-	Ports       egressAgentPorts `json:"ports"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// AltIDs 同一台机器上**另外几份 agent** 自报的 id（v0.31.31）。
+	//
+	// 指纹相同 ⇒ 同一台物理机器。同一台机器跑两份 agent 时，两份会抢同一个
+	// 隧道端口，后到的那份 `ssh -R` 必然失败 —— 现象是"我又接了一台，但出口 IP
+	// 没变"。把多出来的 id 记下来，页面才能说清"请停掉哪一份"。
+	AltIDs []string         `json:"alt_ids,omitempty"`
+	Ports  egressAgentPorts `json:"ports"`
 	// Cmd / CmdAt 待执行（或最近一条）指令。空串 = none。
 	Cmd   string `json:"cmd,omitempty"`
 	CmdAt int64  `json:"cmd_at,omitempty"`
@@ -269,10 +275,35 @@ func (a *app) machinesSave(m map[string]*egressMachine) error {
 	return a.store.SetKV(kvEgressAgentMachines, string(raw))
 }
 
+// egressMachMu 机器表的**读-改-写**互斥锁（v0.31.31）。
+//
+// 为什么必须有（这是"两台电脑却是同一个出口 IP"的根因之一）：
+// poll / report 的处理是典型的 load → modify → save（整张表一次性 JSON 覆盖）。
+// 两台机器的 agent 同时 poll 时，两个请求会**各自读到同一份快照**、都算出
+// "第一个空闲端口是 X"、然后各自整表写回 —— 结果两张记录拿到**同一个隧道端口**。
+// sshd 只允许一个 `-R` 监听同端口，后到的那台 `ssh -R` 直接失败（日志里是
+// `remote port forwarding failed`），而云端看到的是"两条线路都通"：
+// 两条线路的 URL 都是 `http://127.0.0.1:X`，探测自然得到**同一个出口 IP**。
+//
+// 锁的粒度是"整个 load→save"，因为落盘是整表覆盖 —— 拆细了等于没锁。
+// 出站探测（egressTunnelReachable / egress.Probe）**不在锁内**：那是网络 IO，
+// 持锁做网络会让一个慢探测卡住所有 agent 的上报。
+var egressMachMu sync.Mutex
+
 // machineEnsure 取一台机器；不存在则登记并**分配端口**。返回值 created 表示本次新建。
 //
 // owner 来自 agent 令牌（见 egressAgentAuth）：0 = 平台，>0 = 该用户。
-func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, owner int64) (mm *egressMachine, created bool) {
+//
+// fp = 机器指纹（v0.31.31，可空）。它改变了"这台是谁"的判定方式：
+//
+//	· 同 owner + 同指纹就已存在 → **就是那台机器**（无论它这次报的 id 是什么）。
+//	  用户重装系统 / 删掉 machine.id 之后会拿到一个新 id，若按 id 分桶就会多出
+//	  一台"幽灵机器"，还占一个新端口 —— 指纹能把它认回来。
+//	· 目标键已存在，但记录上的指纹**非空且不同** → 说明有**另一台机器**在复用
+//	  这个 id（最常见：把整份安装目录连同 machine.id 一起拷到第二台电脑）。
+//	  此时不能共用端口（共用 = 两条线路指向同一台机器 = 同一个出口 IP），
+//	  必须分出一个新键 + 新端口。
+func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, owner int64, fp string) (mm *egressMachine, created bool) {
 	rawID := strings.TrimSpace(id)
 	if rawID == "" {
 		rawID = egressDefaultMachine
@@ -285,9 +316,81 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 		hostname = ""
 	}
 	key := egressMachineKey(owner, rawID)
+	fp = strings.TrimSpace(fp)
+
+	// ---- 指纹优先（v0.31.31）----
+	if fp != "" {
+		// (a) 同 owner + 同指纹 = 同一台机器：认回既有记录，不新建、不占新端口。
+		for k, v := range m {
+			if v == nil || v.OwnerUserID != owner || strings.TrimSpace(v.Fingerprint) != fp {
+				continue
+			}
+			if k != key {
+				// 同一个 agent 换了 id（重装/清目录），或历史升级路径留下的重复记录：
+				// 把状态挪到既有记录上，并清掉这个**冗余**记录。
+				//
+				// 为什么要删而不是留着：一条机器记录 = 一条线路 = 一个出口端口。
+				// 留着它，页面上就又多出一条"线路"，而它指向的是同一台机器 ——
+				// 这正是"两台电脑却是同一个 IP"的错觉来源。
+				// 只删"指纹为空或相同"的记录；指纹不同的说明是另一台机器占着这个 id，
+				// 那种情形下面 (b) 会单独处理，不能动。
+				if dup, ok := m[key]; ok && dup != nil &&
+					(strings.TrimSpace(dup.Fingerprint) == "" || strings.TrimSpace(dup.Fingerprint) == fp) {
+					delete(m, key)
+					log.Printf("INFO: [egress] 指纹 %s 已登记为 %s，本次上报 id=%q 归并到既有记录（清理冗余记录 %s）",
+						fp, k, rawID, key)
+				} else {
+					log.Printf("INFO: [egress] 指纹 %s 已登记为 %s，本次上报 id=%q 归并到既有记录",
+						fp, k, rawID)
+				}
+			}
+			if strings.TrimSpace(hostname) != "" {
+				v.Hostname = hostname
+			}
+			if strings.TrimSpace(v.ID) == "" {
+				v.ID = rawID
+			}
+			if rawID != "" && !strings.EqualFold(rawID, v.ID) {
+				seen := false
+				for _, x := range v.AltIDs {
+					if strings.EqualFold(x, rawID) {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					v.AltIDs = append(v.AltIDs, rawID)
+				}
+			}
+			return v, false
+		}
+		// (b) 该键已被另一台机器占用（指纹不同）→ 复制安装目录的经典症状。
+		if exist, ok := m[key]; ok && strings.TrimSpace(exist.Fingerprint) != "" &&
+			strings.TrimSpace(exist.Fingerprint) != fp {
+			base := key + "~" + fp
+			if len(fp) > 6 {
+				base = key + "~" + fp[:6]
+			}
+			alt := base
+			for i := 2; ; i++ {
+				if _, taken := m[alt]; !taken {
+					break
+				}
+				alt = fmt.Sprintf("%s#%d", base, i)
+			}
+			log.Printf("WARN: [egress] machine id %q 被两台机器复用（指纹 %s ≠ %s）—— "+
+				"第二台已改用独立键 %s 与独立端口；请确认是否复制了安装目录",
+				rawID, fp, exist.Fingerprint, alt)
+			key = alt
+		}
+	}
+
 	if exist, ok := m[key]; ok {
 		if strings.TrimSpace(hostname) != "" {
 			exist.Hostname = hostname
+		}
+		if fp != "" && strings.TrimSpace(exist.Fingerprint) == "" {
+			exist.Fingerprint = fp // 老记录补指纹（上面 (b) 已排除"指纹不同"的情形）
 		}
 		return exist, false
 	}
@@ -325,6 +428,7 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 			mm = &egressMachine{
 				ID: rawID, Hostname: strings.TrimSpace(hostname),
 				OwnerUserID: owner, CreatedAt: time.Now().Unix(),
+				Fingerprint: fp,
 			}
 			m[key] = mm
 			return mm, true
@@ -333,6 +437,10 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 	mm = &egressMachine{
 		ID: rawID, Hostname: strings.TrimSpace(hostname), Ports: ports,
 		OwnerUserID: owner, CreatedAt: time.Now().Unix(),
+		// 指纹**在新建时就落库**（v0.31.31）：只在 report 里补的话，先到的 poll
+		// 会留下一条"有 id 无指纹"的记录，于是复制目录的第二台在第一次 poll 时
+		// 根本判不出来（要等下一次 report 才纠正，那一小段时间它用的是别人的端口）。
+		Fingerprint: fp,
 	}
 	m[key] = mm
 	return mm, true
@@ -537,6 +645,52 @@ func (a *app) egressAgentAuth(r *http.Request) (int64, bool) {
 // poll / report
 // ---------------------------------------------------------------------------
 
+// egressRegister 登记/更新一台机器（**唯一入口**，全程持锁）。
+//
+// 为什么把它单独抽出来（v0.31.31）：poll 与 report 都是
+// `machinesLoad → machineEnsure → machinesSave` 的读-改-写，而这个"表"是
+// **整张 JSON 一次性覆盖**。两处各写一遍临界区，只要有一处漏锁，就会回到
+// "两台机器抢同一个端口"的老毛病上；抽成一个函数后，锁只在一个地方存在，
+// 新加的入口（比如将来的心跳）也只能走它。
+//
+// owner 来自 agent 令牌；st != nil 表示这次带状态上报（report），否则只是取指令（poll）。
+// dupAgent = 这次上报的 machine id 与**该指纹名下已登记的那台**不一致 ——
+// 即同一台机器上跑了多份 agent。
+func (a *app) egressRegister(id, hostname, fp string, owner int64, st *egressAgentState) (mm *egressMachine, created, dupAgent bool, err error) {
+	egressMachMu.Lock()
+	defer egressMachMu.Unlock()
+
+	m := a.machinesLoad()
+	mm, created = a.machineEnsure(m, id, hostname, owner, fp)
+	// 老机器端口可能不在本账号段内（v0.31.24 全局分配 → v0.31.25 分段），迁回来。
+	moved := a.egressMigratePortsToSeg(m, owner)
+
+	if st != nil {
+		mm.State, mm.StateAt = *st, st.At
+		if strings.TrimSpace(st.Hostname) != "" {
+			mm.Hostname = strings.TrimSpace(st.Hostname)
+		}
+		if s := strings.TrimSpace(st.Fingerprint); s != "" {
+			mm.Fingerprint = s
+		}
+	}
+
+	rawID := strings.TrimSpace(id)
+	if rawID == "" {
+		rawID = egressDefaultMachine
+	}
+	// 只在"确实带着 id"时判重复：老 agent 不带 machine 参数（rawID=default），
+	// 它与普通记录本来就不同键，不能算"多装了一份"。
+	dupAgent = strings.TrimSpace(id) != "" && mm.ID != "" && !strings.EqualFold(rawID, mm.ID)
+
+	if created || moved > 0 || st != nil {
+		if e := a.machinesSave(m); e != nil {
+			return mm, created, dupAgent, e
+		}
+	}
+	return mm, created, dupAgent, nil
+}
+
 // handleEgressAgentPoll GET /api/agent/poll?machine=<id>&hostname=<h>
 //
 // agent 取指令的入口。**每次都返回当前指令**（而不是"取走即清"）：
@@ -552,12 +706,23 @@ func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	id := strings.TrimSpace(r.URL.Query().Get("machine"))
 	host := strings.TrimSpace(r.URL.Query().Get("hostname"))
-	m := a.machinesLoad()
-	mm, created := a.machineEnsure(m, id, host, owner)
-	// 老机器端口可能不在本账号段内（v0.31.24 全局分配 → v0.31.25 分段），迁回来。
-	moved := a.egressMigratePortsToSeg(m, owner)
-	if created || moved > 0 {
-		_ = a.machinesSave(m)
+	fp := strings.TrimSpace(r.URL.Query().Get("fingerprint"))
+	mm, created, dupAgent, err := a.egressRegister(id, host, fp, owner, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	// 同一台机器上的**非主 agent**：直接让它停（判据见 egressRegister）。
+	if dupAgent {
+		log.Printf("WARN: [egress] machine id %q 与 %q 同指纹（同一台机器跑了两份 agent）—— 已让前者停止",
+			id, mm.ID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"action": "stop",
+			"note": "同一台机器上已有一份 agent 在运行（指纹相同）；这一份请直接关闭，" +
+				"否则两份会抢同一个隧道端口，出口 IP 也不会多出来",
+			"proxy_port": mm.Ports.ProxyPort, "tunnel_port": mm.Ports.TunnelPort,
+		})
+		return
 	}
 	if created {
 		log.Printf("INFO: [egress] 新 agent 已登记 machine=%s owner=%d host=%q tunnel_port=%d",
@@ -593,17 +758,8 @@ func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.At = time.Now().Unix()
-	m := a.machinesLoad()
-	mm, _ := a.machineEnsure(m, r.URL.Query().Get("machine"), st.Hostname, owner)
-	_ = a.egressMigratePortsToSeg(m, owner)
-	mm.State, mm.StateAt = st, st.At
-	if strings.TrimSpace(st.Hostname) != "" {
-		mm.Hostname = strings.TrimSpace(st.Hostname)
-	}
-	if fp := strings.TrimSpace(st.Fingerprint); fp != "" {
-		mm.Fingerprint = fp
-	}
-	if err := a.machinesSave(m); err != nil {
+	mm, _, _, err := a.egressRegister(r.URL.Query().Get("machine"), st.Hostname, st.Fingerprint, owner, &st)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -674,6 +830,19 @@ type egressMachineView struct {
 	// SameMachineOf 与本机同指纹的其它机器 key —— 非空即"重复接入"，
 	// 这类"两条线路"必然同一个出口，还会互相抢隧道端口。
 	SameMachineOf []string `json:"same_machine_of,omitempty"`
+	// AltIDs 同一台机器上另外几份 agent 自报的 id（v0.31.31）。
+	// 非空 = 一台电脑装了多份 agent，它们抢同一个隧道端口，多出来的出口并不存在。
+	AltIDs []string `json:"alt_ids,omitempty"`
+	// TunnelExitIP **云端从隧道这一侧实测**的出口 IP（v0.31.31）。
+	//
+	// 与 ExitIP（agent 自报，走本机代理直出）是两条不同的链路：
+	//   · ExitIP      = "这台机器如果自己上网，看到的是什么 IP"
+	//   · TunnelExitIP = "平台通过这条隧道出去，实际从哪个 IP 出口"
+	// 两者不一致，说明**隧道没有落到这台机器上**（端口被另一台占了 / 转发没建起来），
+	// 而页面会同时显示两条"线路"，看起来像"两个出口"。
+	TunnelExitIP string `json:"tunnel_exit_ip,omitempty"`
+	// ExitMismatch 上面两者都有值且不相等 → 隧道指向的不是这台机器。
+	ExitMismatch bool `json:"exit_mismatch,omitempty"`
 	// SameExitOf 出口 IP 相同、但指纹不同的其它机器 key。
 	// 它不是配置错误（两台机器同一条宽带 / 同一 NAT / 双线负载均衡），
 	// 但**不会带来新 IP** —— 后台必须把它说出来，否则"我又接了一台"是错觉。
@@ -947,9 +1116,16 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 
 	// 线路池：按 URL 认线路（名字是给人看的、可改，URL 才是身份）。
 	proxyIDByURL := map[string]string{}
+	// proxyLastIP = 该线路**最近一次探活（从云端经隧道发出）**看到的出口 IP。
+	// 这个值不采信 agent 自报，因此可以用来校验"隧道到底通到哪台机器"。
+	proxyLastIP := map[string]string{}
 	if proxies, err := a.store.ListEgressProxies(); err == nil {
 		for _, p := range proxies {
-			proxyIDByURL[strings.TrimSpace(p.URL)] = p.ID
+			u := strings.TrimSpace(p.URL)
+			proxyIDByURL[u] = p.ID
+			if ip := normalizeExitIP(p.LastIP); ip != "" {
+				proxyLastIP[u] = ip
+			}
 		}
 	}
 
@@ -1003,10 +1179,18 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 			ProxyID:   proxyIDByURL[url],
 			Applied:   applied,
 			HostBound: bound[url], HostTotal: hostTotal,
-			CurrentCmd:  mm.Cmd,
-			LastAt:      mm.StateAt,
-			IsDefault:   key == egressDefaultMachine,
-			Fingerprint: strings.TrimSpace(mm.Fingerprint),
+			CurrentCmd:   mm.Cmd,
+			LastAt:       mm.StateAt,
+			IsDefault:    key == egressDefaultMachine,
+			Fingerprint:  strings.TrimSpace(mm.Fingerprint),
+			AltIDs:       append([]string(nil), mm.AltIDs...),
+			TunnelExitIP: proxyLastIP[url],
+		}
+		// 两条链路对不上 = 隧道没落到这台机器上（v0.31.31）。
+		// 只在两边都有值时才判：任一侧缺值（线路还没探过 / agent 还没探到）
+		// 属于"不知道"，不能当成"不一致"去报警。
+		if aIP := normalizeExitIP(mm.State.ExitIP); aIP != "" && mv.TunnelExitIP != "" {
+			mv.ExitMismatch = aIP != mv.TunnelExitIP
 		}
 		if fp := strings.TrimSpace(mm.Fingerprint); fp != "" {
 			for _, k := range fpGroup[fp] {
@@ -1242,6 +1426,17 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 	//     这类"两条线路"必然同一个 IP，而且互相抢隧道端口。
 	//   - 同出口 IP、指纹不同 = 两台不同机器，但从同一条宽带/同一个 NAT 出去
 	//     （双线负载均衡、公司出口、同户多机）。这不是配置错误，但**不会带来新 IP**。
+	// 隧道实测出口（v0.31.31）：线路池里 last_ip 是**云端经该 URL 的隧道探到的**，
+	// 与 agent 自报的 exit_ip 是两条不同链路。两者不一致 = 这条隧道没落到那台机器。
+	proxyLastIP := map[string]string{}
+	if proxies, err := a.store.ListEgressProxies(); err == nil {
+		for _, p := range proxies {
+			if ip := normalizeExitIP(p.LastIP); ip != "" {
+				proxyLastIP[strings.TrimSpace(p.URL)] = ip
+			}
+		}
+	}
+
 	byFP := map[string][]string{}
 	byExit := map[string][]string{}
 	for key, mm := range all {
@@ -1274,6 +1469,11 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 		url := egressHomeURL(mm.Ports.TunnelPort)
 		fp := strings.TrimSpace(mm.Fingerprint)
 		ip := normalizeExitIP(mm.State.ExitIP)
+		tunnelIP := proxyLastIP[url]
+		mismatch := false
+		if ip != "" && tunnelIP != "" && ip != tunnelIP {
+			mismatch = true
+		}
 		out[url] = map[string]any{
 			"id":               mm.ID,
 			"key":              key,
@@ -1293,6 +1493,12 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 			"same_exit":  others(byExit[ip], key),
 			"last_at":    mm.StateAt,
 			"is_default": mm.ID == egressDefaultMachine,
+			// tunnel_exit_ip 云端经隧道实测的出口；exit_mismatch 两者不一致。
+			"tunnel_exit_ip": tunnelIP,
+			"exit_mismatch":  mismatch,
+			// alt_ids 同一台机器上另外几份 agent 自报的 id（一台电脑装了多份）。
+			"alt_ids": append([]string(nil), mm.AltIDs...),
+			"port":    mm.Ports.TunnelPort,
 		}
 	}
 	return out
@@ -1429,7 +1635,15 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scop
 		})
 		return
 	}
-	res, err := a.applyHomeEgress(mm.Ports.TunnelPort, scope)
+	// rebind_all（v0.31.31）：默认 **false** = 只接管未指定出口的号。
+	// 显式 true 才是旧行为（把我名下所有号都改到这条线路）。
+	var req struct {
+		RebindAll bool `json:"rebind_all"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	res, err := a.applyHomeEgress(mm.Ports.TunnelPort, scope, req.RebindAll)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -1446,6 +1660,15 @@ type egressHomeApplyResult struct {
 	DefaultOK bool   `json:"default_ok"`
 	HostBound int    `json:"host_bound"`
 	HostTotal int    `json:"host_total"`
+	// Skipped 已显式绑在**别的线路**上、本次刻意没动的账号数（v0.31.31）。
+	//
+	// 为什么这是必需的（用户现场："两台电脑两个 IP，拉起来却是同一个出口"）：
+	// 旧行为是"应用 = 把我名下所有号改绑到这条线路"。于是用户在第二台电脑上
+	// 拉一次，第一台电脑上那些号就被**静默搬走了** —— 两台机器最后都只有一台
+	// 在真正承重，看到的自然是同一个出口 IP。
+	Skipped int `json:"skipped,omitempty"`
+	// RebindAll 本次是否强制改绑（用户显式要求）。
+	RebindAll bool   `json:"rebind_all,omitempty"`
 	Probed    bool   `json:"probed"`
 	ExitIP    string `json:"exit_ip,omitempty"`
 }
@@ -1468,7 +1691,7 @@ type egressHomeApplyResult struct {
 // 理由：全局默认出口是平台级决定（它同时决定所有平台号与所有"跟随默认"的账号
 // 从哪出去），而用户提供的代理是不可信第三方 —— 它只应承载它主人的号。
 // 用户拉起的线路仍会进线路池（带 owner），管理员据此可显式分配给别人。
-func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeApplyResult, error) {
+func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool) (egressHomeApplyResult, error) {
 	url := egressHomeURL(tunnelPort)
 	var res egressHomeApplyResult
 	res.ProxyURL = url
@@ -1516,6 +1739,7 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeAppl
 		return res, err
 	}
 	res.ProxyID = hit.ID
+	res.RebindAll = rebindAll
 
 	// 2) 全局默认出口 —— **仅平台视角**。用户视角下这一步不是"少做了"，
 	// 而是"本来就不该做"：他要的只是自己那几十个号从家里出去。
@@ -1546,8 +1770,19 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeAppl
 			continue // 别人的号一个都不碰
 		}
 		res.HostTotal++
-		if strings.TrimSpace(acc.EgressProxy) == url {
+		cur := strings.TrimSpace(acc.EgressProxy)
+		if cur == url {
 			res.HostBound++
+			continue
+		}
+		// **非破坏式绑定**（v0.31.31）：只接管"还没指定出口"的号。
+		//
+		// 已显式绑到别的线路的号，说明用户/管理员已经为它做过决定（另一台机器的
+		// 线路、或某条商业代理）。一键拉起顺手把它们搬过来，等于"在 B 机上点一下，
+		// A 机上的号全跑了" —— 而页面上只显示"绑定成功 N 个"，没有任何提示。
+		// 需要整体改绑时由调用方显式传 rebind_all=true（按钮文案也会写明）。
+		if !rebindAll && cur != "" {
+			res.Skipped++
 			continue
 		}
 		if err := a.store.SetAccountEgress(acc.UID, url); err != nil {

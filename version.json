@@ -1,16 +1,16 @@
 {
-  "version": "0.31.30",
+  "version": "0.31.31",
   "min_supported": "0.24.0",
-  "notes": "v0.31.30：12153 硬冷却 / 保活惰性 / 旅行巡检 / 失效标红四件事。① 12153（会话失效）从\"10 分钟软冷却\"改为**首次即硬冷却至次日 04:00**（对齐 workbuddy2api-panel）：继续把这个号排进候选只会白打一次上游，04:00 是额度/签到重置墙钟。与「连续 3 次才摘号」并存 —— 冷却挡重试、阈值管要不要摘。统一在 Proxy.handleSessionDead 与 scheduler 的签到前补刷新/保活两处生效。② 保活加惰性阈值：LazyRefreshHours 默认 0 → **2 小时**（剩余寿命 >2h 就不刷，对齐 hub 的做法）；配合 v0.31.29 的全天分散，正常情况下每个号一天最多真刷一次。③ 旅行巡检 9/21 两点 → **每 4 小时**（0/4/8/12/16/20）：单程约 4 小时，原来 9 点派出、13 点到站却要等 21 点才领，白压 8 小时；巡检自带 dailyLimitReached 判断，多点几次不会超额派遣。④ 失效可视化：新增 accounts.token_dead_at 增量列（用既有 ALTER 列表，**已补老库迁移用例**）；Proxy.handleSessionDead 落标记、UpdateTokens（刷新成功）与导入成功自动清除。账号列表下发 token_dead / token_dead_at；管理后台账号卡**整卡红框 + 红标签「登录失效·需重新登录」+ footer「重新登录」按钮**（直达批量导入弹窗）；用户控制台代挂卡同样标红并给「重新登录」三步指引。⑤ 测试：token_dead_test 2 条（老库迁移幂等 / 标记-清除-刷新写回自动清），全量 go test 与 uitest 均通过。",
-  "released_at": 1792269004,
+  "notes": "v0.31.31：三件事一起落地 —— 健康检测插件化 / 账号出口可逐号分配 / 出口 IP 一致性问题的一次性修法。\n① 健康检测做成插件（health-check，用户端可用）：新增 pluginDef.Kind（claim / health）由服务端下发，前端按 kind 渲染面板（不再按 id 猜）。新增用户侧 POST /api/host/accounts/health 与 GET …/health/last：只查本人号（别人的 uid 静默剔除）、allowDelete=false（用户点检测不会停用/删除任何账号），结果按 uid 与账号清单合并，未检测的也列出来。插件面板：选号 → 发起 → 15s 轮询接回结果，显示状态/对话探活/余额/出口。\n② 账号出口可分配（用户端）：新增 GET /api/host/egress/lines（我的号 + 我能用的线路 + 每号实际出口 IP）、POST /api/host/egress/assign（逐号/批量；线路白名单 = owner∈{0,我}，别人的线路 403）、POST /api/host/egress/rebalance（按不同出口 IP 均衡，同 IP 多线路只算一个出口）。前端新增「我的账号出口」卡：逐号下拉即改、批量设置、一键均衡、账号分布诊断（几个 IP、各几个号）。\n③ 出口 IP 一致的三个成因，能修的全修了：(a) 端口互斥 —— poll/report 的 load→ensure→migrate→save 收敛到唯一入口 egressRegister 并全程持 egressMachMu；此前无锁时两台机器同时上线会各自算出同一个空闲端口，后到那台 ssh -R 失败，而两条线路都指向先到那台，探测自然是同一个 IP。(b) 指纹身份 —— 同一 id 不同指纹（复制安装目录）分出新键 + 新端口，不顶掉原机；同指纹不同 id（重装/删 machine.id）认回同一台并清理冗余记录；同机两份 agent 记录 alt_ids 并在 poll 里让非主 agent 停。agent v0.3.2 首次 poll 即带指纹。(c) 隧道实测校验 + 一键修复 —— 新增 POST /api/egress/home/repair，检测端口冲突/越段/隧道实测出口与自报不一致，换新端口并下发 start 重建；前端两端都加了「修复出口」与不一致告警。\n④ apply 改为非破坏式：一键拉起后的「应用」只接管未指定出口的号（返回 skipped 计数），不再把已绑到别的线路的号搬走 —— 这是「在 B 机点一下、A 机的号全跑过来」的直接修复；整体改绑改为显式按钮「全部改绑」（rebind_all）。\n⑤ 测试：新增 egress_identity_test.go（指纹合并/复制目录/并发端口唯一/修复换端口）、host_egress_lines_test.go（越权线路 403、别人的号静默剔除、按 IP 均衡只用 2 个出口、apply 非破坏式）、host_health_test.go（只回本人号、不泄露别人、不处置）；plugin 用例里写死的「只有 1 个插件」改为「包含目标插件」；uitest 的 egress-self 增加「我的账号出口」渲染断言（按 IP 报数 / 两个 IP / 均衡按钮）。全量 go test 与 uitest 均通过。\n⑥ 诚实边界：软件不能把一台电脑变出第二个公网 IP；本版保证的是三点 —— 不同电脑不会再被并成一条线路、不同出口能被真正分给不同账号、同 IP 的事实在两端都看得见（线路卡、池总览、账号分布）且能一键纠偏。",
+  "released_at": 1792271131,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.30/webapp.exe",
-      "sha256": "5aa6a439961ef4565ba3f2fd912c4c7f257e8e8a93b823fad0d8f9acd85fa66e",
-      "size": 15238656
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.31/webapp.exe",
+      "sha256": "98413c6fc142059123a83cd5a26c170d65068f9c3e2880ff0d3393ba2df94d93",
+      "size": 15336448
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

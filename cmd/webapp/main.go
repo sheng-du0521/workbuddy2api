@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.30"
+const version = "0.31.31"
 
 type app struct {
 	store  *Store
@@ -1408,6 +1408,9 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/egress/home/pull", a.egressActorGuard(a.handleEgressHomePull))
 	mux.HandleFunc("POST /api/egress/home/release", a.egressActorGuard(a.handleEgressHomeRelease))
 	mux.HandleFunc("POST /api/egress/home/apply", a.egressActorGuard(a.handleEgressHomeApply))
+	// 出口体检与纠偏（v0.31.31）：端口冲突 / 隧道没落到本机 → 换端口重建。
+	// 只碰 ports 与 cmd 两个字段，不动账号、线路与全局默认。
+	mux.HandleFunc("POST /api/egress/home/repair", a.egressActorGuard(a.handleEgressRepair))
 	// 一键安装（v0.31.25）：下载一个可双击运行的 .bat —— 里面只有服务地址与
 	// **当前登录用户自己的**令牌。挂 userGuard（只认会话）：安装包是按"人"发的，
 	// 不该出现在共享的运维密钥通道里。
@@ -1443,12 +1446,22 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/host/accounts", a.userGuard(a.handleHostAccounts))
 	// 导出（v0.31.29）：只导出自己名下的号；文件里是凭证明文，前端须二次确认。
 	mux.HandleFunc("GET /api/host/accounts/export", a.userGuard(a.handleExportHostAccounts))
+	// 健康检测（v0.31.31，插件 health-check）：只查本人号，且 allowDelete=false。
+	// 路由放在 /accounts/{uid}/... 之前无冲突（静态段与通配段分开注册）。
+	mux.HandleFunc("POST /api/host/accounts/health", a.userGuard(a.handleHostHealthCheck))
+	mux.HandleFunc("GET /api/host/accounts/health/last", a.userGuard(a.handleHostHealthLast))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/group", a.userGuard(a.handleHostSetGroup))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/pool", a.userGuard(a.handleHostPool))
 	mux.HandleFunc("DELETE /api/host/accounts/{uid}", a.userGuard(a.handleHostDeleteAccount))
 	mux.HandleFunc("GET /api/host/accounts/{uid}/resources", a.userGuard(a.handleHostResources))
 	mux.HandleFunc("GET /api/host/accounts/{uid}/task-status", a.userGuard(a.handleHostAccountTaskStatus))
 	mux.HandleFunc("POST /api/host/egress", a.userGuard(a.handleHostEgress))
+	// 账号出口（v0.31.31）：逐号分配 + 按出口 IP 均衡。
+	// 旧的 /api/host/egress 是"全量覆盖"语义（一个 URL 应用到所有号），
+	// 多机场景下它会静默把别的机器上的号搬走 —— 新页面不再用它。
+	mux.HandleFunc("GET /api/host/egress/lines", a.userGuard(a.handleHostEgressLines))
+	mux.HandleFunc("POST /api/host/egress/assign", a.userGuard(a.handleHostEgressAssign))
+	mux.HandleFunc("POST /api/host/egress/rebalance", a.userGuard(a.handleHostEgressRebalance))
 	mux.HandleFunc("GET /api/system/info", a.userGuard(a.handleSystemInfo))
 	mux.HandleFunc("GET /api/host/earnings", a.userGuard(a.handleHostEarnings))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/task", a.userGuard(a.handleHostSetTask))
