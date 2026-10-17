@@ -1674,6 +1674,12 @@ type egressHomeApplyResult struct {
 	RebindAll bool   `json:"rebind_all,omitempty"`
 	Probed    bool   `json:"probed"`
 	ExitIP    string `json:"exit_ip,omitempty"`
+	// Warnings 本次**刻意没做**的事（v0.31.35）。例如：这条 URL 已被某个用户认领，
+	// 平台视角就不再把它设成全局默认、也不把自挂号绑上去。
+	//
+	// 为什么不用 error：线路注册本身是成功的（隧道确实通了），
+	// 只是"不能拿它当平台出口"—— 用错误会让调用方以为整件事失败。
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // applyHomeEgress 把某台机器的本地出口线路**应用到位**（幂等，可反复调用）。
@@ -1744,9 +1750,33 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 	res.ProxyID = hit.ID
 	res.RebindAll = rebindAll
 
+	// 归属守卫（v0.31.35）：平台视角拉到一条**已被用户认领**的 URL 时，
+	// 绝不能再把它当平台出口用 —— 否则"全局默认 = 某用户家宽"、"自挂号全搬到他家"。
+	// 这种情形只可能来自端口/URL 撞车（用户段与平台段本该不同），
+	// 但代码不能依赖"本该"，否则一次端口迁移就会触发。
+	userOwnedLine := hit.OwnerUserID > 0
+	if scope.Platform && userOwnedLine {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"这条线路（%s）已由用户 #%d 认领：已登记，但**不会**设为全局默认出口，也不会改绑任何账号。"+
+				"平台出口请用平台自己的机器（端口 11080-11089）", url, hit.OwnerUserID))
+		log.Printf("WARN: [egress] 平台视角命中用户线路 %s（owner=#%d）：跳过默认出口与账号绑定",
+			url, hit.OwnerUserID)
+	}
+	// 用户视角同理（v0.31.35）：正常路径下这台机器的 URL 归属就是他自己
+	// （端口段隔离），但代码不依赖"本该" —— 一旦端口迁移/记录错位，
+	// 这里若不拦，用户的号会被绑到**另一个用户**的线路上。
+	if !scope.Platform && hit.OwnerUserID > 0 && hit.OwnerUserID != scope.UserID {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"这条线路（%s）属于用户 #%d，不能用于你的账号：已登记但不会绑定任何号。"+
+				"请重新拉起你自己的代理（或联系管理员核对端口归属）", url, hit.OwnerUserID))
+		log.Printf("WARN: [egress] 用户 #%d 的机器命中他人线路 %s（owner=#%d）：跳过绑定",
+			scope.UserID, url, hit.OwnerUserID)
+		return res, nil
+	}
+
 	// 2) 全局默认出口 —— **仅平台视角**。用户视角下这一步不是"少做了"，
 	// 而是"本来就不该做"：他要的只是自己那几十个号从家里出去。
-	if scope.Platform {
+	if scope.Platform && !userOwnedLine {
 		// 护栏（v0.31.26）：这条 URL 若已被某个用户认领（owner 粘性 >0），
 		// 把它设成全局默认等于让全平台从这个用户的家庭宽带走。
 		// 平台视角拉的机器正常是 owner=0；能走到这里的只有"URL 先被用户占过"这种情形。
@@ -1761,6 +1791,12 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 	}
 
 	// 3) 显式绑定自挂号（只改 egress_proxy 一个字段）。按视角收窄到自己的号。
+	//
+	// 平台视角 + 命中用户线路 → 整体跳过（见上面 userOwnedLine 的说明）。
+	// 这一步用 return 而不是 if 包住整段，是为了让"为什么没绑"在代码里更显眼。
+	if scope.Platform && userOwnedLine {
+		return res, nil
+	}
 	accs, err := a.store.ListAccounts()
 	if err != nil {
 		return res, err

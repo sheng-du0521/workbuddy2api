@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -420,6 +421,17 @@ func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	// 归属校验（v0.31.35 补漏）：这条路径此前**只校验格式**，于是用户在设置页手填
+	// 别人的线路 URL 就能把号绑上去 —— assign 拦得住，设置页拦不住，规则形同虚设。
+	// 现在与 assign 共用 `hostEgressLineFor`，规则只有一份实现。
+	if _, lerr := a.hostEgressLineFor(u, norm, true); lerr != nil {
+		status := http.StatusBadRequest
+		if errors.Is(lerr, errEgressForeignLine) {
+			status = http.StatusForbidden
+		}
+		writeJSON(w, status, map[string]any{"error": lerr.Error()})
+		return
+	}
 
 	owned, err := a.store.ListAccountsByOwner(u.ID)
 	if err != nil {
@@ -508,6 +520,14 @@ func (a *app) ensureUserEgressLine(u *User, rawURL string) string {
 				break
 			}
 		}
+	}
+	// ⚠️ 命中已存在的线路时先判归属（v0.31.35）：下面那句无条件 `hit.Enabled = true`
+	// 会把**别人停用的线路重新启用** —— 一个用户只要在设置页填上别人线路的 URL
+	// 就能把那条线拉活。这类"副作用跨过归属边界"的代码必须在这里截住。
+	if hit != nil && hit.OwnerUserID > 0 && hit.OwnerUserID != u.ID {
+		log.Printf("WARN: [host] 用户 %s 试图登记他人线路 %s（owner=#%d），已拒绝",
+			u.Username, url, hit.OwnerUserID)
+		return ""
 	}
 	if hit == nil {
 		hit = &EgressProxy{

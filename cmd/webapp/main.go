@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.34"
+const version = "0.31.35"
 
 type app struct {
 	store  *Store
@@ -1635,6 +1635,9 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/egress/default/repair", a.adminGuard(a.handleEgressDefaultRepair))
 	// 账号出口 ↔ 线路池对齐（v0.31.33）：补登记池外的账号出口、合并同 URL 不同写法。
 	mux.HandleFunc("POST /api/admin/egress/converge", a.adminGuard(a.handleEgressConverge))
+	// 出站口径（v0.31.35）：统一走服务器 / 撤回。GET 看快照，POST 切换（带 dry_run 与备份）。
+	mux.HandleFunc("GET /api/admin/egress/policy", a.adminGuard(a.handleEgressPolicy))
+	mux.HandleFunc("POST /api/admin/egress/policy", a.adminGuard(a.handleEgressPolicy))
 	mux.HandleFunc("GET /api/admin/egress/overview", a.adminGuard(a.handleEgressOverview))
 	// 账号代理视图（v0.17.9）：逐账号的出口配置与实际出口（只读本地，不出站）。
 	mux.HandleFunc("GET /api/admin/egress/accounts", a.adminGuard(a.handleEgressAccounts))

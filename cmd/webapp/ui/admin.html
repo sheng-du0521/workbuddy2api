@@ -507,6 +507,17 @@
           <div id="egressAlert" class="sub" style="margin:0;"></div>
         </div>
 
+        <!-- 出站口径（v0.31.35）：一句话决定"还用不用代理"。
+             与下面的线路池是两个问题：池子管"有哪些出口"，这里管"现在用不用"。
+             放在最前面是有意的 —— 出了事第一件要做的就是"先全部回服务器"。 -->
+        <div class="card" id="egrPolicyCard">
+          <div class="section-head">
+            <h2>出站口径</h2>
+            <span class="muted" style="font-size:12px;" id="egrPolicyHint"></span>
+          </div>
+          <div id="egrPolicyBody" class="sub" style="margin:0;">正在读取…</div>
+        </div>
+
         <div class="section-head">
           <h2>出口线路池</h2>
           <a class="muted" style="font-size:12px;" href="#egressAssign">↓ 跳到批量分配</a>
@@ -6657,6 +6668,120 @@ function runStateChip(a) {
 
 // ---- R1：线路失效处置策略 ----
 
+// ---- 出站口径（v0.31.35）----
+//
+// 与上面的「线路失效处置」是两个问题：
+//   · 那个管"线路坏了怎么办"（strict / migrate）；
+//   · 这个管"现在还用不用线路"（server = 全部从服务器本机 IP 出）。
+// 名字刻意区分（loadOutboundPolicy vs loadEgressPolicy），否则半年后没人分得清。
+async function loadOutboundPolicy() {
+  const body = $('egrPolicyBody');
+  if (!body) return;
+  let d;
+  try {
+    d = await api('/api/admin/egress/policy');
+  } catch (e) {
+    body.textContent = '读取失败：' + (e && e.message ? e.message : e);
+    return;
+  }
+  body.textContent = '';
+
+  const server = d.mode === 'server';
+  const hint = $('egrPolicyHint');
+  if (hint) {
+    hint.textContent = server ? '当前：全部走服务器' : '当前：仍有号绑定线路';
+    hint.style.color = server ? '' : '#b9770e';
+  }
+
+  const kv = el('div', 'row');
+  kv.style.cssText = 'flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px;';
+  const tag = (text, tone, title) => {
+    const t = el('span', 'tag ' + (tone || ''), text);
+    if (title) t.title = title;
+    return t;
+  };
+  kv.appendChild(tag('未指定（跟随默认）' + d.direct_accounts, 'ok',
+    '这些号没有单独配出口：全局默认为空时直接从服务器本机 IP 出去'));
+  kv.appendChild(tag('绑定线路' + d.line_accounts, d.line_accounts ? 'warn' : '',
+    '这些号仍在走代理线路（含用户住宅线路 / 代理池）'));
+  if (d.explicit_direct) {
+    kv.appendChild(tag('显式直连' + d.explicit_direct, '',
+      '逐号写了 direct：**覆盖**全局默认，即使以后设置默认也不生效'));
+  }
+  kv.appendChild(tag(d.default_egress ? ('全局默认 ' + d.default_egress) : '全局默认：无',
+    d.default_egress ? 'accent' : '', '未指定出口的号会继承它；为空时从服务器本机 IP 直连'));
+  body.appendChild(kv);
+
+  const note = el('div', 'sub');
+  note.style.margin = '0 0 10px';
+  note.innerHTML = '「统一走服务器」= 把所有号的出口清成<b>跟随默认</b>、并把<b>全局默认清空</b> —— '
+    + '于是全部从<b>服务器本机 IP</b> 出站。<b>不动线路池</b>（线路、探活、归属都保留），'
+    + '随时可以撤回。操作前会<b>自动备份</b>每个号的旧值。';
+  body.appendChild(note);
+
+  const row = el('div', 'row');
+  row.style.cssText = 'flex-wrap:wrap;gap:8px;align-items:center;';
+
+  const toServer = el('button', '', '统一走服务器');
+  toServer.disabled = server && !d.default_egress;
+  toServer.title = '清空所有账号出口与全局默认，全部从服务器本机 IP 出站（自动备份，可撤回）';
+  toServer.onclick = async () => {
+    toServer.disabled = true;
+    try {
+      // 先预览：把"会动多少个号、原本分布在哪些出口"摆出来再让人确认。
+      const pv = await post('/api/admin/egress/policy', { mode: 'server', dry_run: true });
+      const dist = Object.keys(pv.before_by_value || {})
+        .map((k) => k + ' × ' + pv.before_by_value[k]).join('\n');
+      const ok = await confirmAsk('把所有账号统一改为「走服务器本机 IP」？\n\n'
+        + '将清空 ' + (pv.affected || 0) + ' 个账号的出口配置'
+        + (pv.default_before ? '，并清空全局默认（' + pv.default_before + '）' : '')
+        + '。\n' + (dist ? '原出口分布：\n' + dist + '\n' : '')
+        + '\n⚠ 出口 IP 会变：上游若按 IP 聚类，这是一次特征变化。'
+        + '\n线路池不会被改动，随时可以撤回。');
+      if (!ok) { toServer.disabled = false; return; }
+      const r = await post('/api/admin/egress/policy', { mode: 'server' });
+      toast('已切换：清空 ' + r.cleared + ' 个账号出口' + (r.default_before ? '，全局默认已清空' : ''), 'ok');
+      if (r.backup_rows) toast('已备份 ' + r.backup_rows + ' 条旧配置，可点「撤回上次切换」恢复', 'ok');
+      loadEgress();
+    } catch (e) {
+      toast('切换失败：' + e.message, 'err');
+      toServer.disabled = false;
+    }
+  };
+  row.appendChild(toServer);
+
+  if (d.backup_count > 0) {
+    const back = el('button', 'ghost', '撤回上次切换');
+    back.title = '把 ' + d.backup_count + ' 个号恢复到切换前的出口（只恢复当前仍为空的号）';
+    back.onclick = async () => {
+      back.disabled = true;
+      try {
+        // ⚠️ 括号不能断在这里：`if (...);` 会让后面的块**无条件执行**，
+        // 于是"撤回"永远退不回去（点了没反应，也不报错）—— 这类写法
+        // linter 不一定抓得到，但后果是"功能看起来在、实际不工作"。
+        if (!(await confirmAsk('撤回上次「统一走服务器」？\n\n'
+          + '会把备份里的出口配置恢复到**当前没有出口**的号上；'
+          + '切换后手工配过的号不覆盖。\n'))) {
+          back.disabled = false;
+          return;
+        }
+        const r = await post('/api/admin/egress/policy', { mode: 'restore' });
+        toast('已恢复 ' + r.restored + ' 个号' + (r.skipped ? '，跳过 ' + r.skipped + ' 条' : ''), 'ok');
+        loadEgress();
+      } catch (e) {
+        toast('撤回失败：' + e.message, 'err');
+        back.disabled = false;
+      }
+    };
+    row.appendChild(back);
+    const when = d.backup_at ? new Date(d.backup_at * 1000).toLocaleString() : '';
+    const b = el('span', 'muted', '备份 ' + d.backup_count + ' 条' + (when ? '（' + when + '）' : ''));
+    b.style.fontSize = '12px';
+    row.appendChild(b);
+  }
+  body.appendChild(row);
+}
+
 async function loadEgressPolicy() {
   const sel = $('egrOnLineDown');
   if (!sel) return;
@@ -7311,6 +7436,7 @@ function showEgrSub(name) {
 // 一次网络抖动就会把右上角刷满 —— 而轮询的意义恰恰是"自己会好"。
 async function loadEgress(silent) {
   loadEgressPolicy(); // R1：线路失效处置策略（独立拉，失败不影响主流程）
+  loadOutboundPolicy(); // v0.31.35：出站口径（统一走服务器 / 撤回）
   try {
     // 三个接口并行：overview 负责风控视角（谁跟谁共用出口、谁在裸奔），
     // proxies 负责线路台账（名字/地区/探活历史），accounts 负责逐账号出口。

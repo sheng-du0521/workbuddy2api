@@ -3020,7 +3020,12 @@ async function pluginFillPanel(p, card, panel) {
   if (p.kind === 'health') {
     return pluginHealthPanel(p, card, panel);
   }
-  const st = pluginState[p.id];
+  // 状态兜底（v0.31.35）：`pluginCard` 会初始化它，但 `openPluginView` 也可能
+  // **不经过卡片**直接进面板（深链 / 将来的"最近使用"入口）。少这行就是
+  // `Cannot read properties of undefined`，整个面板空白且不报错给用户。
+  const st = (pluginState[p.id] = pluginState[p.id] || {
+    targets: null, picked: null, running: false, rows: {},
+  });
   panel.textContent = '';
   panel.appendChild(el('div', 'sub', '正在读取可操作的账号…'));
 
@@ -3149,7 +3154,7 @@ function pluginResultBadge(r) {
 
 // pluginRun **串行**执行：一个号一个请求，号与号之间留间隔；逐号刷新结果。
 async function pluginRun(p, card, panel) {
-  const st = pluginState[p.id];
+  const st = (pluginState[p.id] = pluginState[p.id] || { rows: {} });
   if (st.running) return;
   const uids = Array.from(st.picked);
   if (!uids.length) return;

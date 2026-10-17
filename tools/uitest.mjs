@@ -2535,6 +2535,118 @@ function run(pageFile, meOverride, plan) {
       rlBad.push('host_import.go 缺少归属校验（会把别人的号导到自己名下）');
     }
   }
+  // v0.31.35：**每个插件都要有独立页面**（不是只有出口代理有）。
+  //
+  // 现场反馈是"插件点开后缺少可视化的单独界面"—— 当时只有 egress 有专属 pane，
+  // claim / health 还挤在卡片里的小面板。这条按**行为**验三种形态：
+  // 逐个点开 → 目标 pane 激活、标题变成插件名、内容非空、有返回栏，再返回列表。
+  const pvBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const PLUGINS = { plugins: [
+      { id: 'claim-compensation', name: '多账号领取积分补偿', desc: '桩', audience: 'both',
+        builtin: true, enabled: true, active: true, kind: 'claim' },
+      { id: 'health-check', name: '账号健康检测', desc: '桩', audience: 'both',
+        builtin: true, enabled: true, active: true, kind: 'health' },
+      { id: 'host-egress', name: '本地出口代理', desc: '桩', audience: 'user',
+        builtin: true, enabled: true, active: true, kind: 'egress' },
+    ] };
+    const HEALTH = {
+      accounts: [
+        { uid: 'p1', nickname: '甲', token_dead: false, checked: true,
+          result: { state: 'ok', state_label: '正常', chat_probed: true, chat_ok: true, credits: 100 } },
+        { uid: 'p2', nickname: '乙', token_dead: true, checked: false, result: null },
+      ],
+      summary: { total: 2, checked: 1, definite: 0, ended_at: now },
+    };
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/dashboard.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.fetch = (url, opts) => {
+          const u = String(url);
+          const body = (b) => Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve(JSON.stringify(b)), json: () => Promise.resolve(b) });
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return body({ user: { id: 2, username: 'u2', is_admin: false } });
+          }
+          if (u.indexOf('/api/plugins') >= 0 && u.indexOf('/claim') >= 0) {
+            // dry_run：服务端解析出的目标列表。
+            return body({ total: 2, dry_run: true, targets: [
+              { uid: 'p1', nickname: '甲' }, { uid: 'p2', nickname: '乙' }] });
+          }
+          if (u.indexOf('/api/plugins') >= 0 && u.indexOf('/enabled') < 0) return body(PLUGINS);
+          if (u.indexOf('/api/host/accounts/health/last') >= 0) return body(HEALTH);
+          if (u.indexOf('/api/egress/home') >= 0) {
+            return body({ machines: [], agent_online: false, tunnel_reachable: false,
+              can_manage: true, manage_scope: 'self', poll_sec: 5 });
+          }
+          if (u.indexOf('/api/host/egress/lines') >= 0) {
+            return body({ lines: [], accounts: [], distinct_exit_ips: 0 });
+          }
+          return body({});
+        };
+      },
+    });
+    const w = dom.window;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+    if (typeof w.navGo === 'function') w.navGo('plugins');
+    await wait(500);
+
+    const wants = [
+      { name: '多账号领取积分补偿', pane: 'plugin-claim-compensation', must: '开始领取' },
+      { name: '账号健康检测', pane: 'plugin-health-check', must: '开始检测' },
+      { name: '本地出口代理', pane: 'egress', must: '本地出口代理' },
+    ];
+    for (const want of wants) {
+      const cards = Array.from(w.document.querySelectorAll('#pluginCards .card'));
+      const card = cards.find((c) => String(c.textContent).indexOf(want.name) >= 0);
+      if (!card) { pvBad.push('插件列表里没有「' + want.name + '」'); continue; }
+      const btn = Array.from(card.querySelectorAll('button'))
+        .find((b) => String(b.textContent).trim() === '打开');
+      if (!btn) { pvBad.push('「' + want.name + '」卡上没有「打开」按钮'); continue; }
+      btn.click();
+      await wait(450);
+      const pane = w.document.querySelector('.pane[data-pane="' + want.pane + '"]');
+      if (!pane || !pane.classList.contains('active')) {
+        pvBad.push('「' + want.name + '」打开后独立页面未激活（pane=' + want.pane + '）');
+        continue;
+      }
+      const txt = String(pane.textContent || '');
+      if (txt.indexOf(want.must) < 0) {
+        pvBad.push('「' + want.name + '」独立页面内容为空或缺少关键动作「' + want.must + '」');
+      }
+      if (!pane.querySelector('[data-plugin-back]')) {
+        pvBad.push('「' + want.name + '」独立页面缺少「← 插件」返回栏');
+      }
+      const title = w.document.getElementById('pageTitle');
+      if (!title || String(title.textContent).indexOf(want.name) < 0) {
+        pvBad.push('「' + want.name + '」打开后标题没变成插件名');
+      }
+      const back = pane.querySelector('[data-plugin-back]');
+      if (back) back.click();
+      await wait(300);
+    }
+
+    // 最后再确认一次：所有插件都能回到列表（不是只有第一个能退）。
+    const plug = w.document.querySelector('.pane[data-pane="plugins"]');
+    if (!plug || !plug.classList.contains('active')) {
+      pvBad.push('从插件独立页面返回后，没有回到插件列表');
+    }
+    try { w.close(); } catch (e) {}
+  }
+  pvBad.forEach((m) => console.log('  [FAIL] plugin-views: ' + m));
+  if (!pvBad.length) {
+    console.log('  [ok] plugin-views: claim / health / egress 三种插件都有独立页面且能返回');
+  }
+
   rlBad.forEach((m) => console.log('  [FAIL] host-relogin: ' + m));
   if (!rlBad.length) {
     console.log('  [ok] host-relogin: 重新登录可扫码/导入 JSON 自助完成；借用用户线路需显式勾选');

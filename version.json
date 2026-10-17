@@ -1,16 +1,16 @@
 {
-  "version": "0.31.34",
+  "version": "0.31.35",
   "min_supported": "0.24.0",
-  "notes": "v0.31.34：**代理规则按角色收紧 + 代理并入插件并给独立界面**。① 用户端规则（改动核心）：用户的线路**只承载自己的号** —— 账号代理与出口代理都一样。他人线路在用户端**结构性不可见**（GET /api/host/egress/lines 直接过滤，不是前端不渲染）、不可分配（assign 403 并指路「让管理员在后台分配」）、不参与按 IP 均衡；推翻了 v0.31.32 的「可借用他人线路」—— 那条规则的实际代价是 access_token 交给第三方机器，一次确认弹窗不是技术保障，且出风控事件时无法区分「我的号自己跑的」与「从别人家宽跑的」。② 管理端（保留并明确）：可以把**任何**线路（含用户接入的住宅 IP）分配给**任何**账号 —— 号池账号、其他用户的代挂号都行，这是「借用住宅 IP」的唯一入口；批量分配默认不勾「纳入用户线路」，勾选即知情（自动挑最闲会把平台 token 随机送去用户家里）；线路卡上标注三类来源（平台自建 / 用户接入 / 代理池导入），「代理」页的「接入出口代理池」入口即批量粘贴候选→探活→只收通的。③ 代理导航并入插件：用户端侧栏移除「代理」，改为插件「本地出口代理」（pluginDef.Kind=egress，Audience=user）；新增 openPluginView/closePluginView —— 插件打开后是**占满内容区的独立界面**（带「← 插件」返回栏、标题改成插件名），不再是卡片里那个一列宽的小面板；egress 视图复用现有代理页 DOM（同一份 id 与加载链），老链接 #egress 自动转成插件并打开。④ 所有插件优化：卡片加形态标签（批量执行 / 检测 / 控制台），停用时「打开」直接禁用（不再点进去收 403）；独立界面统一「返回栏 + 标题 + 说明 + 全宽内容」；独立界面型插件走批量执行接口时在**解析参数前**就返回 400 指路。⑤ 测试：新增 host_egress_rule_test（均衡只用平台+自己、插件契约：user 端有且 kind=egress、admin 端无、执行接口 400）；host_egress_lines_test 改为断言他人线路不可见 + assign 403 且账号未被改动；uitest 的 egress-self 增加行为断言（点「打开」→ 代理 pane 激活 + 标题变插件名 → 点返回回插件列表）。全量 go test 与 uitest 均通过。",
-  "released_at": 1792275410,
+  "notes": "v0.31.35：**出站统一走服务器 + 代理规则冲突排查 + 插件独立页面全覆盖**。① 新增出站口径开关（`GET/POST /api/admin/egress/policy`）：`mode=server` 把所有账号出口清成「跟随默认」并把全局默认清空 → 全部从服务器本机 IP 出站；`mode=restore` 从自动备份撤回。支持 `dry_run` 预览（返回受影响号数与原出口分布）；操作前把每个号的旧值写进 kv 备份；**不动线路池**（线路/探活/归属都保留）。生产已执行：清空 10 个账号出口（原 21160）、清空全局默认（原 11080），38 个号全部直连，出站 IP 47.103.194.103。② 修运行时不生效的坑：`SyncAccounts` 只重建账号级映射，`p.defaultEgress` 由 `ReloadSelection` 赋值 —— 只调前者会让「库里默认已空、运行时还在用 11080」，overview 同时显示「38 个未指定」和「默认 11080」自相矛盾。两个都调，并加断言（`ResolveEgress` 必须为空）。③ 代理规则冲突排查（三处真实漏洞）：（a）设置页「我的出口 → 应用到全部」此前**只校验格式**，手填别人的线路 URL 就能把号绑上去（assign 拦得住、设置页拦不住）；（b）`ensureUserEgressLine` 命中别人**已停用**的线路时无条件 `Enabled=true`，等于一个用户能把别人的线拉活；（c）`applyHomeEgress` 平台视角命中已被用户认领的 URL 时，仍会设默认并把自挂号全绑上去（用户视角同理）。三处统一收敛到 `hostEgressLineFor(u, norm, allowNew)`：assign 只允许池内线路、设置页允许用户新接自己的代理（allowNew=true），归属判定用**哨兵错误**而不是匹配文案（文案一改状态码就漂）。判定顺序也修正为「先归属、后启用」——「别人的」是别等了，「停用的」才是等一等。④ 插件独立页面全覆盖：claim / health / egress 三种形态都能打开独立页面（占满内容区 + 返回栏 + 标题改插件名 + 侧栏仍高亮插件）；`pluginFillPanel`/`pluginRun` 补 `pluginState` 兜底（不经卡片直接进面板不再 TypeError）。⑤ 测试：新增 `egress_outbound_test.go`（预览不写库 / 执行后账号与默认全空 + 运行时同步 + 备份存在 + 线路池未动 / 撤回只恢复当前为空的号；设置页填他人线路 403 且对方线路仍停用）；uitest 新增 `plugin-views`（逐个点开三种插件，断言 pane 激活、标题、内容、返回）。全量 go test 与 uitest 均通过。",
+  "released_at": 1792277174,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.34/webapp.exe",
-      "sha256": "835fb5016e491e3e2883e52b6b72de2e8ed83066f66d3ae65eb011c896757ee8",
-      "size": 15389184
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.35/webapp.exe",
+      "sha256": "85ed5ff9018f4302979f67f055dbdf742206aae49298cbcbdfe2752e0c7c9eca",
+      "size": 15415296
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

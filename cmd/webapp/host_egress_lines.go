@@ -47,6 +47,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -115,6 +117,71 @@ type hostEgressAccountView struct {
 	ForeignBound bool `json:"foreign_bound,omitempty"`
 	// ForeignOwnerName 这条线路的主人（给"要不要改回去"提供判断依据）。
 	ForeignOwnerName string `json:"foreign_owner_name,omitempty"`
+}
+
+// errEgressForeignLine 线路属于他人 —— 用**哨兵错误**而不是匹配文案来判状态码。
+//
+// 为什么（v0.31.35）：调用方需要区分 403（别人的线路，找管理员）与 400
+// （不在池里 / 已停用，自己可处理）。此前用 `strings.Contains(err, "其他用户")`，
+// 文案一改状态码就悄悄变成 400 —— 那种漂移没有任何测试会红，只会让前端弹错提示。
+var errEgressForeignLine = fmt.Errorf("这条线路属于其他用户，你的号不能用它。" +
+	"用户的线路只承载自己的账号；如果确实需要，请让管理员在「代理 → 线路池 → 分配」里指定")
+
+// hostEgressLineFor 校验「这条线路能不能被该用户用在自己的号上」。
+//
+// **规则只有这一份实现**（v0.31.34 补漏）：此前 `assign` 有校验、而设置页的
+// 「我的出口 → 应用到全部」没有 —— 用户在设置页手填 `http://127.0.0.1:21160`
+// （别人的线路）就能把号绑上去，接口层完全绕过规则。这属于"同一个概念两处判定"，
+// 迟早会漂；现在两个入口共用本函数。
+//
+// allowNew 区分两种动作（这就是"规则一致、动作不同"的落点）：
+//
+//	true  设置页「我的出口」：用户填自由文本，**允许是他自己新接的代理** ——
+//	      池里没有就返回 (nil,nil)，由 `ensureUserEgressLine` / `setAccountEgress`
+//	      登记成他自己名下的线路。堵掉这条等于"用户再也不能新增自己的代理"，
+//	      那不是收紧规则，是把功能删了。
+//	false 逐号分配下拉：只能选**池里已有**的线路。允许任意 URL 会让
+//	      "随手写个地址"就多出一条线路，池子很快就没人维护得动。
+//
+// 返回 (nil, nil) 表示「直连 / 清空跟随默认 / 允许新建」—— 调用方按 allowNew 理解。
+// 错误文案已经面向用户写好（含下一步该找谁），调用方直接 400/403 透出即可。
+func (a *app) hostEgressLineFor(u *User, norm string, allowNew bool) (*EgressProxy, error) {
+	if u == nil || norm == "" || egress.IsDirect(norm) {
+		return nil, nil
+	}
+	list, err := a.store.ListEgressProxies()
+	if err != nil {
+		return nil, fmt.Errorf("读取线路池失败：%v", err)
+	}
+	want := egressURLKey(norm)
+	var line *EgressProxy
+	for _, p := range list {
+		if egressURLKey(p.URL) == want {
+			line = p
+			break
+		}
+	}
+	if line == nil {
+		if allowNew {
+			// 用户自己新接的代理：放行，调用方会登记为他的线路。
+			return nil, nil
+		}
+		return nil, fmt.Errorf("这条线路不在线路池里。请先在你的电脑上「一键拉起」，或由管理员录入该线路")
+	}
+	// ⚠️ **先判归属，再判启用**（v0.31.35 由测试逼出来的顺序）。
+	//
+	// 反过来的话，用户填了一条"别人的、且已被停用"的线路会收到
+	// 「这条线路已被停用」—— 他会以为是自己的线路坏了、等探活恢复就好；
+	// 而真正的事实是"这条根本不是你的"。两个结论的处理方式完全不同：
+	// 停用是**等**，归属是**别等了**。错误信息必须说后者。
+	// 他人的线路一律拒（产品规则，不是越权兜底）：用户的线路只承载自己的号。
+	if line.OwnerUserID != 0 && line.OwnerUserID != u.ID {
+		return nil, errEgressForeignLine
+	}
+	if !line.Enabled {
+		return nil, fmt.Errorf("这条线路已被停用（连续探活失败或人工停用），不能指派给账号")
+	}
+	return line, nil
 }
 
 // handleHostEgressLines GET /api/host/egress/lines
@@ -294,46 +361,17 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 线路必须"我能用"：平台线路 or 我自己的。别人的线路一律拒（理由见文件头）。
-	var line *EgressProxy
-	if norm != "" && !egress.IsDirect(norm) {
-		list, err := a.store.ListEgressProxies()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
+	// 线路必须"我能用"：平台线路 or 我自己的（规则与设置页共用一份实现）。
+	line, lerr := a.hostEgressLineFor(u, norm, false)
+	if lerr != nil {
+		// 404/403 的区分对调用方有意义（"不在池里"可自救，"别人的"只能找管理员），
+		// 但对外统一 400/403 两种即可：文案已经说清该做什么。
+		status := http.StatusBadRequest
+		if errors.Is(lerr, errEgressForeignLine) {
+			status = http.StatusForbidden
 		}
-		// 比对走规范化键（v0.31.33 口径）：历史行可能还是旧写法，
-		// 用原文比会出现"明明在池里却报不在"。
-		want := egressURLKey(norm)
-		for _, p := range list {
-			if egressURLKey(p.URL) == want {
-				line = p
-				break
-			}
-		}
-		if line == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "这条线路不在线路池里。请先在你的电脑上「一键拉起」，或由管理员录入该线路",
-			})
-			return
-		}
-		if !line.Enabled {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "这条线路已被停用（连续探活失败或人工停用），不能指派给账号",
-			})
-			return
-		}
-		// 他人的线路一律拒（v0.31.34 规则）：用户的线路只承载自己的号。
-		//
-		// 这不是"越权兜底"，而是**产品规则**，所以文案要说清下一步该找谁 ——
-		// 写成"无权限"会让人以为是个权限 bug，实际是"这件事只有管理员能做"。
-		if line.OwnerUserID != 0 && line.OwnerUserID != u.ID {
-			writeJSON(w, http.StatusForbidden, map[string]any{
-				"error": "这条线路属于其他用户，你的号不能用它。" +
-					"用户的线路只承载自己的账号；如果确实需要，请让管理员在「代理 → 线路池 → 分配」里指定",
-			})
-			return
-		}
+		writeJSON(w, status, map[string]any{"error": lerr.Error()})
+		return
 	}
 
 	owned, err := a.store.ListAccountsByOwner(u.ID)
