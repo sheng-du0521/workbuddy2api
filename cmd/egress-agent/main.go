@@ -39,12 +39,14 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -57,7 +59,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.0"
+const agentVersion = "0.3.1"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -79,8 +81,18 @@ type agentState struct {
 	Hostname string `json:"hostname"`
 	ProxyOK  bool   `json:"proxy_ok"`
 	TunnelOK bool   `json:"tunnel_ok"`
-	ExitIP   string `json:"exit_ip,omitempty"`
-	Message  string `json:"message,omitempty"`
+	// ExitIP 纯 IP（v0.3.1 起）。此前是「IP（地区 ISP）」复合串，云端无法按 IP 比较，
+	// 于是"两条线路其实是同一个出口"这件事在后台完全看不出来。
+	ExitIP string `json:"exit_ip,omitempty"`
+	// ExitIPNote 归属地/运营商（原复合串括号里的部分），只给人看。
+	ExitIPNote string `json:"exit_ip_note,omitempty"`
+	// Fingerprint 机器指纹（v0.3.1）：hostname + 主网卡 MAC + 首选内网 IP 的哈希。
+	// 用来识破「同一台机器跑了两份 agent」，以及「拷贝安装目录到另一台电脑导致
+	// machine.id 重复」这两种会让后台误以为有两条独立线路的情况。
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// LocalIP 本机首选内网地址（人眼核对"这是哪台电脑"）。
+	LocalIP string `json:"local_ip,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type agent struct {
@@ -101,6 +113,11 @@ type agent struct {
 	lastAction string
 	msg        string
 	exitIP     string
+	exitNote   string
+	// fp / localIP 启动时算一次即可：MAC 与内网地址不会在运行期变化，
+	// 每 5 秒重算一遍只是白白遍历网卡。
+	fp      string
+	localIP string
 }
 
 func (a *agent) setMsg(f string, args ...any) {
@@ -169,8 +186,11 @@ func (a *agent) report() {
 	st.ProxyOK = a.proxyCmd != nil
 	st.TunnelOK = a.sshCmd != nil
 	st.ExitIP = a.exitIP
+	st.ExitIPNote = a.exitNote
 	st.Message = a.msg
 	a.mu.Unlock()
+	st.Fingerprint = a.fp
+	st.LocalIP = a.localIP
 	_ = a.post("/api/agent/report?machine="+url.QueryEscape(a.machine), st, nil)
 }
 
@@ -319,7 +339,8 @@ func (a *agent) probeExitIP(proxyPort int) {
 		return
 	}
 	a.mu.Lock()
-	a.exitIP = fmt.Sprintf("%s（%s %s %s）", d.Query, d.RegionName, d.City, d.ISP)
+	a.exitIP = d.Query
+	a.exitNote = strings.TrimSpace(strings.Join([]string{d.RegionName, d.City, d.ISP}, " "))
 	a.mu.Unlock()
 }
 
@@ -546,9 +567,12 @@ func main() {
 		mid = agentMachineID(dir)
 	}
 
-	a := &agent{server: base, token: *token, proxy: *proxy, key: *key, user: *user, machine: mid}
-	log.Printf("wb2api-egress-agent %s 启动 | 云端=%s | 机器=%s(%s) | 代理=%s | 私钥=%s",
-		agentVersion, base, mid, hostname(), *proxy, *key)
+	a := &agent{
+		server: base, token: *token, proxy: *proxy, key: *key, user: *user, machine: mid,
+		fp: machineFingerprint(), localIP: localIPv4(),
+	}
+	log.Printf("wb2api-egress-agent %s 启动 | 云端=%s | 机器=%s(%s) | 指纹=%s | 内网=%s | 代理=%s | 私钥=%s",
+		agentVersion, base, mid, hostname(), a.fp, a.localIP, *proxy, *key)
 
 	// 自检模式：只验一次令牌与网络，然后退出。
 	if *once {
@@ -639,4 +663,60 @@ func main() {
 		a.report()
 		time.Sleep(pollInterval)
 	}
+}
+
+// machineFingerprint 这台机器的物理指纹（v0.3.1）。
+//
+// 为什么不能只用 machine.id：那个 id 是 agent 自己生成、存在同目录 machine.id 里的。
+// 用户把整个安装目录拷到另一台电脑（很常见：家里两台机都想接进来）→ 两份 agent
+// 报同一个 id，云端按 owner+id 分桶就会把两台并成一台，第二台永远抢不到端口。
+// 指纹取的是 hostname + 主网卡 MAC + 首选内网 IP，跨目录、跨版本都稳定，
+// 且不是 agent 随便填的 —— 后台据此能直接说"这两条线路是同一台机器"。
+//
+// 取不到 MAC（容器/权限受限）时退化为 hostname+内网 IP：仍然是"同一台机器会相同"，
+// 只是区分度低一些，并在日志里说明，不假装自己拿到了。
+func machineFingerprint() string {
+	parts := []string{strings.ToLower(strings.TrimSpace(hostname())), primaryMAC(), localIPv4()}
+	seed := strings.Join(parts, "|")
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:8])
+}
+
+// primaryMAC 第一块"像真网卡"的 MAC（跳过回环、全零、虚拟网桥常见的空值）。
+func primaryMAC() string {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, f := range ifs {
+		if f.Flags&net.FlagLoopback != 0 || len(f.HardwareAddr) == 0 {
+			continue
+		}
+		// 全零 MAC（部分虚拟网卡）没有区分度，跳过。
+		zero := true
+		for _, b := range f.HardwareAddr {
+			if b != 0 {
+				zero = false
+				break
+			}
+		}
+		if zero {
+			continue
+		}
+		return strings.ToLower(f.HardwareAddr.String())
+	}
+	return ""
+}
+
+// localIPv4 本机首选内网地址（不发包：UDP "连接"只做路由选择）。
+func localIPv4() string {
+	c, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer c.Close()
+	if a, ok := c.LocalAddr().(*net.UDPAddr); ok {
+		return a.IP.String()
+	}
+	return ""
 }

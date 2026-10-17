@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.25"
+const version = "0.31.26"
 
 type app struct {
 	store  *Store
@@ -1582,6 +1582,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/egress/recover", a.adminGuard(a.handleEgressRecover))
 	mux.HandleFunc("POST /api/admin/egress/candidates", a.adminGuard(a.handleEgressCandidates))
 	mux.HandleFunc("POST /api/admin/egress/assign", a.adminGuard(a.handleEgressAssign))
+	// 全局默认出口修复（v0.31.26）：护栏管不了历史配置，历史配置需要一键改回。
+	mux.HandleFunc("POST /api/admin/egress/default/repair", a.adminGuard(a.handleEgressDefaultRepair))
 	mux.HandleFunc("GET /api/admin/egress/overview", a.adminGuard(a.handleEgressOverview))
 	// 账号代理视图（v0.17.9）：逐账号的出口配置与实际出口（只读本地，不出站）。
 	mux.HandleFunc("GET /api/admin/egress/accounts", a.adminGuard(a.handleEgressAccounts))

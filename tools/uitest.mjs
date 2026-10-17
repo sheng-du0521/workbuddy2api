@@ -2188,16 +2188,31 @@ function run(pageFile, meOverride, plan) {
               json: () => Promise.resolve({ user: { id: 1, username: 'admin', is_admin: true } }) });
           }
           if (u.indexOf('/api/admin/egress/proxies') >= 0) {
+            const U1 = 'http://10.1.1.1:8080';
+            const U2 = 'http://10.1.1.2:8080';
             const body = JSON.stringify({
-              proxies: [{
-                id: 'p1', name: '线路甲', url: 'http://10.1.1.1:8080', region: '某地', note: '备注',
-                enabled: true, last_ok: true, last_ip: '9.9.9.9', last_check: now,
-                fail_streak: 0, created_at: now, updated_at: now, owner_user_id: 0,
-              }],
-              bound: { 'http://10.1.1.1:8080': 3 },
-              bound_names: { 'http://10.1.1.1:8080': ['甲'] },
+              // v0.31.26：两条线路**同一个出口 IP** —— 页面必须说出"实际只有 1 个出口"。
+              // 只看条数会给出错误的安全感（2026-10-17 现场：2 条线路都是 39.91.80.16）。
+              proxies: [
+                {
+                  id: 'p1', name: '线路甲', url: U1, region: '某地', note: '备注',
+                  enabled: true, last_ok: true, last_ip: '9.9.9.9', last_check: now,
+                  fail_streak: 0, created_at: now, updated_at: now, owner_user_id: 0,
+                },
+                {
+                  id: 'p2', name: '线路乙', url: U2, region: '某地', note: '同一条宽带',
+                  enabled: true, last_ok: true, last_ip: '9.9.9.9', last_check: now,
+                  fail_streak: 0, created_at: now, updated_at: now, owner_user_id: 0,
+                },
+              ],
+              bound: { [U1]: 3, [U2]: 0 },
+              bound_names: { [U1]: ['甲'], [U2]: [] },
               owners: {},
               machines: {},
+              exit_ip: { [U1]: '9.9.9.9', [U2]: '9.9.9.9' },
+              shared_exit: { [U1]: [U2], [U2]: [U1] },
+              shared_exit_groups: [{ exit_ip: '9.9.9.9', urls: [U1, U2], names: ['线路甲', '线路乙'], owners: [0, 0] }],
+              distinct_exit_ips: 1,
             });
             return Promise.resolve({ ok: true, status: 200,
               text: () => Promise.resolve(body), json: () => Promise.resolve(JSON.parse(body)) });
@@ -2220,11 +2235,21 @@ function run(pageFile, meOverride, plan) {
     await wait(600);
     const box = w.document.getElementById('egrCards');
     const n = box ? box.children.length : -1;
-    if (n !== 1) {
-      egrBad.push(`代理页线路卡应渲染 1 张，实得 ${n}（0 = 卡构造时抛错被 try/catch 吞掉）`);
+    if (n !== 2) {
+      egrBad.push(`代理页线路卡应渲染 2 张，实得 ${n}（0 = 卡构造时抛错被 try/catch 吞掉）`);
     }
     if (box && String(box.textContent).indexOf('线路甲') < 0) {
       egrBad.push('线路卡里没有线路名 —— 前端读的键与服务端下发的不一致');
+    }
+    // v0.31.26 出口身份：同 IP 的两条线路必须在卡片与总览上说明"实际只有 1 个 IP"。
+    const txt = box ? String(box.textContent) : '';
+    if (txt.indexOf('共用出口') < 0) {
+      egrBad.push('两条线路 last_ip 相同，但卡片没有"共用出口"提示 —— 「多条线路 = 多个 IP」的错觉会保留');
+    }
+    const hint = w.document.getElementById('egrPoolHint');
+    const htxt = hint ? String(hint.textContent) : '';
+    if (htxt.indexOf('1 个不同出口 IP') < 0) {
+      egrBad.push(`线路池总览应按 IP 报数（期望含「1 个不同出口 IP」），实得「${htxt}」`);
     }
     try { w.close(); } catch (e) {}
   }

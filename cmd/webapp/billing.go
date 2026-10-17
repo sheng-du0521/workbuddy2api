@@ -1511,6 +1511,13 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "全局默认出口代理：" + err.Error()})
 			return
 		}
+		// 护栏（v0.31.26）：全局默认是**唯一不经逐个指定就生效**的出口，
+		// 指向用户线路会让全平台未指定出口的号从这个用户的家庭宽带走。
+		// 见 egress_default.go 文件头（含 2026-10-17 的生产现场）。
+		if msg := a.defaultEgressGuard(p); msg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+			return
+		}
 		if err := a.store.SetKV(kvEgressDefault, p); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return

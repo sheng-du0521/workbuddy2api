@@ -6371,6 +6371,15 @@ let egrList = [];
 // （隧道断 = 整条线路一起失效），不标出来运维只会看到"探活失败"。
 let egrBound = {};
 let egrMachines = {};
+// egrExitIP / egrSharedExit / egrDistinctExits（v0.31.26）出口身份三件套。
+//
+// 为什么单开这三个变量：线路**条数**不等于**不同出口 IP 的个数**。
+// 同机多 agent、同一家宽的多个入口都会给出"多条线路、一个 IP"的结果 ——
+// 而按线路均衡分配看起来就像"已经分散了"（2026-10-17 现场：2 条线路都是
+// 39.91.80.16，38 个号全在这一个出口上）。页面必须按 IP 说话。
+let egrExitIP = {};       // url → 归一化出口 IP
+let egrSharedExit = {};   // url → 同 IP 的其它 url（数组）
+let egrDistinctExits = 0; // 实际不同出口 IP 个数
 // egrAssignUrl 非空 = 只把**这一条**线路分配给目标范围（线路卡上的「分配」按钮）。
 let egrAssignUrl = '';
 // egrOwners 线路 URL → **声明者**用户名（v0.31.23）；egrBoundNames = 正在用它的号主。
@@ -7240,6 +7249,9 @@ async function loadEgress(silent) {
     egrMachines = (pl && pl.machines) || {};
     egrOwners = (pl && pl.owners) || {};
     egrBoundNames = (pl && pl.bound_names) || {};
+    egrExitIP = (pl && pl.exit_ip) || {};
+    egrSharedExit = (pl && pl.shared_exit) || {};
+    egrDistinctExits = (pl && typeof pl.distinct_exit_ips === 'number') ? pl.distinct_exit_ips : 0;
     if (ac) {
       egrAccounts = ac.accounts || [];
       egrAccSummary = ac.summary || {};
@@ -7300,7 +7312,30 @@ function renderEgressAlert() {
   // （文案里要 <b>/<code>），所以任何来自后端的值都必须先转义 —— 否则一个
   // 被精心构造的代理 URL / 备注就能在管理后台里执行脚本。
   // 注意 o.default_egress 是**管理员配置**的值，仍属"可写"面（配置可能被社工诱导填入）。
-  if (o.default_egress) items.push({ tone: '', text: '全局默认出口代理已配置 <code>' + escapeHTML(o.default_egress) + '</code>：未指定的账号会走它；如需某账号直连，请用「直连」显式覆盖。' });
+  // 默认出口指向**用户线路**（v0.31.26）：这是最需要立刻处理的一条 ——
+  // 它意味着全平台未指定出口的号都在从某个用户的家庭宽带走，并与他的号同 IP。
+  if (o.default_user_owned) {
+    items.push({
+      tone: 'err',
+      text: '全局默认出口指向<b>用户 #' + (o.default_owner_user || 0) + '</b> 的线路 <code>'
+        + escapeHTML(o.default_egress || '') + '</code>：所有未单独指定出口的账号都会从这位用户的家庭宽带出去，'
+        + '并与他的号落在同一个公网 IP 上。应改回平台线路，或显式把号分配到那条线路。',
+      repair: true,
+    });
+  } else if (o.default_egress) {
+    items.push({ tone: '', text: '全局默认出口代理已配置 <code>' + escapeHTML(o.default_egress) + '</code>：未指定的账号会走它；如需某账号直连，请用「直连」显式覆盖。' });
+  }
+  // 同 IP 多线路（v0.31.26）：线路条数 ≠ 可用 IP 数。
+  if ((o.shared_exits || []).length) {
+    const g = o.shared_exits;
+    items.push({
+      tone: 'warn',
+      text: '有 <b>' + g.length + '</b> 组线路共用同一个出口 IP（'
+        + g.map((x) => x.exit_ip + ' × ' + x.urls.length + ' 条').join('、')
+        + '）——线路条数不等于可用 IP 数，实际只有 <b>' + (o.distinct_exit_ips || 0) + '</b> 个出口。'
+        + '自动分配已按 IP 去重，不会把这些号"分散"到同一个 IP 上。',
+    });
+  }
 
   const badge = $('egressBadge');
   if (bad) { badge.textContent = String(bad); badge.classList.remove('hidden'); }
@@ -7314,6 +7349,23 @@ function renderEgressAlert() {
     const d = el('div', 'notice ' + it.tone);
     // 文案里含 <b> 的走 innerHTML（内容全部由本文件生成，不含用户输入）。
     d.innerHTML = it.text;
+    // 可操作的结论要带按钮：只写"应该改回平台线路"而不给按钮，等于把
+    // 一个 5 秒的动作留成一条需要另找地方执行的任务。
+    if (it.repair) {
+      const b = el('button', '', '改回平台线路');
+      b.style.marginLeft = '10px';
+      b.title = '把全局默认出口改回平台自己的线路（优先探活通过的那条）；不改动任何账号上显式指定的出口';
+      b.onclick = async () => {
+        if (!(await confirmAsk('把全局默认出口改回平台自己的线路？\n（只改"未指定出口"的账号所继承的那个默认，不动任何账号上显式指定的出口）'))) return;
+        b.disabled = true;
+        try {
+          const r = await post('/api/admin/egress/default/repair', { mode: 'platform' });
+          toast('已改回：' + (r.default_egress || '（无可用平台线路）'), 'ok');
+          loadEgress();
+        } catch (e) { toast(e.message, 'err'); b.disabled = false; }
+      };
+      d.appendChild(b);
+    }
     box.appendChild(d);
   }
 }
@@ -7336,6 +7388,15 @@ function renderEgrPoolHint() {
   const fromCtl = egrList.filter((p) => egrMachines[p.url]).length;
   const fromUser = egrList.filter((p) => p.owner_user_id > 0).length;
   box.appendChild(document.createTextNode('共 ' + egrList.length + ' 条线路'));
+  // 出口 IP 口径（v0.31.26）：把"几条线路 / 几个 IP"并排说出来。
+  // 只说条数会给出错误的安全感 —— 两条线路可能共用一个家宽出口。
+  const withIP = egrList.filter((p) => egrExitIP[p.url]).length;
+  if (withIP) {
+    box.appendChild(document.createTextNode('、实际 ' + egrDistinctExits + ' 个不同出口 IP'));
+    if (egrDistinctExits < withIP) {
+      box.appendChild(el('b', 'err', '（有 ' + (withIP - egrDistinctExits) + ' 条与其它线路共用同一出口，不会提供额外 IP）'));
+    }
+  }
   if (fromCtl) {
     box.appendChild(document.createTextNode('，其中 ' + fromCtl + ' 条来自控制台「一键拉起」（卡片标注「本机 agent」）'));
   }
@@ -7684,6 +7745,18 @@ function egrCard(p) {
     line('来源', '本机 agent · ' + (mach.hostname || mach.id)
       + (mach.online ? '（在线）' : '（离线）')
       + (mach.tunnel_reachable ? ' · 隧道通' : ' · 隧道不通'), alive ? 'ok' : 'err');
+    // 同一台机器跑了两份 agent（v0.31.26）：machine id 是 agent 自报的，
+    // 拷一次安装目录就会重复；指纹才是"这是不是同一台电脑"的证据。
+    const dupFp = mach.duplicate_fingerprint || [];
+    if (dupFp.length) {
+      line('⚠ 重复接入', '同一台机器还在跑另一份 agent（' + dupFp.join('、') + '）：'
+        + '两条线路必然同一个出口 IP，还会互相抢隧道端口。请停掉多余的那份。', 'err');
+    }
+    const sameExit = mach.same_exit || [];
+    if (sameExit.length) {
+      line('同出口机器', '与 ' + sameExit.join('、') + ' 出口 IP 相同（不同机器、同一条宽带或同一 NAT）——'
+        + '不是配置错误，但不会带来新 IP。', 'warn');
+    }
   } else if (owner) {
     line('来源', '用户「' + owner + '」在控制台配置', 'ok');
   } else {
@@ -7694,6 +7767,16 @@ function egrCard(p) {
   const bn = egrBoundNames[p.url] || [];
   if (bn.length) line('在用归属', bn.join(' · '), '');
   line('真实出口 IP', p.last_ip || '（未探到）', p.last_ip ? 'ok' : '');
+  // 同一出口 IP 上还有别的线路（v0.31.26）：必须写在卡片上，
+  // 否则"我又加了一条线"会一直是错觉。
+  const shared = egrSharedExit[p.url] || [];
+  if (shared.length) {
+    const names = shared.map((u) => {
+      const q = egrList.find((x) => x.url === u);
+      return (q && q.name) || u;
+    });
+    line('⚠ 共用出口', '与「' + names.join('」「') + '」是同一个公网 IP —— 这两条线路不会提供额外的 IP', 'err');
+  }
   if (p.last_check) line('上次探活', fmtTime(p.last_check));
   if (p.fail_streak) line('连续失败', p.fail_streak + ' 次', 'err');
   if (stat.owners && stat.owners.length) line('涉及号主', stat.owners.map((o) => (o === 0 ? '平台' : '#' + o)).join(' · '));

@@ -1,16 +1,16 @@
 {
-  "version": "0.31.25",
+  "version": "0.31.26",
   "min_supported": "0.24.0",
-  "notes": "v0.31.25：**「用户代理」按钮全自动化** —— 点一下就好，不再让用户复制粘贴任何参数或密钥。① 先修一个**上一版没解决的前提**：v0.31.24 把「拉起出口」开放给了普通用户，但 agent 建反向隧道需要一把能登录服务器的 SSH 私钥，而部署用的是 root 那把（ai.pem）——把 root 私钥分发给每个用户等于每人一个 root。**不分发，用户就拉不起来**。现在改为**每用户一把专属受限密钥**：服务端 ssh-keygen 生成，写进 authorized_keys 时带 `restrict,command=\"/bin/true\",port-forwarding,permitlisten=\"127.0.0.1:12xxx\" ×10`，agent 用 `-user` 登录。② ⚠️ **实测纠正了一个想当然**（隔离 sshd 实例上验的）：**`restrict` 并不禁止 exec** —— `ssh -i key host 'id'` 照样能跑（它只禁 pty / agent 转发 / X11 / user-rc）。所以必须再加 `command=\"/bin/true\"` 顶替 exec；实测顶替后 `ssh -N -R` 的转发**不受影响**，而 `permitlisten` 精确挡住段外端口（连平台自己的 11080 与别的用户的 12040 都被服务端拒绝：`remote port forwarding failed for listen port 11080`）。③ **端口分区**：平台 11080-11089；用户 `12000+(uid%1000)*10` .. `+9`（每用户 10 台机器）。老机器（v0.31.24 全局分配、可能落在 1108x）会在下次 poll 时**幂等迁回本段**并重新下发 start，否则它会被 permitlisten 拒而表现为「连不通」。段满时 poll 明确报 409，不静默溢出。④ **一键安装**：控制台新增「① 下载本机代理安装包」→ `GET /api/egress/home/install` 按当前用户动态生成一个 **.bat**（只含服务地址 + 他自己的令牌，**不含任何密钥材料**——脚本会进浏览器下载目录并长期留存，私钥不该躺在那儿）。用户双击运行即完成；页面随后进入「等待接入」轮询，检测到那台电脑就**自动接着拉起**，全程只需「点一下 + 双击一下」。⑤ **agent 自举**：新增 `GET /api/agent/config`（令牌鉴权）——agent 首次启动凭令牌取回自己的受限私钥落盘到 key.pem，因此安装包与安装脚本都不必携带密钥；新增 `-config egress.json`（避开命令行转义）；`-R` 改为显式 `127.0.0.1:port`（与 permitlisten 的显式地址匹配）。⑥ **异常与并发**：pull 加**去抖**（同机器 3s 内重复不刷新指令 At —— 否则 agent 会把隧道拆了又建，表现为「点了反而更慢」）；apply 加**单飞**（并发第二个 409「正在应用中」，且该检查刻意放在隧道检查**之前**，否则连点第二次会得到误导性的「隧道未就绪」）；前端的失败提示统一走 `egressErrHint()` 把原文翻译成下一步（令牌无效→重新下载安装包、端口被拒、密钥被拒、隧道被占…），**原文一律保留**，映射错了也有据可查。⑦ 交付：agent 升 **v0.3.0**；`GET /api/egress/agent/bundle?part=agent|proxy`（令牌鉴权，避免变成公开的 15MB 下载位）下发可执行文件；文件缺失时**点名目录**（部署最常见的遗漏）。⑧ 测试：新增 `egress_auto_test.go` 9 条 —— 端口段分配/不重叠/段满、老机器幂等迁移、**限制行必须含 command= 与 permitlisten**（两处均做过变异检验：去掉即红）、安装脚本不含密钥材料、自举形状与平台视角不下发私钥、bundle 缺文件报错、pull 去抖、apply 单飞与 409、段满 409；另加 uitest 行为守卫 `egress-setup`（未接入时必须有「下载安装包」入口）。全量 go test 全绿、uitest PASS、jscheck 0 错误。",
-  "released_at": 1792184000,
+  "notes": "v0.31.26：**让不同宽带真的各出各的 IP**，先拆掉「多条线路 = 多个 IP」这个错觉。① 现场数据里三个根因：同**一台**电脑跑了两份 agent（v0.1.0 占 default 桶 + v0.3.0 用用户令牌），hostname 与出口 IP 完全相同（DESKTOP-AQO1QE4 / 39.91.80.16），后台却显示两条线路；全局默认出口被设成用户隧道 21160，38 个号全跟着它走，平台 11080 一个号都没用；分配算法按**线路**均衡，把号「分散」到同一个 IP 上 —— 报表说分散了，实际没隔离。② 出口身份按 **IP** 算：新增 `egress_exit.go` —— `normalizeExitIP`（兼容老 agent 的「IP（地区 ISP）」复合串）、`groupExits`、`dedupeProxiesByExit`；代理页/概览下发 `distinct_exit_ips`、`shared_exit`、`shared_exit_groups`；线路卡直接标「⚠ 共用出口」，池总览写「N 条线路、实际 M 个不同出口 IP」。③ **自动分配按 IP 去重**：同一出口的多条线路折叠成一条代表（平台线路优先），返回 `merged_exits` 与人话警告，杜绝「看起来分散」。④ **机器指纹**（agent v0.3.1）：hostname + 主网卡 MAC + 首选内网 IP 的哈希；同指纹 = 同一台机器（重复接入）会被直接点出来；不同机器但同出口 IP 标「同出口机器」（同宽带/NAT，不是配置错误，但不带来新 IP）。agent 同时改为上报**纯 IP** + 地区/ISP 两个字段。⑤ **全局默认出口护栏**：不允许指向用户线路（否则全平台未指定出口的号都从某个用户的家庭宽带走、并与他的号同 IP）；新增 `POST /api/admin/egress/default/repair`（mode=platform|none），告警区带「改回平台线路」按钮。⑥ 测试：`egress_exit_test.go` 4 条（含「两种形状必须归一相等」与「用户线路不被选为代表」）、`egress_default_test.go` 2 条、多机测试补两段（同指纹/同出口/复合串归一）；uitest `egr-cards` 改成两条同 IP 线路，断言卡片与总览都按 IP 说话。全量 go test 全绿、uitest PASS。",
+  "released_at": 1792228833,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.25/webapp.exe",
-      "sha256": "c76ef9412647817b9e08e9a2dc9855558522b5cd60bec3258cc80054b1259557",
-      "size": 15166976
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.26/webapp.exe",
+      "sha256": "c3b32741bfe18096e0b9458e545ff0854057c11a075cc9a11287aa359106108e",
+      "size": 15208960
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

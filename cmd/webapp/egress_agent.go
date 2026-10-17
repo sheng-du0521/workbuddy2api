@@ -157,7 +157,21 @@ type egressAgentState struct {
 	TunnelOK bool `json:"tunnel_ok"`
 	// ExitIP agent **通过该代理**查到的出口 IP（这是最有说服力的一行：
 	// 它证明"流量确实从家里出去了"，而不是"进程起来了"）。
+	//
+	// ⚠️ 历史上这里存的是 `"39.91.80.16（Shandong Jinan …）"` **复合串**（v0.3.0 及以前）。
+	// 比较出口是否相同必须走 `normalizeExitIP`（见 egress_exit.go）—— 直接比字符串
+	// 会把同一个 IP 的两种形状判成两个出口，同 IP 归并就完全失效。
 	ExitIP string `json:"exit_ip,omitempty"`
+	// ExitIPNote 出口 IP 的归属地/运营商（v0.31.26 起 agent 分开上报）。
+	ExitIPNote string `json:"exit_ip_note,omitempty"`
+	// Fingerprint 机器指纹（v0.31.26）：hostname + 主网卡 MAC + 首选内网 IP 的哈希。
+	//
+	// 它回答的是这台机器**能不能被 agent 自报的 id 骗过**的问题：machine id 是
+	// agent 自己生成、随参数上行的（用户把整个目录拷到另一台电脑就会重复），
+	// 而指纹取的是这台机器的物理特征 —— 两台机器同一个指纹，基本只能是同一台机器。
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// LocalIP 本机首选内网地址（人眼核对"这是哪台机器"用，不参与判定）。
+	LocalIP string `json:"local_ip,omitempty"`
 	// Message 最近一条人话状态（错误原文也放这里）。
 	Message string `json:"message,omitempty"`
 }
@@ -175,7 +189,10 @@ type egressMachine struct {
 	// 归属**由认领它的 agent 令牌决定**，且是**粘性**的 —— 机器一旦被某个用户
 	// 认领，别人就不能再操作它（视图里看不到、pull/apply 也拒），
 	// 与线路池 `EgressProxy.OwnerUserID` 同一条原则：归属是事后唯一的追责线索。
-	OwnerUserID int64            `json:"owner_user_id,omitempty"`
+	OwnerUserID int64 `json:"owner_user_id,omitempty"`
+	// Fingerprint 最近一次上报的机器指纹（v0.31.26）。
+	// 与 agent 自报的 machine id 并存：id 用来分桶，指纹用来识破"同一个 id/同一台机器"。
+	Fingerprint string           `json:"fingerprint,omitempty"`
 	Ports       egressAgentPorts `json:"ports"`
 	// Cmd / CmdAt 待执行（或最近一条）指令。空串 = none。
 	Cmd   string `json:"cmd,omitempty"`
@@ -583,6 +600,9 @@ func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(st.Hostname) != "" {
 		mm.Hostname = strings.TrimSpace(st.Hostname)
 	}
+	if fp := strings.TrimSpace(st.Fingerprint); fp != "" {
+		mm.Fingerprint = fp
+	}
 	if err := a.machinesSave(m); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -649,6 +669,15 @@ type egressMachineView struct {
 	LastAt     int64  `json:"last_at"`
 	// IsDefault 是否是不带 machine 参数的老 agent（default 桶）。
 	IsDefault bool `json:"is_default"`
+	// Fingerprint 机器指纹（v0.31.26）：同指纹 = **同一台机器**跑了两份 agent。
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// SameMachineOf 与本机同指纹的其它机器 key —— 非空即"重复接入"，
+	// 这类"两条线路"必然同一个出口，还会互相抢隧道端口。
+	SameMachineOf []string `json:"same_machine_of,omitempty"`
+	// SameExitOf 出口 IP 相同、但指纹不同的其它机器 key。
+	// 它不是配置错误（两台机器同一条宽带 / 同一 NAT / 双线负载均衡），
+	// 但**不会带来新 IP** —— 后台必须把它说出来，否则"我又接了一台"是错觉。
+	SameExitOf []string `json:"same_exit_of,omitempty"`
 }
 
 // egressHomeView 控制台「代理」页的状态载荷。
@@ -939,6 +968,18 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 	}
 	bound, hostTotal := a.egressHostBinding(urls, scope.hostOwner())
 
+	// 同指纹 / 同出口分组（v0.31.26）：见 egressMachineView 两个字段的注释。
+	fpGroup := map[string][]string{}
+	exitGroup := map[string][]string{}
+	for _, k := range keys {
+		if fp := strings.TrimSpace(m[k].Fingerprint); fp != "" {
+			fpGroup[fp] = append(fpGroup[fp], k)
+		}
+		if ip := normalizeExitIP(m[k].State.ExitIP); ip != "" {
+			exitGroup[ip] = append(exitGroup[ip], k)
+		}
+	}
+
 	for _, key := range keys {
 		mm := m[key]
 		url := egressHomeURL(mm.Ports.TunnelPort)
@@ -962,10 +1003,32 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 			ProxyID:   proxyIDByURL[url],
 			Applied:   applied,
 			HostBound: bound[url], HostTotal: hostTotal,
-			CurrentCmd: mm.Cmd,
-			LastAt:     mm.StateAt,
-			IsDefault:  key == egressDefaultMachine,
+			CurrentCmd:  mm.Cmd,
+			LastAt:      mm.StateAt,
+			IsDefault:   key == egressDefaultMachine,
+			Fingerprint: strings.TrimSpace(mm.Fingerprint),
 		}
+		if fp := strings.TrimSpace(mm.Fingerprint); fp != "" {
+			for _, k := range fpGroup[fp] {
+				if k != key {
+					mv.SameMachineOf = append(mv.SameMachineOf, k)
+				}
+			}
+		}
+		if ip := normalizeExitIP(mm.State.ExitIP); ip != "" {
+			for _, k := range exitGroup[ip] {
+				if k == key {
+					continue
+				}
+				// 同指纹的已经由 SameMachineOf 表达了，不重复报两次。
+				if fp := strings.TrimSpace(mm.Fingerprint); fp != "" && strings.TrimSpace(m[k].Fingerprint) == fp {
+					continue
+				}
+				mv.SameExitOf = append(mv.SameExitOf, k)
+			}
+		}
+		sort.Strings(mv.SameMachineOf)
+		sort.Strings(mv.SameExitOf)
 		mv.Tunnel = egressTunnelReachable(mm.Ports.TunnelPort)
 		mv.Ready = mv.Online && mv.Tunnel
 		v.Machines = append(v.Machines, mv)
@@ -1170,16 +1233,59 @@ func (a *app) egressBoundNamesByURL(urls []string) map[string][]string {
 func (a *app) egressMachinesByURL() map[string]map[string]any {
 	out := map[string]map[string]any{}
 	now := time.Now().Unix()
-	for _, mm := range a.machinesLoad() {
+	all := a.machinesLoad()
+
+	// 同指纹 / 同出口 IP 的分组（v0.31.26）。
+	//
+	// 这两个分组回答的是两个不同的问题，别混：
+	//   - 同指纹 = **同一台机器**跑了两份 agent（拷贝了安装目录 / 老 agent 占了 default 桶）。
+	//     这类"两条线路"必然同一个 IP，而且互相抢隧道端口。
+	//   - 同出口 IP、指纹不同 = 两台不同机器，但从同一条宽带/同一个 NAT 出去
+	//     （双线负载均衡、公司出口、同户多机）。这不是配置错误，但**不会带来新 IP**。
+	byFP := map[string][]string{}
+	byExit := map[string][]string{}
+	for key, mm := range all {
+		if fp := strings.TrimSpace(mm.Fingerprint); fp != "" {
+			byFP[fp] = append(byFP[fp], key)
+		}
+		if ip := normalizeExitIP(mm.State.ExitIP); ip != "" {
+			byExit[ip] = append(byExit[ip], key)
+		}
+	}
+	others := func(group []string, self string) []string {
+		list := make([]string, 0, len(group)-1)
+		for _, k := range group {
+			if k != self {
+				list = append(list, k)
+			}
+		}
+		sort.Strings(list)
+		return list
+	}
+
+	for key, mm := range all {
 		url := egressHomeURL(mm.Ports.TunnelPort)
+		fp := strings.TrimSpace(mm.Fingerprint)
+		ip := normalizeExitIP(mm.State.ExitIP)
 		out[url] = map[string]any{
 			"id":               mm.ID,
+			"key":              key,
 			"hostname":         mm.Hostname,
+			"owner_user_id":    mm.OwnerUserID,
 			"online":           mm.online(now),
 			"tunnel_reachable": egressTunnelReachable(mm.Ports.TunnelPort),
-			"exit_ip":          mm.State.ExitIP,
-			"last_at":          mm.StateAt,
-			"is_default":       mm.ID == egressDefaultMachine,
+			// exit_ip 归一化（用于比较/分组），exit_ip_raw 保留原文（用于人眼核对地区）。
+			"exit_ip":      ip,
+			"exit_ip_raw":  mm.State.ExitIP,
+			"exit_ip_note": mm.State.ExitIPNote,
+			"fingerprint":  fp,
+			"local_ip":     mm.State.LocalIP,
+			// duplicate_fingerprint 与 self 同指纹的**其它**机器 key。
+			"duplicate_fingerprint": others(byFP[fp], key),
+			// same_exit 出口 IP 相同、但指纹不同的机器 key（两台机器同一个出口）。
+			"same_exit":  others(byExit[ip], key),
+			"last_at":    mm.StateAt,
+			"is_default": mm.ID == egressDefaultMachine,
 		}
 	}
 	return out
@@ -1407,10 +1513,17 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeAppl
 	// 2) 全局默认出口 —— **仅平台视角**。用户视角下这一步不是"少做了"，
 	// 而是"本来就不该做"：他要的只是自己那几十个号从家里出去。
 	if scope.Platform {
-		if err := a.store.SetKV(kvEgressDefault, url); err != nil {
-			return res, err
+		// 护栏（v0.31.26）：这条 URL 若已被某个用户认领（owner 粘性 >0），
+		// 把它设成全局默认等于让全平台从这个用户的家庭宽带走。
+		// 平台视角拉的机器正常是 owner=0；能走到这里的只有"URL 先被用户占过"这种情形。
+		if hit.OwnerUserID == 0 {
+			if err := a.store.SetKV(kvEgressDefault, url); err != nil {
+				return res, err
+			}
+			res.DefaultOK = true
+		} else {
+			log.Printf("WARN: [egress] 拒绝把用户线路 %s（用户 #%d）设为全局默认出口", url, hit.OwnerUserID)
 		}
-		res.DefaultOK = true
 	}
 
 	// 3) 显式绑定自挂号（只改 egress_proxy 一个字段）。按视角收窄到自己的号。

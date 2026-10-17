@@ -375,6 +375,21 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ⚠️ 自动模式下按**出口 IP** 折叠候选（v0.31.26）。
+	//
+	// 不折的后果是"看起来分散、其实同一个 IP"：分配算法按线路做负载均衡，
+	// 同机多 agent 的两条线路会被轮流使用，于是一半的号被"均衡"到同一个公网
+	// IP 上，而报表显示"已分散到 2 条线路"（2026-10-17 生产现场正是如此：
+	// 2 条线路 last_ip 都是 39.91.80.16，38 个号全在这一个出口上）。
+	//
+	// 显式指名线路（wantURL != ""）时**不折**：管理员点的就是这条 URL，
+	// 悄悄换成别的线路会让他以为自己点错了。
+	mergedExits := map[string]string{}
+	var dedupeWarn []string
+	if wantURL == "" {
+		usable, mergedExits, dedupeWarn = dedupeProxiesByExit(usable, map[string]int{})
+	}
+
 	maxPer := req.MaxPerProxy
 	if maxPer <= 0 {
 		maxPer = a.store.egressMaxPerProxy()
@@ -385,6 +400,7 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	plan, warnings := planEgressAssignment(targets, usable, maxPer, isolate)
+	warnings = append(dedupeWarn, warnings...)
 
 	if !req.DryRun {
 		for _, it := range plan {
@@ -402,15 +418,36 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	for _, it := range plan {
 		perProxy[it.Proxy]++
 	}
+	// 分配结果落在几个**不同出口 IP** 上（这才是风控视角的"分散程度"：
+	// 分到 2 条线路但同一个 IP = 1 个出口，见 egress_exit.go）。
+	exitByURL := map[string]string{}
+	for _, p := range usable {
+		exitByURL[p.URL] = exitIPOfProxy(p)
+	}
+	usedExits := map[string]bool{}
+	for _, it := range plan {
+		if strings.TrimSpace(it.Proxy) == "" {
+			continue
+		}
+		ip := exitByURL[it.Proxy]
+		if ip == "" {
+			ip = "unknown:" + it.Proxy // 未探到出口的线路各算一个，不能互相顶替
+		}
+		usedExits[ip] = true
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"assigned":      len(plan),
-		"proxies_used":  len(perProxy),
-		"max_per_proxy": maxPer,
-		"isolate_owner": isolate,
-		"dry_run":       req.DryRun,
-		"plan":          plan,
-		"per_proxy":     perProxy,
-		"warnings":      warnings,
+		"assigned":       len(plan),
+		"proxies_used":   len(perProxy),
+		"distinct_exits": len(usedExits),
+		"max_per_proxy":  maxPer,
+		"isolate_owner":  isolate,
+		"dry_run":        req.DryRun,
+		"plan":           plan,
+		"per_proxy":      perProxy,
+		"warnings":       warnings,
+		// merged_exits 被折叠的线路 → 代表线路。前端据此解释"为什么只用了 1 条"，
+		// 而不是让人怀疑分配少派了线路。
+		"merged_exits": mergedExits,
 	})
 }
 
@@ -600,6 +637,19 @@ type egressOverviewView struct {
 	OverCount int `json:"over_count"`
 	// Unassigned 参与平台消耗但未配代理（直接暴露本机 IP）的账号数。
 	Unassigned int `json:"unassigned"`
+	// DistinctExitIPs 实际不同的出口 IP 个数（v0.31.26）。
+	//
+	// 与 len(Proxies) 的区别是本文件开头那段事故的全部要点：**线路条数不是出口数**。
+	// 顶部告警与页面总览都以这个数为准来回答"我现在有几个 IP 在轮换"。
+	DistinctExitIPs int `json:"distinct_exit_ips"`
+	// SharedExits 落在同一个出口 IP 上的线路组（仅列 >=2 条的组）。
+	SharedExits []egressExitGroup `json:"shared_exits"`
+	// DefaultOwnerUser 全局默认出口若指向**用户线路**，这里是该用户 id（否则 0）。
+	DefaultOwnerUser int64 `json:"default_owner_user"`
+	// DefaultUserOwned = DefaultOwnerUser > 0。含义很具体：
+	// 所有「未单独指定出口」的账号都会从**某个用户的家庭宽带**出去 ——
+	// 既是越界使用别人的带宽，也会把平台号与该用户的号绑在同一个 IP 上。
+	DefaultUserOwned bool `json:"default_user_owned"`
 }
 
 // handleEgressOverview 出口聚合看板。
@@ -735,6 +785,23 @@ func (a *app) egressOverview() (egressOverviewView, error) {
 	}
 	sort.Slice(owners, func(i, j int) bool { return owners[i] < owners[j] })
 
+	// 出口身份：按 IP 归并（见 egress_exit.go）。
+	ownerOf := map[string]int64{}
+	for _, p := range proxies {
+		ownerOf[p.URL] = p.OwnerUserID
+	}
+	items := make([]exitItem, 0, len(synced))
+	for _, v := range synced {
+		items = append(items, exitItem{
+			URL: v.URL, Name: v.Name, IP: v.LastIP, Owner: ownerOf[v.URL], OK: v.LastOK,
+		})
+	}
+	shared, distinct := groupExits(items)
+	defOwner := int64(0)
+	if strings.TrimSpace(defEgress) != "" {
+		defOwner = ownerOf[defEgress]
+	}
+
 	return egressOverviewView{
 		Proxies:            synced,
 		DirectAccountCount: directCount,
@@ -745,6 +812,10 @@ func (a *app) egressOverview() (egressOverviewView, error) {
 		OverCount:          overCount,
 		Unassigned:         unassigned,
 		DefaultEgress:      defEgress,
+		DistinctExitIPs:    distinct,
+		SharedExits:        shared,
+		DefaultOwnerUser:   defOwner,
+		DefaultUserOwned:   defOwner > 0,
 	}, nil
 }
 
@@ -775,16 +846,31 @@ func (a *app) handleEgressProxies(w http.ResponseWriter, r *http.Request) {
 		// 挂在 GET 的**附加键**上（而不是塞进 EgressProxy 结构）：既有形状
 		// （Go 字段名序列化）被前端大量引用，改形状等于把这一页全部重写。
 		urls := make([]string, 0, len(list))
+		items := make([]exitItem, 0, len(list))
+		exitIPs := map[string]string{}
 		for _, p := range list {
 			urls = append(urls, p.URL)
+			items = append(items, exitItem{
+				URL: p.URL, Name: p.Name, IP: p.LastIP, Owner: p.OwnerUserID, OK: p.LastOK,
+			})
+			exitIPs[p.URL] = exitIPOfProxy(p)
 		}
+		// 出口身份（v0.31.26）：**条数 ≠ 不同 IP 数**。
+		// 同一出口上挂多条线路（同机多 agent、同一家宽的多个入口）时，
+		// 管理员必须一眼看出来「我这里其实只有 1 个 IP」，否则"分散分配"
+		// 只会把号分散到同一个 IP 上（见 egress_exit.go 文件头）。
+		groups, distinct := groupExits(items)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"proxies":       list,
-			"max_per_proxy": a.store.egressMaxPerProxy(),
-			"bound":         a.egressBoundByURL(urls),
-			"bound_names":   a.egressBoundNamesByURL(urls),
-			"owners":        a.egressOwnerNames(list),
-			"machines":      a.egressMachinesByURL(),
+			"proxies":            list,
+			"max_per_proxy":      a.store.egressMaxPerProxy(),
+			"bound":              a.egressBoundByURL(urls),
+			"bound_names":        a.egressBoundNamesByURL(urls),
+			"owners":             a.egressOwnerNames(list),
+			"machines":           a.egressMachinesByURL(),
+			"exit_ip":            exitIPs,
+			"shared_exit":        sharedExitOfURLs(groups),
+			"shared_exit_groups": groups,
+			"distinct_exit_ips":  distinct,
 		})
 
 	case http.MethodPost:

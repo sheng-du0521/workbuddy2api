@@ -141,6 +141,43 @@ func TestEgressMachineMultiHost(t *testing.T) {
 	if !strings.HasSuffix(m2.ProxyURL, fmt.Sprintf(":%d", c2.TunnelPort)) {
 		t.Fatalf("mid-2 的线路 URL 应指向它自己的隧道端口，得 %q", m2.ProxyURL)
 	}
+
+	// ---- 5) 同指纹 = 同一台机器（v0.31.26）：必须点出来，别让人以为有两条线 ----
+	//
+	// 现场原型：本机先后跑了 v0.1.0（占 default 桶）与 v0.3.0（用户令牌），
+	// 两个 key、两个端口、两条线路，出口都是 39.91.80.16。
+	report("", egressAgentState{Hostname: "DESKTOP-AQO1QE4", ExitIP: "39.91.80.16（山东 济南 联通）", Fingerprint: "fp-same"})
+	report("mid-2", egressAgentState{Hostname: "DESKTOP-AQO1QE4", ExitIP: "39.91.80.16", Fingerprint: "fp-same"})
+	v2 := a.buildEgressHomeView(httptest.NewRequest(http.MethodGet, "/api/egress/home", nil), egressScope{Platform: true})
+	x1, x2 := findMachine(v2, egressDefaultMachine), findMachine(v2, "mid-2")
+	if len(x1.SameMachineOf) != 1 || x1.SameMachineOf[0] != "mid-2" {
+		t.Fatalf("default 应指出与自己同指纹的 mid-2，得 %v", x1.SameMachineOf)
+	}
+	if len(x2.SameMachineOf) != 1 || x2.SameMachineOf[0] != egressDefaultMachine {
+		t.Fatalf("mid-2 应反过来指出 default，得 %v", x2.SameMachineOf)
+	}
+	// 同指纹的也同出口，但不要再重复报一次 SameExitOf（一个事实说一遍）。
+	if len(x1.SameExitOf) != 0 {
+		t.Fatalf("同指纹机器不该再进 SameExitOf，得 %v", x1.SameExitOf)
+	}
+
+	// 复合串与纯 IP 必须被认成同一个出口（老 agent 报的就是复合串）。
+	byURL := a.egressMachinesByURL()
+	if got := byURL[x1.ProxyURL]["exit_ip"]; got != "39.91.80.16" {
+		t.Fatalf("机器出口 IP 应归一化为纯 IP，得 %v", got)
+	}
+
+	// ---- 6) 两台不同机器、出口相同：不是配置错误，但"没有新 IP"必须说清 ----
+	report("", egressAgentState{Hostname: "pc-a", ExitIP: "8.8.8.8", Fingerprint: "fp-a"})
+	report("mid-2", egressAgentState{Hostname: "pc-b", ExitIP: "8.8.8.8", Fingerprint: "fp-b"})
+	v3 := a.buildEgressHomeView(httptest.NewRequest(http.MethodGet, "/api/egress/home", nil), egressScope{Platform: true})
+	y1 := findMachine(v3, egressDefaultMachine)
+	if len(y1.SameMachineOf) != 0 {
+		t.Fatalf("不同指纹不该算同一台机器，得 %v", y1.SameMachineOf)
+	}
+	if len(y1.SameExitOf) != 1 || y1.SameExitOf[0] != "mid-2" {
+		t.Fatalf("应指出 mid-2 与自己同出口，得 %v", y1.SameExitOf)
+	}
 }
 
 // TestEgressHomeApplyTargetsMachine 应用动作只影响**被指定的那台**机器的线路。

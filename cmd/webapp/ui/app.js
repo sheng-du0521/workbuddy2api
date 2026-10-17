@@ -3004,8 +3004,14 @@ function renderEgressHome(box, v) {
   }
   card.appendChild(tbl);
 
-  // ---- 全部机器一览（多机时）----
-  if (machines.length > 1) {
+  // ---- 全部机器一览（多机时，或存在重复接入/同出口时）----
+  //
+  // 为什么要多一个显示条件（v0.31.26）：一台机器的场景也可能有问题 ——
+  // 同一台电脑跑了两份 agent，或两台机器其实从同一条宽带/NAT 出去。
+  // 这两种情况在页面上"看起来像多了一条线路"，但并不会多一个 IP；
+  // 不点出来，用户会一直以为"我已经有两个出口了"。
+  const anyDup = machines.some((m) => (m.same_machine_of || []).length || (m.same_exit_of || []).length);
+  if (machines.length > 1 || anyDup) {
     const mt = el('div', 'sub');
     mt.style.marginTop = '10px';
     mt.appendChild(el('div', null, '已接入的机器（每台一条独立隧道，端口不同，可同时在线）：'));
@@ -3020,6 +3026,21 @@ function renderEgressHome(box, v) {
         + (m.exit_ip ? ' · 出口 ' + m.exit_ip : '')
         + (m.applied ? ' · 已应用' : '')));
       mt.appendChild(line);
+      const lab = (k) => egressLabels[k] || k;
+      for (const k of (m.same_machine_of || [])) {
+        const w = el('div', null, '⚠ 与「' + lab(k) + '」是同一台机器（重复接入）：两条线路必然同一个出口 IP，'
+          + '还会互相抢隧道端口 —— 请停掉多余的那份 agent。');
+        w.style.color = '#c0392b';
+        w.style.paddingLeft = '12px';
+        mt.appendChild(w);
+      }
+      for (const k of (m.same_exit_of || [])) {
+        const w = el('div', null, '同一出口 IP 的还有「' + lab(k) + '」：不是配置错误（同一条宽带 / 同一 NAT），'
+          + '但不会带来新的 IP。要得到不同出口，需要改用另一条宽带或换个网络环境。');
+        w.style.color = '#b9770e';
+        w.style.paddingLeft = '12px';
+        mt.appendChild(w);
+      }
     }
     card.appendChild(mt);
   }
