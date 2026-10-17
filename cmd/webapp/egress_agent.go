@@ -1253,6 +1253,13 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 		}
 	}
 	others := func(group []string, self string) []string {
+		// ⚠️ 必须先判空（v0.31.26 线上 500 的成因）：老 agent 不上报指纹，
+		// `byFP[""]` 就是 nil，而 `make([]string, 0, len-1)` 在 len=0 时
+		// **cap = -1 → panic（makeslice: cap out of range）**，
+		// 结果是整页线路池 500 —— 且本地测试全绿，因为用例里都设了指纹。
+		if len(group) <= 1 {
+			return nil
+		}
 		list := make([]string, 0, len(group)-1)
 		for _, k := range group {
 			if k != self {

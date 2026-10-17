@@ -167,6 +167,34 @@ func TestEgressMachineMultiHost(t *testing.T) {
 		t.Fatalf("机器出口 IP 应归一化为纯 IP，得 %v", got)
 	}
 
+	// ---- 5b) 老 agent（无指纹）也必须能取线路视图 ----
+	//
+	// 这条是**线上 500 的回归**：`egressMachinesByURL` 里按指纹分组后
+	// `make([]string, 0, len(group)-1)`，无指纹时 group 为 nil → cap=-1 → panic，
+	// 整个代理页 500。此前用例都设了指纹，所以从未走到这条路径。
+	// 必须把**存量记录上的指纹清空**才算真的走到那条路径：
+	// 上报处理只在指纹非空时覆盖（老 agent 不上报时保留旧值），
+	// 所以单发一条无指纹的 report 是模拟不出"从没上报过指纹"的机器的。
+	mn := a.machinesLoad()
+	for _, x := range mn {
+		x.Fingerprint = ""
+	}
+	if err := a.machinesSave(mn); err != nil {
+		t.Fatalf("machinesSave: %v", err)
+	}
+	report("", egressAgentState{Hostname: "legacy", ExitIP: "1.2.3.4"})
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("无指纹的老 agent 不该让线路视图 panic：%v", r)
+			}
+		}()
+		out := a.egressMachinesByURL()
+		if len(out) == 0 {
+			t.Fatal("无指纹时也应返回机器视图")
+		}
+	}()
+
 	// ---- 6) 两台不同机器、出口相同：不是配置错误，但"没有新 IP"必须说清 ----
 	report("", egressAgentState{Hostname: "pc-a", ExitIP: "8.8.8.8", Fingerprint: "fp-a"})
 	report("mid-2", egressAgentState{Hostname: "pc-b", ExitIP: "8.8.8.8", Fingerprint: "fp-b"})
