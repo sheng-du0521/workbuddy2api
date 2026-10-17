@@ -1,16 +1,16 @@
 {
-  "version": "0.31.33",
+  "version": "0.31.34",
   "min_supported": "0.24.0",
-  "notes": "v0.31.33：**账号代理与出口代理一致化** —— 两边永远是同一份数据、同一个出口 IP。① 根因：线路的身份是 URL 字符串（egress_proxies.url 唯一键、accounts.egress_proxy 存同一个串），但账号那侧是自由文本且**不登记进池**：管理端「账号代理·改」填一个自定义代理，只写 accounts 表，线路池看不见它、也不会有 last_ip —— 于是账号侧永远回答不出\"这个号实际从哪个 IP 出去\"，池子的「N 条线路 / M 个 IP」也漏了它。更隐蔽的是写法漂移：`HTTP://a:1/` 与 `http://a:1`是两条线路、各自探活计数，出口 IP 却是同一个。② 规范化（internal/egress.Normalize + Validate 输出规范值）：协议名与主机小写、去掉空路径尾斜杠、丢弃 fragment；刻意不删默认端口、不重排 query（会改变行为）。store.SetAccountEgress 在**唯一落库点**统一规范化，任何绕不过它。③ 单一入口（cmd/webapp/egress_align.go）：`setAccountEgress` = 校验 → **确保线路池里存在**（缺则自动登记，归属按账号号主，名字带用户名）→ 再写账号。顺序刻意如此：反过来的话登记失败就会留下\"池里没有的出口\"。管理端单号改出口、用户端「我的出口」都改走它。④ 历史数据对齐：`convergeAccountEgress` 合并同一代理的不同写法（保留创建最早、并把它改写成规范 URL）、补登记池外的账号出口、把账号上的写法改写成规范值；启动时跑一次（不探活，避免拖慢首屏），另新增 `POST /api/admin/egress/converge`（可 probe=true 顺手探活拿 IP）。⑤ 查询侧同口径：管理端账号代理视图、用户端账号出口视图、机器视图的线路台账、绑定计数全部改用 `egressURLKey`（规范化键）比对 —— 否则历史行仍会「明明在池里却显示不在」。⑥ 概览新增 `orphan_account_egress`（池外出口条数，正常恒为 0）；管理后台线路池显示该计数并给「对齐账号出口」按钮，用户端出口面板的 IP 也随之有值（来自线路 last_ip，与出口代理同一个字段）。⑦ 测试：align 两条（写入即登记 + 幂等 + direct/空串不登记；历史脏数据合并/补登记/改写/孤儿清零/二次对齐无改动）、egress 包补规范化断言（大写协议、尾斜杠、fragment）；uitest 新增 egress-consistency 守卫（禁止 admin_ext 绕过统一入口、store 必须规范化、页面必须有告警与对齐入口）。⑧ 诚实边界：规范化会**改写历史数据**（大小写/尾斜杠那一类），行为等价但字符串会变；对齐不做\"按出口 IP 合并两条不同代理\"——那需要探活证据，且两条不同代理恰好同 IP 时合并会破坏用户意图，本版只把\"同一 URL 不同写法\"合并，同 IP 仍在页面上按 IP 报数。",
-  "released_at": 1792274581,
+  "notes": "v0.31.34：**代理规则按角色收紧 + 代理并入插件并给独立界面**。① 用户端规则（改动核心）：用户的线路**只承载自己的号** —— 账号代理与出口代理都一样。他人线路在用户端**结构性不可见**（GET /api/host/egress/lines 直接过滤，不是前端不渲染）、不可分配（assign 403 并指路「让管理员在后台分配」）、不参与按 IP 均衡；推翻了 v0.31.32 的「可借用他人线路」—— 那条规则的实际代价是 access_token 交给第三方机器，一次确认弹窗不是技术保障，且出风控事件时无法区分「我的号自己跑的」与「从别人家宽跑的」。② 管理端（保留并明确）：可以把**任何**线路（含用户接入的住宅 IP）分配给**任何**账号 —— 号池账号、其他用户的代挂号都行，这是「借用住宅 IP」的唯一入口；批量分配默认不勾「纳入用户线路」，勾选即知情（自动挑最闲会把平台 token 随机送去用户家里）；线路卡上标注三类来源（平台自建 / 用户接入 / 代理池导入），「代理」页的「接入出口代理池」入口即批量粘贴候选→探活→只收通的。③ 代理导航并入插件：用户端侧栏移除「代理」，改为插件「本地出口代理」（pluginDef.Kind=egress，Audience=user）；新增 openPluginView/closePluginView —— 插件打开后是**占满内容区的独立界面**（带「← 插件」返回栏、标题改成插件名），不再是卡片里那个一列宽的小面板；egress 视图复用现有代理页 DOM（同一份 id 与加载链），老链接 #egress 自动转成插件并打开。④ 所有插件优化：卡片加形态标签（批量执行 / 检测 / 控制台），停用时「打开」直接禁用（不再点进去收 403）；独立界面统一「返回栏 + 标题 + 说明 + 全宽内容」；独立界面型插件走批量执行接口时在**解析参数前**就返回 400 指路。⑤ 测试：新增 host_egress_rule_test（均衡只用平台+自己、插件契约：user 端有且 kind=egress、admin 端无、执行接口 400）；host_egress_lines_test 改为断言他人线路不可见 + assign 403 且账号未被改动；uitest 的 egress-self 增加行为断言（点「打开」→ 代理 pane 激活 + 标题变插件名 → 点返回回插件列表）。全量 go test 与 uitest 均通过。",
+  "released_at": 1792275410,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.33/webapp.exe",
-      "sha256": "1033e4e0b02efe87a29ad122e787d9bab580c570e561f39b514c93c36b3d21ff",
-      "size": 15378944
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.34/webapp.exe",
+      "sha256": "835fb5016e491e3e2883e52b6b72de2e8ed83066f66d3ae65eb011c896757ee8",
+      "size": 15389184
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

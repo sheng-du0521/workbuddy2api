@@ -28,7 +28,6 @@
       <button class="nav-item" data-nav="wallet" data-on="loadWallet" data-title="充值提现" data-sub="充值码兑换、提现申请与流水"><span class="ico">💳</span>充值提现</button>
       <div class="nav-group">代挂</div>
       <button class="nav-item" data-nav="host" data-on="loadHostAccounts" data-title="账号代挂" data-sub="把你的账号挂到平台：自用反代 / 申请进号池赚收益"><span class="ico">🔗</span>账号代挂<span class="badge hidden" id="hostInviteBadge">0</span></button>
-      <button class="nav-item" data-nav="egress" data-on="loadEgressHome" data-title="代理" data-sub="把本机住宅出口（家里的宽带）接进平台出站链路：一键拉起、自动应用"><span class="ico">🛡</span>代理</button>
       <button class="nav-item" data-nav="market" data-on="loadMarket" data-title="账号市场" data-sub="买断在售账号，转入你的代挂序列"><span class="ico">🏷</span>账号市场</button>
       <button class="nav-item" data-nav="growth" data-on="loadHostGrowth" data-title="成长任务" data-sub="手动选号做官方成长计划，查看完成进度"><span class="ico">🌱</span>成长任务</button>
       <div class="nav-group">收益</div>
@@ -377,8 +376,17 @@
     </section>
 
     <!-- ==================== 账号代挂 ==================== -->
-    <!-- ==================== 本地出口代理（v0.31.17） ==================== -->
-    <section class="pane" data-pane="egress">
+    <!-- ==================== 本地出口代理（v0.31.17；v0.31.34 改为插件视图） ====================
+         这个 pane 不再挂在侧导航上，而是由「插件 → 本地出口代理」打开：
+         点插件卡的「打开」→ 整页切到这里（data-plugin-view 供 openPluginView 定位）。
+         为什么保留同一份 DOM：里面每一个 id 都被 loadEgressHome / loadHostEgressLines
+         使用，重写一份"插件专用版"等于把两条链路各自维护一遍，很快就有一边漏字段。 -->
+    <section class="pane" data-pane="egress" data-plugin-view="host-egress">
+      <!-- 插件视图的返回栏：用户从插件进来，必须能一眼看出"这是插件里的一页"并能回去。 -->
+      <div class="row" style="align-items:center;gap:10px;margin:0 0 10px;">
+        <button class="ghost sm" data-plugin-back="1">← 插件</button>
+        <span class="muted" style="font-size:12px;">插件 · 本地出口代理</span>
+      </div>
       <div class="section-head">
         <h2>本地出口代理</h2>
         <span class="slot-refresh" data-refresh="loadEgressHome" data-refresh-label="刷新状态"></span>
@@ -390,8 +398,9 @@
         <br>用法：点下面的<b>「① 下载本机代理安装包」</b>，在目标电脑上<b>双击运行</b>它 ——
         安装包已经带上了你的服务地址与令牌，<b>不需要复制粘贴任何东西</b>；
         装好后本页会<b>自动检测到那台电脑并接着拉起代理</b>。
-        <br>这条线路<b>只作用于你自己的号</b>：平台的全局默认出口不会被动，
-        也不会影响任何其他用户。管理员可在后台看到这条线路并显式分配给别的号。
+        <br>🔒 <b>作用范围</b>：这条线路<b>只承载你自己的号</b>（账号代理与出口代理都是）。
+        其他用户的线路你既看不到也选不到；管理员可以在后台把你的线路显式分配给其他账号
+        —— 那属于管理动作，费用与责任由平台侧承担。
       </div>
       <div id="egressHomeBox"></div>
 
@@ -409,6 +418,8 @@
           点<b>「按出口 IP 均衡」</b>即可把号均分到<b>不同出口</b>上 ——
           同一个 IP 的多条线路只算一个出口，不会自欺。
           <br>⚠️ <b>线路条数 ≠ 出口 IP 数</b>：下面会分别报出来。
+          <br>可选线路 = <b>平台线路 + 你自己接的线路</b>。别人接的线路不会出现在这里
+          （住宅 IP 属于他本人，把凭证发过去等于把号交给他）。
         </div>
         <div id="egrAccBox"></div>
       </div>
@@ -550,7 +561,9 @@
         插件是<b>可安装 / 可停用</b>的功能单元：每张卡片右侧有开关，<b>停用只影响你自己</b>
         （入口与执行都停下，<b>不会改动任何数据</b>，随时可再启用）。
         平台是否提供某个插件由管理员决定 —— 若显示「平台已停用」，请联系管理员。
-        点开卡片即可使用；批量类操作一律<b>逐个串行</b>出站，不做"一键全并发"。
+        <br>点<b>「打开」</b>进入该插件的<b>独立界面</b>（不是挤在卡片里的小面板）：
+        带返回栏、占满内容区，表格与状态看得清。批量类操作一律<b>逐个串行</b>出站，
+        不做"一键全并发"。
       </div>
       <div class="cards" id="pluginCards"></div>
     </section>

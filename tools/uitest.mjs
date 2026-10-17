@@ -2331,6 +2331,20 @@ function run(pageFile, meOverride, plan) {
             return Promise.resolve({ ok: true, status: 200,
               text: () => Promise.resolve(body), json: () => Promise.resolve(SELF_VIEW) });
           }
+          // 插件列表（v0.31.34）：三种 kind 各一个，用来验"打开 = 独立界面"。
+          if (u.indexOf('/api/plugins') >= 0 && u.indexOf('/enabled') < 0) {
+            const PLUG = { plugins: [
+              { id: 'claim-compensation', name: '多账号领取积分补偿', desc: '桩',
+                audience: 'both', builtin: true, enabled: true, active: true, kind: 'claim' },
+              { id: 'health-check', name: '账号健康检测', desc: '桩',
+                audience: 'both', builtin: true, enabled: true, active: true, kind: 'health' },
+              { id: 'host-egress', name: '本地出口代理', desc: '桩',
+                audience: 'user', builtin: true, enabled: true, active: true, kind: 'egress' },
+            ] };
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(JSON.stringify(PLUG)),
+              json: () => Promise.resolve(PLUG) });
+          }
           // 我的账号出口（v0.31.31）：两条线路、两个不同出口 IP、两个号。
           // 页面必须按 IP 报数，并且逐号给出"从哪出去"。
           if (u.indexOf('/api/host/egress/lines') >= 0) {
@@ -2376,7 +2390,11 @@ function run(pageFile, meOverride, plan) {
     const w = dom.window;
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
-    if (typeof w.navGo === 'function') w.navGo('egress');
+    // v0.31.34：代理页已并入插件，侧导航不再有 egress 项 ——
+    // 必须走 openPluginView 进入（这也顺带验证了「插件能打开独立界面」）。
+    if (typeof w.openPluginView === 'function') {
+      w.openPluginView({ id: 'host-egress', name: '本地出口代理', kind: 'egress', desc: '桩' });
+    }
     await wait(700);
     const box = w.document.getElementById('egressHomeBox');
     const txt = box ? String(box.textContent) : '';
@@ -2420,11 +2438,68 @@ function run(pageFile, meOverride, plan) {
         egrSelfBad.push('缺少「按出口 IP 均衡」按钮 —— 用户没有办法一键把号分散到不同出口');
       }
     }
+    // v0.31.34：**代理并入插件**，且插件打开后是独立界面（不是卡片里的小面板）。
+    //
+    // 这一条同时守住三件事：
+    //   ① 侧导航不再有「代理」项（否则等于两个入口，状态会打架）；
+    //   ② 代理页 DOM 带 data-plugin-view，且带返回栏（用户必须能退出来）；
+    //   ③ 点插件卡的「打开」真的整页切过去，再点返回真的回到插件列表。
+    const dashSrc = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8');
+    if (dashSrc.indexOf('data-nav="egress"') >= 0) {
+      egrSelfBad.push('用户端侧导航仍有「代理」项 —— 它已并入插件，两个入口会各显示一套状态');
+    }
+    if (dashSrc.indexOf('data-plugin-view="host-egress"') < 0) {
+      egrSelfBad.push('代理页缺少 data-plugin-view 标记，openPluginView 找不到它');
+    }
+    if (dashSrc.indexOf('data-plugin-back') < 0) {
+      egrSelfBad.push('代理页缺少「← 插件」返回栏，用户进去就出不来');
+    }
+
+    // 行为：进插件列表 → 点「本地出口代理」的「打开」→ 断言整页切换 → 返回。
+    if (typeof w.navGo === 'function') w.navGo('plugins');
+    await wait(500);
+    const cards = Array.from(w.document.querySelectorAll('#pluginCards .card'));
+    if (cards.length !== 3) {
+      egrSelfBad.push(`插件页应渲染 3 张卡，实得 ${cards.length}`);
+    }
+    const egrCardEl = cards.find((c) => String(c.textContent).indexOf('本地出口代理') >= 0);
+    if (!egrCardEl) {
+      egrSelfBad.push('插件列表里没有「本地出口代理」—— 代理入口彻底丢了');
+    } else {
+      const openBtn = Array.from(egrCardEl.querySelectorAll('button'))
+        .find((b) => String(b.textContent).trim() === '打开');
+      if (!openBtn) {
+        egrSelfBad.push('「本地出口代理」卡上没有「打开」按钮');
+      } else {
+        openBtn.click();
+        await wait(400);
+        const egrPane = w.document.querySelector('.pane[data-pane="egress"]');
+        if (!egrPane || !egrPane.classList.contains('active')) {
+          egrSelfBad.push('点「打开」后代理页没有变成独立界面（pane 未激活）');
+        }
+        const title = w.document.getElementById('pageTitle');
+        if (!title || String(title.textContent).indexOf('本地出口代理') < 0) {
+          egrSelfBad.push('进入插件后标题应改成插件名（用户要知道自己在哪一页）');
+        }
+        const back = egrPane ? egrPane.querySelector('[data-plugin-back]') : null;
+        if (!back) {
+          egrSelfBad.push('独立界面缺少返回按钮');
+        } else {
+          back.click();
+          await wait(400);
+          const plugPane = w.document.querySelector('.pane[data-pane="plugins"]');
+          if (!plugPane || !plugPane.classList.contains('active')) {
+            egrSelfBad.push('点「← 插件」没有回到插件列表');
+          }
+        }
+      }
+    }
+
     try { w.close(); } catch (e) {}
   }
   egrSelfBad.forEach((m) => console.log('  [FAIL] egress-self: ' + m));
   if (!egrSelfBad.length) {
-    console.log('  [ok] egress-self: 用户视角代理页可操作，且不出现「全局默认出口」等误导文案');
+    console.log('  [ok] egress-self: 代理并入插件且能进独立界面；用户视角不出现「全局默认出口」');
   }
 
   // v0.31.32：**重新登录必须能自助完成**（扫码 或 导入 auth JSON），
@@ -2555,7 +2630,11 @@ function run(pageFile, meOverride, plan) {
     const w = dom.window;
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
-    if (typeof w.navGo === 'function') w.navGo('egress');
+    // v0.31.34：代理页已并入插件，侧导航不再有 egress 项 ——
+    // 必须走 openPluginView 进入（这也顺带验证了「插件能打开独立界面」）。
+    if (typeof w.openPluginView === 'function') {
+      w.openPluginView({ id: 'host-egress', name: '本地出口代理', kind: 'egress', desc: '桩' });
+    }
     await wait(700);
     const box = w.document.getElementById('egressHomeBox');
     const txt = box ? String(box.textContent) : '';

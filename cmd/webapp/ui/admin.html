@@ -514,6 +514,14 @@
         <div class="sub" style="margin:0 0 10px;">
           这里维护「可从哪些 IP 出去」。账号各自绑定一条线路，<b>同一号主的账号不应共用出口</b>。
           <br>保存时会实测线路并回显<b>真实出口 IP</b>；连续 3 次探活失败的线路会自动停用。
+          <br><b>三类来源</b>（卡片上有标注）：
+          <b>平台自建</b>（管理员手填 / 平台 agent）·
+          <b>用户接入</b>（用户在控制台拉起的住宅 IP）·
+          <b>代理池导入</b>（下方「批量探活导入」收进来的）。
+          <br>🔑 <b>作用范围</b>：用户的线路<b>只服务他自己的号</b>；管理员可以把它
+          <b>显式分配给任意账号</b>（含号池账号、其他用户的代挂号）—— 这正是"借用用户住宅 IP"
+          的唯一入口，用户自己做不到。分配会改变<span class="mono">accounts.egress_proxy</span>，
+          <b>不改线路归属</b>。
           <br>停用后绑在它上面的账号怎么处置，由下方<b>失效处置策略</b>决定 ——
           默认的<b>「不静默换出口」会把这些账号暂停服务</b>（留在原线路、<b>绝不回落直连</b>），
           等你补线路或改绑定。
@@ -534,7 +542,7 @@
              出站请求带的是账号 access_token，公开免费代理是不可信的第三方主机；
              且实测可用率仅约 1%，自动绑上去等于给每个账号装定时炸弹。 -->
         <details style="margin:0 0 12px;">
-          <summary class="muted" style="font-size:12px;cursor:pointer;">批量探活导入候选线路（粘贴一批，只收通得过的）</summary>
+          <summary class="muted" style="font-size:12px;cursor:pointer;">接入出口代理池（粘贴一批候选线路，探活后只收通得过的）</summary>
           <div style="margin-top:8px;">
             <textarea id="egrCandText" rows="4" placeholder="每行一条，如 http://1.2.3.4:8080（# 开头为注释，支持逗号/空白分隔）" style="width:100%;"></textarea>
             <div class="row" style="margin-top:8px;">
@@ -626,7 +634,7 @@
             <!-- v0.31.32：借用用户住宅 IP。默认不勾 —— 勾了就等于"平台账号的
                  access_token 可以从某个用户的家里出去"，这是知情决定。 -->
             <label class="inline" style="font-size:12px;"
-              title="把用户控制台接进来的线路也纳入自动候选。用户线路是别人的机器：勾选后平台账号的请求（含 access_token）会经过对方设备。">
+              title="把用户控制台接进来的线路也纳入自动候选。用户线路是别人的机器：勾选后平台账号的请求（含 access_token）会经过对方设备。不勾也能用：在线路卡上点「分配」显式指定即可。">
               <input type="checkbox" id="egrIncludeUser"> 纳入用户线路（借用住宅 IP）
             </label>
             <button class="ghost" id="btnEgrDry">预览方案</button>
@@ -7488,6 +7496,13 @@ function renderEgrPoolHint() {
     box.appendChild(el('b', 'err', '；有 ' + orphan + ' 个账号的出口不在线路池里'
       + '（点上方「对齐账号出口」补登记）'));
   }
+  // 号走在他人线路上（v0.31.34）：合法但要知情 —— 那批号靠在别人的家宽上，
+  // 对方一关机就全掉，而且凭证对线路主人可见。
+  const fbound = (egrView && egrView.foreign_bound_accounts) || 0;
+  if (fbound > 0) {
+    box.appendChild(el('b', 'warn', '；有 ' + fbound + ' 个账号正走在他人的线路上'
+      + '（存量借用或你的显式分配：对方掉线即不可用，可在「账号代理」逐号改回）'));
+  }
   const dups = egrList.filter((p) => {
     const m = egrMachines[p.url];
     return m && (m.alt_ids || []).length;
@@ -7815,7 +7830,9 @@ function egrCard(p) {
   // 不受我们控制的第三方出口，只能被显式指名分配（不进自动选线与自动迁移）。
   if (p.owner_user_id > 0) {
     chips.appendChild(chipWithTitle('用户线路', 'warn',
-      '这条出口由用户在控制台配置，不受平台控制：只能被**显式指名**分配，不参与自动选线与自动迁移'));
+      '这条出口由用户在控制台配置（住宅 IP），不受平台控制。'
+      + '用户自己的号可以随便用；给平台/别人的号用只能由管理员显式分配，'
+      + '或在批量分配里勾「纳入用户线路」才会进自动候选（默认不进，避免把凭证随机送去用户家里）'));
   }
   card.appendChild(chips);
 

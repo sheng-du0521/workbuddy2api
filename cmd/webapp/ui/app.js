@@ -361,7 +361,13 @@ function setupNav(root) {
     return true;
   };
   items.forEach((it) => { it.onclick = () => go(it.dataset.nav); });
-  const initial = (location.hash || '').replace('#', '');
+  let initial = (location.hash || '').replace('#', '');
+  // 兼容老链接（v0.31.34）：「代理」曾是一级导航，现在并进插件。
+  // 直接落到第一个导航项会让人以为"页面没了"，所以转成插件页 + 稍后自动打开该插件。
+  if (initial === 'egress') {
+    window.__openPluginAfterLoad = 'host-egress';
+    initial = 'plugins';
+  }
   if (!initial || !go(initial, true)) {
     const first = items.find((x) => x.classList.contains('active')) || items[0];
     if (first) go(first.dataset.nav, true);
@@ -2582,6 +2588,13 @@ async function loadPlugins() {
     return;
   }
   for (const p of list) box.appendChild(pluginCard(p));
+  // 老链接 #egress 的落地（见 setupNav）：列表就绪后自动进入插件。
+  const want = window.__openPluginAfterLoad;
+  if (want) {
+    window.__openPluginAfterLoad = '';
+    const one = list.find((x) => x.id === want);
+    if (one) openPluginView(one);
+  }
 }
 
 // pluginToggleSwitch 一张卡上的启停开关（v0.31.22）。
@@ -2615,10 +2628,133 @@ function pluginToggleSwitch(p, on, disabled, text, title) {
   return lab;
 }
 
+// ======================================================================
+// 插件独立视图（v0.31.34）
+//
+// 为什么不再用"卡片里展开的小面板"：
+//   · 插件本来就是一个个**独立功能**（领取、体检、出口代理），而卡片只有
+//     一列宽度、还夹在列表里 —— 逐号表格、隧道状态、机器列表塞进去根本读不清；
+//   · 「本地出口代理」这类插件是**持续操作的控制台**，不是"点一次就跑"，
+//     必须占满内容区并带自己的返回栏，否则用户会不知道该页属于谁、怎么退出去。
+//
+// 结构：
+//   · 有专属 pane 的插件（egress 复用现有代理页 DOM）→ `.pane[data-plugin-view="<id>"]`；
+//   · 其余插件 → 动态建一个通用 pane（返回栏 + 标题 + 说明 + [data-plugin-body]）。
+//
+// ⚠️ 不写 location.hash：插件视图是"插件"这个导航项的子页，
+// 深链回退到 hash 会与 setupNav 的初始解析打架（刷新后会落到第一个导航项）。
+// ======================================================================
+
+// pluginViewPane 取得/创建某插件的独立视图容器（幂等）。
+function pluginViewPane(p) {
+  let pane = document.querySelector('.pane[data-plugin-view="' + p.id + '"]');
+  if (pane) return pane;
+
+  pane = el('section', 'pane');
+  pane.setAttribute('data-plugin-view', p.id);
+  pane.setAttribute('data-pane', 'plugin-' + p.id);
+
+  const bar = el('div', 'row');
+  bar.style.cssText = 'align-items:center;gap:10px;margin:0 0 10px;';
+  const back = el('button', 'ghost sm', '← 插件');
+  back.setAttribute('data-plugin-back', '1');
+  bar.appendChild(back);
+  bar.appendChild(el('span', 'muted', '插件 · ' + p.name));
+  pane.appendChild(bar);
+
+  const head = el('div', 'section-head');
+  head.appendChild(el('h2', null, p.name));
+  pane.appendChild(head);
+  // 卡片上的 desc 由服务端给（可能含 <b>），用 innerHTML 保留强调；
+  // 内容是注册表里的常量，不来自用户输入。
+  const desc = el('div', 'sub');
+  desc.style.margin = '0 0 14px';
+  desc.innerHTML = p.desc || '';
+  pane.appendChild(desc);
+
+  const body = el('div');
+  body.setAttribute('data-plugin-body', '1');
+  pane.appendChild(body);
+
+  // 插到「插件」页后面（同级），这样它天然是插件的子页位置。
+  const host = document.querySelector('.pane[data-pane="plugins"]');
+  if (host && host.parentNode) host.parentNode.insertBefore(pane, host.nextSibling);
+  else document.body.appendChild(pane);
+  return pane;
+}
+
+// openPluginView 打开某插件的独立界面（隐藏其它 pane，侧栏仍停在「插件」）。
+function openPluginView(p) {
+  const pane = pluginViewPane(p);
+  const items = Array.from(document.querySelectorAll('.nav-item'));
+  document.querySelectorAll('.pane').forEach((x) => x.classList.remove('active'));
+  pane.classList.add('active');
+  // 侧栏保持「插件」高亮：用户的位置感是"我在插件里"，而不是"我掉到了别的页"。
+  items.forEach((x) => x.classList.toggle('active', x.dataset.nav === 'plugins'));
+  setTxt('pageTitle', p.name);
+  setTxt('pageSub', '插件 · ' + (p.kind === 'egress' ? '独立控制台' : '批量操作'));
+  window.__pluginViewOpen = p.id;
+  if (typeof window.onNavChange === 'function') window.onNavChange('plugin:' + p.id);
+  // 回到顶部：从列表点进来时页面可能已经滚到很下面，不重置会"打开后一片空白"。
+  try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch (e) { /* 忽略 */ }
+
+  if (p.kind === 'egress') {
+    // 复用现有代理页加载链（含机器状态 + 我的账号出口两张卡）。
+    if (typeof window.loadEgressHome === 'function') window.loadEgressHome();
+    return;
+  }
+  const body = pane.querySelector('[data-plugin-body="1"]');
+  if (body) pluginFillPanel(p, pane, body);
+}
+
+// closePluginView 回到插件列表。
+function closePluginView() {
+  window.__pluginViewOpen = '';
+  const back = document.querySelector('.nav-item[data-nav="plugins"]');
+  if (back) {
+    // 复用导航逻辑：它负责恢复标题、隐藏其它 pane、重跑 loadPlugins（刷新状态）。
+    back.click();
+    return;
+  }
+  // 兜底（理论上不会走到）：手工恢复。
+  document.querySelectorAll('.pane').forEach((x) => x.classList.remove('active'));
+  const pane = document.querySelector('.pane[data-pane="plugins"]');
+  if (pane) pane.classList.add('active');
+  setTxt('pageTitle', '插件');
+  if (typeof window.loadPlugins === 'function') window.loadPlugins();
+}
+
+// 返回按钮用**事件委托**：pane 可能是动态创建的，逐次绑定容易漏。
+if (typeof document !== 'undefined' && !window.__pluginBackBound) {
+  window.__pluginBackBound = true;
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    const btn = t && t.closest ? t.closest('[data-plugin-back]') : null;
+    if (!btn) return;
+    e.preventDefault();
+    closePluginView();
+  });
+}
+
 // pluginCard 一张插件卡：标题 + 状态 + 启用开关 + 展开的执行面板。
+// pluginKindLabel 插件形态的中文标签（v0.31.34）。
+//
+// 为什么在卡片上标出来：用户看到三张卡却不知道"打开之后会是什么"，
+// 而三种形态的交互差别很大（执行一次 / 读一次状态 / 持续控制台）。
+// 标签让人在点之前就有预期。
+function pluginKindLabel(kind) {
+  switch (kind) {
+    case 'health': return { text: '检测', title: '只读检查每个号的凭证/余额/对话/出口' };
+    case 'egress': return { text: '控制台', title: '持续运行的出口代理：拉起隧道、逐号分配出口' };
+    case 'claim': return { text: '批量执行', title: '对选中的号逐个串行执行一次写操作' };
+    default: return { text: '批量执行', title: '' };
+  }
+}
+
 function pluginCard(p) {
+  // 状态容器：独立视图里的面板会复用（picked / targets / rows 跨开关保留）。
   const st = (pluginState[p.id] = pluginState[p.id] || {
-    open: false, targets: null, picked: null, running: false, rows: {},
+    targets: null, picked: null, running: false, rows: {},
   });
   const card = el('div', 'card');
   card.style.marginBottom = '14px';
@@ -2634,6 +2770,13 @@ function pluginCard(p) {
   badge.style.fontSize = '12px';
   badge.style.marginLeft = '8px';
   head.appendChild(badge);
+  // 形态标签：让「打开」之前就知道里面是什么。
+  const kl = pluginKindLabel(p.kind);
+  const kindTag = el('span', 'tag', kl.text);
+  kindTag.style.fontSize = '12px';
+  kindTag.style.marginLeft = '6px';
+  if (kl.title) kindTag.title = kl.title;
+  head.appendChild(kindTag);
   card.appendChild(head);
 
   card.appendChild(el('div', 'sub', p.desc || ''));
@@ -2659,29 +2802,27 @@ function pluginCard(p) {
         : '只影响你自己的入口与执行，不影响平台其他用户'));
   }
 
-  const btnToggle = el('button', 'ghost', st.open ? '收起' : '打开');
-  btnToggle.addEventListener('click', () => {
-    st.open = !st.open;
-    pluginRenderPanel(p, card);
-  });
-  row.appendChild(btnToggle);
+  // 打开 = 进入**独立界面**（v0.31.34）。不再在卡片里展开小面板。
+  //
+  // 停用时禁用按钮：点进去也只会拿到 403，不如在入口就把话说清
+  // （"停用"是个明确状态，不该用一个失败弹窗来表达）。
+  const btnOpen = el('button', '', '打开');
+  btnOpen.disabled = !active;
+  btnOpen.title = active
+    ? '进入独立界面（占满内容区，带返回栏）'
+    : '插件已停用：先启用再打开';
+  btnOpen.addEventListener('click', () => openPluginView(p));
+  row.appendChild(btnOpen);
+
+  // 领取类插件额外给一个"批量"提示：用户最关心"会不会一次打一堆请求"。
+  if (p.kind !== 'health' && p.kind !== 'egress') {
+    const hint = el('span', 'muted', '逐个串行');
+    hint.style.fontSize = '11px';
+    hint.title = '该插件对选中的号依次执行，每次只发一个上游请求';
+    row.appendChild(hint);
+  }
   card.appendChild(row);
-
-  const panel = el('div');
-  panel.dataset.panelFor = p.id;
-  card.appendChild(panel);
-  if (st.open) pluginFillPanel(p, card, panel);
   return card;
-}
-
-// pluginRenderPanel 切换展开态（重画这一张卡的面板区）。
-function pluginRenderPanel(p, card) {
-  const panel = card.querySelector('[data-panel-for="' + p.id + '"]');
-  if (!panel) return;
-  panel.textContent = '';
-  const btn = card.querySelector('button.ghost');
-  if (btn) btn.textContent = p.id && pluginState[p.id] && pluginState[p.id].open ? '收起' : '打开';
-  if (pluginState[p.id] && pluginState[p.id].open) pluginFillPanel(p, card, panel);
 }
 
 // pluginHealthPanel 健康检测面板（v0.31.31）。
@@ -3312,8 +3453,11 @@ function renderHostEgress(d) {
   const usable = heUsableLines();
   const hint = document.getElementById('egrAccHint');
   if (hint) {
+    // 口径（v0.31.34）：这里只统计**我能用的**线路（平台 + 我的）。
+    // 写「共 N 条」会让人以为全平台只有 N 条，而别人的线路对他是不可见的 ——
+    // 一个总数既不能用来判断"我够不够"，还会引出"为什么我看不到别的"这类疑问。
     hint.textContent = heAccounts.length
-      ? ('共 ' + heLines.length + ' 条线路 · 可用 ' + usable.length + ' 条 · 实际 '
+      ? ('可用 ' + usable.length + ' 条线路（平台 + 我的）· 实际 '
         + (d.distinct_exit_ips || 0) + ' 个不同出口 IP')
       : '';
   }
@@ -3356,7 +3500,7 @@ function renderHostEgress(d) {
   opt('__direct', '直连（不走任何代理）');
   opt('__clear', '跟随默认（清空本号出口配置）');
   for (const l of usable) {
-    const who = l.mine ? '' : (l.platform ? '［平台］' : ('［他人 ' + (l.owner_name || '') + '］'));
+    const who = l.mine ? '［我的］' : '［平台］';
     opt(l.url, who + '线路：' + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : '（出口未知）'));
   }
   bar.appendChild(sel);
@@ -3367,13 +3511,6 @@ function renderHostEgress(d) {
     const uids = Array.from(hePicked);
     if (!uids.length) { toast('先勾选账号', 'err'); return; }
     const proxy = v === '__direct' ? 'direct' : (v === '__clear' ? '' : v);
-    // 借用他人线路的代价提示（v0.31.32）：这不是"多了一个 IP"，而是"多经过一台别人的机器"。
-    const line = heLines.find((x) => x.url === v);
-    if (line && line.foreign) {
-      if (!(await confirmAsk('这条线路由「' + (line.owner_name || '其他用户') + '」提供。\n\n'
-        + '⚠ 这些号的上游请求（含 access_token）会**经过对方的机器**，对方在技术上可以看到。\n'
-        + '仅在你信任对方时使用。继续？'))) return;
-    }
     apply.disabled = true;
     try {
       const r = await post('/api/host/egress/assign', { uids, proxy });
@@ -3400,10 +3537,10 @@ function renderHostEgress(d) {
     const txt = el('div');
     txt.style.padding = '2px 0';
     txt.appendChild(el('b', null, ip + '  '));
-    // 每条线路标注归属（v0.31.32）：自己的 / 平台 / **他人的**。
-    // 别人接进来的线路现在可以借用，但"借的是谁的机器"必须一眼看见。
+    // 归属只有两种（v0.31.34）：平台线路 / 我自己接的。
+    // 他人的线路后端已不再下发，这里也就不需要"借的是谁的机器"那套标注。
     txt.appendChild(el('span', null, arr.map((l) => {
-      const who = l.mine ? '' : (l.platform ? '平台・' : ('他人 ' + (l.owner_name || '') + '・'));
+      const who = l.mine ? '我的・' : '平台・';
       return who + (l.name || l.url) + '（' + l.url + '）';
     }).join('、')));
     if (arr.length > 1) {
@@ -3438,10 +3575,10 @@ function renderHostEgress(d) {
         + '要真正多出 IP，需要另一台电脑（另一条宽带）接入，或换一条不同出口的线路。');
       w.style.cssText = 'margin-top:6px;color:#b9770e;font-size:12px;';
       diag.appendChild(w);
-    } else if (usable.length && usable.every((l) => l.foreign)) {
-      const w = el('div', null, '你的可用线路全部是**他人提供**的：能用，但流量会经过对方的机器。'
-        + '建议自己也接一台（「一键拉起」），把主要账号放回自己的出口。');
-      w.style.cssText = 'margin-top:6px;color:#b9770e;font-size:12px;';
+    } else if (usable.length && !usable.some((l) => l.mine)) {
+      const w = el('div', null, '你现在只用了平台线路。想要自己的住宅 IP，点上面的'
+        + '「① 下载本机代理安装包」在任意一台电脑上运行即可 —— 那条线路只承载你自己的号。');
+      w.style.cssText = 'margin-top:6px;color:#888;font-size:12px;';
       diag.appendChild(w);
     } else if (distinct === 1 && usable.length === 1) {
       const w = el('div', null, '当前只有 1 条线路：所有号都从这一个 IP 出去。再接一台电脑（另一条宽带）就能分散。');
@@ -3499,6 +3636,16 @@ function renderHostEgress(d) {
     ipLine.style.fontSize = '11px';
     if (!a.exit_ip) ipLine.style.color = '#b9770e';
     exitTxt.appendChild(ipLine);
+    // 越界绑定（v0.31.34）：这个号当前走的是别人的线路。
+    // 规则收紧后用户选不到那条线路，所以他要靠这行字才知道"我现在在借谁的机器"。
+    if (a.foreign_bound) {
+      const fb = el('div', null, '⚠ 当前走的是「' + (a.foreign_owner_name || '其他用户')
+        + '」的线路：你的号经过对方的机器，对方一关机这个号就不可用。'
+        + '建议用右侧下拉改成自己的或平台线路。');
+      fb.style.fontSize = '11px';
+      fb.style.color = '#c0392b';
+      exitTxt.appendChild(fb);
+    }
     if (a.token_dead) {
       const dead = el('div', null, '⚠ 登录已失效，改出口无效 —— 请先重新登录');
       dead.style.fontSize = '11px';
@@ -3514,7 +3661,7 @@ function renderHostEgress(d) {
     const od = el('option', null, '直连'); od.value = 'direct'; one.appendChild(od);
     const oc = el('option', null, '跟随默认'); oc.value = '__clear'; one.appendChild(oc);
     for (const l of usable) {
-      const who = l.mine ? '' : (l.platform ? '［平台］' : ('［他人 ' + (l.owner_name || '') + '］'));
+      const who = l.mine ? '［我的］' : '［平台］';
       const o = el('option', null, who + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : ''));
       o.value = l.url;
       one.appendChild(o);
@@ -3522,14 +3669,6 @@ function renderHostEgress(d) {
     one.onchange = async () => {
       const v = one.value;
       if (!v) return;
-      const line = heLines.find((x) => x.url === v);
-      if (line && line.foreign) {
-        if (!(await confirmAsk('这条线路由「' + (line.owner_name || '其他用户') + '」提供。\n\n'
-          + '⚠ 这个号的上游请求（含 access_token）会**经过对方的机器**。继续？'))) {
-          one.value = '';
-          return;
-        }
-      }
       const proxy = v === '__clear' ? '' : v;
       one.disabled = true;
       try {

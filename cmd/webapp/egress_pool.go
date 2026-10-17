@@ -665,6 +665,11 @@ type egressOverviewView struct {
 	// 非 0 = 有人绕过接口直接改了库，或者 URL 无法规范化 —— 两种情况都会让
 	// 「账号代理」与「出口代理」的 IP 对不上，所以要在页面上报出来并可一键对齐。
 	OrphanAccountEgress int `json:"orphan_account_egress"`
+	// ForeignBoundAccounts 号走在他人的线路上（存量借用 / 管理员显式分配）的账号数（v0.31.34）。
+	//
+	// 不是"错误"，但必须知情：这些号的上游请求经过另一台机器，
+	// 那台机器一关机整批就掉；而且凭证对线路主人可见。
+	ForeignBoundAccounts int `json:"foreign_bound_accounts"`
 }
 
 // handleEgressOverview 出口聚合看板。
@@ -818,20 +823,21 @@ func (a *app) egressOverview() (egressOverviewView, error) {
 	}
 
 	return egressOverviewView{
-		Proxies:             synced,
-		DirectAccountCount:  directCount,
-		DirectExplicit:      directExplicit,
-		DirectOwners:        owners,
-		Bad:                 badRows,
-		MaxPerProxy:         maxPer,
-		OverCount:           overCount,
-		Unassigned:          unassigned,
-		DefaultEgress:       defEgress,
-		DistinctExitIPs:     distinct,
-		SharedExits:         shared,
-		DefaultOwnerUser:    defOwner,
-		DefaultUserOwned:    defOwner > 0,
-		OrphanAccountEgress: a.orphanAccountEgress(),
+		Proxies:              synced,
+		DirectAccountCount:   directCount,
+		DirectExplicit:       directExplicit,
+		DirectOwners:         owners,
+		Bad:                  badRows,
+		MaxPerProxy:          maxPer,
+		OverCount:            overCount,
+		Unassigned:           unassigned,
+		DefaultEgress:        defEgress,
+		DistinctExitIPs:      distinct,
+		SharedExits:          shared,
+		DefaultOwnerUser:     defOwner,
+		DefaultUserOwned:     defOwner > 0,
+		OrphanAccountEgress:  a.orphanAccountEgress(),
+		ForeignBoundAccounts: a.foreignBoundAccounts(),
 	}, nil
 }
 

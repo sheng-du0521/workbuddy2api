@@ -15,6 +15,7 @@ package main
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,34 +52,36 @@ func TestHostEgressLinesAndAssign(t *testing.T) {
 
 	d := heLines(t, f, f.cookieA)
 	lines := d["lines"].([]any)
-	// 三条线路对 A 都可见。v0.31.32 起**别人的线路也可选**（产品要求借用住宅 IP），
-	// 但必须带 foreign 标志与主人名 —— 前端据此弹"流量会经过对方机器"的确认。
-	if len(lines) != 3 {
-		t.Fatalf("线路列表应含 3 条，得 %d", len(lines))
+	// v0.31.34 规则收紧：**他人的线路不返回**（以前会列出来并允许借用）。
+	//
+	// 为什么改：那条规则的实际效果是"把 access_token 交给第三方机器"，
+	// 一次确认弹窗不是技术保障；而且出了风控事件无法区分"我的号自己跑的"
+	// 与"从别人家宽跑的"。用户线路只承载自己的号；要借用只能由管理员在后台显式分配。
+	if len(lines) != 2 {
+		t.Fatalf("线路列表应只含平台+自己的 2 条（他人的不返回），得 %d：%v", len(lines), lines)
 	}
 	noteOf := map[string]string{}
-	foreignOf := map[string]map[string]any{}
+	seen := map[string]bool{}
 	for _, x := range lines {
 		m := x.(map[string]any)
 		u := m["url"].(string)
+		seen[u] = true
 		noteOf[u], _ = m["note"].(string)
-		foreignOf[u] = m
+		if m["foreign"] == true {
+			t.Fatalf("用户端不该再返回 foreign 线路：%v", m)
+		}
 	}
-	if noteOf[mine] != "" || noteOf[platform] != "" || noteOf[others] != "" {
-		t.Fatalf("启用中的线路都应可选（含他人的），得 note=%q/%q/%q",
-			noteOf[mine], noteOf[platform], noteOf[others])
+	if !seen[mine] || !seen[platform] {
+		t.Fatalf("平台线路与自己的线路必须可见，得 %v", seen)
 	}
-	if foreignOf[others]["foreign"] != true {
-		t.Fatal("别人的线路必须标 foreign=true（前端要靠它弹借用确认）")
+	if seen[others] {
+		t.Fatal("他人的线路不能出现在用户视角（v0.31.34 起结构性过滤）")
 	}
-	if foreignOf[others]["owner_name"] == "" || foreignOf[others]["owner_name"] == nil {
-		t.Fatal("别人的线路必须带主人用户名（借的是谁的机器要能看见）")
+	if noteOf[mine] != "" || noteOf[platform] != "" {
+		t.Fatalf("启用中的线路都应可选，得 note=%q/%q", noteOf[mine], noteOf[platform])
 	}
-	if foreignOf[mine]["foreign"] == true {
-		t.Fatal("自己的线路不该被标成 foreign")
-	}
-	if got := d["distinct_exit_ips"].(float64); got != 3 {
-		t.Fatalf("三条线路三个出口 IP（1.1.1.1 / 2.2.2.2 / 3.3.3.3），得 %v", got)
+	if got := d["distinct_exit_ips"].(float64); got != 2 {
+		t.Fatalf("可见线路有两个出口 IP（1.1.1.1 / 2.2.2.2），得 %v", got)
 	}
 
 	// 正向：把自己的号指到自己的线路
@@ -95,22 +98,21 @@ func TestHostEgressLinesAndAssign(t *testing.T) {
 		t.Fatalf("账号出口未写入，得 %+v", acc)
 	}
 
-	// 正向（v0.31.32）：别人的线路**允许借用** —— 但返回里要带 foreign + 主人名，
-	// 前端据此弹"凭证会经过对方机器"的确认；服务端另有一条 WARN 审计日志。
+	// 负向（v0.31.34）：别人的线路 → 403。
+	//
+	// 这不是"越权兜底"而是**产品规则**，所以文案必须指路（"让管理员在后台分配"），
+	// 写成"无权限"会让人以为是权限 bug。这里同时断言**账号没被改动** ——
+	// 一条只报错但已经写库的接口，比不报错更糟。
 	code, raw = eaReq(t, f.mux, "POST", "/api/host/egress/assign",
 		`{"uids":["us-a-acct"],"proxy":"`+others+`"}`, f.cookieA, "")
-	if code != http.StatusOK {
-		t.Fatalf("借用别人的线路应 200（v0.31.32 起允许），得 %d %s", code, raw)
+	if code != http.StatusForbidden {
+		t.Fatalf("指向他人的线路必须 403，得 %d %s", code, raw)
 	}
-	if d := eaJSON(t, raw); d["foreign"] != true || d["owner_name"] == nil {
-		t.Fatalf("借用他人线路应回 foreign=true 与 owner_name，得 %v", d)
+	if !strings.Contains(string(raw), "管理员") {
+		t.Fatalf("403 文案要说清下一步找管理员，得 %s", raw)
 	}
-	if a, _ := f.store.GetAccount("us-a-acct"); a == nil || a.EgressProxy != others {
-		t.Fatalf("借用未写入，得 %+v", a)
-	}
-	// 复位，后面的断言不受影响
-	if err := f.store.SetAccountEgress("us-a-acct", mine); err != nil {
-		t.Fatalf("reset: %v", err)
+	if a, _ := f.store.GetAccount("us-a-acct"); a == nil || a.EgressProxy != mine {
+		t.Fatalf("被拒绝的分配不该改动账号，得 %+v", a)
 	}
 
 	// 负向：拿别人的 uid 改别人的号 → 目标被静默剔除，最终"没有可设置的账号"

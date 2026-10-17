@@ -25,9 +25,24 @@
 // # 边界（越权是这里唯一的高危点）
 //
 //   - 目标账号一律 `OwnerUserID == 我`，别人的号静默剔除（不报错、不泄露存在性）；
-//   - 可选线路只有 `owner_user_id ∈ {0, 我}` 的启用线路：**平台线路可用、别人的线路不可用**
-//     （别人的线路 = 别人的代理，把 access_token 从那儿送出去等于把号交给他）；
+//   - 可选线路只有 `owner_user_id ∈ {0, 我}` 的启用线路：**平台线路可用、别人的线路不可用**；
 //   - 只写 `accounts.egress_proxy` 一个字段，不碰全局默认出口、不碰任何人的账号状态。
+//
+// # 规则变更（v0.31.34）：他人线路一律不出现在用户视角
+//
+// v0.31.32 曾按"住宅 IP 稀缺、谁的机器都能承载"放开过借用（列出他人线路 + 切换前确认）。
+// 实际跑下来这条规则的**代价被低估了**：
+//
+//	① 凭证可见是架构事实而非提示问题 —— 承载方机器上的代理进程必然看到
+//	   `Authorization: Bearer …`，一次"确认"弹窗挡不住任何技术风险；
+//	② 责任归属说不清 —— 出了风控事件，无法区分"我的号自己跑的"与"从别人家宽跑的"；
+//	③ 用户的线路本来就是为了**自己的号**拿一个住宅 IP，借给别人用只是额外风险。
+//
+// 所以现在：**用户的线路只承载自己的号**（账号代理与出口代理都是）。他人线路
+// 在用户端**不返回、不可选、不可分配**；需要把某条线路用在别人的号上，
+// 唯一路径是管理员在管理后台显式分配（那里有归属、审计与停用能力）。
+//
+// 字段 `Foreign` / `OwnerName` 保留但恒为空值：协议兼容，且管理端仍要区分来源。
 package main
 
 import (
@@ -35,6 +50,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"workbuddy2api/internal/egress"
@@ -49,13 +65,12 @@ type egressLineView struct {
 	Mine bool `json:"mine"`
 	// Platform 平台线路（所有用户都可以用；不是我的，但也不是别人的私线）。
 	Platform bool `json:"platform"`
-	// Foreign **其他用户**接进来的线路（v0.31.32）。
-	//
-	// 产品上明确要求"支持走别人的"：住宅 IP 是稀缺资源，谁接进来的都能被借用。
-	// 代价必须写在脸上 —— 流量经过那台机器，`access_token` 对它的主人可见。
-	// 所以这个标志不是"禁用"，而是"前端必须显式标注并在切换前确认"。
+	// Foreign **其他用户**接进来的线路 —— v0.31.34 起用户端**不再返回**这类线路，
+	// 因此该字段恒 false。保留是为了：① 前端旧版本不至于因缺字段报错；
+	// ② 管理端视图仍需要"这条是谁的"这一维度（那里用 OwnerUserID/OwnerName）。
 	Foreign bool `json:"foreign"`
-	// OwnerName 线路主人的用户名（平台线路为空）。借用时至少要知道借的是谁的。
+	// OwnerName 线路主人的用户名（平台线路为空）。用户端现在只会看到自己的线路，
+	// 所以通常是"我自己"或空；保留字段便于管理端复用同一份结构。
 	OwnerName string `json:"owner_name,omitempty"`
 	Enabled   bool   `json:"enabled"`
 	LastOK    bool   `json:"last_ok"`
@@ -89,6 +104,17 @@ type hostEgressAccountView struct {
 	ExitSource string `json:"exit_source"`
 	// TokenDead 该号登录已失效（12153），此时改出口没有意义。
 	TokenDead bool `json:"token_dead,omitempty"`
+	// ForeignBound 这个号当前走的是**别人的线路**（v0.31.34）。
+	//
+	// 规则收紧后用户不能再选别人的线路，但**存量绑定还在跑**：v0.31.32 那段
+	// "可借用"时期留下的数据不会自己消失。不标出来，用户会以为"这个号有出口"，
+	// 而它其实正经过另一个用户的机器（凭证对对方可见）。
+	//
+	// 处置由用户决定（下拉改成自己的/平台线路即可），系统**不自动改** ——
+	// 改出口会改变这个号的风控画像，不该由一次版本升级替人做决定。
+	ForeignBound bool `json:"foreign_bound,omitempty"`
+	// ForeignOwnerName 这条线路的主人（给"要不要改回去"提供判断依据）。
+	ForeignOwnerName string `json:"foreign_owner_name,omitempty"`
 }
 
 // handleHostEgressLines GET /api/host/egress/lines
@@ -117,6 +143,8 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 线路视图：只给"我能用"的（平台 + 我自己的）。
+	// 他人的线路**完全不返回**（v0.31.34）：以前会列出来并标"可选/需确认"，但那条规则
+	// 的实际效果是"把凭证交给第三方机器"，而弹窗确认不是技术保障。见文件头说明。
 	lines := make([]egressLineView, 0, len(proxies))
 	mineCount := map[string]int{}
 	for _, acc := range accs {
@@ -136,7 +164,12 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 		url := strings.TrimSpace(p.URL)
 		mine := p.OwnerUserID == u.ID
 		platform := p.OwnerUserID == 0
-		foreign := p.OwnerUserID > 0 && !mine
+		// 他人的线路直接跳过（不返回、不可选）。这条判断放在最前面，
+		// 是为了让"看不见"成为结构性结果，而不是靠前端不渲染。
+		if p.OwnerUserID > 0 && !mine {
+			continue
+		}
+		foreign := false
 		lv := egressLineView{
 			URL: url, Name: p.Name, OwnerUserID: p.OwnerUserID,
 			Mine: mine, Platform: platform, Foreign: foreign,
@@ -145,12 +178,7 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 			BoundMine:  mineCount[url],
 			BoundTotal: totalCount[url],
 		}
-		if foreign {
-			lv.OwnerName = a.userNameByID(p.OwnerUserID)
-		}
-		// 只有"停用"是不可选的：其他用户的线路**可选**（v0.31.32 的产品决定），
-		// 但前端必须标注主人并在切换前确认"流量会经过他的机器"。
-		// 这里刻意不写 note —— note 的语义是"不可选的原因"。
+		// 只有"停用"是不可选的原因（可见的线路都是自己能用的）。
 		if !p.Enabled {
 			lv.Note = "这条线路已被停用（连续探活失败或人工停用）"
 		}
@@ -226,6 +254,16 @@ func (a *app) hostEgressAccountOf(acc *Account, byURL map[string]*EgressProxy, d
 	if p := byURL[egressURLKey(v.Resolved)]; p != nil {
 		v.ResolvedName = p.Name
 		v.ExitIP = normalizeExitIP(p.LastIP)
+		// 越界绑定：号主的号指向了别人的线路（存量数据 / 管理员分配）。
+		// 对用户而言这条线路是"看不见的"（lines 里已过滤），所以必须在这里说明，
+		// 否则他只能看到一个出口 IP，却找不到自己什么时候配过它。
+		if p.OwnerUserID > 0 && p.OwnerUserID != acc.OwnerUserID {
+			v.ForeignBound = true
+			v.ForeignOwnerName = a.userNameByID(p.OwnerUserID)
+			if v.ForeignOwnerName == "" {
+				v.ForeignOwnerName = "用户 #" + strconv.FormatInt(p.OwnerUserID, 10)
+			}
+		}
 	} else if v.ExitSource == "line" {
 		v.ResolvedName = "（不在线路池）"
 	}
@@ -264,8 +302,11 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		// 比对走规范化键（v0.31.33 口径）：历史行可能还是旧写法，
+		// 用原文比会出现"明明在池里却报不在"。
+		want := egressURLKey(norm)
 		for _, p := range list {
-			if strings.TrimSpace(p.URL) == norm {
+			if egressURLKey(p.URL) == want {
 				line = p
 				break
 			}
@@ -282,9 +323,17 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		// 别人的线路**允许借用**（v0.31.32，产品决定）：住宅 IP 稀缺，谁的机器都可以承载。
-		// 留痕放在 target 算完之后（见下），因为日志要带上"一共多少个号"，
-		// 而那时候才知道目标集有多少 —— 排查时那个数字比什么都好用。
+		// 他人的线路一律拒（v0.31.34 规则）：用户的线路只承载自己的号。
+		//
+		// 这不是"越权兜底"，而是**产品规则**，所以文案要说清下一步该找谁 ——
+		// 写成"无权限"会让人以为是个权限 bug，实际是"这件事只有管理员能做"。
+		if line.OwnerUserID != 0 && line.OwnerUserID != u.ID {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "这条线路属于其他用户，你的号不能用它。" +
+					"用户的线路只承载自己的账号；如果确实需要，请让管理员在「代理 → 线路池 → 分配」里指定",
+			})
+			return
+		}
 	}
 
 	owned, err := a.store.ListAccountsByOwner(u.ID)
@@ -315,14 +364,6 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 借用他人出口的审计（v0.31.32）：出问题时"谁的号走过谁的机器"是第一条线索，
-	// 所以这里用 WARN 级别 —— 它不该被常规日志淹掉。
-	if line != nil && line.OwnerUserID != 0 && line.OwnerUserID != u.ID {
-		log.Printf("WARN: [host] 用户 %s(#%d) 借用用户 #%d 的出口 %s 承载 %d 个号"+
-			"（这些请求的 access_token 会经过对方机器）",
-			u.Username, u.ID, line.OwnerUserID, strings.TrimSpace(line.URL), len(targets))
-	}
-
 	changed := 0
 	for _, uid := range targets {
 		if err := a.store.SetAccountEgress(uid, norm); err != nil {
@@ -338,10 +379,7 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 	}
 	if line != nil {
 		res["proxy_name"] = line.Name
-		res["foreign"] = line.OwnerUserID > 0 && line.OwnerUserID != u.ID
-		if line.OwnerUserID > 0 && line.OwnerUserID != u.ID {
-			res["owner_name"] = a.userNameByID(line.OwnerUserID)
-		}
+		res["mine"] = line.OwnerUserID == u.ID
 		res["exit_ip"] = normalizeExitIP(line.LastIP)
 		if res["exit_ip"] == "" {
 			res["note"] = "已保存。这条线路还没有探活记录，出口 IP 稍后（最多 5 分钟）会在列表里出现"
@@ -401,27 +439,19 @@ func (a *app) handleHostEgressRebalance(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	// 可用线路 + 按出口 IP 归并（同一 IP 的多条线路只算一个出口）。
-	// 可用线路 = 平台 + 我的 + **别人的**（v0.31.32）。别人的线路也能承载我的号，
-	// 前端会在切换前提示"流量经过他的机器"，这里不再拦。
+	// 可用线路 = 平台 + 我的（v0.31.34 收紧）。他人的线路不参与均衡 ——
+	// 规则是"用户的线路只承载自己的号"，均衡属于用户自助动作，必须遵守同一条规则。
 	usable := make([]*EgressProxy, 0, len(proxies))
 	for _, p := range proxies {
 		if !p.Enabled {
 			continue
 		}
+		if p.OwnerUserID > 0 && p.OwnerUserID != u.ID {
+			continue
+		}
 		usable = append(usable, p)
 	}
 	groups, warns := groupEgressLinesByExit(usable, u.ID)
-	// 借用别人的线路时明确说一句：这是"能用"而不是"没代价"。
-	borrowed := map[int64]bool{}
-	for _, g := range groups {
-		if g.proxy != nil && g.proxy.OwnerUserID > 0 && g.proxy.OwnerUserID != u.ID {
-			borrowed[g.proxy.OwnerUserID] = true
-		}
-	}
-	if len(borrowed) > 0 {
-		warns = append(warns, "本次分配用到了他人提供的出口：流量会经过对方的机器（凭证对它可见）")
-	}
 	if len(groups) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "没有可用线路：请先在自己的电脑上「一键拉起」，或联系管理员添加线路",

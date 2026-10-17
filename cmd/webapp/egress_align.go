@@ -395,3 +395,40 @@ func (a *app) orphanAccountEgress() int {
 	}
 	return n
 }
+
+// foreignBoundAccounts 统计「号走在他人的线路上」的账号数（v0.31.34）。
+//
+// 规则收紧后，这只可能来自两种情形：
+//
+//	· v0.31.32 那段"可借用"时期留下的存量绑定；
+//	· 管理员在后台显式把用户线路分配给某个账号（**合法**，这是"借用住宅 IP"）。
+//
+// 两种情况都不该静默存在：第一种是用户不知道自己正经过别人的机器，
+// 第二种是运维需要知道"有多少号靠在别人的家宽上"（对方一关机就全掉）。
+// 页面按数量报出来，并提示用「对齐账号出口」看明细。
+func (a *app) foreignBoundAccounts() int {
+	accs, err := a.store.ListAccounts()
+	if err != nil {
+		return 0
+	}
+	proxies, err := a.store.ListEgressProxies()
+	if err != nil {
+		return 0
+	}
+	owner := map[string]int64{}
+	for _, p := range proxies {
+		owner[egressURLKey(p.URL)] = p.OwnerUserID
+	}
+	n := 0
+	for _, acc := range accs {
+		v := strings.TrimSpace(acc.EgressProxy)
+		if v == "" || egress.IsDirect(v) {
+			continue
+		}
+		// map 里不存在 = 池里没有这条线路，归"孤儿出口"那一类，不在这里重复计。
+		if o, ok := owner[egressURLKey(v)]; ok && o > 0 && o != acc.OwnerUserID {
+			n++
+		}
+	}
+	return n
+}

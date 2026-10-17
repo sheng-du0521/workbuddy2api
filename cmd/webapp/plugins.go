@@ -47,8 +47,12 @@ type pluginDef struct {
 	Builtin bool
 	// Kind 插件的**面板形态**（v0.31.31）：决定前端展开后渲染哪一种面板。
 	//
-	//	"claim"  选号 → 逐个串行执行 → 逐行结果（领取类插件）
-	//	"health" 选号 → 发起检测 → 展示每号的检测结论（健康检测）
+	//	"claim"   选号 → 逐个串行执行 → 逐行结果（领取类插件）
+	//	"health"  选号 → 发起检测 → 展示每号的检测结论（健康检测）
+	//	"egress"  打开即进入**独立界面**（代理 / 本地出口）：它没有"一次执行"，
+	//	          而是一个持续操作的控制台。前端据此把这类的「打开」渲染成整页视图，
+	//	          而不是塞进卡片里的小面板 —— 隧道状态、逐号出口、机器列表这些
+	//	          放在 400px 宽的卡片里根本没法用（v0.31.34 的现场反馈）。
 	//
 	// 为什么要显式区分而不是让前端按 id 猜：面板的交互与文案完全不同
 	// （领取的语义是"执行一次写操作"，检测的语义是"读一次状态"）。
@@ -65,6 +69,9 @@ var pluginRegistry = []pluginDef{
 		Desc:     "批量向上游领取「活动补偿」（有则领、无则静默）。补偿是幂等写：同一个号重复调用不会重复到账。",
 		Audience: "both",
 		Builtin:  true,
+		// 显式声明形态：前端靠它选面板（空值会落到 default，行为一样，
+		// 但"看起来像忘了填"的字段迟早被人改成别的默认值）。
+		Kind: "claim",
 	},
 	{
 		ID:   pluginIDHealthCheck,
@@ -75,7 +82,31 @@ var pluginRegistry = []pluginDef{
 		Builtin:  true,
 		Kind:     "health",
 	},
+	{
+		ID:   pluginIDHostEgress,
+		Name: "本地出口代理",
+		Desc: "把你自己的电脑接进平台的出站链路：一键拉起本机代理 + SSH 反向隧道，" +
+			"让你名下的号从<b>你家的宽带</b>出去（住宅 IP）；并可逐号把号分到你的多条线路上。",
+		Audience: "user",
+		Builtin:  true,
+		Kind:     "egress",
+	},
 }
+
+// pluginIDHostEgress 「本地出口代理」插件的 id（v0.31.34）。
+//
+// 为什么把它从**侧导航**挪进插件：
+//
+//	· 它不是一个"页面功能"，而是一套**持续运行的基础设施**（下载安装包、拉起隧道、
+//	  维持心跳、逐号分配出口）。放在一级导航里，用户会以为它是"用一次就走"的功能；
+//	· 侧导航已有 13 项，再往上加只会让"常用功能"被稀释；
+//	· 插件化之后它可以被用户自己停用（不想要这条链路的人不必一直看到它），
+//	  也能被平台统一停用（例如某次上游风控期间暂时关闭自助接入）。
+//
+// 与其他插件的差别：它是**独立界面**（Kind=egress），没有"执行一次"的语义 ——
+// 因此 `handlePluginClaim` 里对它返回 400（明确说清"没有执行入口"），
+// 而不是让它掉进 default 分支报"未实现"。
+const pluginIDHostEgress = "host-egress"
 
 // pluginIDHealthCheck 健康检测插件的 id。
 //
@@ -581,6 +612,19 @@ func (a *app) handlePluginClaim(w http.ResponseWriter, r *http.Request, wantAdmi
 			return
 		}
 	}
+	// 独立界面型插件（Kind=egress）没有"执行一次"的语义 —— 它是持续运行的控制台。
+	//
+	// 这条判断放在**解析参数之前**：否则 `dry_run:true` 会先返回一份目标列表，
+	// 调用方会以为"接口能用，只是还没执行"。语义不对的接口应该在门口就拒绝，
+	// 而不是先陪它走完一遍流程。
+	if def.Kind == "egress" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "这个插件是独立界面（把本机接成出口代理），不通过批量执行接口运行；" +
+				"请在插件页点「打开」进入它的面板",
+		})
+		return
+	}
+
 	var req claimRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
