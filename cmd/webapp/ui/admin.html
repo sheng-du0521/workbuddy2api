@@ -289,6 +289,11 @@
            它原本是「先看结论再挑号」的入口，但结果卡片会随全量检测变长，
            把账号卡挤到很下面。现在本页只在工具行留「检测勾选 / 健康检测 →」两个入口，
            检测动作与全部结果都在「健康检测」页。 -->
+      <!-- 来源健康度（v0.31.37）：把「扫码登录是不是更容易掉线」变成可计算的数字。
+           为什么放这里而不是实时概览页：它回答的是"我该怎么处置这批号"，
+           与账号卡是同一个决策现场；放到概览页只会变成一个没人对照的图表。 -->
+      <div class="ecard" id="accSourceStats" style="margin-bottom:10px;"></div>
+
       <div class="cards" id="accCards"></div>
     </section>
 
@@ -2462,7 +2467,14 @@ function accountCard(a) {
     '消耗组：' + (a.consume_group_text || consumeLabel(cg)) + (a.consume_group ? '' : '（自动）')));
   if (a.owner_id > 0) chips.appendChild(el('span', 'tag warn', '代挂 · ' + (a.owner_name || ('用户#' + a.owner_id))));
   if (a.host_group) chips.appendChild(el('span', 'tag accent', '代挂组：' + a.host_group));
-  if (a.token_dead) chips.appendChild(chipWithTitle('登录失效 · 需重新登录', 'err', 'refresh token 已被上游作废（12153）。等下去不会好，只能重新导入该账号的 auth 文件。'));
+  // 来源（v0.31.37）：扫码 / 导入 / 历史。
+  // 放在这个位置是有意的：它紧挨着下面那排健康状态，看"哪一类号在掉线"时
+  // 来源与状态在同一视线范围内，不用来回滚动对照。
+  if (a.source === 'qr') chips.appendChild(chipWithTitle('扫码登录', 'accent', '通过设备授权扫码进来的号。这类号通常号主本机也在用，两边共用同一条 refresh 轮换链，更容易出现"续期凭证被对方刷走"。'));
+  else if (a.source === 'import') chips.appendChild(chipWithTitle('JSON 导入', '', '通过 auth JSON 导入（桌面端导出/备份恢复）。'));
+  else chips.appendChild(chipWithTitle('来源未知', '', '该账号在 v0.31.37 之前入库，没有来源标记。'));
+  if (a.token_dead) chips.appendChild(chipWithTitle('登录失效 · 需重新登录', 'err', 'refresh token 已被上游作废（12153）且 access 也已过期。等下去不会好，只能重新导入该账号的 auth 文件。'));
+  else if (a.refresh_lost) chips.appendChild(chipWithTitle('仅剩 access · 需尽快重登', 'warn', 'refresh token 已失效（通常是号主本机客户端刷新时轮换走了），但 access 仍可用。现在还能服务，**不会自动续期**，请在 access 过期前重新登录一次。'));
   else if (off) chips.appendChild(el('span', 'tag err', '已停用'));
   else if (a.cooling_for > 0) chips.appendChild(el('span', 'tag warn', (a.cool_kind === 'hard' ? '硬' : '软') + '冷却 ' + a.cooling_for + 's'));
   else chips.appendChild(el('span', 'tag ok', '可用'));
@@ -3105,6 +3117,52 @@ function renderPoolDash(d) {
   rk.appendChild(poolKpi('代挂账号', hosting, { d: hosting ? '归属用户的账号' : '暂无代挂' }));
 }
 
+// loadSourceStats 拉取并渲染「来源健康度」（v0.31.37）。
+//
+// 口径全部来自服务端（source_stats.go），前端**不重算**：
+// 一旦两边各算一遍，同样的名字早晚会得出两个数字，而运维只会相信先看到的那个。
+// 失败静默：这是辅助观测，不该因为一个统计接口把账号池页弄成错误页。
+async function loadSourceStats() {
+  const box = $('accSourceStats');
+  if (!box) return;
+  let rows = [];
+  try {
+    const d = await api('/api/admin/accounts/source-stats');
+    rows = d.rows || [];
+  } catch (e) { return; }
+  box.textContent = '';
+  const head = el('div', 'row');
+  head.style.justifyContent = 'space-between';
+  head.appendChild(el('b', null, '来源健康度'));
+  const hint = el('span', 'muted', '分母 = 该来源全部账号；「仅剩 access」不算失效（还能服务到过期）');
+  hint.style.fontSize = '11px';
+  head.appendChild(hint);
+  box.appendChild(head);
+
+  const tbl = el('div');
+  tbl.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;';
+  for (const r of rows) {
+    // 三个来源各自一块：总数 + 真死 + 仅剩 access + 失效率。
+    // 空来源（0 个号）也画出来 —— 它正好说明"这一类还没开始积累"，比隐藏更诚实。
+    const cell = el('div');
+    cell.style.cssText = 'flex:1;min-width:150px;border:1px solid rgba(127,127,127,.2);'
+      + 'border-radius:8px;padding:8px 10px;';
+    const t = el('div');
+    t.appendChild(el('b', null, r.label || r.source || '历史/未知'));
+    t.appendChild(el('span', 'muted', ' · ' + r.total + ' 个'));
+    cell.appendChild(t);
+    const line2 = el('div', 'muted');
+    line2.style.fontSize = '12px';
+    const rate = (typeof r.dead_rate === 'number') ? (r.dead_rate * 100).toFixed(0) + '%' : '—';
+    line2.textContent = '在池 ' + r.in_pool + ' · 失效 ' + r.dead + '（' + rate + '）· 仅剩 access ' + r.lost;
+    if (r.dead > 0) line2.style.color = '#c0392b';
+    else if (r.lost > 0) line2.style.color = '#b9770e';
+    cell.appendChild(line2);
+    tbl.appendChild(cell);
+  }
+  box.appendChild(tbl);
+}
+
 function renderAccounts() {
   renderGroupBar();
   renderAccStateFilter();
@@ -3324,6 +3382,7 @@ async function loadAccounts() {
     // 注：号池仪表盘已迁到「实时概览」页，由那里的轮询驱动（见 loadLive → loadPoolDash），
     // 此处不再触发 —— 账号池页只负责账号卡片本身。
     renderAccounts();
+    loadSourceStats();
     try {
       const s = await api('/api/admin/settings');
       const parts = [];

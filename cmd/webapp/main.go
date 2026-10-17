@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.36"
+const version = "0.31.37"
 
 type app struct {
 	store  *Store
@@ -679,6 +679,18 @@ type accountView struct {
 	TokenDead bool `json:"token_dead"`
 	// TokenDeadAt 失效确认时刻（unix 秒，0 = 正常）。
 	TokenDeadAt int64 `json:"token_dead_at,omitempty"`
+	// Source 账号来源（v0.31.37）：qr / import / 空（历史）。
+	//
+	// 存在的理由只有一个：让"扫码登录的号是不是更容易掉线"变成**可计算**的问题。
+	// 此前来源既没落库也没下发，只能靠运维印象；而印象与数据经常相反。
+	Source string `json:"source"`
+	// RefreshLost refresh token 已失效但 access 仍可用（v0.31.37）。
+	//
+	// 与 TokenDead 的分工：TokenDead = 现在就不能服务了（必须重登）；
+	// RefreshLost = 还能服务到 access 过期，但**不会再自动续期**，得提前去重登。
+	// 只给一个布尔会把"还有一个月可用"的号渲染成红牌，那正是"莫名掉线"的来源。
+	RefreshLost   bool  `json:"refresh_lost"`
+	RefreshLostAt int64 `json:"refresh_lost_at,omitempty"`
 	// RunState 运行态枚举（R9）：把布尔位与自由文案收敛成九态，见 runstate.go。
 	// 存在的理由：区分「风控冷却」与「限流冷却」—— 两者处置方向相反，此前都显示"冷却中"。
 	RunState string `json:"run_state"`
@@ -975,6 +987,9 @@ func (a *app) allAccountViewsErr() ([]accountView, error) {
 	creditByUID := a.store.CreditPacksByUID()
 	// 登录失效标记（一次轻查询；不塞进 Account 的 SELECT 列清单，避免 scan 顺序错位）。
 	deadMap := a.store.TokenDeadMap()
+	// 仅剩 access 标记 / 来源（同为轻查询，理由同上）。
+	lostMap := a.store.RefreshLostMap()
+	srcMap := a.store.SourceMap()
 	out := make([]accountView, 0, len(dbAccounts))
 	for _, acc := range dbAccounts {
 		st, ok := statusByUID[acc.UID]
@@ -986,6 +1001,11 @@ func (a *app) allAccountViewsErr() ([]accountView, error) {
 			v.TokenDead = true
 			v.TokenDeadAt = at
 		}
+		if at, ok := lostMap[acc.UID]; ok && !v.TokenDead {
+			v.RefreshLost = true
+			v.RefreshLostAt = at
+		}
+		v.Source = srcMap[acc.UID]
 		if acc.OwnerUserID > 0 {
 			v.OwnerName = names[acc.OwnerUserID]
 		}
@@ -1169,14 +1189,28 @@ func (a *app) pollOAuth(w http.ResponseWriter, sid string, ownerUserID int64) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "pending", "message": res.Message})
 		return
 	}
+	// 扫码成功 = 规范化落库（v0.31.37，见 oauth_pool.go）：
+	// 补 device_token / 记来源 / 按开关自动入池，并生成与导出同构的 auth JSON。
+	// **必须在 SyncAccounts 之前**：自动入池改的是库里的 pool_state，而 SyncAccounts
+	// 按库重建池内 `inPool` 映射 —— 顺序反了会表现为"界面上显示已入池，但选号仍跳过"。
+	authJSON, errMat := a.materializeQRLogin(res.Account)
+	if errMat != nil {
+		log.Printf("WARN: [qr] 规范化落库失败 uid=%s: %v", res.Account.UID, errMat)
+	}
 	// 新号入库后立即对齐池，免去下一次请求时才发现。
 	_ = a.proxy.SyncAccounts()
 	acc, _ := a.store.GetAccount(res.Account.UID)
 	if st, ok := a.proxy.pool.Status(res.Account.UID); ok {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "done", "account": a.toView(st, acc)})
+		out := map[string]any{"status": "done", "account": a.toView(st, acc)}
+		if authJSON != "" {
+			// 前端用它做「下载 auth JSON」：扫码之后用户手里就有一份可直接再导入的凭据，
+			// 不必再等导出接口（那是"事后补救"，这里是"当场交付"）。
+			out["auth_json"] = authJSON
+		}
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "done"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "done", "auth_json": authJSON})
 }
 
 // modelsCache 模型列表缓存（避免每次 /v1/models 都打上游）。
@@ -1493,6 +1527,9 @@ func (a *app) routes() *http.ServeMux {
 
 	// 管理后台：账号池 / 用户 / 兑换码 / 设置
 	mux.HandleFunc("GET /api/admin/status", a.adminGuard(a.handleStatus))
+	// 账号来源健康度（v0.31.37）：把"扫码登录是不是更容易掉线"变成可计算的数字。
+	// 只读聚合，零出站（见 source_stats.go 的口径说明）。
+	mux.HandleFunc("GET /api/admin/accounts/source-stats", a.adminGuard(a.handleAccountSourceStats))
 	// 选号轨迹诊断（v0.17.5）：按会话聚合流水，列出「被多个账号服务过」的会话 ——
 	// 直接回答「同一场对话是否在调用过程中换号」。只读，不参与运行时决策。
 	mux.HandleFunc("GET /api/admin/selection-trace", a.adminGuard(a.handleSelectionTrace))

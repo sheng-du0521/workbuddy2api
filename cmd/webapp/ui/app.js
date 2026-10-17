@@ -16,6 +16,22 @@ const $ = (id) => document.getElementById(id);
 // 用户看到的是乱码而不是"导出失败的原因"。用 fetch 取 blob 才能把后端原文抛出来。
 // 为什么先确认再下载：导出的文件里是 access_token / refresh_token **明文**，
 // 拿到它就等于拿到账号 —— 这一句话必须由调用方在 confirm 里说清。
+// downloadText 把一段文本存成文件（扫码登录当场下载 auth JSON 用）。
+// 与 downloadJSONFrom 的分工：那个走服务端附件（Content-Disposition 给文件名），
+// 这个的数据已经在内存里（服务端随 poll 响应返回），不必再发一次请求。
+function downloadText(text, name) {
+  if (!text) return;
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name || 'account.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    try { URL.revokeObjectURL(a.href); a.remove(); } catch (e) { /* 忽略 */ }
+  }, 1000);
+}
+
 async function downloadJSONFrom(url, fallbackName) {
   const r = await fetch(url, { credentials: 'same-origin' });
   if (!r.ok) {
@@ -1142,21 +1158,39 @@ function oauthLoginDialog(opts) {
       if (d.status === 'done') {
         finished = true;
         stop();
-        renderDone(d.account);
+        // 把整个响应传下去（v0.31.37）：扫码成功后服务端会带回 auth_json，
+        // 用户当场就能存一份可直接再导入的凭据，而不用事后去"导出"里找。
+        renderDone(d.account, d);
         return;
       }
       hint.textContent = d.message || '等待浏览器完成登录…';
     });
   };
 
-  const renderDone = (account) => {
+  const renderDone = (account, resp) => {
     authBox.textContent = '';
     const ok = el('div', 'notice ok');
     const name = account && (account.nickname || account.uid);
     ok.appendChild(el('b', '', '已采集账号：' + (name || '（匿名）')));
     if (account && account.realm) ok.appendChild(el('span', 'muted', ' · ' + (account.realm === 'global' ? '国际版' : '国内版')));
+    // 入池结果要**明说**：自动入池是服务端按开关做的决策，用户没有点过任何"申请"，
+    // 不告知就会在下一次看到"已入池"时以为是自己记错了（或以为系统乱动了状态）。
+    if (account && account.owner_id > 0) {
+      ok.appendChild(el('span', 'muted', account.pool_state === 'in'
+        ? ' · 已自动入池' : ' · 已入库（未入池，可在号池页申请）'));
+    }
     authBox.appendChild(ok);
+    // 来源说明：扫码进来的号与"导入 JSON"落库同构，区别只在来源标记。
+    authBox.appendChild(el('div', 'muted',
+      '已按导入同构落库（设备凭证/来源已写入）。想留一份凭据？可下载 auth JSON，'
+      + '以后这个号失效时直接用它重新导入。'));
+
     const row = el('div', 'row');
+    if (resp && resp.auth_json) {
+      const dl = el('button', 'ghost', '下载 auth JSON');
+      dl.onclick = () => downloadText(resp.auth_json, 'wb2api-qr-' + ((account && account.uid) || 'account') + '.json');
+      row.appendChild(dl);
+    }
     const fin = el('button', '', '完成');
     fin.onclick = () => { m.close(); if (typeof opts.onDone === 'function') opts.onDone(account); };
     row.appendChild(fin);
@@ -3740,6 +3774,13 @@ function renderHostEgress(d) {
       dead.style.fontSize = '11px';
       dead.style.color = '#c0392b';
       exitTxt.appendChild(dead);
+    } else if (a.refresh_lost) {
+      // 仅剩 access（v0.31.37）：现在还能用，但**不会自动续期**了。
+      // 这条提示的目的就是让人在"还能用"的窗口里主动去重登，而不是等到某天突然掉线。
+      const lost = el('div', null, '⚠ 续期凭证已失效（还能用到 access 过期）—— 建议尽快重新登录一次');
+      lost.style.fontSize = '11px';
+      lost.style.color = '#b9770e';
+      exitTxt.appendChild(lost);
     }
     row.appendChild(exitTxt);
 

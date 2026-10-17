@@ -137,6 +137,8 @@ func (a *app) handleHostImportAccounts(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		_ = a.store.ClearTokenDead(acc.UID)
+		// 来源（v0.31.37）：用户端导入与管理员导入同源同口径。
+		_ = a.store.SetAccountSource(acc.UID, sourceImport)
 		nicknames = append(nicknames, acc.Nickname)
 	}
 

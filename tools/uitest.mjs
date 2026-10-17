@@ -2690,6 +2690,58 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.37：**来源可度量 + 扫码=导入 + 假掉线分档**必须结构性成立。
+  //
+  // 这一版要回答的问题是"掉线是不是集中在扫码登录的号"。答案的前提是三件事都在：
+  //   ① 每条写入路径都记来源（漏一条，那一类号就会掉进"历史/未知"，结论被稀释）；
+  //   ② 扫码落库与导入同构（device_token 显式写、自动入池走开关）；
+  //   ③ 12153 先看 access 是否还活着，别把还能用一个月的号直接标死。
+  // 三者都是"加了才成立、删了不报错"的类型，所以必须由守卫盯住。
+  const srcBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const store = read('cmd/webapp/store.go');
+    for (const col of ['ADD COLUMN source', 'ADD COLUMN refresh_lost_at']) {
+      if (!store.includes(col)) srcBad.push('store.go 缺增量列迁移：' + col);
+    }
+    if (!store.includes('func normSource(')) srcBad.push('store.go 缺 normSource（来源取值必须封闭）');
+    // 三条写入路径
+    const oauthPool = read('cmd/webapp/oauth_pool.go');
+    if (!oauthPool.includes('sourceQR')) srcBad.push('oauth_pool.go 没有给扫码登录打来源标记');
+    if (!oauthPool.includes('AccountDeviceToken')) {
+      srcBad.push('扫码登录没有把 device_token 显式落库（运行期只能靠派生，导出/迁移拿不到真实值）');
+    }
+    if (!oauthPool.includes('qrAutoPoolKey')) srcBad.push('扫码登录没有自动入池开关（要么无法回滚，要么永不入池）');
+    if (!read('cmd/webapp/import_desktop.go').includes('sourceImport')) {
+      srcBad.push('import_desktop.go 没有记来源（导入号会掉进"历史/未知"）');
+    }
+    if (!read('cmd/webapp/host_import.go').includes('sourceImport')) {
+      srcBad.push('host_import.go 没有记来源');
+    }
+    // 假掉线分档
+    const proxy = read('cmd/webapp/proxy.go');
+    if (!proxy.includes('MarkRefreshLost')) {
+      srcBad.push('proxy.go 的 12153 处置没有区分「仅剩 access」—— 会把还能用的号标成死号');
+    }
+    if (!proxy.includes('accessAlive')) srcBad.push('proxy.go 缺少 access 是否过期的判定');
+    // 端点 + 页面
+    if (!read('cmd/webapp/source_stats.go').includes('buildSourceStats')) {
+      srcBad.push('source_stats.go 缺少统计口径实现');
+    }
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('accSourceStats')) srcBad.push('admin.html 没有「来源健康度」卡片容器');
+    if (!adminHtml.includes('loadSourceStats')) srcBad.push('admin.html 没有加载来源健康度');
+    if (!adminHtml.includes("a.source === 'qr'")) srcBad.push('admin.html 账号卡没有来源标签');
+    const appJs = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+    if (!appJs.includes('downloadText')) srcBad.push('app.js 缺少「扫码后下载 auth JSON」的实现');
+    if (!appJs.includes('refresh_lost')) srcBad.push('app.js 没有「仅剩 access」提示（用户端看不到预警）');
+  }
+  srcBad.forEach((m) => console.log('  [FAIL] account-source: ' + m));
+  if (!srcBad.length) {
+    console.log('  [ok] account-source: 来源三路径写入 + 扫码=导入同构 + 12153 分档 + 页面可读');
+  }
+
   // v0.31.25：**还没接入 agent 时，页面必须给出"下载安装包"这条路**。
   //
   // 这一版之前，这里的文案是"请先在目标电脑上运行下面那行命令" —— 用户要自己

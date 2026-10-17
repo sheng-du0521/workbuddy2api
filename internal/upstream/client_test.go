@@ -480,6 +480,7 @@ func TestRefreshPreservesExpiryWhenOmitted(t *testing.T) {
 }
 
 func TestRefreshSessionDead(t *testing.T) {
+	resetRefreshCaches() // 进程级刷新闸门：用例间必须隔离（v0.31.37）
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 401,
@@ -1049,6 +1050,7 @@ func TestChatHeadersRacesRefreshToken(t *testing.T) {
 // 上限 10 年（实测 R-D 响应恒 expiresIn=5184000=60d，10 年是纯防御量级）。
 // 超限按脏值处理：保留旧 ExpiresAt（与缺省分支同语义）。
 func TestRefreshTokenExpiresInSanityCap(t *testing.T) {
+	resetRefreshCaches() // 进程级刷新闸门：用例间必须隔离（v0.31.37）
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":99999999999}}`), nil
 	})
@@ -1069,6 +1071,7 @@ func TestRefreshTokenExpiresInSanityCap(t *testing.T) {
 // TestRefreshTokenExpiresInWithinCapApplied 正常量级（60d，实测 R-D 恒 5184000）
 // 不受上限影响：ExpiresAt 照常推进。
 func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+	resetRefreshCaches() // 进程级刷新闸门：用例间必须隔离（v0.31.37）
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`), nil
 	})

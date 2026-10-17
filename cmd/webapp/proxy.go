@@ -2114,6 +2114,32 @@ func (p *Proxy) handleSessionDead(uid string) {
 	// 与「3 次才摘号」并存：**冷却挡重试，阈值管要不要摘**。一次 12153 有可能是
 	// 并发刷新的抖动，所以仍不因一次就摘；但它已经证明"这个号此刻不能服务"，
 	// 把它留在候选里没有任何好处。
+	// ---- 先分档：refresh 丢了 ≠ 这个号不能用了（v0.31.37）----
+	//
+	// 上游的 refresh 是**轮换制**：同一账号在号主本机客户端上也登着时，两边共用
+	// 同一条轮换链，谁后刷谁把对方手里的 refresh 打掉（invalid_grant / 12153），
+	// 但 **access token 往往还剩几十天**，照常能服务。
+	//
+	// 此前这种情况被直接判成"登录失效"：硬冷却到次日 04:00 + 整卡标红。于是运维
+	// 看到的是一批"莫名其妙同时掉线"的号，而它们其实只是丢了续期权。处置方向错在
+	// 把两件事当一件：**能不能服务**（看 access）与**能不能自动续期**（看 refresh）。
+	//
+	// 现在的分档：
+	//   · access 仍有效（ExpiresAt 在未来）→ 记 refresh_lost + 软冷却，
+	//     不写 token_dead_at、不进硬冷却，卡片给"仅剩 access"预警；
+	//   · access 也过期/未知            → 才是真死，走原来的硬冷却 + 标红。
+	acc, _ := p.store.GetAccount(uid)
+	accessAlive := acc != nil && acc.ExpiresAt > time.Now().Unix()
+	if accessAlive {
+		p.pool.Cooldown(uid, pool.CoolSoft, softCooldown, "refresh 已失效，仅剩 access（需尽快重登）")
+		if err := p.store.MarkRefreshLost(uid); err != nil {
+			log.Printf("WARN: 标记 refresh 丢失失败 uid=%s: %v", uid, err)
+		}
+		log.Printf("WARN: [token] %s refresh 12153 但 access 仍有效（exp=%d），按「仅剩 access」处理",
+			logfmt.Label(uid, acc.Nickname), acc.ExpiresAt)
+		// 不累计 sessionDeadFails：这不是"这个号不能服务"，累计会把可用号摘掉。
+		return
+	}
 	p.pool.CooldownUntilTomorrow4AM(uid, "12153 会话失效（需重新登录）")
 	// 落库标记（v0.31.30）：卡片要整卡标红 + 给「重新登录 / 导入 JSON」按钮。
 	// store 写失败不影响处置（冷却已在内存生效），但会少一个界面提示 —— 记日志。

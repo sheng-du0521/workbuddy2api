@@ -9,6 +9,8 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1192,9 +1194,19 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
 //
 // refreshFlight 一次在途的刷新（单飞用）。
+//
+// 除了 err 之外还要**带结果**（v0.31.37）：单飞的后来者必须拿到同一份新凭据。
+// 只传 err 是不够的 —— 后来者手里那份 Auth 可能完全没被写过（同账号存在两份
+// 凭据对象时），它会带着**已经作废的旧 token** 继续跑，下一次请求就是 12153。
 type refreshFlight struct {
 	done chan struct{}
 	err  error
+
+	// 成功后的结果快照（err == nil 时有效）。
+	access    string
+	refresh   string
+	expiresAt int64
+	at        time.Time
 }
 
 // refreshFlights 按 *auth.Auth 的在途刷新登记表（v0.31.28）。
@@ -1211,26 +1223,133 @@ type refreshFlight struct {
 // 会不会被撤销"）。单飞是这里唯一的正确做法：同一账号同一时刻只允许一次真实请求，
 // 其余等待者复用同一次结果。
 //
-// key 用 *auth.Auth 指针而不是 uid：同一账号在池里只会有一份 Auth；用指针还能把
-// "测试里两个 Client 操作同一 Auth"也纳入同一把闸门。
+// key 用 **refresh token 的值**而不是 *auth.Auth 指针（v0.31.37 修正）。
+//
+// 旧实现按指针做键，前提是"同一账号在池里只有一份 Auth"。这个前提在生产里不总成立
+// （池内的 Auth、健康检测构造的快照、手工触发的任务各自持有自己的对象），一旦出现
+// 两份，两把闸门互不可见 → 同一个 refresh token 被双花 → 上游按轮换制撤销旧凭证，
+// 严重时连带作废刚签发的新 token（同类项目 misakano7545/workbuddy2api-panel 的
+// "按 RT 单飞 + 60s 宽限"就是这个问题的另一份修法）。
+//
+// 用 RT 做键是**按"被消耗的那张票"上锁**，与调用方持有几个对象无关：谁拿着同一张
+// refresh token，谁就在同一把闸门后面。
 var refreshFlights sync.Map
+
+// refreshGrace 刷新成功后的宽限缓存：旧 refresh token → 结果（v0.31.37）。
+//
+// 为什么还需要它：单飞只挡住**并发**。真实故障里有大量"前后脚"的串行调用 ——
+// 第一次刷新刚完成、登记表刚删除，第二个调用方（还拿着自己那份旧 RT）就进来了，
+// 它会真的拿旧 RT 再打一次上游，得到 invalid_grant，并把 12153 甩给账号处置逻辑。
+// 60 秒宽限让这类后来者直接复用上一次的结果，而不是再去烧一张已经作废的票。
+//
+// 60 秒的取值：刷新结果的有效期以天计，60s 足够覆盖"两次调用前后脚"；
+// 太长则会让真正的新会话（比如用户刚重新扫码）拿到旧结果，反而不好。
+const refreshGrace = 60 * time.Second
+
+var refreshGraceCache sync.Map
+
+// refreshKey 由 **uid + refresh token** 派生单飞键（不落原文，便于内存排查时脱敏）。
+//
+// 为什么键里要带 uid 与 client 作用域（v0.31.37 修正）：
+//
+//	· 只按 RT 做键时，不同账号在同一个进程里会命中同一缓存项（测试里反复构造
+//	  "rt-old" 就会撞）—— 这张缓存保存的是**别人的凭证**，碰撞一次就是串号；
+//	· 再加 client 作用域，是为了让"每个上游客户端各有一份宽限"成立：生产里只有
+//	  一个 Client，行为不变；而"临时造一个 Client 去验证"（测试、诊断工具）不会
+//	  被别的实例留下的结果顶掉 —— 那种"明明该发请求却没发"极难排查。
+func refreshKey(scope, uid, rt string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + uid + "\x00" + rt))
+	return hex.EncodeToString(sum[:16])
+}
+
+// sweepRefreshGrace 清掉超过 2×宽限的缓存项。
+//
+// 不做主动清理的后果不是"慢"，而是**内存只增不减**：每张被消费过的 RT 都会留一条
+// 含 access/refresh 明文的结果快照。宽限只有 60s，留 2 倍时间足够容错。
+func sweepRefreshGrace() {
+	now := time.Now()
+	refreshGraceCache.Range(func(k, v any) bool {
+		if f, _ := v.(*refreshFlight); f == nil || now.Sub(f.at) > 2*refreshGrace {
+			refreshGraceCache.Delete(k)
+		}
+		return true
+	})
+}
+
+// applyRefreshResult 把 flight 里的结果写回目标 Auth（幂等：值相同就不动）。
+func applyRefreshResult(a *auth.Auth, f *refreshFlight) {
+	if a == nil || f == nil || f.err != nil || f.access == "" {
+		return
+	}
+	a.Lock()
+	defer a.Unlock()
+	if a.AccessToken == f.access {
+		return
+	}
+	a.AccessToken = f.access
+	if f.refresh != "" {
+		a.RefreshToken = f.refresh
+	}
+	if f.expiresAt > 0 {
+		a.ExpiresAt = f.expiresAt
+	}
+}
 
 // RefreshToken 刷新 access/refresh token（**同一账号并发调用只会真正发一次请求**）。
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	if a == nil {
 		return fmt.Errorf("nil auth")
 	}
+	// 宽限命中：同一张（已作废的）旧 RT 在 60s 内被再次要求刷新 → 直接回放。
+	//
+	// 空 uid 不参与宽限（v0.31.37）：没有 uid 就没有"这是谁的凭证"，
+	// 缓存一条无主的结果等于按 RT 取值串号 —— 而这正是本函数要防的事。
+	rtSnapshot := a.RefreshTokenValue()
+	key := refreshKey(fmt.Sprintf("%p", c), a.UID, rtSnapshot)
+	graceOK := a.UID != "" && rtSnapshot != ""
+	if graceOK {
+		if v, ok := refreshGraceCache.Load(key); ok {
+			prev, _ := v.(*refreshFlight)
+			switch {
+			case prev == nil || time.Since(prev.at) >= refreshGrace:
+				refreshGraceCache.Delete(key)
+			case a.AccessTokenValue() == prev.access && a.RefreshTokenValue() == prev.refresh:
+				// 调用方**就是**上次刷新成功的那份凭据，它没有"陈旧"可言 ——
+				// 这次要求刷新是刻意的（保活用同一张未轮换的 RT 再续一次）。
+				// 此时不能回放，否则会把一次真实刷新吞掉（表现为 keepalive 记成功、
+				// 上游其实没被打、以及"连续 12153 应当累计"的判据永远不成立）。
+				refreshGraceCache.Delete(key)
+			default:
+				applyRefreshResult(a, prev)
+				return prev.err
+			}
+		}
+	}
+
 	f := &refreshFlight{done: make(chan struct{})}
-	if v, loaded := refreshFlights.LoadOrStore(a, f); loaded {
+	if v, loaded := refreshFlights.LoadOrStore(key, f); loaded {
 		prev, _ := v.(*refreshFlight)
 		<-prev.done
+		// 后来者必须**拿到同一份凭据**，而不只是同一个 error（见 refreshFlight 注释）。
+		applyRefreshResult(a, prev)
 		return prev.err
 	}
 	defer func() {
-		refreshFlights.Delete(a)
+		refreshFlights.Delete(key)
 		close(f.done)
 	}()
 	f.err = c.refreshTokenOnce(a)
+	if f.err == nil {
+		// 记录本次结果：既给并发等待者，也给 60s 内的串行后来者。
+		a.Lock()
+		f.access, f.refresh, f.expiresAt = a.AccessToken, a.RefreshToken, a.ExpiresAt
+		a.Unlock()
+		f.at = time.Now()
+		if graceOK {
+			sweepRefreshGrace()
+			refreshGraceCache.Store(key, f)
+		}
+	}
 	return f.err
 }
 

@@ -314,6 +314,27 @@ func (s *Store) migrate() error {
 		// 用它算"凭证多少天没更新"会得出**偏年轻**的结论（改个分组就重置了），
 		// 而陈旧检测的全部意义就是发现"这个凭证很久没换了"。
 		`ALTER TABLE accounts ADD COLUMN device_token_at INTEGER NOT NULL DEFAULT 0`,
+		// 账号来源（v0.31.37）：qr = 扫码/设备授权登录，import = 桌面 auth JSON 导入，
+		// 空串 = 历史行/未知（前端按「历史」显示）。
+		//
+		// 为什么要落库：运营侧反复出现"扫码登录的号掉线更多"的判断，但此前**没有
+		// 任何列能区分来源** —— 于是这条判断既无法证实也无法证伪，只能靠印象。
+		// 加上这一列之后，"扫码 vs 导入"的失效率才是可计算的（见 source-stats）。
+		//
+		// 刻意**不进 accountCols / UpsertAccount**（同 credit_packs 的处理）：来源是
+		// "第一次怎么进来的"，重新登录/重同步都不该改写它；混进 UpsertAccount 会让
+		// 每次 OAuth 刷新把 import 号洗成 qr。
+		`ALTER TABLE accounts ADD COLUMN source TEXT NOT NULL DEFAULT ''`,
+		// refresh token 已失效但 access token 仍可用的时刻（v0.31.37），0 = 正常。
+		//
+		// 为什么不能直接标 token_dead：上游的 refresh 是**轮换制**，同一账号在号主
+		// 本机客户端上也登录着时，两边共用同一条轮换链 —— 对方刷走之后我们手里的
+		// refresh 立刻变成 invalid_grant(12153)，但 **access token 往往还能用到过期**。
+		// 此前把这种情况直接判成"登录失效"并硬冷却到次日 04:00，等于把一个还能服务
+		// 一个月的号当死号处理（用户看到的就是"莫名其妙掉线"）。
+		// 现在分成两档：refresh 丢了 → 记本列 + 软冷却（提前预警）；
+		// access 也过期了 → 才写 token_dead_at（真死，必须重登）。
+		`ALTER TABLE accounts ADD COLUMN refresh_lost_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate add column: %w", err)
@@ -684,18 +705,25 @@ func (s *Store) SetDisabled(uid string, disabled bool) error {
 func (s *Store) UpdateTokens(uid, accessToken, refreshToken string, expiresAt int64) error {
 	// token_dead_at 一并清零（v0.31.30）：能成功刷新并写回，就证明这个号的会话活了 ——
 	// 卡片上的红标必须立刻消失，否则用户重新登录后仍看到"失效"，会以为没生效。
+	// refresh_lost_at 同理清零（v0.31.37）：刷新成功说明 refresh 链路恢复了。
 	_, err := s.db.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?, expires_at = ?,
-	        token_dead_at = 0, updated_at = ? WHERE uid = ?`,
+	        token_dead_at = 0, refresh_lost_at = 0, updated_at = ? WHERE uid = ?`,
 		s.encField(accessToken), s.encField(refreshToken), expiresAt, time.Now().Unix(), uid)
 	return err
 }
 
-// MarkTokenDead 标记账号登录失效（refresh 12153），供卡片整卡标红与按钮提示。
+// MarkTokenDead 标记账号登录失效（refresh 12153 且 access 也已过期），供卡片整卡标红与按钮提示。
+//
+// ⚠️ 触发条件必须是「access 也不能用了」（v0.31.37）：
+// 上游 refresh 轮换会让我们的 refresh 变成 invalid_grant，而 access 往往还能用很久。
+// 那种情况属于 refresh_lost（MarkRefreshLost），不是这里 —— 见两函数的说明。
 func (s *Store) MarkTokenDead(uid string) error {
 	if strings.TrimSpace(uid) == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`UPDATE accounts SET token_dead_at = ? WHERE uid = ? AND token_dead_at = 0`,
+	// 真死时 refresh_lost 已经是历史状态，一并清掉，避免同一个号同时挂着两个"异常"徽标。
+	_, err := s.db.Exec(`UPDATE accounts SET token_dead_at = ?, refresh_lost_at = 0
+		WHERE uid = ? AND token_dead_at = 0`,
 		time.Now().Unix(), uid)
 	return err
 }
@@ -709,12 +737,11 @@ func (s *Store) ClearTokenDead(uid string) error {
 	if strings.TrimSpace(uid) == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`UPDATE accounts SET token_dead_at = 0 WHERE uid = ?`, uid)
+	_, err := s.db.Exec(`UPDATE accounts SET token_dead_at = 0, refresh_lost_at = 0 WHERE uid = ?`, uid)
 	return err
 }
 
 // TokenDeadMap 返回 uid → 失效时刻（仅含已标记的号）。
-//
 // 单独查询而不是塞进 Account/SELECT 列清单：改 select 列要同步 scan 顺序，
 // 是这个仓库最容易出错的地方之一（多一列就整片扫空）。这里只多一次轻查询。
 func (s *Store) TokenDeadMap() map[string]int64 {
@@ -729,6 +756,99 @@ func (s *Store) TokenDeadMap() map[string]int64 {
 		var at int64
 		if rows.Scan(&uid, &at) == nil {
 			out[uid] = at
+		}
+	}
+	return out
+}
+
+// MarkRefreshLost 记录「refresh token 已失效，但 access token 仍可用」（v0.31.37）。
+//
+// 与 MarkTokenDead 刻意分开：这两件事的处置方向相反 ——
+//
+//	· token_dead  → 真死，必须重登，硬冷却到次日 04:00；
+//	· refresh_lost → 半死，**仍能服务到 access 过期**，只需软冷却 + 提前预警。
+//
+// 合并成一个状态会让"还能不能服务"无法回答，于是要么白扔一个月的额度，
+// 要么让一个真的死号继续被选中。
+func (s *Store) MarkRefreshLost(uid string) error {
+	if strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE accounts SET refresh_lost_at = ? WHERE uid = ? AND refresh_lost_at = 0`,
+		time.Now().Unix(), uid)
+	return err
+}
+
+// ClearRefreshLost 清除「仅剩 access」标记（重新登录 / 导入 / 刷新成功）。
+func (s *Store) ClearRefreshLost(uid string) error {
+	if strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE accounts SET refresh_lost_at = 0 WHERE uid = ?`, uid)
+	return err
+}
+
+// RefreshLostMap 返回 uid → 「refresh 丢失」时刻（仅含已标记的号）。
+// 与 TokenDeadMap 同构：单独轻查询，不动 27 列的 scan 顺序。
+func (s *Store) RefreshLostMap() map[string]int64 {
+	out := map[string]int64{}
+	rows, err := s.db.Query(`SELECT uid, refresh_lost_at FROM accounts WHERE refresh_lost_at > 0`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid string
+		var at int64
+		if rows.Scan(&uid, &at) == nil {
+			out[uid] = at
+		}
+	}
+	return out
+}
+
+// 账号来源取值（v0.31.37）。空串 = 历史行/未知。
+const (
+	sourceQR     = "qr"
+	sourceImport = "import"
+)
+
+// normSource 归一来源取值：只认已知的三种，其余一律按「未知」处理（空串）。
+// 为什么不在写库前宽松接受任意字符串：来源会进聚合统计，一个拼错的
+// "qr " 或 "QR" 会在报表里变成第三类，而报表的前提就是类别互斥且封闭。
+func normSource(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case sourceQR:
+		return sourceQR
+	case sourceImport:
+		return sourceImport
+	}
+	return ""
+}
+
+// SetAccountSource 写入账号来源。空值不覆盖已有值（避免一次重同步把来源洗掉）。
+func (s *Store) SetAccountSource(uid, src string) error {
+	v := normSource(src)
+	if strings.TrimSpace(uid) == "" || v == "" {
+		return nil
+	}
+	// 只允许"空 → 有值"，不允许互改：来源是首次进入方式，后续登录/导入不改写它。
+	_, err := s.db.Exec(`UPDATE accounts SET source = ? WHERE uid = ? AND ifnull(source,'') = ''`, v, uid)
+	return err
+}
+
+// SourceMap 返回 uid → 来源（空串不入表）。
+func (s *Store) SourceMap() map[string]string {
+	out := map[string]string{}
+	rows, err := s.db.Query(`SELECT uid, source FROM accounts WHERE ifnull(source,'') <> ''`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid, src string
+		if rows.Scan(&uid, &src) == nil {
+			out[uid] = src
 		}
 	}
 	return out

@@ -506,6 +506,10 @@ func (a *app) importDesktopAccounts(list []desktopAccount, source, path string) 
 			res.Errors = append(res.Errors, fmt.Sprintf("%s 写入失败：%v", acc.UID, err))
 			continue
 		}
+		// 来源（v0.31.37）：只写"空 → import"，不改写已有来源（扫码号重新导入仍是扫码号）。
+		if err := a.store.SetAccountSource(acc.UID, sourceImport); err != nil {
+			log.Printf("WARN: [import] 写来源失败 uid=%s: %v", acc.UID, err)
+		}
 		if existing[acc.UID] {
 			res.Updated++
 		} else {

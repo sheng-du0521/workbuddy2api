@@ -49,6 +49,11 @@ type exportedAccount struct {
 	TokenType    string `json:"token_type,omitempty"`
 	DeviceToken  string `json:"device_token,omitempty"`
 
+	// Source 来源（v0.31.37）：qr / import / 空（历史）。
+	// 导入侧不认这个字段（会被忽略），但只要它是"导出→导入"同一套结构里的一项，
+	// 备份文件就自带"这个号当初怎么进来的"，复盘时不必再去翻登录日志。
+	Source string `json:"source,omitempty"`
+
 	// ---- 以下为元信息：导入侧不存在这些字段，会被忽略（不参与闭环）----
 	// 放它们是为了让备份文件**可读**（谁、哪个分组、什么时候导的）。
 	Realm      string `json:"realm,omitempty"`
@@ -60,7 +65,13 @@ type exportedAccount struct {
 }
 
 // buildExportRows 把账号换算成导出行（纯函数，便于单测字段映射）。
+// source 可传 nil（= 不带来源），避免所有既有调用点被迫改签名。
 func buildExportRows(accs []*Account, now int64, tag string) []exportedAccount {
+	return buildExportRowsWithSource(accs, now, tag, nil)
+}
+
+// buildExportRowsWithSource 带来源的导出行（v0.31.37）。
+func buildExportRowsWithSource(accs []*Account, now int64, tag string, src map[string]string) []exportedAccount {
 	out := make([]exportedAccount, 0, len(accs))
 	for _, acc := range accs {
 		if acc == nil {
@@ -80,6 +91,7 @@ func buildExportRows(accs []*Account, now int64, tag string) []exportedAccount {
 			PoolState:    acc.PoolState,
 			OwnerID:      acc.OwnerUserID,
 			ConsumeGrp:   acc.ConsumeGroup,
+			Source:       src[acc.UID],
 			ExportedAt:   now,
 			PluginTag:    tag,
 		}
@@ -142,7 +154,8 @@ func (a *app) handleExportHostAccounts(w http.ResponseWriter, r *http.Request) {
 
 // writeExport 统一落盘响应。
 func (a *app) writeExport(w http.ResponseWriter, accs []*Account, tag string) {
-	rows := buildExportRows(accs, time.Now().Unix(), "wb2api/"+version+" "+tag)
+	// 来源一次批量取（N+1 查询在这里完全没必要，且导出动辄几十个号）。
+	rows := buildExportRowsWithSource(accs, time.Now().Unix(), "wb2api/"+version+" "+tag, a.store.SourceMap())
 	// 顶层数组（不是 {accounts:[…]}）：导入侧的第一条分支就吃数组，
 	// 且桌面端原生导出也是数组形态 —— 少一层包装就少一处"格式对不上"。
 	raw, err := json.MarshalIndent(rows, "", "  ")

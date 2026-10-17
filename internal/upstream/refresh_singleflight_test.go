@@ -30,6 +30,11 @@ import (
 // refreshTestServer 一个最小的 refresh 端点：返回新 token，并统计被调用次数。
 func refreshTestServer(t *testing.T, calls *int32, fail bool) *httptest.Server {
 	t.Helper()
+	// 每个用例都从干净闸门开始（v0.31.37）：
+	// refreshFlights / refreshGraceCache 是**进程级**的（它们保护的是上游凭证，
+	// 不能挂在某个对象上），用例之间会互相污染 —— 表现为"请求次数少一次"这种
+	// 完全看不出原因的错误。清在这里而不是每个用例各写一行，避免以后新加用例漏掉。
+	resetRefreshCaches()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(calls, 1)
 		// 模拟上游 I/O 延迟，让并发请求真的重叠（否则单飞根本没被考验）。
