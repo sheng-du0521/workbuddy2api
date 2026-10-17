@@ -1,15 +1,15 @@
 {
-  "version": "0.31.37",
+  "version": "0.31.38",
   "min_supported": "0.24.0",
-  "notes": "v0.31.37：账号来源可度量 + 扫码登录=导入同构 + 「假掉线」分档（附同类项目比对）。① 来源列（core）：accounts 新增 source（qr/import/空=历史）与 refresh_lost_at 两条增量列 + 老库迁移。三条写入路径都记来源：扫码（PollOAuth→qr）、桌面 JSON 导入（→import）、用户端代挂导入（→import）；只允许「空→值」，重新导入/重新登录不会改写首次来源（否则「扫码号失效更多」的结论会被抢救动作自动擦掉）。② 扫码登录规范化落库：新增 oauth_pool.go —— 扫码成功后按导入同构补齐 device_token（运行期同源派生值，显式落库，写 device_token_at）、记 source=qr、按 kv qr_auto_pool（默认开，设 0 回滚到邀请制）自动入池并写备注，并把与导出逐字同构的 auth JSON 随 poll 响应返回（前端「下载 auth JSON」，当场留一份可直接再导入的凭据）。materialize 必须跑在 SyncAccounts 之前（否则界面显示已入池、选号仍跳过）。③ 「假掉线」分档（重要）：12153 到来时先看 access 是否仍有效 —— 有效则只记 refresh_lost_at + 软冷却、卡片给「仅剩 access · 需尽快重登」，不写 token_dead_at、不进次日 04:00 硬冷却、不累计 sessionDeadFails；access 也过期才走原判死路径。依据：上游 refresh 是轮换制，号主本机客户端一刷新就会把我们手里的 refresh 打掉，但 access 往往还剩几十天（生产实测 10 个被判死的号 expires_at 全在 11-14 之后）。④ refresh 闸门修正：单飞键从 *auth.Auth 指针改为 (client, uid, refresh_token) 派生值 —— 同一个号存在两份凭据对象时旧实现是两把互不可见的闸门，等于把同一张票双花；等待者现在**同时拿到新凭据**（旧实现只传 error，等待者会拿着已作废的 token 继续跑）。新增 60s 宽限：前后脚的串行调用直接回放上次结果；但调用方凭据已是最新时不回放（那是刻意重刷，吞掉它就等于 keepalive 记成功、上游其实没被打）。缓存带 2×宽限清扫，避免含明文凭证的结果快照只增不减。⑤ 观测：新增 GET /api/admin/accounts/source-stats（只读、零出站）按来源聚合 号数/在池/失效/仅剩 access/失效率，口径写死在 buildSourceStats（分母=该来源全部账号；refresh_lost 单列不并入 dead，否则会把要验证的判断做假）；管理端账号池顶部新增「来源健康度」卡，账号卡加来源标签与「仅剩 access」徽标；用户端出口行同步预警。⑥ 测试：account_source_test.go（老库迁移/只写一次/三态互斥/统计口径/normSource 封闭取值）与 refresh_grace_test.go（按 RT 单飞/双对象同票/宽限回放/宽限过期/键派生）；uitest 新增 account-source 守卫。调研全文见 docs/同类项目比对-20261018.md。",
+  "notes": "v0.31.38（v0.31.37 的收尾）：用户端「我的账号出口」行补上 refresh_lost 字段与「仅剩 access」预警。v0.31.37 只在管理端账号卡渲染了这条预警，用户端的线路行仍只认 token_dead —— 于是「号主自己看得到号快掉线了」这件事其实没做到（前端判断存在、后端没下发字段）。本次把 lost 一并取回并传进 hostEgressAccountOf，真死优先（MarkTokenDead 已清 lost 位，这里只防御历史行两位并存）。其余同 v0.31.37：v0.31.37：账号来源可度量 + 扫码登录=导入同构 + 「假掉线」分档（附同类项目比对）。① 来源列（core）：accounts 新增 source（qr/import/空=历史）与 refresh_lost_at 两条增量列 + 老库迁移。三条写入路径都记来源：扫码（PollOAuth→qr）、桌面 JSON 导入（→import）、用户端代挂导入（→import）；只允许「空→值」，重新导入/重新登录不会改写首次来源（否则「扫码号失效更多」的结论会被抢救动作自动擦掉）。② 扫码登录规范化落库：新增 oauth_pool.go —— 扫码成功后按导入同构补齐 device_token（运行期同源派生值，显式落库，写 device_token_at）、记 source=qr、按 kv qr_auto_pool（默认开，设 0 回滚到邀请制）自动入池并写备注，并把与导出逐字同构的 auth JSON 随 poll 响应返回（前端「下载 auth JSON」，当场留一份可直接再导入的凭据）。materialize 必须跑在 SyncAccounts 之前（否则界面显示已入池、选号仍跳过）。③ 「假掉线」分档（重要）：12153 到来时先看 access 是否仍有效 —— 有效则只记 refresh_lost_at + 软冷却、卡片给「仅剩 access · 需尽快重登」，不写 token_dead_at、不进次日 04:00 硬冷却、不累计 sessionDeadFails；access 也过期才走原判死路径。依据：上游 refresh 是轮换制，号主本机客户端一刷新就会把我们手里的 refresh 打掉，但 access 往往还剩几十天（生产实测 10 个被判死的号 expires_at 全在 11-14 之后）。④ refresh 闸门修正：单飞键从 *auth.Auth 指针改为 (client, uid, refresh_token) 派生值 —— 同一个号存在两份凭据对象时旧实现是两把互不可见的闸门，等于把同一张票双花；等待者现在**同时拿到新凭据**（旧实现只传 error，等待者会拿着已作废的 token 继续跑）。新增 60s 宽限：前后脚的串行调用直接回放上次结果；但调用方凭据已是最新时不回放（那是刻意重刷，吞掉它就等于 keepalive 记成功、上游其实没被打）。缓存带 2×宽限清扫，避免含明文凭证的结果快照只增不减。⑤ 观测：新增 GET /api/admin/accounts/source-stats（只读、零出站）按来源聚合 号数/在池/失效/仅剩 access/失效率，口径写死在 buildSourceStats（分母=该来源全部账号；refresh_lost 单列不并入 dead，否则会把要验证的判断做假）；管理端账号池顶部新增「来源健康度」卡，账号卡加来源标签与「仅剩 access」徽标；用户端出口行同步预警。⑥ 测试：account_source_test.go（老库迁移/只写一次/三态互斥/统计口径/normSource 封闭取值）与 refresh_grace_test.go（按 RT 单飞/双对象同票/宽限回放/宽限过期/键派生）；uitest 新增 account-source 守卫。调研全文见 docs/同类项目比对-20261018.md。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.37/webapp.exe",
-      "sha256": "43dd348830c1c5d1e8c240dcb88a1afaa4fcd277a345a59f023663b7db62c10e",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.38/webapp.exe",
+      "sha256": "0642091b65f9fb2bbe3faacffe385fee49e00152d013a8d226d98177f70db239",
       "size": 15441920
     }
   ],

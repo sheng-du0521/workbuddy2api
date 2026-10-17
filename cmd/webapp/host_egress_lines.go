@@ -106,6 +106,12 @@ type hostEgressAccountView struct {
 	ExitSource string `json:"exit_source"`
 	// TokenDead 该号登录已失效（12153），此时改出口没有意义。
 	TokenDead bool `json:"token_dead,omitempty"`
+	// RefreshLost refresh 已失效但 access 仍可用（v0.31.37）。
+	//
+	// 与 TokenDead 分开是必须的：前者是"这个号现在不能服务"，后者是"还能服务，
+	// 但不会自动续期"。并成一个布尔会让"还有一个月可用"的号在界面上与死号长得一样 ——
+	// 用户就会去重登一个其实没坏的号，或者干脆忽略掉真的警告。
+	RefreshLost bool `json:"refresh_lost,omitempty"`
 	// ForeignBound 这个号当前走的是**别人的线路**（v0.31.34）。
 	//
 	// 规则收紧后用户不能再选别人的线路，但**存量绑定还在跑**：v0.31.32 那段
@@ -203,6 +209,8 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 	}
 	def := a.defaultEgress()
 	dead := a.store.TokenDeadMap()
+	// 「仅剩 access」也一起取（v0.31.37）：用户端要能在号还没坏的时候看到预警。
+	lost := a.store.RefreshLostMap()
 
 	byURL := make(map[string]*EgressProxy, len(proxies))
 	for _, p := range proxies {
@@ -265,7 +273,7 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 	// 账号视图
 	out := make([]hostEgressAccountView, 0, len(accs))
 	for _, acc := range accs {
-		out = append(out, a.hostEgressAccountOf(acc, byURL, def, dead))
+		out = append(out, a.hostEgressAccountOf(acc, byURL, def, dead, lost))
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Nickname != out[j].Nickname {
@@ -298,13 +306,16 @@ func countDistinctLineIPs(lines []egressLineView) int {
 
 // hostEgressAccountOf 组装单个账号的出口视图（纯函数式，无副作用）。
 func (a *app) hostEgressAccountOf(acc *Account, byURL map[string]*EgressProxy, def string,
-	dead map[string]int64) hostEgressAccountView {
+	dead, lost map[string]int64) hostEgressAccountView {
 	v := hostEgressAccountView{
 		UID: acc.UID, Nickname: acc.Nickname, PoolState: acc.PoolState,
 		Configured: strings.TrimSpace(acc.EgressProxy),
 	}
 	if _, ok := dead[acc.UID]; ok {
 		v.TokenDead = true
+	} else if _, ok := lost[acc.UID]; ok {
+		// 真死优先（MarkTokenDead 已清 lost 位，这里只是防御历史行同时存在两位）。
+		v.RefreshLost = true
 	}
 	switch {
 	case egress.IsDirect(v.Configured):
