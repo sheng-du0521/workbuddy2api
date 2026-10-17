@@ -2105,14 +2105,26 @@ func (p *Proxy) promptDegradeView() map[string]any {
 // Pool.RetireAccount 闸门；未达阈值只做可逆软冷却。计数由任意一次成功请求
 // （NoteSuccess）清零，故「偶发一次」不会累积。
 func (p *Proxy) handleSessionDead(uid string) {
+	// 首次 12153 即**硬冷却至次日 04:00**（v0.31.30，对齐同类项目 workbuddy2api-panel）：
+	//
+	// 12153 = 会话失效（refresh token 已废），继续把这个号排进候选只会白打一次上游，
+	// 而 04:00 是上游额度/签到的重置墙钟，也是"重新登录后最有意义的重试点"。
+	// 之前只给 10 分钟软冷却，于是"冷却一过又被选中 → 又失败"往复，既不服务也永远不摘。
+	//
+	// 与「3 次才摘号」并存：**冷却挡重试，阈值管要不要摘**。一次 12153 有可能是
+	// 并发刷新的抖动，所以仍不因一次就摘；但它已经证明"这个号此刻不能服务"，
+	// 把它留在候选里没有任何好处。
+	p.pool.CooldownUntilTomorrow4AM(uid, "12153 会话失效（需重新登录）")
+	// 落库标记（v0.31.30）：卡片要整卡标红 + 给「重新登录 / 导入 JSON」按钮。
+	// store 写失败不影响处置（冷却已在内存生效），但会少一个界面提示 —— 记日志。
+	if err := p.store.MarkTokenDead(uid); err != nil {
+		log.Printf("WARN: 标记登录失效失败 uid=%s: %v", uid, err)
+	}
 	if p.pool.NoteSessionDead(uid) {
 		if p.pool.RetireAccount(uid, upstream.ErrSessionDead, "连续 12153（会话失效）超阈值，已禁用，需重登") {
 			p.archiveAbnormal(uid, "会话失效（12153）连续超阈值，已禁用", false)
 		}
-		return
 	}
-	p.pool.Cooldown(uid, pool.CoolSoft, softCooldown,
-		"12153 session dead（累计中，未超阈值仅软冷却）")
 }
 
 // applyRefreshFailure refresh token 失败时的账号处置（v0.24.8 补齐分流）。

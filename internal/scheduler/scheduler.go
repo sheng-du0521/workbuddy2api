@@ -830,6 +830,10 @@ func (s *Scheduler) checkinFiltered(only map[string]bool) ([]CheckinOutcome, err
 				log.Printf("checkin %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+					s.cfg.Pool.CooldownUntilTomorrow4AM(st.UID, "12153 会话失效（需重新登录）")
+					if s.cfg.OnTokenDead != nil {
+						s.cfg.OnTokenDead(st.UID, st.Nickname, "refresh 12153（refresh token 已失效）")
+					}
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
 						log.Printf("WARN: checkin %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 					}
@@ -1230,6 +1234,8 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				// 首次即硬冷却至次日 04:00（v0.31.30）：刷新都失效了，再被选中也服务不了。
+				s.cfg.Pool.CooldownUntilTomorrow4AM(st.UID, "12153 会话失效（需重新登录）")
 				if s.cfg.OnTokenDead != nil {
 					s.cfg.OnTokenDead(st.UID, st.Nickname, "refresh 12153（refresh token 已失效）")
 				}

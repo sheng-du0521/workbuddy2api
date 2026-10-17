@@ -2535,6 +2535,14 @@ async function checkOneHealth(uid, btn) {
 function accountCard(a) {
   const off = a.disabled || a.manual_off;
   const card = el('article', 'ecard acc-card' + (off ? ' dim' : ''));
+  // 登录失效（v0.31.30）：**整卡标红** + 顶部红条 + footer 给「重新登录」。
+  // 为什么不能只加一个小标签：token 废了的号在页面上和健康号长得一样，
+  // 而它既不能服务、也不会自己好 —— 必须一眼能挑出来，否则运维会一直以为"号是好的"。
+  if (a.token_dead) {
+    card.classList.add('acc-dead');
+    card.style.borderColor = '#e74c3c';
+    card.style.boxShadow = 'inset 0 0 0 1px rgba(231,76,60,.35)';
+  }
   // 卡片带 uid（v0.25.0）：积分补新器要能**就地**定位并重画某一张卡的积分区块，
   // 否则每刷一个新的就得整页重载（会打断滚动与勾选）。
   card.dataset.uid = a.uid;
@@ -2571,7 +2579,8 @@ function accountCard(a) {
     '消耗组：' + (a.consume_group_text || consumeLabel(cg)) + (a.consume_group ? '' : '（自动）')));
   if (a.owner_id > 0) chips.appendChild(el('span', 'tag warn', '代挂 · ' + (a.owner_name || ('用户#' + a.owner_id))));
   if (a.host_group) chips.appendChild(el('span', 'tag accent', '代挂组：' + a.host_group));
-  if (off) chips.appendChild(el('span', 'tag err', '已停用'));
+  if (a.token_dead) chips.appendChild(chipWithTitle('登录失效 · 需重新登录', 'err', 'refresh token 已被上游作废（12153）。等下去不会好，只能重新导入该账号的 auth 文件。'));
+  else if (off) chips.appendChild(el('span', 'tag err', '已停用'));
   else if (a.cooling_for > 0) chips.appendChild(el('span', 'tag warn', (a.cool_kind === 'hard' ? '硬' : '软') + '冷却 ' + a.cooling_for + 's'));
   else chips.appendChild(el('span', 'tag ok', '可用'));
   if (a.owner_id > 0) {
@@ -2710,6 +2719,16 @@ function accountCard(a) {
   }));
 
   const foot = el('footer');
+  if (a.token_dead) {
+    const re = el('button', 'danger', '重新登录');
+    re.title = '在 WorkBuddy 桌面端重新登录该账号 → 导出 auth 文件 → 粘贴到「批量导入 JSON」（会覆盖旧凭证并自动清掉红标）';
+    re.onclick = () => {
+      toast('请在桌面端重新登录后导出 auth 文件，然后在顶部「批量导入 JSON」里粘贴导入', 'warn');
+      const imp = $('btnImportDesktop');
+      if (imp) imp.click();
+    };
+    foot.appendChild(re);
+  }
   const toggle = el('button', 'ghost', off ? '启用' : '停用');
   // v0.23.1：停用会**联动归档到「异常」分组**（releases 说明见 handleDisable），
   // 启用会**自动回归原分组**。故 toast 要把这件事说清楚 —— 否则管理员看到分组

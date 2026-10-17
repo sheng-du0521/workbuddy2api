@@ -1665,6 +1665,13 @@ function hostCard(h) {
   const name = h.nickname || h.uid;
   const model = taskModelOf(h.task);
   const card = el('article', 'ecard' + (h.disabled ? ' dim' : ''));
+  // 登录失效（v0.31.30）：整卡标红 + 后续 chips 里加红标 + footer 给「重新登录」。
+  // 用户视角更要说清楚：号在页面上看着正常，但平台根本用不了它 —— 不标红，
+  // 用户只会看到"我的号挂着但没收益"。
+  if (h.token_dead) {
+    card.style.borderColor = '#e74c3c';
+    card.style.boxShadow = 'inset 0 0 0 1px rgba(231,76,60,.35)';
+  }
   const head = el('header');
   head.appendChild(el('div', 'avatar ' + avatarTone(name), name.charAt(0).toUpperCase()));
   const who = el('div', 'who');
@@ -1674,6 +1681,12 @@ function hostCard(h) {
   card.appendChild(head);
 
   const chips = el('div', 'chips');
+  if (h.token_dead) {
+    const dead = el('span', 'tag err', '登录失效 · 需重新登录');
+    dead.title = '这个号的登录凭证已被上游作废，平台无法再使用它。请在 WorkBuddy 桌面端重新登录该账号，'
+      + '导出 auth 文件后交给管理员导入（导入后红标会自动消失）。';
+    chips.appendChild(dead);
+  }
   chips.appendChild(el('span', 'tag', h.realm === 'global' ? '国际版' : '国内版'));
   if (h.host_group) chips.appendChild(el('span', 'tag accent', '代挂组：' + h.host_group));
   chips.appendChild(hostStateTag(h.pool_state));
@@ -1699,6 +1712,22 @@ function hostCard(h) {
     chips.appendChild(t);
   }
   card.appendChild(chips);
+
+  // 登录失效的操作入口（v0.31.30）：用户端没有导入接口（账号由管理员导入），
+  // 所以这里给的是**明确的下一步**，而不是一个点了没反应的红标。
+  if (h.token_dead) {
+    const row = el('div', 'row');
+    row.style.marginTop = '8px';
+    const re = el('button', 'danger sm', '重新登录');
+    re.onclick = () => {
+      alert('请按这三步操作：\n\n1) 在 WorkBuddy 桌面端重新登录这个账号；\n'
+        + '2) 从桌面端导出 auth 文件（或复制其 JSON 内容）；\n'
+        + '3) 把文件/内容交给管理员，在「账号池 → 批量导入 JSON」导入。\n\n'
+        + '导入成功后这张卡的红标会自动消失。');
+    };
+    row.appendChild(re);
+    card.appendChild(row);
+  }
 
   const body = el('div', 'body');
   // 积分展示（v0.24.3 安全修复）：**默认只读池内快照，不再渲染即出站**。

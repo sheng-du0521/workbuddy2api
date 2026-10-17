@@ -1,16 +1,16 @@
 {
-  "version": "0.31.29",
+  "version": "0.31.30",
   "min_supported": "0.24.0",
-  "notes": "v0.31.29：账号导出 / 快照恢复 / 保活分散 / 失效上报四件事。① 导出（管理端 + 用户端）：GET /api/admin/accounts/export[?uids=] 与 GET /api/host/accounts/export，格式与「导入账号」**严格闭环**（字段名对齐 desktopAccount、顶层数组、expiresAt 毫秒），并有 TestExportRoundTrip 把导出→解析放进同一断言里 —— 字段漂移会立刻红（device_token 就这样丢过一轮）。管理端勾选优先、无勾选导全部；用户端只导自己名下的号。前端下载前二次确认：文件里是凭证明文，等同账号钥匙。② 快照恢复：10-18 全池 token 被上游作废后，从 10-16 本地快照里逐个实测，**25 个号的旧 token 仍返回 200**，已按导入接口写回生产（expires_at 已从 11-14 变成 11-12），抽验 checkin/travel 均 ok；剩 13 个（8 个快照里已失效 + 5 个不在快照）需重新登录。③ 失效归因（排除「切换代理」）：token 的 JWT iat=22:01:02~22:01:15（13 秒内 38 个号，串行保活），exp=11-14、kid 与仍有效的旧 token 相同 → **不是密钥轮换、不是出口切换**（默认出口在 23:5x 才改，且 11080/21160 是同一个公网 IP 39.91.80.16）。更符合「22:01 这批批量刷新被上游撤销」。④ 保活改造：默认时点从 [22] 改为**全天 24 小时**，并按 uid 哈希 % 24 给每个号一个专属小时（keepaliveHourOf），另加 0.15~0.85s 抖动 —— 上游任何时刻最多看到 1~2 次刷新，不再是「13 秒内 38 个号」。临近过期（6h）时无视分散立刻刷，避免为了好看把号刷废。⑤ 失效上报：refresh 被判 12153 时回调 OnTokenDead → 写 risk_reports（source=token）+ WARN 日志，健康检测页的台账把它标成「登录失效·需重新登录」（与「风控冷却」区分开，处理方式完全不同）。⑥ 同类项目调研（截至 10-17）：workbuddy2api-hub v1.6.8 的保活是「22:00 扫描，剩余寿命 <2h 才刷」；workbuddy2api-panel 把 12153 判为「硬冷却至次日 04:00 + 提示重新登录」；Buddy2API 已补 WorkBuddy 5.6 加密信封兼容，并提醒「重导入会覆盖仍可刷新的明文凭据」；社区脚本指出**旅行接口在 www.workbuddy.cn/activity/growth/buddy/...（不带 /v2）**，且应采用「先领后派 + 达上限绝不派 + 只读失败一律降级」。活动侧：签到仍 100/天、连签 7 天有额外奖励（活动制、按「期」开放、断签清零），连登按「每天≥1 次对话」计，猫猫旅行约 4 小时一趟 —— 以客户端当期显示为准。",
-  "released_at": 1792267818,
+  "notes": "v0.31.30：12153 硬冷却 / 保活惰性 / 旅行巡检 / 失效标红四件事。① 12153（会话失效）从\"10 分钟软冷却\"改为**首次即硬冷却至次日 04:00**（对齐 workbuddy2api-panel）：继续把这个号排进候选只会白打一次上游，04:00 是额度/签到重置墙钟。与「连续 3 次才摘号」并存 —— 冷却挡重试、阈值管要不要摘。统一在 Proxy.handleSessionDead 与 scheduler 的签到前补刷新/保活两处生效。② 保活加惰性阈值：LazyRefreshHours 默认 0 → **2 小时**（剩余寿命 >2h 就不刷，对齐 hub 的做法）；配合 v0.31.29 的全天分散，正常情况下每个号一天最多真刷一次。③ 旅行巡检 9/21 两点 → **每 4 小时**（0/4/8/12/16/20）：单程约 4 小时，原来 9 点派出、13 点到站却要等 21 点才领，白压 8 小时；巡检自带 dailyLimitReached 判断，多点几次不会超额派遣。④ 失效可视化：新增 accounts.token_dead_at 增量列（用既有 ALTER 列表，**已补老库迁移用例**）；Proxy.handleSessionDead 落标记、UpdateTokens（刷新成功）与导入成功自动清除。账号列表下发 token_dead / token_dead_at；管理后台账号卡**整卡红框 + 红标签「登录失效·需重新登录」+ footer「重新登录」按钮**（直达批量导入弹窗）；用户控制台代挂卡同样标红并给「重新登录」三步指引。⑤ 测试：token_dead_test 2 条（老库迁移幂等 / 标记-清除-刷新写回自动清），全量 go test 与 uitest 均通过。",
+  "released_at": 1792269004,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.29/webapp.exe",
-      "sha256": "93ce902190fd9d601d4e6f97c49f79e3ae0a9be2d2b40764e8f503223deef707",
-      "size": 15232512
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.30/webapp.exe",
+      "sha256": "5aa6a439961ef4565ba3f2fd912c4c7f257e8e8a93b823fad0d8f9acd85fa66e",
+      "size": 15238656
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

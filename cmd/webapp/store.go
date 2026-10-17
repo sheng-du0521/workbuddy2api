@@ -288,6 +288,11 @@ func (s *Store) migrate() error {
 		`ALTER TABLE accounts ADD COLUMN consume_group TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN consume_group_prev TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN consume_group_note TEXT NOT NULL DEFAULT ''`,
+		// 登录失效标记（v0.31.30）：refresh 12153 被确认的时刻，0 = 正常。
+		// 为什么落库：卡片要整卡标红并给「重新登录」入口，这需要**逐号**状态位；
+		// 风控台账是事件流，用它反推"当前还有效吗"只能靠时间窗猜。
+		// 清零点精确：UpdateTokens（刷新成功写回）与导入成功（ClearTokenDead）。
+		`ALTER TABLE accounts ADD COLUMN token_dead_at INTEGER NOT NULL DEFAULT 0`,
 		// 成长任务最近执行时间戳（v0.17.0）：0 = 从未跑过。仅用于账号卡展示，
 		// 不作准入判断（手动选号执行）；不做每日去重（行为事件本身按天幂等）。
 		`ALTER TABLE accounts ADD COLUMN growth_done_at INTEGER NOT NULL DEFAULT 0`,
@@ -662,9 +667,56 @@ func (s *Store) SetDisabled(uid string, disabled bool) error {
 
 // UpdateTokens 写回刷新后的 token。
 func (s *Store) UpdateTokens(uid, accessToken, refreshToken string, expiresAt int64) error {
-	_, err := s.db.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?, expires_at = ?, updated_at = ? WHERE uid = ?`,
+	// token_dead_at 一并清零（v0.31.30）：能成功刷新并写回，就证明这个号的会话活了 ——
+	// 卡片上的红标必须立刻消失，否则用户重新登录后仍看到"失效"，会以为没生效。
+	_, err := s.db.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?, expires_at = ?,
+	        token_dead_at = 0, updated_at = ? WHERE uid = ?`,
 		s.encField(accessToken), s.encField(refreshToken), expiresAt, time.Now().Unix(), uid)
 	return err
+}
+
+// MarkTokenDead 标记账号登录失效（refresh 12153），供卡片整卡标红与按钮提示。
+func (s *Store) MarkTokenDead(uid string) error {
+	if strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE accounts SET token_dead_at = ? WHERE uid = ? AND token_dead_at = 0`,
+		time.Now().Unix(), uid)
+	return err
+}
+
+// ClearTokenDead 清除登录失效标记（重新导入成功后调用）。
+//
+// 为什么必须显式清：重新导入的判断是"uid 已存在 → upsert"，而 upsert 刻意不覆盖
+// 业务状态列（见 import_desktop.go 顶部说明）。不清这一位，用户按提示重新导入后
+// 卡片仍然是红的 —— 那比不标红更让人困惑。
+func (s *Store) ClearTokenDead(uid string) error {
+	if strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE accounts SET token_dead_at = 0 WHERE uid = ?`, uid)
+	return err
+}
+
+// TokenDeadMap 返回 uid → 失效时刻（仅含已标记的号）。
+//
+// 单独查询而不是塞进 Account/SELECT 列清单：改 select 列要同步 scan 顺序，
+// 是这个仓库最容易出错的地方之一（多一列就整片扫空）。这里只多一次轻查询。
+func (s *Store) TokenDeadMap() map[string]int64 {
+	out := map[string]int64{}
+	rows, err := s.db.Query(`SELECT uid, token_dead_at FROM accounts WHERE token_dead_at > 0`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid string
+		var at int64
+		if rows.Scan(&uid, &at) == nil {
+			out[uid] = at
+		}
+	}
+	return out
 }
 
 // SetCooldown 给账号设置冷却到期时间戳（Unix 秒），并累计失败次数。

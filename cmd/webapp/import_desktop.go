@@ -498,6 +498,9 @@ func (a *app) importDesktopAccounts(list []desktopAccount, source, path string) 
 			res.Errors = append(res.Errors, fmt.Sprintf("%s 缺少 access_token 与 refresh_token，已跳过", acc.UID))
 			continue
 		}
+		// 导入即视为"已重新登录"：清掉登录失效标记（v0.31.30）。
+		// 不清的话，用户按提示重新导入后卡片仍然标红 —— 比不标更让人困惑。
+		_ = a.store.ClearTokenDead(acc.UID)
 		if err := a.store.UpsertAccount(acc); err != nil {
 			res.Skipped++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s 写入失败：%v", acc.UID, err))

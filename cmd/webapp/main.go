@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.29"
+const version = "0.31.30"
 
 type app struct {
 	store  *Store
@@ -661,6 +661,13 @@ type accountView struct {
 	// EgressError 出站代理不可用的原因（空 = 正常）。非空时该账号已被排除出平台选号，
 	// 目的是不让它从本机 IP 裸奔出去（见 Proxy.egressBad 的说明）。
 	EgressError string `json:"egress_error,omitempty"`
+	// TokenDead 登录已失效（refresh 12153）——v0.31.30。
+	//
+	// 前端据此把整张卡标红并给「重新登录 / 导入 JSON」入口。**必须与"冷却"分开**：
+	// 冷却等下去会好，登录失效等多久都不会好，只能重新导入。
+	TokenDead bool `json:"token_dead"`
+	// TokenDeadAt 失效确认时刻（unix 秒，0 = 正常）。
+	TokenDeadAt int64 `json:"token_dead_at,omitempty"`
 	// RunState 运行态枚举（R9）：把布尔位与自由文案收敛成九态，见 runstate.go。
 	// 存在的理由：区分「风控冷却」与「限流冷却」—— 两者处置方向相反，此前都显示"冷却中"。
 	RunState string `json:"run_state"`
@@ -955,6 +962,8 @@ func (a *app) allAccountViewsErr() ([]accountView, error) {
 	// 积分明细缓存（v0.24.9）：**一次查询**批量载入，卡片直接展示（零出站），
 	// 点「刷新明细」才出站。逐个账号查会是 N+1，故走 ByUID 批量接口。
 	creditByUID := a.store.CreditPacksByUID()
+	// 登录失效标记（一次轻查询；不塞进 Account 的 SELECT 列清单，避免 scan 顺序错位）。
+	deadMap := a.store.TokenDeadMap()
 	out := make([]accountView, 0, len(dbAccounts))
 	for _, acc := range dbAccounts {
 		st, ok := statusByUID[acc.UID]
@@ -962,6 +971,10 @@ func (a *app) allAccountViewsErr() ([]accountView, error) {
 			st = pool.Status{UID: acc.UID, Nickname: acc.Nickname, Realm: acc.Realm}
 		}
 		v := a.toViewP(st, acc, creditByUID[acc.UID])
+		if at, ok := deadMap[acc.UID]; ok {
+			v.TokenDead = true
+			v.TokenDeadAt = at
+		}
 		if acc.OwnerUserID > 0 {
 			v.OwnerName = names[acc.OwnerUserID]
 		}

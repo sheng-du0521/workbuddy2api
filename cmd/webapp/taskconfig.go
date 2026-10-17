@@ -65,13 +65,21 @@ func DefaultTaskConfig() TaskConfig {
 		Enabled:       true,
 		JitterMinutes: 5,
 		CheckinHours:  []int{9, 21},
-		TravelHours:   []int{9, 21},
+		// 旅行巡检改为**每 4 小时**（v0.31.30）：单程约 4 小时（同类项目口径），
+		// 原来只在 9/21 点巡检 → 9 点派出、13 点就到站，却要等到 21 点才领，
+		// 白白压着 8 小时。巡检自带 dailyLimitReached 判断，多点几次不会超额派遣。
+		TravelHours:   []int{0, 4, 8, 12, 16, 20},
 		ActivityHours: []int{10},
 		// 保活改为**每小时一次**（v0.31.29）：配合 scheduler 的按账号分散窗口，
 		// 全池刷新从"13 秒内 38 个号"变成"每小时 1~2 个号"。
 		// 2026-10-18 的教训：批量续期对上游是一眼可见的异常模式。
-		KeepaliveHours:      hours24(),
-		CatHours:            []int{1},
+		KeepaliveHours: hours24(),
+		CatHours:       []int{1},
+		// 惰性刷新（v0.31.30）：剩余有效期 > 2 小时就不刷 —— 对齐同类项目
+		// （workbuddy2api-hub：22:00 扫描、剩余寿命 <2h 才刷）。
+		// 之前的默认 0（= 无条件下刷）意味着"每小时都会把所有轮到小时的号刷一遍"，
+		// 既没必要，也在上游留下成片的 refresh 记录。
+		LazyRefreshHours:    2,
 		ActivityReportCount: 5,
 		ExpiringSoonDays:    7,
 		// 批内任务错峰默认开启（60~150s）：同一时点多类任务遍历同一批账号，
