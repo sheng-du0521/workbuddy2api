@@ -659,6 +659,12 @@ type egressOverviewView struct {
 	// 所有「未单独指定出口」的账号都会从**某个用户的家庭宽带**出去 ——
 	// 既是越界使用别人的带宽，也会把平台号与该用户的号绑在同一个 IP 上。
 	DefaultUserOwned bool `json:"default_user_owned"`
+	// OrphanAccountEgress 账号上配了出口、但线路池里找不到这条线路的条数（v0.31.33）。
+	//
+	// 正常恒为 0：所有写入路径都走 setAccountEgress（规范化 + 登记），启动还会对齐一次。
+	// 非 0 = 有人绕过接口直接改了库，或者 URL 无法规范化 —— 两种情况都会让
+	// 「账号代理」与「出口代理」的 IP 对不上，所以要在页面上报出来并可一键对齐。
+	OrphanAccountEgress int `json:"orphan_account_egress"`
 }
 
 // handleEgressOverview 出口聚合看板。
@@ -812,19 +818,20 @@ func (a *app) egressOverview() (egressOverviewView, error) {
 	}
 
 	return egressOverviewView{
-		Proxies:            synced,
-		DirectAccountCount: directCount,
-		DirectExplicit:     directExplicit,
-		DirectOwners:       owners,
-		Bad:                badRows,
-		MaxPerProxy:        maxPer,
-		OverCount:          overCount,
-		Unassigned:         unassigned,
-		DefaultEgress:      defEgress,
-		DistinctExitIPs:    distinct,
-		SharedExits:        shared,
-		DefaultOwnerUser:   defOwner,
-		DefaultUserOwned:   defOwner > 0,
+		Proxies:             synced,
+		DirectAccountCount:  directCount,
+		DirectExplicit:      directExplicit,
+		DirectOwners:        owners,
+		Bad:                 badRows,
+		MaxPerProxy:         maxPer,
+		OverCount:           overCount,
+		Unassigned:          unassigned,
+		DefaultEgress:       defEgress,
+		DistinctExitIPs:     distinct,
+		SharedExits:         shared,
+		DefaultOwnerUser:    defOwner,
+		DefaultUserOwned:    defOwner > 0,
+		OrphanAccountEgress: a.orphanAccountEgress(),
 	}, nil
 }
 

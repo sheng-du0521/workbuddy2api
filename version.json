@@ -1,16 +1,16 @@
 {
-  "version": "0.31.32",
+  "version": "0.31.33",
   "min_supported": "0.24.0",
-  "notes": "v0.31.32：重新登录自助化（扫码 / 导入 JSON）+ 允许借用他人线路 + 管理端借用用户住宅 IP。① 用户端「重新登录」不再是死路：卡片上的按钮直接开弹窗，两条路并列 ——(a) 扫码登录（复用现有 OAuth 弹窗，登录成功即覆盖该号凭证）；(b) 导入 auth JSON（新增 POST /api/host/accounts/import，与「导出 JSON」严格闭环；支持粘贴或选文件，一次最多 50 个）。账号代挂区也新增「导入 JSON」按钮，便于换机批量迁移。② PollOAuth 加固（这是\"重新登录\"真正能用的前提）：(a) 同一个 uid 已存在且归属不是自己 → **拒绝**（此前会把令牌写到原号主/平台账号上，形成串号：A 的号换了会话，B 以为自己加成功了）；(b) 保留人工停用（disabled 是管理员裁决，登录不该顺手解除），但清冷却/失败计数；(c) 成功即清 token_dead_at（不清的话红标一直亮，用户会以为没生效而反复扫码）。③ 可用线路 = 平台 + 自己的 + **别人的**：用户端不再 403 拦他人线路，改为\"可选 + 显式标注\"：线路卡与下拉都写「他人 <用户名>」，切换前弹确认（流量经过对方机器、access_token 对其可见），服务端打 WARN 审计日志（谁把几个号放到了谁的线路上）。按 IP 均衡也纳入他人线路，代表线路优先级 = 自己的 → 平台 → 他人（按代价排，不是按所有权）。④ 管理端借用用户住宅 IP：批量分配新增「纳入用户线路（借用住宅 IP）」勾选框（include_user_lines=true）。默认仍不自动选用户线路 —— 自动挑\"最闲的一条\"会把平台账号的access_token 随机送到某个用户家里；勾选即代表管理员知情。线路归属与账号归属都不因借用改变。⑤ 测试：host_import_test（新号入库 / 同号重导=更新且不动出口、清失效标记 / 别人的号与平台号被跳过且令牌未被改写）、egress_userline_assign_test（默认不进候选→400；勾选后分配到用户线路，且双方归属不变）、host_egress_lines_test 改为断言\"他人线路可选 + foreign/owner_name 齐全\"；uitest 新增 host-relogin 守卫（卡片必须开弹窗、不得调管理端导入接口、管理端必须有借用开关）。全量 go test 与 uitest 均通过。⑥ 诚实边界：扫码路径依赖上游 OAuth 回调，单测覆盖不到（本次只测了归属/状态保持的代码分支）；他人线路的\"可见凭证\"是架构事实（HTTP 代理），本版做的是标注 + 审计，不是技术上阻止。",
-  "released_at": 1792272828,
+  "notes": "v0.31.33：**账号代理与出口代理一致化** —— 两边永远是同一份数据、同一个出口 IP。① 根因：线路的身份是 URL 字符串（egress_proxies.url 唯一键、accounts.egress_proxy 存同一个串），但账号那侧是自由文本且**不登记进池**：管理端「账号代理·改」填一个自定义代理，只写 accounts 表，线路池看不见它、也不会有 last_ip —— 于是账号侧永远回答不出\"这个号实际从哪个 IP 出去\"，池子的「N 条线路 / M 个 IP」也漏了它。更隐蔽的是写法漂移：`HTTP://a:1/` 与 `http://a:1`是两条线路、各自探活计数，出口 IP 却是同一个。② 规范化（internal/egress.Normalize + Validate 输出规范值）：协议名与主机小写、去掉空路径尾斜杠、丢弃 fragment；刻意不删默认端口、不重排 query（会改变行为）。store.SetAccountEgress 在**唯一落库点**统一规范化，任何绕不过它。③ 单一入口（cmd/webapp/egress_align.go）：`setAccountEgress` = 校验 → **确保线路池里存在**（缺则自动登记，归属按账号号主，名字带用户名）→ 再写账号。顺序刻意如此：反过来的话登记失败就会留下\"池里没有的出口\"。管理端单号改出口、用户端「我的出口」都改走它。④ 历史数据对齐：`convergeAccountEgress` 合并同一代理的不同写法（保留创建最早、并把它改写成规范 URL）、补登记池外的账号出口、把账号上的写法改写成规范值；启动时跑一次（不探活，避免拖慢首屏），另新增 `POST /api/admin/egress/converge`（可 probe=true 顺手探活拿 IP）。⑤ 查询侧同口径：管理端账号代理视图、用户端账号出口视图、机器视图的线路台账、绑定计数全部改用 `egressURLKey`（规范化键）比对 —— 否则历史行仍会「明明在池里却显示不在」。⑥ 概览新增 `orphan_account_egress`（池外出口条数，正常恒为 0）；管理后台线路池显示该计数并给「对齐账号出口」按钮，用户端出口面板的 IP 也随之有值（来自线路 last_ip，与出口代理同一个字段）。⑦ 测试：align 两条（写入即登记 + 幂等 + direct/空串不登记；历史脏数据合并/补登记/改写/孤儿清零/二次对齐无改动）、egress 包补规范化断言（大写协议、尾斜杠、fragment）；uitest 新增 egress-consistency 守卫（禁止 admin_ext 绕过统一入口、store 必须规范化、页面必须有告警与对齐入口）。⑧ 诚实边界：规范化会**改写历史数据**（大小写/尾斜杠那一类），行为等价但字符串会变；对齐不做\"按出口 IP 合并两条不同代理\"——那需要探活证据，且两条不同代理恰好同 IP 时合并会破坏用户意图，本版只把\"同一 URL 不同写法\"合并，同 IP 仍在页面上按 IP 报数。",
+  "released_at": 1792274581,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.32/webapp.exe",
-      "sha256": "d16a765e5da08f6ca38ee6c11f3369ffa70d15d448287e953c1f0b5abfe1d15e",
-      "size": 15357440
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.33/webapp.exe",
+      "sha256": "1033e4e0b02efe87a29ad122e787d9bab580c570e561f39b514c93c36b3d21ff",
+      "size": 15378944
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

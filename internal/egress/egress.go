@@ -119,7 +119,62 @@ func Validate(raw string) (string, error) {
 	if err != nil || n < 1 || n > 65535 {
 		return "", fmt.Errorf("端口 %q 不合法（应为 1-65535）", port)
 	}
-	return s, nil
+	// 统一成**唯一写法**（v0.31.33）：见 Normalize 的注释。
+	return canonicalProxyURL(u, scheme), nil
+}
+
+// Normalize 把代理 URL 规范化为**唯一写法**（v0.31.33）。
+//
+// # 为什么必须规范化
+//
+// 线路的**身份是 URL 字符串**（`egress_proxies.url` 是唯一键、账号上也存这个串）。
+// 同一个代理写两遍不同拼法就是两条"线路"：
+//
+//	http://1.2.3.4:8080   /   http://1.2.3.4:8080/   /   HTTP://1.2.3.4:8080
+//
+// 三条线路各自探活、各自计数、各自算"同出口上限"，而它们的出口 IP 是同一个 ——
+// 于是页面上「3 条线路、1 个 IP」，分配算法还以为自己在做隔离。这正是
+// 「账号代理与出口代理 IP 不一致」在数据层的样子：**账号上存的是 A 写法，
+// 线路池里存的是 B 写法**，两边对不上，谁也认不出谁。
+//
+// 规范化只做**语义等价**的改写，不改任何会改变行为的细节：
+//   - 协议名与主机名转小写（DNS 与 URL scheme 都不区分大小写）；
+//   - 去掉空路径的尾部斜杠（`/` 与空路径等价）；
+//   - 丢弃 fragment（`#xxx` 从不发给代理）。
+//
+// 刻意**不**做的事：不删默认端口（http:80 / https:443）—— 这个仓库的校验要求
+// 显式端口，删了会让"存进去的"和"用户填的"看起来不一样，反而更难核对；
+// 不重排 query（少数代理用 query 区分身份，重排有风险）。
+func Normalize(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("代理 URL 无法解析：%v", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if !SupportedSchemes[scheme] {
+		// 交给 Validate 给出面向人的错误文案（这里只是不让 Normalize 悄悄放行）。
+		return "", fmt.Errorf("不支持的代理协议 %q（支持 http / https / socks5）", u.Scheme)
+	}
+	return canonicalProxyURL(u, scheme), nil
+}
+
+// canonicalProxyURL 由已解析的 URL 生成规范写法（scheme 已小写）。
+func canonicalProxyURL(u *url.URL, scheme string) string {
+	out := *u
+	out.Scheme = scheme
+	// Host 含 userinfo 之外的部分；url.URL.Host 是 "host:port"（可能带 IPv6 方括号）。
+	host := strings.ToLower(out.Host)
+	out.Host = host
+	out.Fragment = ""
+	out.RawFragment = ""
+	if out.Path == "/" {
+		out.Path = ""
+	}
+	return out.String()
 }
 
 // probeEndpoints 出口 IP 探测端点候选（按「国内可达性优先」排序）。

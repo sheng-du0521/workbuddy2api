@@ -111,15 +111,14 @@ func (a *app) handleAccountEgress(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "账号不存在"})
 		return
 	}
-	p := strings.TrimSpace(req.Proxy)
-	// 校验统一走 internal/egress：与运行时路由、同步期检查同一份口径。
-	// 账号级校验额外接受 direct 哨兵（显式直连，覆盖全局默认代理）。
-	if _, err := egress.ValidateAccountEgress(p); err != nil {
+	// 校验 + **登记进线路池** + 规范化，一次做完（v0.31.33）。
+	//
+	// 以前这里只校验格式就直接写账号：填一个池里没有的自定义代理，账号上就有了
+	// 一条"出口代理页看不见、也没有出口 IP"的线路 —— 这正是"账号代理与出口代理
+	// 对不上"的来源。现在走统一入口，账号上出现的 URL 一定能在池里找到。
+	p, err := a.setAccountEgress(uid, req.Proxy)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := a.store.SetAccountEgress(uid, p); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	_ = a.proxy.SyncAccounts()

@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.32"
+const version = "0.31.33"
 
 type app struct {
 	store  *Store
@@ -373,6 +373,17 @@ func main() {
 		a.proxy.Close()
 		_ = store.Close()
 		os.Exit(updateExitCode(st))
+	}
+
+	// 账号出口 ↔ 线路池对齐（v0.31.33）：把历史数据里"账号上有、池里没有"的出口
+	// 补登记，并把同一代理的不同写法合并。**不探活** —— 启动阶段做网络请求会拖慢
+	// 首屏，且失败不好处理；出口 IP 由定时探活（5 分钟一轮）补齐。
+	// 失败只记日志：对齐是"数据卫生"，不该阻止服务启动。
+	if res, err := a.convergeAccountEgress(false); err != nil {
+		log.Printf("WARN: [egress] 启动对齐账号出口失败（不影响启动）：%v", err)
+	} else if res.MergedLines+res.RegisteredLines+res.RewrittenAccounts > 0 {
+		log.Printf("INFO: [egress] 启动对齐：合并重复线路 %d 条、补登记 %d 条、改写账号 %d 个",
+			res.MergedLines, res.RegisteredLines, res.RewrittenAccounts)
 	}
 
 	defer a.proxy.Close()
@@ -1622,6 +1633,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/egress/assign", a.adminGuard(a.handleEgressAssign))
 	// 全局默认出口修复（v0.31.26）：护栏管不了历史配置，历史配置需要一键改回。
 	mux.HandleFunc("POST /api/admin/egress/default/repair", a.adminGuard(a.handleEgressDefaultRepair))
+	// 账号出口 ↔ 线路池对齐（v0.31.33）：补登记池外的账号出口、合并同 URL 不同写法。
+	mux.HandleFunc("POST /api/admin/egress/converge", a.adminGuard(a.handleEgressConverge))
 	mux.HandleFunc("GET /api/admin/egress/overview", a.adminGuard(a.handleEgressOverview))
 	// 账号代理视图（v0.17.9）：逐账号的出口配置与实际出口（只读本地，不出站）。
 	mux.HandleFunc("GET /api/admin/egress/accounts", a.adminGuard(a.handleEgressAccounts))

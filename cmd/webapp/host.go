@@ -454,7 +454,10 @@ func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
 	}
 	changed := 0
 	for _, uid := range targets {
-		if err := a.store.SetAccountEgress(uid, norm); err != nil {
+		// 统一入口（v0.31.33）：规范化 + 确保池里存在这条线路。用户在"我的出口"
+		// 里手填的地址从此会被自动登记进线路池，管理后台能看到、能探活、能分配 ——
+		// 而不是只躺在 accounts.egress_proxy 里当一条"看不见的出口"。
+		if _, err := a.setAccountEgress(uid, norm); err != nil {
 			log.Printf("WARN: [host] 设置代挂出口失败 acct=%s: %v", uid, err)
 			continue
 		}

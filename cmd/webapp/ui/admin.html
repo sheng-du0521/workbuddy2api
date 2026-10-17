@@ -593,7 +593,12 @@
         <div class="row" style="margin:0 0 10px;gap:8px;align-items:center;">
           <button class="ghost sm" id="btnEgrRepair"
             title="检查所有 agent 机器的隧道端口是否冲突、隧道实测出口与自报是否一致；发现问题就换端口并让那台机器重建隧道">修复出口端口冲突</button>
+          <!-- 一致化（v0.31.33）：账号上填的出口若不在线路池里，这里会补登记并探活，
+               让「账号代理」与「出口代理」用的永远是同一份数据、同一个出口 IP。 -->
+          <button class="ghost sm" id="btnEgrConverge"
+            title="把账号上配置的出口全部登记进线路池（缺则补、重复写法则合并），并顺手探活拿到真实出口 IP。只改出口配置，不动账号状态">对齐账号出口</button>
           <span class="muted" style="font-size:12px;" id="egrRepairHint"></span>
+          <span class="muted" style="font-size:12px;" id="egrConvergeHint"></span>
         </div>
         <div class="cards" id="egrCards"></div>
 
@@ -7476,6 +7481,13 @@ function renderEgrPoolHint() {
     box.appendChild(el('b', 'err', '；有 ' + mism.length + ' 条线路的隧道实测出口与本机自报不一致'
       + '（隧道没落到那台机器上 —— 点「修复出口端口冲突」）'));
   }
+  // 账号出口缺失线路（v0.31.33）：账号上配了出口、池里却没有 —— 那号就没法回答
+  // "实际从哪个 IP 出去"，而池子的 IP 账也漏了它。点「对齐账号出口」即可修。
+  const orphan = (egrView && egrView.orphan_account_egress) || 0;
+  if (orphan > 0) {
+    box.appendChild(el('b', 'err', '；有 ' + orphan + ' 个账号的出口不在线路池里'
+      + '（点上方「对齐账号出口」补登记）'));
+  }
   const dups = egrList.filter((p) => {
     const m = egrMachines[p.url];
     return m && (m.alt_ids || []).length;
@@ -8141,6 +8153,33 @@ async function egrSetDirect(mode) {
     toast('已' + label + '：' + d.assigned + ' 个账号', 'ok');
     loadEgress();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+if ($('btnEgrConverge')) {
+  $('btnEgrConverge').onclick = async () => {
+    const btn = $('btnEgrConverge');
+    const hint = $('egrConvergeHint');
+    btn.disabled = true;
+    if (hint) hint.textContent = '正在对齐（会逐条探活，可能要几十秒）…';
+    try {
+      const d = await post('/api/admin/egress/converge', { probe: true });
+      const r = d.result || {};
+      const parts = [];
+      if (r.merged_lines) parts.push('合并重复 ' + r.merged_lines + ' 条');
+      if (r.registered_lines) parts.push('补登记 ' + r.registered_lines + ' 条');
+      if (r.rewritten_accounts) parts.push('改写账号 ' + r.rewritten_accounts + ' 个');
+      if (r.probed) parts.push('探活 ' + r.probed + ' 条');
+      const msg = parts.length ? parts.join('、') : '已经对齐，无需改动';
+      if (hint) hint.textContent = msg + (r.orphans ? '；仍有 ' + r.orphans + ' 条异常' : '');
+      toast(msg, 'ok');
+      for (const n of (r.notes || []).slice(0, 4)) toast(n, 'warn');
+      loadEgress();
+    } catch (e) {
+      if (hint) hint.textContent = '';
+      toast('对齐失败：' + e.message, 'err');
+    }
+    btn.disabled = false;
+  };
 }
 
 if ($('btnEgrRepair')) {

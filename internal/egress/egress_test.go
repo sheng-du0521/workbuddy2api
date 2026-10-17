@@ -24,7 +24,11 @@ func TestValidate(t *testing.T) {
 		{"https://user:pass@proxy.example.com:3128", "https://user:pass@proxy.example.com:3128"},
 		{"socks5://127.0.0.1:1080", "socks5://127.0.0.1:1080"},
 		{"  http://1.2.3.4:8080  ", "http://1.2.3.4:8080"}, // 首尾空白被裁剪
-		{"HTTP://1.2.3.4:8080", "HTTP://1.2.3.4:8080"},     // 协议大小写不敏感
+		// v0.31.33 起**输出统一小写**：线路身份是 URL 字符串，
+		// 保留大小写会让同一个代理变成两条线路（各自探活、各自计数、同一个 IP）。
+		{"HTTP://1.2.3.4:8080", "http://1.2.3.4:8080"},
+		{"http://Proxy.Example.COM:3128/", "http://proxy.example.com:3128"}, // 去尾斜杠 + 主机小写
+		{"socks5://1.2.3.4:1080/#frag", "socks5://1.2.3.4:1080"},            // fragment 丢弃
 	}
 	for _, c := range ok {
 		got, err := Validate(c.in)

@@ -2465,6 +2465,45 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] host-relogin: 重新登录可扫码/导入 JSON 自助完成；借用用户线路需显式勾选');
   }
 
+  // v0.31.33：**账号代理与出口代理的一致化**必须结构性成立，不能靠约定。
+  //
+  // 规则：凡是"把任意 URL 写进 accounts.egress_proxy"的入口，都必须走
+  // `a.setAccountEgress`（它负责规范化 + 登记进线路池）。直接调
+  // `a.store.SetAccountEgress` 就等于制造一条"池里没有、也没有出口 IP"的线路 ——
+  // 那正是两边 IP 对不上的来源。这条守卫就是防它悄悄长回来。
+  const ecBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const store = read('cmd/webapp/store.go');
+    if (!store.includes('egress.Normalize')) {
+      ecBad.push('store.SetAccountEgress 没有规范化 URL —— 同一条代理的两种写法会变成两条线路');
+    }
+    const adminExt = read('cmd/webapp/admin_ext.go');
+    if (adminExt.includes('a.store.SetAccountEgress')) {
+      ecBad.push('admin_ext.go 绕过 setAccountEgress 直接写账号出口（不会登记进线路池）');
+    }
+    const hostSrc = read('cmd/webapp/host.go');
+    if (!hostSrc.includes('a.setAccountEgress(')) {
+      ecBad.push('host.go 的「我的出口」没有走统一入口（用户填的地址不会进线路池）');
+    }
+    const align = read('cmd/webapp/egress_align.go');
+    if (!align.includes('ensureEgressLineRegistered')) {
+      ecBad.push('egress_align.go 缺少自动登记逻辑');
+    }
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('btnEgrConverge')) {
+      ecBad.push('admin.html 缺少「对齐账号出口」入口（历史脏数据没有修复手段）');
+    }
+    if (!adminHtml.includes('orphan_account_egress')) {
+      ecBad.push('admin.html 没有展示"池外出口"计数 —— 不一致时会静默存在');
+    }
+  }
+  ecBad.forEach((m) => console.log('  [FAIL] egress-consistency: ' + m));
+  if (!ecBad.length) {
+    console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
+  }
+
   // v0.31.25：**还没接入 agent 时，页面必须给出"下载安装包"这条路**。
   //
   // 这一版之前，这里的文案是"请先在目标电脑上运行下面那行命令" —— 用户要自己

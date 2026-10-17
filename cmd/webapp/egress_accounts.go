@@ -132,7 +132,8 @@ func (a *app) handleEgressAccounts(w http.ResponseWriter, r *http.Request) {
 	// URL → 线路台账（取备注名与 id，便于「指定线路」显示成人读的名字）。
 	byURL := map[string]*EgressProxy{}
 	for _, p := range proxies {
-		byURL[p.URL] = p
+		// 用规范化键（v0.31.33）：历史行可能是旧写法，原样比会"查不到"。
+		byURL[egressURLKey(p.URL)] = p
 	}
 
 	out := egressAccountsView{
@@ -182,7 +183,7 @@ func (a *app) handleEgressAccounts(w http.ResponseWriter, r *http.Request) {
 		default:
 			item.State = egrStateDirectImplicit
 		}
-		if p, ok := byURL[resolved]; ok {
+		if p, ok := byURL[egressURLKey(resolved)]; ok {
 			item.ProxyID, item.ProxyName = p.ID, p.Name
 		}
 		item.StateLabel = stateLabelOf(item.State)

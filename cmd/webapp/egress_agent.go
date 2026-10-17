@@ -1076,7 +1076,9 @@ func (a *app) defaultEgress() string {
 func (a *app) egressHostBinding(urls []string, owner int64) (bound map[string]int, total int) {
 	bound = map[string]int{}
 	for _, u := range urls {
-		bound[u] = 0
+		// 键统一走规范化（v0.31.33）：账号上存的可能是旧写法，
+		// 原样比会让"已绑定"显示成 0（页面于是提示"还没应用"）。
+		bound[egressURLKey(u)] = 0
 	}
 	accs, err := a.store.ListAccounts()
 	if err != nil {
@@ -1091,8 +1093,9 @@ func (a *app) egressHostBinding(urls []string, owner int64) (bound map[string]in
 		}
 		total++
 		if u := strings.TrimSpace(acc.EgressProxy); u != "" {
-			if _, ok := bound[u]; ok {
-				bound[u]++
+			k := egressURLKey(u)
+			if _, ok := bound[k]; ok {
+				bound[k]++
 			}
 		}
 	}
@@ -1121,7 +1124,7 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 	proxyLastIP := map[string]string{}
 	if proxies, err := a.store.ListEgressProxies(); err == nil {
 		for _, p := range proxies {
-			u := strings.TrimSpace(p.URL)
+			u := egressURLKey(p.URL)
 			proxyIDByURL[u] = p.ID
 			if ip := normalizeExitIP(p.LastIP); ip != "" {
 				proxyLastIP[u] = ip

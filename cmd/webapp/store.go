@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/egress"
 	"workbuddy2api/internal/usage"
 
 	_ "modernc.org/sqlite"
@@ -496,9 +498,22 @@ func (s *Store) SetAccountGroup(uid, group string) error {
 }
 
 // SetAccountEgress 设置账号专用出站代理。空串 = 走全局默认/直连。
+//
+// **写库前统一规范化**（v0.31.33）：线路的身份是 URL 字符串（`egress_proxies.url`
+// 是唯一键），而账号上存的是同一个串。同一个代理写成 `HTTP://a:1/` 与 `http://a:1`
+// 会让"账号代理"和"出口代理"对不上号 —— 页面显示两条线、实际一个 IP。
+//
+// 放在这里（而不是每个调用点各写一遍）是因为这是**唯一**的落库处：
+// 只要还有一条路径绕过规范化，两边就又会漂。非法的 URL 原样写入（不在这里报错）：
+// 校验的责任在 `ValidateAccountEgress` / `a.setAccountEgress`，写库层不该吞掉它，
+// 也不该静默改成别的值 —— 那会让"我填的"和"存下的"不一致且没人知道。
 func (s *Store) SetAccountEgress(uid, proxy string) error {
+	v := strings.TrimSpace(proxy)
+	if canon, err := egress.Normalize(v); err == nil {
+		v = canon
+	}
 	_, err := s.db.Exec(`UPDATE accounts SET egress_proxy = ?, updated_at = ? WHERE uid = ?`,
-		strings.TrimSpace(proxy), time.Now().Unix(), uid)
+		v, time.Now().Unix(), uid)
 	return err
 }
 

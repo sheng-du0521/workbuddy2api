@@ -113,7 +113,7 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 
 	byURL := make(map[string]*EgressProxy, len(proxies))
 	for _, p := range proxies {
-		byURL[strings.TrimSpace(p.URL)] = p
+		byURL[egressURLKey(p.URL)] = p
 	}
 
 	// 线路视图：只给"我能用"的（平台 + 我自己的）。
@@ -223,7 +223,7 @@ func (a *app) hostEgressAccountOf(acc *Account, byURL map[string]*EgressProxy, d
 		// 所以没有可展示的出口 IP（除非运维自己知道机房 IP）。
 		v.Resolved, v.ExitSource = "", "direct"
 	}
-	if p := byURL[v.Resolved]; p != nil {
+	if p := byURL[egressURLKey(v.Resolved)]; p != nil {
 		v.ResolvedName = p.Name
 		v.ExitIP = normalizeExitIP(p.LastIP)
 	} else if v.ExitSource == "line" {
