@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.31"
+const version = "0.31.32"
 
 type app struct {
 	store  *Store
@@ -1448,6 +1448,9 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/host/accounts/export", a.userGuard(a.handleExportHostAccounts))
 	// 健康检测（v0.31.31，插件 health-check）：只查本人号，且 allowDelete=false。
 	// 路由放在 /accounts/{uid}/... 之前无冲突（静态段与通配段分开注册）。
+	// 用户端导入账号 JSON（v0.31.32）：重新登录的另一条路（不必扫码）。
+	// 只写自己名下的号：别人的号跳过并说明（见 host_import.go 文件头）。
+	mux.HandleFunc("POST /api/host/accounts/import", a.userGuard(a.handleHostImportAccounts))
 	mux.HandleFunc("POST /api/host/accounts/health", a.userGuard(a.handleHostHealthCheck))
 	mux.HandleFunc("GET /api/host/accounts/health/last", a.userGuard(a.handleHostHealthLast))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/group", a.userGuard(a.handleHostSetGroup))

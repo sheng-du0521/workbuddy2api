@@ -3132,6 +3132,143 @@ async function loadEgressHome() {
 }
 
 // ======================================================================
+// 重新登录 / 导入账号 JSON（v0.31.32）
+//
+// 背景：token 被判失效（12153）之后**只能重新登录**。用户端此前只有「扫码添加」
+// 一条路，而且失败后卡片上只有一个"去找管理员"的三步提示 —— 失效号一多，
+// 恢复就被卡在人工环节。这里补齐两条自助路径：
+//   ① 扫码（复用现有 oauth 弹窗，登录成功即覆盖该号凭证）；
+//   ② 导入 auth JSON（与「导出 JSON」严格闭环，粘回去即可）。
+// ======================================================================
+
+// hostImportJSONDialog 打开"粘贴/选择 auth JSON"弹窗。
+//
+// opts.onDone(count) 在导入成功后调用（用于刷新列表）。
+function hostImportJSONDialog(opts) {
+  opts = opts || {};
+  const m = openModal(opts.title || '导入账号 JSON',
+    '粘上 WorkBuddy 导出的 auth 文件内容（或直接选文件）。**同一个号**再导一次 = 重新登录，'
+    + '会覆盖旧凭证并清掉「登录失效」标记；新号则直接加到你名下。');
+  const body = m.body;
+
+  const ta = el('textarea');
+  ta.placeholder = '[{"uid":"…","access_token":"…","refresh_token":"…"}] 或单个对象 {…}';
+  ta.rows = 8;
+  ta.style.cssText = 'width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12px;';
+  body.appendChild(ta);
+
+  const row = el('div', 'row');
+  row.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;';
+
+  // 文件选择：读文本塞进 textarea —— 不直接把文件传给后端，用户能先看到内容再决定。
+  const file = document.createElement('input');
+  file.type = 'file';
+  file.accept = '.json,application/json,text/plain';
+  file.style.display = 'none';
+  file.onchange = () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { ta.value = String(rd.result || ''); };
+    rd.onerror = () => toast('读取文件失败', 'err');
+    rd.readAsText(f, 'utf-8');
+  };
+  body.appendChild(file);
+  const pick = el('button', 'ghost', '选择文件…');
+  pick.onclick = () => file.click();
+  row.appendChild(pick);
+
+  const run = el('button', '', '导入');
+  run.onclick = async () => {
+    const txt = String(ta.value || '').trim();
+    if (!txt) { toast('先粘贴内容或选择文件', 'err'); return; }
+    if (!(await confirmAsk('导入这段 JSON？\n\n· 同一个号会覆盖旧凭证（= 重新登录）；\n'
+      + '· 新号直接加到你名下（未申请入池）；\n· 不属于你的号会被跳过并说明原因。'))) return;
+    run.disabled = true;
+    try {
+      const d = await post('/api/host/accounts/import', { json: txt });
+      toast(d.note || ('已导入 ' + d.imported + ' 个、更新 ' + d.updated + ' 个'), 'ok');
+      for (const s of (d.skips || []).slice(0, 6)) {
+        toast((s.uid ? maskUID(s.uid) + '：' : '') + s.reason, 'warn');
+      }
+      m.close();
+      if (typeof opts.onDone === 'function') opts.onDone(d);
+    } catch (e) {
+      toast('导入失败：' + (e && e.message ? e.message : e), 'err');
+      run.disabled = false;
+    }
+  };
+  row.appendChild(run);
+
+  const cancel = el('button', 'ghost', '取消');
+  cancel.onclick = m.close;
+  row.appendChild(cancel);
+  body.appendChild(row);
+}
+
+// hostReloginDialog 重新登录某个代挂号：扫码 / 导入 JSON 两条路并列。
+//
+// 只对**自己的号**有意义（服务端也只允许改自己的号），所以这里不做权限判断 ——
+// 按钮只出现在自己名下的卡片上。
+function hostReloginDialog(acc) {
+  const name = (acc && (acc.nickname || maskUID(acc.uid))) || '账号';
+  const m = openModal('重新登录 · ' + name,
+    '两种方式选一种即可。登录成功后这个号的凭证会被替换、红色「登录失效」标记自动消失，'
+    + '原有的分组 / 出口 / 入池状态**不会被改动**。');
+  const body = m.body;
+
+  // ① 扫码
+  const t1 = el('div', 'sub');
+  t1.style.margin = '4px 0 8px';
+  t1.appendChild(el('b', null, '① 扫码登录（推荐）'));
+  t1.appendChild(document.createTextNode('：点下面按钮，在打开的页面里登录这个账号，本页会自动采集。'));
+  body.appendChild(t1);
+  body.appendChild(oauthScanButtons({
+    startUrl: '/api/host/oauth/start',
+    pollUrl: '/api/host/oauth/poll',
+    title: '扫码重新登录 · ' + name,
+    subtitle: '选版本后点「开始扫码登录」；在浏览器里完成登录，本页会自动把凭证写回这个账号。',
+    onDone: (account) => {
+      const got = (account && account.uid) || '';
+      if (got && acc && acc.uid && got !== acc.uid) {
+        // 扫的号与要修的不是同一个：如实说，不要假装成功。
+        toast('登录的是另一个账号（' + (account.nickname || got) + '），已按其 uid 入库；'
+          + '要修「' + name + '」请扫它自己的账号', 'warn');
+      } else {
+        toast('已重新登录：' + name, 'ok');
+      }
+      m.close();
+      if (typeof loadHostAccounts === 'function') loadHostAccounts();
+    },
+  }));
+
+  // ② 导入 JSON
+  const t2 = el('div', 'sub');
+  t2.style.margin = '16px 0 8px';
+  t2.appendChild(el('b', null, '② 导入 auth JSON'));
+  t2.appendChild(document.createTextNode(
+    '：如果你有桌面端导出的 auth 文件（或之前在本站「导出 JSON」存下的），直接粘进来即可。'));
+  body.appendChild(t2);
+
+  const imp = el('button', 'ghost', '打开导入窗口');
+  imp.onclick = () => {
+    m.close();
+    hostImportJSONDialog({
+      title: '导入 auth JSON · ' + name,
+      onDone: () => { if (typeof loadHostAccounts === 'function') loadHostAccounts(); },
+    });
+  };
+  body.appendChild(imp);
+
+  const tip = el('div', 'sub');
+  tip.style.marginTop = '14px';
+  tip.style.fontSize = '12px';
+  tip.textContent = '提示：扫码与导入都必须用**这个号自己**的登录信息。'
+    + '导入别人的号会被拒绝（归属仍是原号主），也不会把别人的号并到你名下。';
+  body.appendChild(tip);
+}
+
+// ======================================================================
 // 我的账号出口（v0.31.31）
 //
 // 用户端的"逐号指定出口"。在它之前，用户只有两个全量动作：
@@ -3219,7 +3356,8 @@ function renderHostEgress(d) {
   opt('__direct', '直连（不走任何代理）');
   opt('__clear', '跟随默认（清空本号出口配置）');
   for (const l of usable) {
-    opt(l.url, '线路：' + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : '（出口未知）'));
+    const who = l.mine ? '' : (l.platform ? '［平台］' : ('［他人 ' + (l.owner_name || '') + '］'));
+    opt(l.url, who + '线路：' + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : '（出口未知）'));
   }
   bar.appendChild(sel);
   const apply = el('button', 'ghost', '应用到勾选');
@@ -3229,6 +3367,13 @@ function renderHostEgress(d) {
     const uids = Array.from(hePicked);
     if (!uids.length) { toast('先勾选账号', 'err'); return; }
     const proxy = v === '__direct' ? 'direct' : (v === '__clear' ? '' : v);
+    // 借用他人线路的代价提示（v0.31.32）：这不是"多了一个 IP"，而是"多经过一台别人的机器"。
+    const line = heLines.find((x) => x.url === v);
+    if (line && line.foreign) {
+      if (!(await confirmAsk('这条线路由「' + (line.owner_name || '其他用户') + '」提供。\n\n'
+        + '⚠ 这些号的上游请求（含 access_token）会**经过对方的机器**，对方在技术上可以看到。\n'
+        + '仅在你信任对方时使用。继续？'))) return;
+    }
     apply.disabled = true;
     try {
       const r = await post('/api/host/egress/assign', { uids, proxy });
@@ -3255,7 +3400,12 @@ function renderHostEgress(d) {
     const txt = el('div');
     txt.style.padding = '2px 0';
     txt.appendChild(el('b', null, ip + '  '));
-    txt.appendChild(el('span', null, arr.map((l) => (l.name || l.url) + '（' + l.url + '）').join('、')));
+    // 每条线路标注归属（v0.31.32）：自己的 / 平台 / **他人的**。
+    // 别人接进来的线路现在可以借用，但"借的是谁的机器"必须一眼看见。
+    txt.appendChild(el('span', null, arr.map((l) => {
+      const who = l.mine ? '' : (l.platform ? '平台・' : ('他人 ' + (l.owner_name || '') + '・'));
+      return who + (l.name || l.url) + '（' + l.url + '）';
+    }).join('、')));
     if (arr.length > 1) {
       txt.appendChild(el('span', null, '  ⚠ 这几条线路共用同一个出口，只会算 1 个 IP'));
       txt.lastChild.style.color = '#b9770e';
@@ -3286,6 +3436,11 @@ function renderHostEgress(d) {
       const w = el('div', null, '⚠ 你有 ' + usable.length + ' 条可用线路，但**只有 ' + distinct
         + ' 个不同出口 IP**：同 IP 的线路再多也只算一个出口。'
         + '要真正多出 IP，需要另一台电脑（另一条宽带）接入，或换一条不同出口的线路。');
+      w.style.cssText = 'margin-top:6px;color:#b9770e;font-size:12px;';
+      diag.appendChild(w);
+    } else if (usable.length && usable.every((l) => l.foreign)) {
+      const w = el('div', null, '你的可用线路全部是**他人提供**的：能用，但流量会经过对方的机器。'
+        + '建议自己也接一台（「一键拉起」），把主要账号放回自己的出口。');
       w.style.cssText = 'margin-top:6px;color:#b9770e;font-size:12px;';
       diag.appendChild(w);
     } else if (distinct === 1 && usable.length === 1) {
@@ -3359,13 +3514,22 @@ function renderHostEgress(d) {
     const od = el('option', null, '直连'); od.value = 'direct'; one.appendChild(od);
     const oc = el('option', null, '跟随默认'); oc.value = '__clear'; one.appendChild(oc);
     for (const l of usable) {
-      const o = el('option', null, (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : ''));
+      const who = l.mine ? '' : (l.platform ? '［平台］' : ('［他人 ' + (l.owner_name || '') + '］'));
+      const o = el('option', null, who + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : ''));
       o.value = l.url;
       one.appendChild(o);
     }
     one.onchange = async () => {
       const v = one.value;
       if (!v) return;
+      const line = heLines.find((x) => x.url === v);
+      if (line && line.foreign) {
+        if (!(await confirmAsk('这条线路由「' + (line.owner_name || '其他用户') + '」提供。\n\n'
+          + '⚠ 这个号的上游请求（含 access_token）会**经过对方的机器**。继续？'))) {
+          one.value = '';
+          return;
+        }
+      }
       const proxy = v === '__clear' ? '' : v;
       one.disabled = true;
       try {

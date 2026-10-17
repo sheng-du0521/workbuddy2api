@@ -51,23 +51,34 @@ func TestHostEgressLinesAndAssign(t *testing.T) {
 
 	d := heLines(t, f, f.cookieA)
 	lines := d["lines"].([]any)
-	// 三条线路对 A 都应"看得见"（页面需要说明"这条不能用"），但只有两条可选。
+	// 三条线路对 A 都可见。v0.31.32 起**别人的线路也可选**（产品要求借用住宅 IP），
+	// 但必须带 foreign 标志与主人名 —— 前端据此弹"流量会经过对方机器"的确认。
 	if len(lines) != 3 {
-		t.Fatalf("线路列表应含 3 条（含不可选的），得 %d", len(lines))
+		t.Fatalf("线路列表应含 3 条，得 %d", len(lines))
 	}
 	noteOf := map[string]string{}
+	foreignOf := map[string]map[string]any{}
 	for _, x := range lines {
 		m := x.(map[string]any)
-		noteOf[m["url"].(string)], _ = m["note"].(string)
+		u := m["url"].(string)
+		noteOf[u], _ = m["note"].(string)
+		foreignOf[u] = m
 	}
-	if noteOf[mine] != "" || noteOf[platform] != "" {
-		t.Fatalf("自己的与平台的线路都应可选，得 note=%q/%q", noteOf[mine], noteOf[platform])
+	if noteOf[mine] != "" || noteOf[platform] != "" || noteOf[others] != "" {
+		t.Fatalf("启用中的线路都应可选（含他人的），得 note=%q/%q/%q",
+			noteOf[mine], noteOf[platform], noteOf[others])
 	}
-	if noteOf[others] == "" {
-		t.Fatal("别人的线路必须带说明（不可选），否则用户会以为能点")
+	if foreignOf[others]["foreign"] != true {
+		t.Fatal("别人的线路必须标 foreign=true（前端要靠它弹借用确认）")
 	}
-	if got := d["distinct_exit_ips"].(float64); got != 2 {
-		t.Fatalf("可用线路里有 2 个不同出口 IP（1.1.1.1 / 2.2.2.2），得 %v", got)
+	if foreignOf[others]["owner_name"] == "" || foreignOf[others]["owner_name"] == nil {
+		t.Fatal("别人的线路必须带主人用户名（借的是谁的机器要能看见）")
+	}
+	if foreignOf[mine]["foreign"] == true {
+		t.Fatal("自己的线路不该被标成 foreign")
+	}
+	if got := d["distinct_exit_ips"].(float64); got != 3 {
+		t.Fatalf("三条线路三个出口 IP（1.1.1.1 / 2.2.2.2 / 3.3.3.3），得 %v", got)
 	}
 
 	// 正向：把自己的号指到自己的线路
@@ -84,11 +95,22 @@ func TestHostEgressLinesAndAssign(t *testing.T) {
 		t.Fatalf("账号出口未写入，得 %+v", acc)
 	}
 
-	// 负向：指到别人的线路 → 403（这是最危险的一条：出口会把凭证交给第三方）
+	// 正向（v0.31.32）：别人的线路**允许借用** —— 但返回里要带 foreign + 主人名，
+	// 前端据此弹"凭证会经过对方机器"的确认；服务端另有一条 WARN 审计日志。
 	code, raw = eaReq(t, f.mux, "POST", "/api/host/egress/assign",
 		`{"uids":["us-a-acct"],"proxy":"`+others+`"}`, f.cookieA, "")
-	if code != http.StatusForbidden {
-		t.Fatalf("指向别人的线路必须 403，得 %d %s", code, raw)
+	if code != http.StatusOK {
+		t.Fatalf("借用别人的线路应 200（v0.31.32 起允许），得 %d %s", code, raw)
+	}
+	if d := eaJSON(t, raw); d["foreign"] != true || d["owner_name"] == nil {
+		t.Fatalf("借用他人线路应回 foreign=true 与 owner_name，得 %v", d)
+	}
+	if a, _ := f.store.GetAccount("us-a-acct"); a == nil || a.EgressProxy != others {
+		t.Fatalf("借用未写入，得 %+v", a)
+	}
+	// 复位，后面的断言不受影响
+	if err := f.store.SetAccountEgress("us-a-acct", mine); err != nil {
+		t.Fatalf("reset: %v", err)
 	}
 
 	// 负向：拿别人的 uid 改别人的号 → 目标被静默剔除，最终"没有可设置的账号"

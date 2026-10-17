@@ -1,16 +1,16 @@
 {
-  "version": "0.31.31",
+  "version": "0.31.32",
   "min_supported": "0.24.0",
-  "notes": "v0.31.31：三件事一起落地 —— 健康检测插件化 / 账号出口可逐号分配 / 出口 IP 一致性问题的一次性修法。\n① 健康检测做成插件（health-check，用户端可用）：新增 pluginDef.Kind（claim / health）由服务端下发，前端按 kind 渲染面板（不再按 id 猜）。新增用户侧 POST /api/host/accounts/health 与 GET …/health/last：只查本人号（别人的 uid 静默剔除）、allowDelete=false（用户点检测不会停用/删除任何账号），结果按 uid 与账号清单合并，未检测的也列出来。插件面板：选号 → 发起 → 15s 轮询接回结果，显示状态/对话探活/余额/出口。\n② 账号出口可分配（用户端）：新增 GET /api/host/egress/lines（我的号 + 我能用的线路 + 每号实际出口 IP）、POST /api/host/egress/assign（逐号/批量；线路白名单 = owner∈{0,我}，别人的线路 403）、POST /api/host/egress/rebalance（按不同出口 IP 均衡，同 IP 多线路只算一个出口）。前端新增「我的账号出口」卡：逐号下拉即改、批量设置、一键均衡、账号分布诊断（几个 IP、各几个号）。\n③ 出口 IP 一致的三个成因，能修的全修了：(a) 端口互斥 —— poll/report 的 load→ensure→migrate→save 收敛到唯一入口 egressRegister 并全程持 egressMachMu；此前无锁时两台机器同时上线会各自算出同一个空闲端口，后到那台 ssh -R 失败，而两条线路都指向先到那台，探测自然是同一个 IP。(b) 指纹身份 —— 同一 id 不同指纹（复制安装目录）分出新键 + 新端口，不顶掉原机；同指纹不同 id（重装/删 machine.id）认回同一台并清理冗余记录；同机两份 agent 记录 alt_ids 并在 poll 里让非主 agent 停。agent v0.3.2 首次 poll 即带指纹。(c) 隧道实测校验 + 一键修复 —— 新增 POST /api/egress/home/repair，检测端口冲突/越段/隧道实测出口与自报不一致，换新端口并下发 start 重建；前端两端都加了「修复出口」与不一致告警。\n④ apply 改为非破坏式：一键拉起后的「应用」只接管未指定出口的号（返回 skipped 计数），不再把已绑到别的线路的号搬走 —— 这是「在 B 机点一下、A 机的号全跑过来」的直接修复；整体改绑改为显式按钮「全部改绑」（rebind_all）。\n⑤ 测试：新增 egress_identity_test.go（指纹合并/复制目录/并发端口唯一/修复换端口）、host_egress_lines_test.go（越权线路 403、别人的号静默剔除、按 IP 均衡只用 2 个出口、apply 非破坏式）、host_health_test.go（只回本人号、不泄露别人、不处置）；plugin 用例里写死的「只有 1 个插件」改为「包含目标插件」；uitest 的 egress-self 增加「我的账号出口」渲染断言（按 IP 报数 / 两个 IP / 均衡按钮）。全量 go test 与 uitest 均通过。\n⑥ 诚实边界：软件不能把一台电脑变出第二个公网 IP；本版保证的是三点 —— 不同电脑不会再被并成一条线路、不同出口能被真正分给不同账号、同 IP 的事实在两端都看得见（线路卡、池总览、账号分布）且能一键纠偏。",
-  "released_at": 1792271131,
+  "notes": "v0.31.32：重新登录自助化（扫码 / 导入 JSON）+ 允许借用他人线路 + 管理端借用用户住宅 IP。① 用户端「重新登录」不再是死路：卡片上的按钮直接开弹窗，两条路并列 ——(a) 扫码登录（复用现有 OAuth 弹窗，登录成功即覆盖该号凭证）；(b) 导入 auth JSON（新增 POST /api/host/accounts/import，与「导出 JSON」严格闭环；支持粘贴或选文件，一次最多 50 个）。账号代挂区也新增「导入 JSON」按钮，便于换机批量迁移。② PollOAuth 加固（这是\"重新登录\"真正能用的前提）：(a) 同一个 uid 已存在且归属不是自己 → **拒绝**（此前会把令牌写到原号主/平台账号上，形成串号：A 的号换了会话，B 以为自己加成功了）；(b) 保留人工停用（disabled 是管理员裁决，登录不该顺手解除），但清冷却/失败计数；(c) 成功即清 token_dead_at（不清的话红标一直亮，用户会以为没生效而反复扫码）。③ 可用线路 = 平台 + 自己的 + **别人的**：用户端不再 403 拦他人线路，改为\"可选 + 显式标注\"：线路卡与下拉都写「他人 <用户名>」，切换前弹确认（流量经过对方机器、access_token 对其可见），服务端打 WARN 审计日志（谁把几个号放到了谁的线路上）。按 IP 均衡也纳入他人线路，代表线路优先级 = 自己的 → 平台 → 他人（按代价排，不是按所有权）。④ 管理端借用用户住宅 IP：批量分配新增「纳入用户线路（借用住宅 IP）」勾选框（include_user_lines=true）。默认仍不自动选用户线路 —— 自动挑\"最闲的一条\"会把平台账号的access_token 随机送到某个用户家里；勾选即代表管理员知情。线路归属与账号归属都不因借用改变。⑤ 测试：host_import_test（新号入库 / 同号重导=更新且不动出口、清失效标记 / 别人的号与平台号被跳过且令牌未被改写）、egress_userline_assign_test（默认不进候选→400；勾选后分配到用户线路，且双方归属不变）、host_egress_lines_test 改为断言\"他人线路可选 + foreign/owner_name 齐全\"；uitest 新增 host-relogin 守卫（卡片必须开弹窗、不得调管理端导入接口、管理端必须有借用开关）。全量 go test 与 uitest 均通过。⑥ 诚实边界：扫码路径依赖上游 OAuth 回调，单测覆盖不到（本次只测了归属/状态保持的代码分支）；他人线路的\"可见凭证\"是架构事实（HTTP 代理），本版做的是标注 + 审计，不是技术上阻止。",
+  "released_at": 1792272828,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.31/webapp.exe",
-      "sha256": "98413c6fc142059123a83cd5a26c170d65068f9c3e2880ff0d3393ba2df94d93",
-      "size": 15336448
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.32/webapp.exe",
+      "sha256": "d16a765e5da08f6ca38ee6c11f3369ffa70d15d448287e953c1f0b5abfe1d15e",
+      "size": 15357440
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

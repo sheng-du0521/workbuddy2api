@@ -207,6 +207,26 @@ func PollOAuth(sessionID string, store *Store, ownerUserID int64) (oauthResult, 
 	if uid == "" {
 		uid = "anonymous-" + newRandomID(6)
 	}
+
+	// ---- 重新登录（v0.31.32）：同一个 uid 已存在时不能"换个人接管" ----
+	//
+	// 为什么必须挡（不是"顺手加个校验"）：
+	//   · UpsertAccount 的 ON CONFLICT **刻意不更新 owner_user_id**（那是业务归属），
+	//     于是 B 用户扫码登录 A 用户代挂的号时，**令牌会写到 A 的账号上** ——
+	//     A 看到的是自己的号"突然换了会话"，B 以为自己添加成功了；
+	//   · 平台号（owner=0）被普通用户扫码同理：令牌被换，归属仍是平台。
+	// 两种都会造成"谁在用什么号"彻底说不清，而排查时最需要的就是这条线索。
+	prev, errPrev := store.GetAccount(uid)
+	if errPrev == nil && prev != nil {
+		if ownerUserID > 0 && prev.OwnerUserID != ownerUserID {
+			who := "平台"
+			if prev.OwnerUserID > 0 {
+				who = "其他用户"
+			}
+			return oauthResult{}, fmt.Errorf("该账号已由%s持有，不能在这里重新登录；"+
+				"如需转移，请先让原持有方删除该账号", who)
+		}
+	}
 	a := &Account{
 		UID:          uid,
 		Nickname:     acct.Nickname,
@@ -220,9 +240,18 @@ func PollOAuth(sessionID string, store *Store, ownerUserID int64) (oauthResult, 
 		// 代挂新号默认未申请入池；平台自持号由 OwnerUserID==0 隐含在池。
 		PoolState: "",
 	}
+	// 人工停用是**管理员的裁决**，重新登录不该把它冲掉（ON CONFLICT 会写
+	// excluded.disabled=false）。冷却与失败计数则要清 —— 新会话意味着那些判据失效。
+	if errPrev == nil && prev != nil {
+		a.Disabled = prev.Disabled
+	}
 	if err := store.UpsertAccount(a); err != nil {
 		return oauthResult{}, fmt.Errorf("save account: %w", err)
 	}
+	// token_dead_at 必须显式清（v0.31.32）：ON CONFLICT 的更新列里没有它，
+	// 不清的话「重新登录」成功了但账号卡仍是红的 —— 用户会以为没生效，
+	// 转而反复扫码（比不标红更糟）。
+	_ = store.ClearTokenDead(uid)
 
 	oauthMu.Lock()
 	delete(oauthSessions, sessionID)

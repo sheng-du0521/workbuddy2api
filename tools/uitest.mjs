@@ -2427,6 +2427,44 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-self: 用户视角代理页可操作，且不出现「全局默认出口」等误导文案');
   }
 
+  // v0.31.32：**重新登录必须能自助完成**（扫码 或 导入 auth JSON），
+  // 而不是再给一句"去找管理员"。这条同时守住三处：
+  //   · 卡片上的按钮真的调了弹窗（不是 alert 三步提示）；
+  //   · 导入入口打的是用户侧接口（不是管理端接口 —— 那会 403）；
+  //   · 管理端有"纳入用户线路"的显式开关（借用住宅 IP 必须是知情动作）。
+  const rlBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const dash = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8');
+    if (!dash.includes('hostReloginDialog(')) {
+      rlBad.push('dashboard.html 的「重新登录」没有打开弹窗（用户仍然无自助路径）');
+    }
+    if (dash.includes("alert('请按这三步操作")) {
+      rlBad.push('dashboard.html 仍留旧的"三步去找管理员"提示 —— 那是死路');
+    }
+    if (!dash.includes("btnHostImport")) {
+      rlBad.push('dashboard.html 缺少「导入 JSON」入口');
+    }
+    if (!APP_JS.includes("'/api/host/accounts/import'")) {
+      rlBad.push('app.js 没有调用用户侧导入接口 /api/host/accounts/import');
+    }
+    if (APP_JS.includes("'/api/admin/accounts/import")) {
+      rlBad.push('用户端不得调用管理端导入接口（会 403，且语义是"替平台收号"）');
+    }
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('egrIncludeUser')) {
+      rlBad.push('admin.html 缺少「纳入用户线路」开关 —— 借用住宅 IP 必须显式知情');
+    }
+    const pluginSrc = fs.readFileSync(path.join(ROOT, 'cmd/webapp/host_import.go'), 'utf8');
+    if (!pluginSrc.includes('OwnerUserID != u.ID')) {
+      rlBad.push('host_import.go 缺少归属校验（会把别人的号导到自己名下）');
+    }
+  }
+  rlBad.forEach((m) => console.log('  [FAIL] host-relogin: ' + m));
+  if (!rlBad.length) {
+    console.log('  [ok] host-relogin: 重新登录可扫码/导入 JSON 自助完成；借用用户线路需显式勾选');
+  }
+
   // v0.31.25：**还没接入 agent 时，页面必须给出"下载安装包"这条路**。
   //
   // 这一版之前，这里的文案是"请先在目标电脑上运行下面那行命令" —— 用户要自己

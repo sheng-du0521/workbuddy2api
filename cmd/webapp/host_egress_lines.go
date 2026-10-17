@@ -49,8 +49,16 @@ type egressLineView struct {
 	Mine bool `json:"mine"`
 	// Platform 平台线路（所有用户都可以用；不是我的，但也不是别人的私线）。
 	Platform bool `json:"platform"`
-	Enabled  bool `json:"enabled"`
-	LastOK   bool `json:"last_ok"`
+	// Foreign **其他用户**接进来的线路（v0.31.32）。
+	//
+	// 产品上明确要求"支持走别人的"：住宅 IP 是稀缺资源，谁接进来的都能被借用。
+	// 代价必须写在脸上 —— 流量经过那台机器，`access_token` 对它的主人可见。
+	// 所以这个标志不是"禁用"，而是"前端必须显式标注并在切换前确认"。
+	Foreign bool `json:"foreign"`
+	// OwnerName 线路主人的用户名（平台线路为空）。借用时至少要知道借的是谁的。
+	OwnerName string `json:"owner_name,omitempty"`
+	Enabled   bool   `json:"enabled"`
+	LastOK    bool   `json:"last_ok"`
 	// ExitIP 归一化后的出口 IP（空 = 还没探到）。
 	ExitIP string `json:"exit_ip,omitempty"`
 	// BoundMine 我名下已经绑在这条线路上的号数。
@@ -128,19 +136,23 @@ func (a *app) handleHostEgressLines(w http.ResponseWriter, r *http.Request) {
 		url := strings.TrimSpace(p.URL)
 		mine := p.OwnerUserID == u.ID
 		platform := p.OwnerUserID == 0
+		foreign := p.OwnerUserID > 0 && !mine
 		lv := egressLineView{
 			URL: url, Name: p.Name, OwnerUserID: p.OwnerUserID,
-			Mine: mine, Platform: platform,
+			Mine: mine, Platform: platform, Foreign: foreign,
 			Enabled: p.Enabled, LastOK: p.LastOK,
 			ExitIP:     normalizeExitIP(p.LastIP),
 			BoundMine:  mineCount[url],
 			BoundTotal: totalCount[url],
 		}
-		switch {
-		case !p.Enabled:
+		if foreign {
+			lv.OwnerName = a.userNameByID(p.OwnerUserID)
+		}
+		// 只有"停用"是不可选的：其他用户的线路**可选**（v0.31.32 的产品决定），
+		// 但前端必须标注主人并在切换前确认"流量会经过他的机器"。
+		// 这里刻意不写 note —— note 的语义是"不可选的原因"。
+		if !p.Enabled {
 			lv.Note = "这条线路已被停用（连续探活失败或人工停用）"
-		case !mine && !platform:
-			lv.Note = "其他用户的线路，不能用于你的号"
 		}
 		lines = append(lines, lv)
 	}
@@ -270,12 +282,9 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if line.OwnerUserID != 0 && line.OwnerUserID != u.ID {
-			writeJSON(w, http.StatusForbidden, map[string]any{
-				"error": "这条线路属于其他用户，不能用于你的账号（出口会把凭证暴露给第三方）",
-			})
-			return
-		}
+		// 别人的线路**允许借用**（v0.31.32，产品决定）：住宅 IP 稀缺，谁的机器都可以承载。
+		// 留痕放在 target 算完之后（见下），因为日志要带上"一共多少个号"，
+		// 而那时候才知道目标集有多少 —— 排查时那个数字比什么都好用。
 	}
 
 	owned, err := a.store.ListAccountsByOwner(u.ID)
@@ -306,6 +315,14 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 借用他人出口的审计（v0.31.32）：出问题时"谁的号走过谁的机器"是第一条线索，
+	// 所以这里用 WARN 级别 —— 它不该被常规日志淹掉。
+	if line != nil && line.OwnerUserID != 0 && line.OwnerUserID != u.ID {
+		log.Printf("WARN: [host] 用户 %s(#%d) 借用用户 #%d 的出口 %s 承载 %d 个号"+
+			"（这些请求的 access_token 会经过对方机器）",
+			u.Username, u.ID, line.OwnerUserID, strings.TrimSpace(line.URL), len(targets))
+	}
+
 	changed := 0
 	for _, uid := range targets {
 		if err := a.store.SetAccountEgress(uid, norm); err != nil {
@@ -321,6 +338,10 @@ func (a *app) handleHostEgressAssign(w http.ResponseWriter, r *http.Request) {
 	}
 	if line != nil {
 		res["proxy_name"] = line.Name
+		res["foreign"] = line.OwnerUserID > 0 && line.OwnerUserID != u.ID
+		if line.OwnerUserID > 0 && line.OwnerUserID != u.ID {
+			res["owner_name"] = a.userNameByID(line.OwnerUserID)
+		}
 		res["exit_ip"] = normalizeExitIP(line.LastIP)
 		if res["exit_ip"] == "" {
 			res["note"] = "已保存。这条线路还没有探活记录，出口 IP 稍后（最多 5 分钟）会在列表里出现"
@@ -381,17 +402,26 @@ func (a *app) handleHostEgressRebalance(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	// 可用线路 + 按出口 IP 归并（同一 IP 的多条线路只算一个出口）。
+	// 可用线路 = 平台 + 我的 + **别人的**（v0.31.32）。别人的线路也能承载我的号，
+	// 前端会在切换前提示"流量经过他的机器"，这里不再拦。
 	usable := make([]*EgressProxy, 0, len(proxies))
 	for _, p := range proxies {
 		if !p.Enabled {
 			continue
 		}
-		if p.OwnerUserID != 0 && p.OwnerUserID != u.ID {
-			continue
-		}
 		usable = append(usable, p)
 	}
-	groups, warns := groupEgressLinesByExit(usable)
+	groups, warns := groupEgressLinesByExit(usable, u.ID)
+	// 借用别人的线路时明确说一句：这是"能用"而不是"没代价"。
+	borrowed := map[int64]bool{}
+	for _, g := range groups {
+		if g.proxy != nil && g.proxy.OwnerUserID > 0 && g.proxy.OwnerUserID != u.ID {
+			borrowed[g.proxy.OwnerUserID] = true
+		}
+	}
+	if len(borrowed) > 0 {
+		warns = append(warns, "本次分配用到了他人提供的出口：流量会经过对方的机器（凭证对它可见）")
+	}
 	if len(groups) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "没有可用线路：请先在自己的电脑上「一键拉起」，或联系管理员添加线路",
@@ -464,7 +494,7 @@ type hostExitPick struct {
 // 代表线路的优先级：**用户自己的 → 平台线路 → 别的**；同优先级下取探活成功的，
 // 再按 URL 稳定排序。这样"我有两条线同 IP"时不会一半号分到平台线、
 // 一半分到自己的线（那看起来像分散，实际是同一个 IP）。
-func groupEgressLinesByExit(list []*EgressProxy) ([]hostExitPick, []string) {
+func groupEgressLinesByExit(list []*EgressProxy, me int64) ([]hostExitPick, []string) {
 	byIP := map[string][]*EgressProxy{}
 	unknown := make([]*EgressProxy, 0, 1)
 	for _, p := range list {
@@ -489,7 +519,7 @@ func groupEgressLinesByExit(list []*EgressProxy) ([]hostExitPick, []string) {
 	for _, ip := range ips {
 		g := byIP[ip]
 		sort.SliceStable(g, func(i, j int) bool {
-			oi, oj := ownerRank(g[i].OwnerUserID), ownerRank(g[j].OwnerUserID)
+			oi, oj := ownerRank(g[i].OwnerUserID, me), ownerRank(g[j].OwnerUserID, me)
 			if oi != oj {
 				return oi < oj
 			}
@@ -510,10 +540,18 @@ func groupEgressLinesByExit(list []*EgressProxy) ([]hostExitPick, []string) {
 	return out, warns
 }
 
-// ownerRank 选代表线路时的优先级：越大越优先（用户的线在用户视角里最该被用上）。
-func ownerRank(owner int64) int {
-	if owner > 0 {
-		return 0 // 用户自己的（调用方已过滤掉别人的）
+// ownerRank 选代表线路时的优先级（**越小越优先**）。
+//
+// 顺序：自己的 → 平台的 → 别人的。理由不是"所有权歧视"，而是**代价**：
+// 走自己的线最快（本机直连）、走平台的线最稳（运维负责）、走别人的线要经过第三方。
+// 同一条 IP 有多个选择时，先选代价最小的那条。
+func ownerRank(owner, me int64) int {
+	switch {
+	case me > 0 && owner == me:
+		return 0
+	case owner == 0:
+		return 1
+	default:
+		return 2
 	}
-	return 1 // 平台线路
 }

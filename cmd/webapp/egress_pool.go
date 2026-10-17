@@ -265,6 +265,14 @@ type assignRequest struct {
 	ProxyURL string `json:"proxy_url"`
 	// DryRun 只算不写，用于预览分配方案。
 	DryRun bool `json:"dry_run"`
+	// IncludeUserLines 自动分配时**把用户接进来的线路也纳入候选**（v0.31.32）。
+	//
+	// 默认 false（保持原纪律）。但产品需求明确："管理后台可以借用用户的住宅 IP，
+	// 自由分配给任意账号" —— 所以要有这个显式开关，而不是逼管理员挨条线路点「分配」。
+	//
+	// 为什么默认关：用户线路是**别人的机器**，自动挑"最闲的一条"会把平台账号的
+	// access_token 随机送到某个用户家里。管理员点这个勾 = 明确表示知情。
+	IncludeUserLines bool `json:"include_user_lines"`
 }
 
 // assignPlanItem 单个账号的分配结果。
@@ -349,13 +357,14 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		if wantURL != "" && strings.TrimSpace(p.URL) != wantURL {
 			continue // 指定了线路 → 只用它
 		}
-		// ⚠️ 用户提供的线路（owner>0）**只能被显式指名**，不进自动候选（v0.31.23）。
+		// 用户提供的线路（owner>0）默认不进自动候选（v0.31.23），
+		// 除非管理员显式勾了 include_user_lines（v0.31.32）。
 		//
-		// 理由与风险等级：那条出口不在我们控制之下（是用户自己的代理）。
-		// 「自动挑一条最闲的」会把**别人的 access_token** 从它送出去 ——
+		// 风险等级：那条出口不在我们控制之下（是用户自己的代理）。
+		// 「自动挑一条最闲的」会把**平台账号的 access_token** 从它送出去 ——
 		// 而 access_token 是 bearer 凭证，谁看到谁就能冒充那个号。
-		// 要让它承载平台账号，必须由管理员明确指定（卡片上点「分配」）。
-		if wantURL == "" && p.OwnerUserID > 0 {
+		// 显式指名（卡片点「分配」）或显式勾选，才代表管理员知情。
+		if wantURL == "" && p.OwnerUserID > 0 && !req.IncludeUserLines {
 			continue
 		}
 		usable = append(usable, p)

@@ -618,6 +618,12 @@
             <label class="inline" style="font-size:12px;">
               <input type="checkbox" id="egrIsolate" checked> 同号主不共用出口
             </label>
+            <!-- v0.31.32：借用用户住宅 IP。默认不勾 —— 勾了就等于"平台账号的
+                 access_token 可以从某个用户的家里出去"，这是知情决定。 -->
+            <label class="inline" style="font-size:12px;"
+              title="把用户控制台接进来的线路也纳入自动候选。用户线路是别人的机器：勾选后平台账号的请求（含 access_token）会经过对方设备。">
+              <input type="checkbox" id="egrIncludeUser"> 纳入用户线路（借用住宅 IP）
+            </label>
             <button class="ghost" id="btnEgrDry">预览方案</button>
             <button id="btnEgrApply">执行分配</button>
             <button class="ghost" id="btnEgrDirect" title="把所选范围内的账号一键设为显式直连（不继承全局默认代理）。用于回退代理。">设为直连</button>
@@ -8074,6 +8080,9 @@ async function egrAssignBody(dry) {
     isolate_owner: $('egrIsolate').checked,
     dry_run: !!dry,
   };
+  // 借用用户住宅 IP（v0.31.32）：显式勾选才把 owner>0 的线路放进自动候选。
+  const inc = $('egrIncludeUser');
+  if (inc && inc.checked) body.include_user_lines = true;
   // 指定了线路（从线路卡点「分配」进来）→ 只在这一条上分配。
   if (egrAssignUrl) body.proxy_url = egrAssignUrl;
   if (v === 'all') {
