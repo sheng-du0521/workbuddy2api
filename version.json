@@ -1,16 +1,16 @@
 {
-  "version": "0.31.27",
+  "version": "0.31.28",
   "min_supported": "0.24.0",
-  "notes": "v0.31.27：**账号指纹完整性审计 + 一处路径级缺口修复**。① 审计方法：生产 38 个号 × 三个账号级指纹头（X-Machine-ID / X-Session-ID / X-Device-Token）按 Go 同口径（md5(\"purpose:uid\")）重算 + 设备凭证审计接口 + 出站注入点全量 grep。② 数据层结论（完整）：38/38 三头非空且各 32 hex；machine / session / device-token 各自 38/38 唯一、跨账号 0 碰撞；同号三头 0 撞值（用途盐隔离成立）；空 uid 0 个（空 uid 会派生空串，是这条链路上唯一会静默失效的输入）。③ 路径层缺口（本次修复）：X-Device-Token 此前只在 `ChatHeaders` 与 `BillingHeaders` 注入，于是**模型列表三条路径**（fetchEnterpriseModels / fetchV3Models / globalModelsOnce）与 **refresh** 不带设备凭证 —— 同一个号在「对话」与「拉模型」上对上游呈现**两套设备身份**（一套有凭证、一套没有），而设备凭证审计页只统计数据层，看不出路径层漏了四处。修法：把 `injectDeviceToken` 提到 `CommonHeaders`（与 machine/session 同层），chat/billing 的显式调用保留（幂等）。④ 测试：新增 `device_token_paths_test.go` 4 条 —— 公共头必带、无凭证时不发空头（优雅降级）、**真实模型列表路径**必须带（httptest 收头断言）、refresh 必须带；变异检验：去掉 CommonHeaders 里的注入，三条路径断言同时红。全量 go test 全绿。⑤ 诚实边界：38/38 的 X-Device-Token 全是**按 uid 派生的合成值**（`device_token_fallback=derive`，账号级真凭证落库 0/38）—— 形式完整、并非上游签发；拿到真凭证后逐号覆盖即可（自动转 account 态）。Python 脚本链路（成长任务/校园任务）的 body 内 machineId/sessionId 已与 Go 同口径对齐，但 `_desktop_headers` 未带三个指纹头、web 域另用 `webmachine` 盐（对齐官方 web 端）——属已知差异，本次未改（低频路径，需真机验证一次再动）。",
-  "released_at": 1792251416,
+  "notes": "v0.31.28：**「账号签到不支持」的排查结论与两处修复**。① 现象：账号卡显示「签到：不支持」，猫猫查询也失败。② 真因（生产实测）：该实例 38 个号的 access/refresh token **同时被上游作废** —— billing/状态接口返回 `401 invalid_token`（openresty/APISIX 的 HTML 页），refresh 端点返回 `12153: refresh token is invalid`，两侧都不可自愈。③ 代码侧根因（高危缺陷）：refresh 是**轮换制且会撤销旧凭证**，而本仓库有四处独立刷新入口（签到前补刷新 / 保活 / 401 重试 / chat 前 refreshIfNeeded）**没有任何互斥** —— 并发双刷同一个 refresh_token 时，第二个必 12153，部分实现还会把「旧 refresh 被重复使用」判为重放并连带作废刚签发的新 token。旧注释里「实测并发双刷新，两个新 token 都有效」的结论已被上游行为推翻（那次只验了「两条都能用」，没验「旧 token 会不会被撤销」）。**修法：`RefreshToken` 加单飞**（`refreshFlights`，按 *auth.Auth 登记在途，等待者复用同一次结果；失败不缓存、顺序调用仍会真刷）。④ 第二处修复（语义）：「查询失败」不再渲染成「不支持」—— 后端出错时 `supported` 是 Go 零值 false，而前端**先判 supported 再判 ok**，于是凭证失效被显示成「功能不支持」。现在前端先判 ok、后端把 401/12153 翻译成「账号登录已失效，需要重新导入 auth 文件」，国际版 travel 也显式 `OK=true`（「查过了，结论是不支持」≠「没查成」）。⑤ 测试：新增 `refresh_singleflight_test.go` 3 条（10 并发只发 1 次请求 / 顺序调用不缓存 / 失败共享且可重试），变异检验去掉单飞 → 10 次请求同时发出（正是事故形态）；uitest 新增 `task-status-semantics` 守卫（判断顺序 + 401 人话 + 单飞存在）。全量 go test 全绿、uitest PASS。⑥ **需要人工处理**：38 个号的 access/refresh 均已被作废，代码无法自愈 —— 需在控制台按原方式重新导入每个号的 auth 文件（导入后自动恢复，无需手动启用）。⑦ 诚实边界：无法 100% 证明本次全池失效就是并发双刷导致（也可能是在官方客户端登录踢掉旧会话、或上游统一吊销），但「并发双刷会被撤销」已由上游 12153 语义与本次现象共同印证，单飞是必须的。",
+  "released_at": 1792264219,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.27/webapp.exe",
-      "sha256": "0bb8279bc987edd8f305a362c7255f1320a83aad5e37417e426cb4e4298bac8e",
-      "size": 15209472
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.28/webapp.exe",
+      "sha256": "cc333891520ce3a6b9613a1bbc9c5eb6a20141487aca4939cc969c7d73ac5604",
+      "size": 15214592
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

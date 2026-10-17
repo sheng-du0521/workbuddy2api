@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -135,7 +136,7 @@ func (a *app) queryTaskStatus(acc *Account) taskStatusView {
 	}
 
 	if st, err := a.proxy.uc.CheckinStatus(au); err != nil {
-		v.Checkin.Error = err.Error()
+		v.Checkin.Error = taskStatusErrText(err)
 	} else {
 		v.Checkin.Supported = st.Supported
 		v.Checkin.CheckedIn = st.CheckedIn
@@ -154,6 +155,10 @@ func (a *app) queryTravelStatus(au *auth.Auth) taskStatusTravel {
 	var t taskStatusTravel
 	// 国际版无猫猫旅行体系（与调度器 D4 门控同口径）：不发无谓请求。
 	if au.IsGlobal() {
+		// OK=true 是**语义必须**：前端用「先判 ok、再判 supported」的顺序渲染，
+		// 国际版是"查过了，结论是不支持"，而不是"没查成"。
+		// 之前这里留零值（OK=false），一旦前端把 ok 提前就会误报「查询失败」。
+		t.OK = true
 		return t
 	}
 	t.Supported = true
@@ -165,7 +170,7 @@ func (a *app) queryTravelStatus(au *auth.Auth) taskStatusTravel {
 		t.State = "no-buddy"
 		return t
 	case err != nil:
-		t.Error = err.Error()
+		t.Error = taskStatusErrText(err)
 		return t
 	case buddy == nil:
 		t.OK = true
@@ -174,7 +179,7 @@ func (a *app) queryTravelStatus(au *auth.Auth) taskStatusTravel {
 	}
 	ts, err := a.proxy.uc.TravelStatus(au)
 	if err != nil {
-		t.Error = err.Error()
+		t.Error = taskStatusErrText(err)
 		return t
 	}
 	t.OK = true
@@ -207,4 +212,20 @@ func (a *app) handleHostAccountTaskStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, a.taskStatus(acc))
+}
+
+// taskStatusErrText 把上游错误翻译成"下一步该做什么"（v0.31.28）。
+//
+// 为什么需要（2026-10-18 现场）：账号的 access/refresh token 被上游作废后，
+// 签到状态与猫猫查询都返回 **HTTP 401 + openresty 的 HTML 错误页**。原样透出去
+// 有两个问题：① 前端把 `supported=false`（零值）先判，于是显示成「签到：不支持」——
+// 用户以为功能不支持，实际是凭证失效；② 错误正文是一坨 HTML，看不出该怎么修。
+func taskStatusErrText(err error) string {
+	var ue *upstream.Error
+	if errors.As(err, &ue) {
+		if ue.Kind == upstream.ErrSessionDead || ue.Status == http.StatusUnauthorized {
+			return "账号登录已失效（access/refresh token 已被上游作废），需要重新导入该账号的 auth 文件"
+		}
+	}
+	return err.Error()
 }

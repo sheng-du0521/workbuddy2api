@@ -1855,6 +1855,38 @@ function run(pageFile, meOverride, plan) {
   probeBad.forEach((m) => console.log('  [FAIL] probe-gate: ' + m));
   if (!probeBad.length) console.log('  [ok] probe-gate: 账号卡不再渲染即出站（改为点开才查）');
 
+  // v0.31.28：**「查询失败」不能渲染成「不支持」**。
+  //
+  // 2026-10-18 全池 token 被上游作废时，账号卡显示的是「签到：不支持」——
+  // 因为后端出错时 `supported` 是 Go 零值 false，而前端**先判 supported、再判 ok**。
+  // 用户看到"功能不支持"，真实原因是凭证失效，处理动作完全不同。
+  // 这条守卫钉三件事：判断顺序（先 ok 后 supported）、后端的 401 人话翻译、refresh 单飞。
+  const tsBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const iFail = APP_JS.indexOf("if (!c.ok) box.appendChild(chipWithTitle('签到：查询失败'");
+    const iSup = APP_JS.indexOf("else if (c.supported === false) box.appendChild(el('span', 'tag', '签到：不支持'))");
+    if (iFail < 0 || iSup < 0) tsBad.push('app.js 找不到签到状态的两个分支');
+    else if (iFail > iSup) tsBad.push('app.js 先判 supported 再判 ok —— 查询失败会被渲染成「签到：不支持」');
+    const iTFail = APP_JS.indexOf("if (!t.ok) box.appendChild(chipWithTitle('旅行：查询失败'");
+    const iTSup = APP_JS.indexOf("else if (t.supported === false) box.appendChild(el('span', 'tag', '旅行：不支持'))");
+    if (iTFail < 0 || iTSup < 0) tsBad.push('app.js 找不到旅行状态的两个分支');
+    else if (iTFail > iTSup) tsBad.push('旅行状态同样要先判 ok 再判 supported');
+
+    const tsSrc = fs.readFileSync(path.join(ROOT, 'cmd/webapp/taskstatus.go'), 'utf8');
+    if (!tsSrc.includes('func taskStatusErrText(')) {
+      tsBad.push('taskstatus.go 缺少 401/12153 的人话翻译（用户只会看到一坨 HTML）');
+    }
+    const upSrc = fs.readFileSync(path.join(ROOT, 'internal/upstream/client.go'), 'utf8');
+    if (!upSrc.includes('refreshFlights')) {
+      tsBad.push('client.go 缺少 refresh 单飞：并发刷新会让第二个请求 12153 并作废旧凭证');
+    }
+  }
+  tsBad.forEach((m) => console.log('  [FAIL] task-status-semantics: ' + m));
+  if (!tsBad.length) {
+    console.log('  [ok] task-status-semantics: 查询失败与「不支持」已分开；refresh 有单飞');
+  }
+
   // v0.31.19：前端字面量里的 /api 路径必须都能在后端路由表里找到。
   //
   // 为什么要单做这条：`admin.html` 的「预览方案 / 执行分配」两个按钮打的是

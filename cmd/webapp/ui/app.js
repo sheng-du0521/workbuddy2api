@@ -647,13 +647,18 @@ async function loadTaskStatus(box, url) {
   const c = d.checkin || {};
   const t = d.travel || {};
   // 签到
-  if (c.supported === false) box.appendChild(el('span', 'tag', '签到：不支持'));
-  else if (!c.ok) box.appendChild(chipWithTitle('签到：查询失败', 'err', c.error));
+  //
+  // ⚠️ 判断顺序是**先 ok、后 supported**（v0.31.28 修正）。
+  // 反过来的话，一次查询失败（supported 是 Go 零值 false）会被渲染成「签到：不支持」——
+  // 2026-10-18 全池 token 被上游作废时，用户看到的就是"账号签到不支持"，
+  // 而真实原因是凭证失效。**"没查成"与"不支持"是两件事，不能共用一句话。**
+  if (!c.ok) box.appendChild(chipWithTitle('签到：查询失败', 'err', c.error));
+  else if (c.supported === false) box.appendChild(el('span', 'tag', '签到：不支持'));
   else if (c.checked_in) box.appendChild(el('span', 'tag ok', '✓ 今日已签到'));
   else box.appendChild(el('span', 'tag warn', '今日未签到'));
-  // 猫猫旅行
-  if (t.supported === false) box.appendChild(el('span', 'tag', '旅行：不支持'));
-  else if (!t.ok) box.appendChild(chipWithTitle('旅行：查询失败', 'err', t.error));
+  // 猫猫旅行（同上：先 ok）
+  if (!t.ok) box.appendChild(chipWithTitle('旅行：查询失败', 'err', t.error));
+  else if (t.supported === false) box.appendChild(el('span', 'tag', '旅行：不支持'));
   else if (t.state === 'arrived') box.appendChild(el('span', 'tag ok', '到站待领 ' + fmtAmt(t.reward_credit)));
   else if (t.state === 'traveling') box.appendChild(el('span', 'tag accent', '猫猫旅行中'));
   else if (t.state === 'no-buddy') box.appendChild(el('span', 'tag', '无猫 · 待领养'));

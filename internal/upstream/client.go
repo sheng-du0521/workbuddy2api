@@ -1190,7 +1190,52 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
 //   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+//
+// refreshFlight 一次在途的刷新（单飞用）。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// refreshFlights 按 *auth.Auth 的在途刷新登记表（v0.31.28）。
+//
+// 为什么必须单飞（2026-10-18 全池 38 个号 access/refresh 同时失效换来的）：
+// 上游的 refresh 是**轮换制且会撤销旧凭证**。两个并发请求带同一个 refresh_token
+// 时，第一个成功并作废旧 token，第二个收到 `12153: refresh token is invalid`；
+// 更糟的是，部分实现把"旧 refresh 被重复使用"判为重放，连带把刚签发的新 token
+// 一起作废 —— 于是账号彻底掉登录（access 也 invalid_token）。
+//
+// 本仓库有四处独立的刷新入口（签到前补刷新 / 保活 / 401 重试 / chat 前
+// refreshIfNeeded），此前**没有任何互斥**；旧注释里"实测并发双刷新两个 token
+// 都有效"的结论已被上游行为推翻（那次实测只覆盖了"两条都能用"，没覆盖"旧 token
+// 会不会被撤销"）。单飞是这里唯一的正确做法：同一账号同一时刻只允许一次真实请求，
+// 其余等待者复用同一次结果。
+//
+// key 用 *auth.Auth 指针而不是 uid：同一账号在池里只会有一份 Auth；用指针还能把
+// "测试里两个 Client 操作同一 Auth"也纳入同一把闸门。
+var refreshFlights sync.Map
+
+// RefreshToken 刷新 access/refresh token（**同一账号并发调用只会真正发一次请求**）。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	if a == nil {
+		return fmt.Errorf("nil auth")
+	}
+	f := &refreshFlight{done: make(chan struct{})}
+	if v, loaded := refreshFlights.LoadOrStore(a, f); loaded {
+		prev, _ := v.(*refreshFlight)
+		<-prev.done
+		return prev.err
+	}
+	defer func() {
+		refreshFlights.Delete(a)
+		close(f.done)
+	}()
+	f.err = c.refreshTokenOnce(a)
+	return f.err
+}
+
+// refreshTokenOnce 真正发一次刷新请求（调用方保证同一账号此刻只有它在跑）。
+func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
@@ -1246,10 +1291,16 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 即「并发刷新已完成」判据；AND 与 OR 在真实形态下等价。唯 OR 会额外放弃的
 	// 「只有单 token 变化」（如手工只改 auth 文件一个字段）不构成放弃条件——本次
 	// 结果覆盖手工编辑。
+	//
+	// ⚠️ v0.31.28 更正：这段守卫只防"后写覆盖先写"，**防不住并发双发请求本身**。
+	// 2026-10-18 上游改为轮换撤销后，双发的第二个请求会 12153，并可能把新 token
+	// 一起作废。真正的闸门是 RefreshToken 的单飞（见 refreshFlights）。
 	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
-		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
-		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
-		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
+		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写。
+		// ⚠️ 旧注释曾以「实测 R-E：服务端无 rotation 撤销，并发双刷新两个新 token
+		// 都有效」为此背书 —— 该结论**已于 2026-10-18 失效**（上游现在会撤销旧
+		// refresh，并可能连带作废新 token）。这条分支现在只是"少覆盖一次"的优化，
+		// 不再承担并发安全（并发安全由 refreshFlights 单飞负责）。
 		return nil
 	}
 	a.AccessToken = tok.AccessToken
