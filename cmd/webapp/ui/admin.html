@@ -279,6 +279,10 @@
         <input type="text" id="accQuery" placeholder="按昵称 / uid / 代挂分组 / 备注搜索"
           style="max-width:260px;" title="不区分大小写；多个关键词用空格分隔（全部命中才算）">
         <span class="muted" style="font-size:12px;" id="accFilterHint"></span>
+        <!-- 导出（v0.31.29）：有勾选 → 只导勾选；无勾选 → 全部。
+             文件里是 access_token/refresh_token 明文，等同账号钥匙。 -->
+        <button class="ghost sm" id="btnAccExport"
+          title="导出账号 JSON（可与「导入账号」闭环：导出的文件能直接再导入）。⚠ 文件里是凭证明文，等同账号钥匙">导出 JSON</button>
       </div>
 
       <!-- 健康检测（v0.23.0 起，v0.23.2 独立成页）：面板不再压在本页账号列表之上 ——
@@ -1749,6 +1753,29 @@ let currentGroup = '__all__';
 // selectedUIDs 手工勾选的账号集合（v0.15.4）。跨分组、跨筛选累积：
 // 允许「从不同分组里各挑几个」一起批量设组，这正是逐个改分组最痛的地方。
 let selectedUIDs = new Set();
+
+// 导出账号 JSON（v0.31.29）。勾选优先；没有勾选就导全部 —— 与「批量设置」的
+// 兜底语义一致，但这里额外弹一次确认：导出是**读**操作（不会改账号），
+// 真正需要提醒的是"文件本身就等于账号钥匙"。
+if ($('btnAccExport')) {
+  $('btnAccExport').onclick = async () => {
+    const uids = Array.from(selectedUIDs || []);
+    const scope = uids.length ? ('已勾选的 ' + uids.length + ' 个账号') : '全部账号（当前没有勾选）';
+    if (!(await confirmAsk('导出 ' + scope + ' 为 JSON？\n\n⚠ 文件里是 access_token / refresh_token 明文，'
+      + '拿到它等于拿到账号，请勿外传或放进公共网盘。'))) return;
+    const btn = $('btnAccExport');
+    btn.disabled = true;
+    try {
+      const url = '/api/admin/accounts/export' + (uids.length ? ('?uids=' + encodeURIComponent(uids.join(','))) : '');
+      await downloadJSONFrom(url, 'wb2api-accounts.json');
+      toast('已开始下载（' + (uids.length || '全部') + '）', 'ok');
+    } catch (e) {
+      toast('导出失败：' + e.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
 let stopLive = null;
 
 const TASK_META = [
@@ -2358,8 +2385,13 @@ function renderRiskReports(list) {
     who.appendChild(el('span', 'ident', (r.uid || '').slice(0, 8) + ' · ' +
       (r.at ? fmtTime(r.at) : '') + ' · 来源 ' + (r.source || '—') + ' · 代码 ' + (r.code || '—')));
     row.appendChild(who);
-    const tag = el('span', 'tag ' + (r.action === 'deleted' ? 'err' : 'warn'),
-      r.action === 'deleted' ? '已删除' : (r.action === 'delete_failed' ? '删除失败·已停用' : '已记录'));
+    // source=token（v0.31.29）：refresh 被上游判 12153 —— 这不是"风控冷却"，也不是
+    // "等下去会好"，而是**登录凭证已废**。标签必须与风控上报区分开，否则运维会
+    // 按"等冷却"的方式去处理一批需要重新登录的号。
+    const tokenDead = r.source === 'token';
+    const tag = el('span', 'tag ' + (tokenDead || r.action === 'deleted' ? 'err' : 'warn'),
+      tokenDead ? '登录失效·需重新登录'
+        : (r.action === 'deleted' ? '已删除' : (r.action === 'delete_failed' ? '删除失败·已停用' : '已记录')));
     row.appendChild(tag);
     if (r.display) row.appendChild(el('div', 'note', '上游原文：' + r.display));
     box.appendChild(row);

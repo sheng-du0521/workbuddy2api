@@ -10,6 +10,34 @@ const $ = (id) => document.getElementById(id);
 // 错误提示切个页就找不到了 —— 而"刚才失败过"恰恰是最需要留下的信息。
 // 签名保持 toast(msg, kind) 兼容，第三参可选 { duration, sticky }。
 
+// downloadJSONFrom 从**需要鉴权**的接口下载 JSON 文件（v0.31.29）。
+//
+// 为什么不用 `<a href>` 直接点：接口出错时浏览器会跳到一屏 JSON 错误页，
+// 用户看到的是乱码而不是"导出失败的原因"。用 fetch 取 blob 才能把后端原文抛出来。
+// 为什么先确认再下载：导出的文件里是 access_token / refresh_token **明文**，
+// 拿到它就等于拿到账号 —— 这一句话必须由调用方在 confirm 里说清。
+async function downloadJSONFrom(url, fallbackName) {
+  const r = await fetch(url, { credentials: 'same-origin' });
+  if (!r.ok) {
+    let t = '';
+    try { t = (await r.text()).slice(0, 200); } catch (e) { /* 忽略读失败 */ }
+    throw new Error(t || ('HTTP ' + r.status));
+  }
+  // 文件名优先用服务端 Content-Disposition（带时间戳，避免多次导出同名覆盖）。
+  const disp = r.headers.get('Content-Disposition') || '';
+  const m = /filename="?([^";]+)"?/.exec(disp);
+  const name = (m && m[1]) || fallbackName || 'export.json';
+  const blob = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    try { URL.revokeObjectURL(a.href); a.remove(); } catch (e) { /* 忽略 */ }
+  }, 1000);
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts, {
     headers: Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}),

@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.28"
+const version = "0.31.29"
 
 type app struct {
 	store  *Store
@@ -390,6 +390,11 @@ func main() {
 	a.proxy.onRetire11140 = func(uid string) []string { return a.retireBy11140(uid, true) }
 
 	// 定时任务：账号在池中自动签到/做任务维持额度。
+	// 失效上报（v0.31.29）必须在构造 runner **之前**赋值：schedulerConfig 在
+	// 构造时就被消费，晚一步设置就永远不生效。
+	taskRunnerOnTokenDead = func(uid, nick, detail string) {
+		a.reportRisk(uid, nick, "12153", detail, "token", "observed")
+	}
 	if !*noTasks {
 		a.tasks = newTaskRunner(px, store, dataDir)
 		a.tasks.Start()
@@ -1423,6 +1428,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/host/oauth/start", a.userGuard(a.handleHostOAuthStart))
 	mux.HandleFunc("GET /api/host/oauth/poll", a.userGuard(a.handleHostOAuthPoll))
 	mux.HandleFunc("GET /api/host/accounts", a.userGuard(a.handleHostAccounts))
+	// 导出（v0.31.29）：只导出自己名下的号；文件里是凭证明文，前端须二次确认。
+	mux.HandleFunc("GET /api/host/accounts/export", a.userGuard(a.handleExportHostAccounts))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/group", a.userGuard(a.handleHostSetGroup))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/pool", a.userGuard(a.handleHostPool))
 	mux.HandleFunc("DELETE /api/host/accounts/{uid}", a.userGuard(a.handleHostDeleteAccount))
@@ -1453,6 +1460,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/admin/selection-balance", a.adminGuard(a.handleSelectionBalance))
 	mux.HandleFunc("GET /api/admin/selection-candidates", a.adminGuard(a.handleSelectionCandidates))
 	mux.HandleFunc("GET /api/admin/accounts", a.adminGuard(a.handleListAccounts))
+	// 账号导出（v0.31.29）：`?uids=` 只导勾选的，不带则全量。格式与导入闭环。
+	mux.HandleFunc("GET /api/admin/accounts/export", a.adminGuard(a.handleExportAccounts))
 	mux.HandleFunc("GET /api/admin/pool", a.adminGuard(a.handlePool))
 	mux.HandleFunc("POST /api/admin/accounts/sync", a.adminGuard(a.handleSync))
 	// 桌面端账号导入（v0.12.0，需求 4）：把 ~/.wb-switch/accounts.json 里的已授权账号合并进号池。

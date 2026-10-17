@@ -62,12 +62,15 @@ type TaskConfig struct {
 // DefaultTaskConfig 缺省配置（与 internal/scheduler 的默认排程一致）。
 func DefaultTaskConfig() TaskConfig {
 	return TaskConfig{
-		Enabled:             true,
-		JitterMinutes:       5,
-		CheckinHours:        []int{9, 21},
-		TravelHours:         []int{9, 21},
-		ActivityHours:       []int{10},
-		KeepaliveHours:      []int{22},
+		Enabled:       true,
+		JitterMinutes: 5,
+		CheckinHours:  []int{9, 21},
+		TravelHours:   []int{9, 21},
+		ActivityHours: []int{10},
+		// 保活改为**每小时一次**（v0.31.29）：配合 scheduler 的按账号分散窗口，
+		// 全池刷新从"13 秒内 38 个号"变成"每小时 1~2 个号"。
+		// 2026-10-18 的教训：批量续期对上游是一眼可见的异常模式。
+		KeepaliveHours:      hours24(),
 		CatHours:            []int{1},
 		ActivityReportCount: 5,
 		ExpiringSoonDays:    7,
@@ -175,12 +178,15 @@ func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, growthOK bool, g
 		growth = nil
 	}
 	return scheduler.Config{
-		Pool:                px.pool,
-		Upstream:            px.uc,
-		CheckinHours:        tc.CheckinHours,
-		TravelHours:         tc.TravelHours,
-		ActivityHours:       tc.ActivityHours,
-		KeepaliveHours:      tc.KeepaliveHours,
+		Pool:           px.pool,
+		Upstream:       px.uc,
+		CheckinHours:   tc.CheckinHours,
+		TravelHours:    tc.TravelHours,
+		ActivityHours:  tc.ActivityHours,
+		KeepaliveHours: tc.KeepaliveHours,
+		// 保活抖动（v0.31.29）：同一小时内轮到多个号时也不连发。固定常量而非配置项 ——
+		// 它是"避免批量形态"的默认纪律，不需要运维去调。
+		KeepaliveJitterMs:   800,
 		CatHours:            tc.CatHours,
 		JitterMinutes:       tc.JitterMinutes,
 		ActivityReportCount: tc.ActivityReportCount,
@@ -209,4 +215,13 @@ func (tc TaskConfig) schedulerConfig(px *Proxy, dataDir string, growthOK bool, g
 		LedgerFile:        filepath.Join(dataDir, "task_ledger.json"),
 		AccountTaskFilter: accountTaskFilter,
 	}
+}
+
+// hours24 返回 0..23（保活改为每小时一次时的默认时点，v0.31.29）。
+func hours24() []int {
+	out := make([]int, 24)
+	for i := range out {
+		out[i] = i
+	}
+	return out
 }

@@ -80,13 +80,20 @@ func installCredentialHook(store *Store) {
 // 手动执行，这里只负责探测脚本链路可用性（growthOK），供 UI 决定是否给出入口。
 //
 // 触发时刻/开关等来自 kv 里的 TaskConfig（管理端可改，见 Reconfigure）。
+// taskRunnerOnTokenDead 保活/签到前补刷新发现"refresh 已被上游作废"时的上报回调
+// （v0.31.29）。由 main.go 注入（不改 newTaskRunner 签名，避免动到三处调用与测试）。
+// nil = 不上报。
+var taskRunnerOnTokenDead func(uid, nick, detail string)
+
 func newTaskRunner(px *Proxy, store *Store, dataDir string) *taskRunner {
 	growthOK := scheduler.GrowthScriptAvailable()
 	tc := store.LoadTaskConfig()
 	r := &taskRunner{proxy: px, store: store, dataDir: dataDir,
 		growthOK: growthOK, growth: growthProvider{store: store}, cfg: tc,
 		taskCfg: loadAccountTaskCfg(store)}
-	r.sch = scheduler.New(tc.schedulerConfig(px, dataDir, growthOK, r.growth, r.accountTaskFilter))
+	sc := tc.schedulerConfig(px, dataDir, growthOK, r.growth, r.accountTaskFilter)
+	sc.OnTokenDead = taskRunnerOnTokenDead
+	r.sch = scheduler.New(sc)
 	return r
 }
 
@@ -177,7 +184,9 @@ func (t *taskRunner) Reconfigure(tc TaskConfig) {
 		t.schCancel() // 停掉旧循环；Run(ctx) 收到取消后退出
 	}
 	t.cfg = tc
-	t.sch = scheduler.New(tc.schedulerConfig(t.proxy, t.dataDir, t.growthOK, t.growth, t.accountTaskFilter))
+	sc := tc.schedulerConfig(t.proxy, t.dataDir, t.growthOK, t.growth, t.accountTaskFilter)
+	sc.OnTokenDead = taskRunnerOnTokenDead
+	t.sch = scheduler.New(sc)
 	t.startScheduler()
 	log.Printf("定时任务已重配置：%s", t.cfgSummary())
 }

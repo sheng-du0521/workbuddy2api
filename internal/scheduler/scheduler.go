@@ -58,6 +58,16 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
+	// KeepaliveJitterMs 保活每次刷新前的随机等待上限（毫秒，v0.31.29）。
+	// 0 = 不等待（旧行为）。默认 800：38 个号即使都在同一小时，也不会打成同一秒。
+	KeepaliveJitterMs int
+	// OnTokenDead 账号 refresh 被判失效（12153）时的回调（v0.31.29）。
+	//
+	// 为什么需要：2026-10-18 全池 token 失效时，页面上只显示"签到：不支持"，
+	// 没有任何地方告诉运维"这些号的登录已经废了"。回调让 webapp 把这件事
+	// 立刻写进风控台账 + 概览告警，而不是等三个周期后被动停用。
+	// nil = 不上报（测试与旧装配不受影响）。
+	OnTokenDead func(uid, nickname, detail string)
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
 
@@ -1210,11 +1220,19 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			continue
 		}
 		t.total++
+		// 抖动（v0.31.29）：即使同一小时轮到多个号，也不要打成同一秒的连发。
+		// 20 个号 × 0.15~0.85s ≈ 2~17 秒，仍然很快，但对上游不再是"一串并发"。
+		if s.cfg.KeepaliveJitterMs > 0 {
+			time.Sleep(time.Duration(rand.Intn(s.cfg.KeepaliveJitterMs)+50) * time.Millisecond)
+		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			t.fail++
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				if s.cfg.OnTokenDead != nil {
+					s.cfg.OnTokenDead(st.UID, st.Nickname, "refresh 12153（refresh token 已失效）")
+				}
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
@@ -1234,7 +1252,48 @@ func (s *Scheduler) runKeepalive(trigger string) {
 // keepaliveSkip 惰性刷新判定：token 剩余有效期还很长（超出保活阈值/惰性刷新窗口）时跳过本轮刷新，
 // 减少对上游的无谓调用（防封），也让「保活」只在真正需要续期时才动。
 // 两个判据都为 0（缺省）时恒返回 false —— 行为与引入前逐字一致（无条件刷新）。
+// keepaliveSpreadGraceHours 分散刷新的兜底窗口：token 在这么多小时内要过期时，
+// 不再等"自己那一小时"，立刻刷（分散是为了好看，不是为了把号刷废）。
+const keepaliveSpreadGraceHours = 6
+
+// keepaliveHourOf 该账号的"专属刷新小时"（0-23）。
+//
+// 为什么要按账号分散（v0.31.29，2026-10-18 全池掉登录换来的）：
+// 原先保活每天 22 点跑一次，38 个号在**13 秒内**被逐个刷新（实测 iat 22:01:02~22:01:15，
+// 同一出口 IP）—— 对上游来说这是一眼可见的批量行为，与"一个正常用户偶尔续期"完全不同。
+// 把每个号固定到一天里的某一小时，上游任何时刻最多看到 1~2 次刷新。
+func keepaliveHourOf(uid string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(uid))
+	return int(h.Sum32() % 24)
+}
+
+// keepaliveSpreadOn 调度是否真的覆盖了全天 24 小时。
+//
+// 只在覆盖 24 小时时启用分散：如果仍是一天一次（KeepaliveHours=[22]），
+// 分散会让绝大多数号永远轮不到自己那一小时 —— 那是把功能关掉而不是优化。
+func (s *Scheduler) keepaliveSpreadOn() bool {
+	seen := map[int]bool{}
+	for _, h := range s.cfg.KeepaliveHours {
+		if h >= 0 && h < 24 {
+			seen[h] = true
+		}
+	}
+	return len(seen) >= 24
+}
+
 func (s *Scheduler) keepaliveSkip(a *auth.Auth) bool {
+	// 分散窗口（先于"还很久才过期"的判断）：不是自己那一小时就跳过，
+	// 除非 token 已临近过期（见 keepaliveSpreadGraceHours）。
+	if s.keepaliveSpreadOn() {
+		now := s.now()
+		if now.Hour() != keepaliveHourOf(a.UID) {
+			exp := a.ExpiresAt
+			if exp <= 0 || exp > now.Unix()+keepaliveSpreadGraceHours*3600 {
+				return true
+			}
+		}
+	}
 	if s.cfg.LazyRefreshHours <= 0 && s.cfg.KeepaliveDays <= 0 {
 		return false
 	}

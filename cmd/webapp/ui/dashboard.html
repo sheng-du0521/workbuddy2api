@@ -430,6 +430,10 @@
         <div class="row">
           <span id="hostSummary" class="muted" style="font-size:12px;"></span>
           <span class="slot-refresh" data-refresh="loadHostAccounts" data-refresh-label="刷新"></span>
+          <!-- 导出（v0.31.29）：只导出自己名下的号；文件可与「导入账号」闭环。
+               ⚠ 含 acc/refresh token 明文 = 账号钥匙。 -->
+          <button class="ghost sm" id="btnHostExport"
+            title="把我名下的代挂账号导出为 JSON（可再导入）。⚠ 文件里是凭证明文，请勿外传">导出 JSON</button>
         </div>
       </div>
       <div class="chipbar" id="hostGroupBar"></div>
@@ -601,6 +605,25 @@ API Key : 在上方「API 密钥」页生成</pre>
 <script>
 let me = null;
 let stopUsageLive = null;
+
+// 导出我的代挂账号（v0.31.29）。只打 `/api/host/accounts/export`，服务端按登录用户
+// 过滤 owner —— 前端不传 uid，也就没有"改个参数导别人的号"这条路。
+if (document.getElementById('btnHostExport')) {
+  document.getElementById('btnHostExport').onclick = async () => {
+    if (!(await confirmAsk('导出我名下的全部代挂账号？\n\n⚠ 文件里是 access_token / refresh_token 明文，'
+      + '拿到它等于拿到账号，请勿外传。'))) return;
+    const btn = document.getElementById('btnHostExport');
+    btn.disabled = true;
+    try {
+      await downloadJSONFrom('/api/host/accounts/export', 'my-accounts.json');
+      toast('已开始下载', 'ok');
+    } catch (e) {
+      toast('导出失败：' + e.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
 // rate 全站折算比例（元/点，v0.17.7）：由后端各接口的 `rate` 字段写入，只作兜底换算用。
 // **不要在这里写死** —— 管理员改提现比例后，写死的值会让「点 ≈ ¥」显示错误。
 let rate = 0;

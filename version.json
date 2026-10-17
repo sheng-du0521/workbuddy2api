@@ -1,16 +1,16 @@
 {
-  "version": "0.31.28",
+  "version": "0.31.29",
   "min_supported": "0.24.0",
-  "notes": "v0.31.28：**「账号签到不支持」的排查结论与两处修复**。① 现象：账号卡显示「签到：不支持」，猫猫查询也失败。② 真因（生产实测）：该实例 38 个号的 access/refresh token **同时被上游作废** —— billing/状态接口返回 `401 invalid_token`（openresty/APISIX 的 HTML 页），refresh 端点返回 `12153: refresh token is invalid`，两侧都不可自愈。③ 代码侧根因（高危缺陷）：refresh 是**轮换制且会撤销旧凭证**，而本仓库有四处独立刷新入口（签到前补刷新 / 保活 / 401 重试 / chat 前 refreshIfNeeded）**没有任何互斥** —— 并发双刷同一个 refresh_token 时，第二个必 12153，部分实现还会把「旧 refresh 被重复使用」判为重放并连带作废刚签发的新 token。旧注释里「实测并发双刷新，两个新 token 都有效」的结论已被上游行为推翻（那次只验了「两条都能用」，没验「旧 token 会不会被撤销」）。**修法：`RefreshToken` 加单飞**（`refreshFlights`，按 *auth.Auth 登记在途，等待者复用同一次结果；失败不缓存、顺序调用仍会真刷）。④ 第二处修复（语义）：「查询失败」不再渲染成「不支持」—— 后端出错时 `supported` 是 Go 零值 false，而前端**先判 supported 再判 ok**，于是凭证失效被显示成「功能不支持」。现在前端先判 ok、后端把 401/12153 翻译成「账号登录已失效，需要重新导入 auth 文件」，国际版 travel 也显式 `OK=true`（「查过了，结论是不支持」≠「没查成」）。⑤ 测试：新增 `refresh_singleflight_test.go` 3 条（10 并发只发 1 次请求 / 顺序调用不缓存 / 失败共享且可重试），变异检验去掉单飞 → 10 次请求同时发出（正是事故形态）；uitest 新增 `task-status-semantics` 守卫（判断顺序 + 401 人话 + 单飞存在）。全量 go test 全绿、uitest PASS。⑥ **需要人工处理**：38 个号的 access/refresh 均已被作废，代码无法自愈 —— 需在控制台按原方式重新导入每个号的 auth 文件（导入后自动恢复，无需手动启用）。⑦ 诚实边界：无法 100% 证明本次全池失效就是并发双刷导致（也可能是在官方客户端登录踢掉旧会话、或上游统一吊销），但「并发双刷会被撤销」已由上游 12153 语义与本次现象共同印证，单飞是必须的。",
-  "released_at": 1792264219,
+  "notes": "v0.31.29：账号导出 / 快照恢复 / 保活分散 / 失效上报四件事。① 导出（管理端 + 用户端）：GET /api/admin/accounts/export[?uids=] 与 GET /api/host/accounts/export，格式与「导入账号」**严格闭环**（字段名对齐 desktopAccount、顶层数组、expiresAt 毫秒），并有 TestExportRoundTrip 把导出→解析放进同一断言里 —— 字段漂移会立刻红（device_token 就这样丢过一轮）。管理端勾选优先、无勾选导全部；用户端只导自己名下的号。前端下载前二次确认：文件里是凭证明文，等同账号钥匙。② 快照恢复：10-18 全池 token 被上游作废后，从 10-16 本地快照里逐个实测，**25 个号的旧 token 仍返回 200**，已按导入接口写回生产（expires_at 已从 11-14 变成 11-12），抽验 checkin/travel 均 ok；剩 13 个（8 个快照里已失效 + 5 个不在快照）需重新登录。③ 失效归因（排除「切换代理」）：token 的 JWT iat=22:01:02~22:01:15（13 秒内 38 个号，串行保活），exp=11-14、kid 与仍有效的旧 token 相同 → **不是密钥轮换、不是出口切换**（默认出口在 23:5x 才改，且 11080/21160 是同一个公网 IP 39.91.80.16）。更符合「22:01 这批批量刷新被上游撤销」。④ 保活改造：默认时点从 [22] 改为**全天 24 小时**，并按 uid 哈希 % 24 给每个号一个专属小时（keepaliveHourOf），另加 0.15~0.85s 抖动 —— 上游任何时刻最多看到 1~2 次刷新，不再是「13 秒内 38 个号」。临近过期（6h）时无视分散立刻刷，避免为了好看把号刷废。⑤ 失效上报：refresh 被判 12153 时回调 OnTokenDead → 写 risk_reports（source=token）+ WARN 日志，健康检测页的台账把它标成「登录失效·需重新登录」（与「风控冷却」区分开，处理方式完全不同）。⑥ 同类项目调研（截至 10-17）：workbuddy2api-hub v1.6.8 的保活是「22:00 扫描，剩余寿命 <2h 才刷」；workbuddy2api-panel 把 12153 判为「硬冷却至次日 04:00 + 提示重新登录」；Buddy2API 已补 WorkBuddy 5.6 加密信封兼容，并提醒「重导入会覆盖仍可刷新的明文凭据」；社区脚本指出**旅行接口在 www.workbuddy.cn/activity/growth/buddy/...（不带 /v2）**，且应采用「先领后派 + 达上限绝不派 + 只读失败一律降级」。活动侧：签到仍 100/天、连签 7 天有额外奖励（活动制、按「期」开放、断签清零），连登按「每天≥1 次对话」计，猫猫旅行约 4 小时一趟 —— 以客户端当期显示为准。",
+  "released_at": 1792267818,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.28/webapp.exe",
-      "sha256": "cc333891520ce3a6b9613a1bbc9c5eb6a20141487aca4939cc969c7d73ac5604",
-      "size": 15214592
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.29/webapp.exe",
+      "sha256": "93ce902190fd9d601d4e6f97c49f79e3ae0a9be2d2b40764e8f503223deef707",
+      "size": 15232512
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
