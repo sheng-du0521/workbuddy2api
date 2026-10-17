@@ -260,6 +260,17 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// 所有出站路径的公共 headers() 注入（wb_accounts.py:250-251），本网关同样全覆盖
 	// （chat 经 ChatHeaders 叠加 CommonHeaders 天然继承；billing 域另行注入）。
 	c.injectAccountStableHeaders(req, a)
+	// X-Device-Token：**必须和上面两个头放在同一处**（v0.31.27 审计发现）。
+	//
+	// 此前它只在 ChatHeaders 与 BillingHeaders 里单独注入，于是三条路径**不带设备凭证**：
+	// 模型列表（fetchEnterpriseModels / fetchV3Models / globalModelsOnce）与 refresh。
+	// 后果不是"少一个头"这么轻 —— 同一个账号在「对话」与「拉模型」上对上游呈现的是
+	// **两套设备身份**（一套有凭证、一套没有），而"稳定差异"正是可用于聚类的特征；
+	// 设备凭证审计页会显示 38/38 都有值，因为那只统计**数据层**，看不见路径层漏了三处。
+	//
+	// 幂等：ChatHeaders / BillingHeaders 仍各自调用 injectDeviceToken（同值覆盖，无害）；
+	// 保留它们的显式调用是为了让"这两条链路带设备凭证"在代码里直接可读。
+	c.injectDeviceToken(req, a)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
