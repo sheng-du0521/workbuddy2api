@@ -482,7 +482,9 @@
     <!-- ==================== 代理（v0.14.0 出口代理；v0.17.9 拆为 出口代理 / 账号代理） ==================== -->
     <section class="pane" data-pane="egress">
       <!-- 子区导航：代理配置是**两层**的，摊在一个长页面里很容易看混，
-           故分成三块。「去哪弄代理」是纯说明，放在同一页省得再去翻文档。 -->
+           故分成两块：**代理总览**（线路 + 账号，一个界面）与设备诊断。
+           v0.31.36 把原来的「出口代理 / 账号代理」两个子区合并 —— 它们本来就是
+           一件事的两面（线路 ↔ 号的映射），分着看必然要在两个 tab 之间来回对。 -->
       <div class="card" style="margin-bottom:16px;">
         <div class="section-head">
           <h2>代理</h2>
@@ -602,7 +604,8 @@
           </div>
           <div class="hint" style="margin-top:8px;">
             支持 <code>http</code> / <code>https</code> / <code>socks5</code>（<b>不支持 socks5h</b>）；
-            需带协议前缀与端口。还没有代理？看子区「<b>去哪弄代理</b>」。
+            需带协议前缀与端口。还没有代理？两条路：<b>用户控制台 → 插件 → 本地出口代理</b>
+            （把某台电脑接成住宅出口），或下面「接入出口代理池」批量导入。
           </div>
         </div>
 
@@ -775,12 +778,23 @@
       </div>
 
       <!-- ========== 子区 ②：账号代理（绑定层） ========== -->
+      <!-- ========== 代理总览 · 第二段：逐账号出口（v0.31.36 与上面的线路合并） ==========
+           合并的意义在于**两个方向同屏**：上面看"一条线路承载了哪些号"，
+           下面看"一个号实际从哪条线路出去"。线路卡的「账号数」可直接下钻过滤。 -->
       <div class="egr-sub" data-egr-sub="accounts" style="display:none;">
+        <div class="section-head" style="margin:24px 0 0;">
+          <h2>逐账号出口</h2>
+          <span class="muted" style="font-size:12px;">每个号<b>实际</b>从哪个 IP 出去</span>
+        </div>
+        <div class="sub" style="margin:6px 0 12px;">
+          与上面一一对应：<b>线路</b>回答"能从哪些 IP 出去"，<b>这里</b>回答"每个号用了哪一条"。
+          点上方线路卡的「账号数」可直接筛出这条线上的号。
+        </div>
         <div class="kpis" id="egrAccKpis"></div>
 
         <div class="card" style="margin-top:16px;">
           <div class="section-head">
-            <h2>逐账号出口</h2>
+            <h2>筛选与改出口</h2>
             <span class="muted" style="font-size:12px;" id="egrAccStamp"></span>
           </div>
           <div class="sub" style="margin:0 0 10px;">
@@ -794,182 +808,14 @@
           <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;">
             <div id="egrAccFilter" class="row"></div>
             <input type="text" id="egrAccQuery" placeholder="按昵称 / uid 过滤" style="max-width:200px;">
+            <!-- 线路下钻（v0.31.36）：点线路卡的「账号数」后在这里显示，可一键清除。 -->
+            <span id="egrAccLineHint" class="row" style="gap:6px;align-items:center;"></span>
             <span id="egrAccCount" class="muted" style="font-size:12px;"></span>
           </div>
           <div class="cards" id="egrAccCards" style="margin-top:12px;"></div>
         </div>
       </div>
 
-      <!-- ========== 子区 ③：去哪弄代理（帮助） ==========
-           内容必须与 dist/Web应用使用说明.md「出口代理从哪来」一节保持一致，
-           尤其是那条硬约束（上游是国内域名 → 海外出口反而异常）。 -->
-      <div class="egr-sub" data-egr-sub="help" style="display:none;">
-        <div class="card">
-          <h2>先记一条硬约束</h2>
-          <div class="sub" style="margin:0 0 10px;">
-            本服务的上游是 <code>copilot.tencent.com</code> / <code>www.codebuddy.cn</code>（<b>国内域名</b>），
-            而账号本身也是<b>国内账号</b>。所以：
-          </div>
-          <ul class="egr-help-list">
-            <li>出口必须<b>能访问国内网络</b>（海外出口访问国内上游本身就慢且不稳）；</li>
-            <li><b>账号属地 ≠ 出口属地</b>本身就是异常特征 ——
-              「国内号常年从某境外机房 IP 访问」比直连更像风险信号；</li>
-            <li>结论：<b>不要买海外住宅代理 / 不要拿境外 VPS 当出口</b>。
-              这一点与「住宅 IP 更抗识别」的通用经验不同，是本项目特有的约束。</li>
-          </ul>
-          <div class="hint" style="margin-top:8px;">
-            例外：若你的账号本身就是海外属地（国际版），那出口应落在<b>对应地区</b>。
-            原则始终是「出口属地与账号属地一致」。
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>渠道对照：按适合度排序</h2>
-          <div class="sub" style="margin:0 0 12px;">
-            选代理的硬指标是 <b>IP 数量够 / IP 干净 / 长期固定 / 国内可达</b>，不是「速度快」。
-          </div>
-          <table class="egr-help-table">
-            <thead><tr><th>渠道</th><th>出口类型</th><th>适合度</th><th>说明</th></tr></thead>
-            <tbody>
-              <tr>
-                <td><b>国内独享 / 静态住宅代理</b></td>
-                <td>真住宅</td>
-                <td><b>生产首选</b></td>
-                <td>一号一 IP、长期固定，最贴合「一个账号一个家」的形态；按 IP 月租</td>
-              </tr>
-              <tr>
-                <td><b>动态拨号 VPS 自建</b></td>
-                <td>运营商拨号</td>
-                <td><b>性价比好</b></td>
-                <td>一个 VPS 一个拨号出口，重启可换 IP；几十元/月，适合中小规模</td>
-              </tr>
-              <tr>
-                <td><b>国内云服务器自建</b>（3proxy / tinyproxy）</td>
-                <td>机房</td>
-                <td>一般</td>
-                <td>独享可控、便宜、部署简单，但<b>机房 IP 风控识别度高</b>，适合低敏感场景</td>
-              </tr>
-              <tr>
-                <td><b>国内动态短效住宅</b>（按量提取）</td>
-                <td>真住宅</td>
-                <td>谨慎</td>
-                <td>便宜，但 <b>IP 会变</b> → 同一账号多 IP 反而更可疑，且与粘性会话冲突</td>
-              </tr>
-              <tr>
-                <td><b>公开免费代理</b></td>
-                <td>混杂</td>
-                <td><b>不要用于生产</b></td>
-                <td>本项目实测可用率约 <b>0.9%</b>，且画像比干净的本机 IP 更差
-                  （见随包的 <code>免费代理测试报告.md</code>）；只适合验证链路</td>
-              </tr>
-              <tr>
-                <td><b>海外住宅 / 海外 VPS</b></td>
-                <td>境外</td>
-                <td><b>不适用</b></td>
-                <td>与上游和账号属地都不匹配，见上方硬约束</td>
-              </tr>
-            </tbody>
-          </table>
-          <div class="hint" style="margin-top:10px;">
-            结论：<b>账号数 ≈ 需要的 IP 数</b>。先按账号数估需要几条线路，再决定自建还是买服务。
-            <br><b>本项目不为任何服务商背书</b>，下面只给类型与检索关键词 —— 别照抄名字就下单，
-            一定先用「保存并探活」和小额测试验一遍。
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>方案 A：自建（推荐起步，中小规模）</h2>
-          <ol class="egr-help-list">
-            <li><b>买机器</b>：国内云厂商的轻量应用服务器 / 按量计费实例（阿里云、腾讯云、华为云等），
-              或<b>动态拨号 VPS</b>（重启换 IP 更省事）。要几个 IP 就开几台，
-              尽量<b>分散到不同地域 / 不同供应商</b> —— 同一个 /24 段开一堆，等于没隔离。</li>
-            <li><b>装代理服务端</b>：只做出口代理不必上复杂方案，
-              <code>3proxy</code>（HTTP + SOCKS，配置一行起）或 <code>tinyproxy</code>（纯 HTTP）最省事；
-              需要加密传输再考虑 <code>sing-box</code> / <code>Xray</code>。</li>
-            <li><b>拿到 URL</b>：配好后会得到形如
-              <code>http://user:pass@1.2.3.4:8080</code> 或
-              <code>socks5://user:pass@1.2.3.4:1080</code>，粘到上面「添加线路」即可。</li>
-            <li><b>务必加认证</b>：<code>user:pass</code> 不能省。裸代理端口会在几小时内被全网扫到，
-              被扫到就等于出口 IP 被别人共用 —— 反而把自己拖进风控。</li>
-            <li><b>防火墙</b>：只放行代理端口；SSH 改非 22 端口或只允许密钥登录。</li>
-          </ol>
-          <div class="hint">
-            一台机器要多个出口：云厂商可挂多个弹性 IP，服务端按<b>入站端口</b>把流量分流到不同出口 IP
-            （3proxy 的 <code>internal</code>/<code>external</code> 多段配置即可）—— 能显著摊薄单 IP 成本。
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>方案 B：买商业代理</h2>
-          <ul class="egr-help-list">
-            <li><b>国内独享静态住宅</b>（首选）：检索「独享静态住宅代理」「固定 IP 代理 月租」。
-              要点是<b>按 IP 月租 + 独享 + 可长期续用</b>，而不是买「IP 池按量提取」。</li>
-            <li><b>国内动态提取型</b>：检索「动态代理 IP」「隧道代理」。
-              按提取量或并发计费，IP 池大但<b>单 IP 存活短</b> ——
-              不适合「一个账号固定一个 IP」，更适合做出口池轮换。</li>
-            <li><b>选型时问清三件事</b>：① 出口是不是真住宅/移动（而不是机房混住宅）；
-              ② 是否<b>独享</b>（共享池里同 IP 可能已有陌生人滥用）；
-              ③ 支持哪些协议（本项目要 <code>http</code>/<code>https</code>/<code>socks5</code>，
-              <b>不支持 socks5h</b>）。</li>
-            <li><b>计费</b>：优先「按量 / 可冻结」，避免买了用不上的配额。</li>
-          </ul>
-        </div>
-
-        <div class="card">
-          <h2>用随包工具先验证（强烈推荐）</h2>
-          <div class="sub" style="margin:0 0 10px;">
-            宣传的可用率不能信，要用<b>真实业务路径</b>验。仓库自带 <code>tools/proxyscan</code>：
-            并发探测并<b>同时验证两个真实上游</b> —— 只通一个的代理会出现
-            「对话能通、计费查询全挂」这种半死状态，必须两个都过才算可用；
-            并且默认启用<b>严格 TLS 校验</b>，会自动排除做 MITM 解密 token 的代理。
-          </div>
-          <pre class="code">export PATH="$PATH:/c/Program Files/Go/bin"
-# 1) 快速初筛（只测国内可达）
-echo "1.2.3.4:8080" &gt; cand.txt
-go run ./tools/proxyscan -in cand.txt -scheme http -c 50 -t 8 -out good.txt
-# 2) 对通过的做真实双上游复验（严格 TLS 默认开启）
-go run ./tools/proxyscan -in good.txt -scheme http -c 20 -t 8 -out final.txt</pre>
-          <div class="hint" style="margin-top:8px;">
-            只买了少量线路的话，也可以直接用本页上方「<b>保存并探活</b>」单条验（回显真实出口 IP）。
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>怎么判断一条代理能不能用</h2>
-          <ul class="egr-help-list">
-            <li><b>能回显真实出口 IP</b> —— 探活通过且 IP 落在<b>国内（或与该账号属地一致）</b>。
-              探活会依次尝试多个公共回显端点；<b>端点全不可达时判为「不确定」而不是「线路坏了」</b>。</li>
-            <li><b>是独享还是共享</b> —— 出口 IP 若被成百上千人共用（免费代理、廉价共享池），
-              这个 IP 在你拿到之前就已经脏了。</li>
-            <li><b>稳定性</b> —— 本页每 5 分钟自动探活，连续 3 次失败会自动停用。
-              频繁被停用的线路别留在池里。</li>
-            <li><b>延迟</b> —— 探活回显里带耗时；&gt;800ms 会显著拖慢对话类接口的首字节时间。</li>
-            <li><b>IP 是否固定</b> —— 同一账号应长期用同一个出口。IP 频繁漂移本身就可疑，
-              所以「独享静态」优先于「动态提取」。</li>
-          </ul>
-        </div>
-
-        <div class="card">
-          <h2>几条容易踩的坑</h2>
-          <ul class="egr-help-list">
-            <li><b>别把所有号塞进一条线路</b> —— 同出口账号数超过上限时页面会告警。
-              上限可在「设置」页调，但放宽只是掩盖风险，不是消除风险。</li>
-            <li><b>同一号主的多个号必须分开</b> —— 这是本项目里最强的关联信号，
-              批量分配默认就带「同号主不共用出口」约束，别关掉。</li>
-            <li><b>改完代理要留意出口异常</b> —— 代理填错或探活失败时该账号会被自动排除出平台选号
-              （<b>运行期绝不回落直连</b>），修好或改回「直连」即恢复。</li>
-            <li><b>「清空」不等于「直连」</b> —— 清空是回到「未指定」，此时若配了全局默认代理，
-              账号会走默认那条；要真的走本机 IP，用「直连」。</li>
-            <li><b>环境变量代理</b> —— 后端进程若有 <code>http_proxy</code>/<code>https_proxy</code>
-              环境变量，「未指定」的账号也会受其影响；「显式直连」是唯一能绕过它的状态。</li>
-            <li><b>别一次全量切过去</b> —— 先买 2~3 条线路、一条挂 2~3 个号，跑 1~2 周看账号健康度
-              （签到是否正常、有无异常归档），确认稳定后再扩量。</li>
-            <li><b>合规</b> —— 代理只用于你自己账号的出口隔离；
-              使用前请自行确认符合目标服务的服务条款与你所在地区的法律法规。
-              本项目不提供任何绕过法律或平台规则的用途。</li>
-          </ul>
-        </div>
-      </div>
     </section>
 
     <!-- ==================== 定时任务 ==================== -->
@@ -6445,7 +6291,7 @@ $('btnSend').onclick = async () => {
 };
 
 // ======================================================================
-// 代理（v0.14.0 出口代理；v0.17.9 拆为「出口代理 / 账号代理 / 去哪弄代理」）
+// 代理（v0.14.0 出口代理；v0.17.9 拆三块；v0.31.36 合回「代理总览」）
 //
 // 代理配置是**两层**的，界面按层分块：
 //   出口代理 = 线路池（有哪些 IP 能出去）—— overview + proxies 两个接口；
@@ -6480,9 +6326,15 @@ let egrView = null;
 let egrEditingId = '';
 
 // ---- 子区（三个）----
-let egrSub = 'pool';
+// 默认子区 = 合并后的「代理总览」（v0.31.36）。旧值 'pool' 是 DOM 段名，
+// 不是子区名 —— 用它会让 tabs 一个都不高亮，accounts 段也不会自动显示。
+let egrSub = 'proxy';
 let egrAccounts = [];
 let egrAccFilter = '__all__';
+// egrAccLine 按**线路 URL** 下钻过滤（v0.31.36）。空 = 不按线路过滤。
+// 与 egrAccFilter（按状态）是**叠加**关系：两者同时生效，避免"点了账号数
+// 之后状态筛选还留着，看不到全部"这种说不清的空列表。
+let egrAccLine = '';
 // egrAccSummary 各状态计数（后端返回）；egrAccDefault 全局默认出口代理（空 = 未配置）。
 let egrAccSummary = {};
 let egrAccDefault = '';
@@ -7383,8 +7235,20 @@ if ($('btnDevTokRefresh')) $('btnDevTokRefresh').onclick = () => loadDeviceDiag(
 if ($('btnDevTokImport')) $('btnDevTokImport').onclick = importDeviceTokens;
 if ($('btnSelRefresh')) $('btnSelRefresh').onclick = () => loadDeviceDiag();
 
-const EGR_SUBS = [['pool', '出口代理'], ['accounts', '账号代理'],
-  ['device', '设备与选号诊断'], ['help', '去哪弄代理']];
+// 子区（v0.31.36）：出口代理与账号代理**合并成「代理总览」**。
+//
+// 为什么合并：它们是同一件事的两面 —— 线路是"能从哪些 IP 出去"，
+// 账号是"每个号实际从哪出去"。分成两个 tab 时，排查"为什么 A 号走了 B 线路"
+// 必须来回切页对照；合并后左右两段在同一屏，且线路卡的「账号数」可直接
+// 下钻过滤账号列表（点一下就只看这条线上的号）。
+//
+// DOM 仍保留 `pool` / `accounts` 两段：视觉上连续，渲染代码不必重写。
+// 分组关系由 EGR_SUB_GROUPS 表达 —— 一个子区可以包含多段。
+const EGR_SUB_GROUPS = {
+  proxy: ['pool', 'accounts'],
+  device: ['device'],
+};
+const EGR_SUBS = [['proxy', '代理总览'], ['device', '设备与选号诊断']];
 
 // EGR_STATE_META 账号代理状态 → 展示元信息。
 // 后端同时返回 state_label，这里只补配色（两端各写一份中文会漂移，故不重复写文案）。
@@ -7414,18 +7278,32 @@ function mountEgrTabs() {
 }
 
 // showEgrSub 切子区（纯显隐，不重新拉数据 —— 数据在 loadEgress 一次拉齐）。
+//
+// 一个子区可以**包含多段 DOM**（见 EGR_SUB_GROUPS）：合并后的「代理总览」
+// 就是 `pool` + `accounts` 两段同时可见。这样合并不需要搬动几百行 HTML，
+// 也就不会把某个 id 搬丢（那些 id 全被渲染函数按名取）。
+// applyEgrSubVisibility 纯显隐（不渲染、不写 hash）。
+//
+// 单独抽出来是为了**初始化**能用：`loadEgress` 第一次跑时数据还在路上，
+// 调 showEgrSub 会顺手 render 一遍空数据（页面闪一下空列表）。初始化只需要
+// 把该显示的段显示出来。
+function applyEgrSubVisibility(name) {
+  const show = EGR_SUB_GROUPS[name] || [name];
+  for (const el2 of Array.from(document.querySelectorAll('.egr-sub'))) {
+    el2.style.display = show.includes(el2.dataset.egrSub) ? '' : 'none';
+  }
+}
+
 function showEgrSub(name) {
   egrSub = name;
-  for (const el2 of Array.from(document.querySelectorAll('.egr-sub'))) {
-    el2.style.display = (el2.dataset.egrSub === name) ? '' : 'none';
-  }
+  applyEgrSubVisibility(name);
   mountEgrTabs();
   const tabs = $('egrTabs');
   if (tabs) {
     const segs = Array.from(tabs.querySelectorAll('.seg'));
     segs.forEach((b, i) => b.classList.toggle('active', EGR_SUBS[i][0] === name));
   }
-  if (name === 'accounts') renderEgrAccCards();
+  if (name === 'proxy') { renderEgressCards(); renderEgrAccCards(); }
   if (name === 'device') loadDeviceDiag();
   try { location.hash = 'egress'; } catch (e) { /* 忽略 */ }
 }
@@ -7435,6 +7313,9 @@ function showEgrSub(name) {
 // silent=true 时失败**不弹 toast**：这个函数现在会被 5 秒轮询调用，
 // 一次网络抖动就会把右上角刷满 —— 而轮询的意义恰恰是"自己会好"。
 async function loadEgress(silent) {
+  // 先把该显示的段摆正（合并后一个子区对应多段；HTML 里 accounts 段默认是
+  // display:none，不摆正就会出现"切到代理页只有线路、账号区不见了"）。
+  applyEgrSubVisibility(egrSub);
   loadEgressPolicy(); // R1：线路失效处置策略（独立拉，失败不影响主流程）
   loadOutboundPolicy(); // v0.31.35：出站口径（统一走服务器 / 撤回）
   try {
@@ -7723,9 +7604,34 @@ function egrAccVisible() {
   const q = ($('egrAccQuery') ? $('egrAccQuery').value : '').trim().toLowerCase();
   return egrAccounts.filter((a) => {
     if (egrAccFilter !== '__all__' && a.state !== egrAccFilter) return false;
+    // 按线路下钻：比 **实际生效** 的值（resolved），不是配置值 ——
+    // "未指定但继承默认" 的号也属于那条线路，按 configured 比会漏掉它们。
+    if (egrAccLine) {
+      const eff = String(a.resolved || '');
+      if (eff !== egrAccLine) return false;
+    }
     if (!q) return true;
     return (a.nickname || '').toLowerCase().includes(q) || (a.uid || '').toLowerCase().includes(q);
   });
+}
+
+// renderEgrAccLineHint 线路下钻的提示条（含"清除"）。
+//
+// 为什么单独一行而不是塞进下拉：下钻是**从上面点下来的**，用户需要看到
+// "我现在看的是这条线路"以及"怎么退回去"；藏在下拉里等于没有提示。
+function renderEgrAccLineHint() {
+  const box = $('egrAccLineHint');
+  if (!box) return;
+  box.textContent = '';
+  if (!egrAccLine) return;
+  const hit = egrList.find((p) => p.url === egrAccLine);
+  const name = (hit && hit.name) || egrAccLine;
+  const tag = el('span', 'tag accent', '只看线路：' + name);
+  tag.title = egrAccLine;
+  box.appendChild(tag);
+  const clear = el('button', 'ghost sm', '清除');
+  clear.onclick = () => { egrAccLine = ''; renderEgrAccCards(); };
+  box.appendChild(clear);
 }
 
 // renderEgrAccKpis 顶部汇总：各状态计数（点击即筛选，省得再去点分段控件）。
@@ -7786,6 +7692,7 @@ function renderEgrAccCards() {
   const box = $('egrAccCards');
   if (!box) return;
   renderEgrAccFilterBar();
+  renderEgrAccLineHint();
   const list = egrAccVisible();
   const cnt = $('egrAccCount');
   if (cnt) cnt.textContent = egrAccounts.length ? ('显示 ' + list.length + ' / ' + egrAccounts.length + ' 个') : '';
@@ -7950,7 +7857,21 @@ function egrCard(p) {
   const chips = el('div', 'chips');
   if (p.region) chips.appendChild(el('span', 'tag accent', p.region));
   chips.appendChild(el('span', 'tag ' + (p.last_ok ? 'ok' : (p.fail_streak ? 'err' : '')), egrProbeText(p)));
-  chips.appendChild(el('span', 'tag ' + (over ? 'err' : (count ? 'ok' : '')), '账号数 ' + count + (over ? ' · 超额' : '')));
+  {
+    const cntTag = el('span', 'tag ' + (over ? 'err' : (count ? 'ok' : '')), '账号数 ' + count + (over ? ' · 超额' : ''));
+    if (count > 0) {
+      // 下钻（v0.31.36）：合并后两段同屏，点它直接在下方筛出这条线路上的号。
+      // 这是"合并"带来的实际价值 —— 不用再切 tab 对照。
+      cntTag.style.cursor = 'pointer';
+      cntTag.title = '点击在下方「逐账号出口」只看这条线路上的号';
+      cntTag.onclick = () => {
+        egrAccLine = p.url;
+        showEgrSub('proxy');
+        renderEgrAccCards();
+      };
+    }
+    chips.appendChild(cntTag);
+  }
   if (conflict) chips.appendChild(chipWithTitle('同号主多账号', 'warn', '号主 #' + (stat.owner_conflict || []).join(' / #') + ' 在该出口上有多个账号'));
   // 用户线路单独打标（v0.31.23）：它的**失效语义与风险等级**都和平台线路不同 ——
   // 不受我们控制的第三方出口，只能被显式指名分配（不进自动选线与自动迁移）。
@@ -8797,7 +8718,7 @@ window.paletteSources = (window.paletteSources || []).concat([
   mountThemeToggle(); // 深色 / 浅色切换（偏好落 localStorage，刷新与重新登录均保持）
   mountAlertCenter(); // v0.31.20：右上角提醒中心（操作反馈 / 待办 / 页面错误）
   mountAccountTools(); // 「改密码」入口
-  mountEgrTabs();      // 代理页子区（出口代理 / 账号代理 / 去哪弄代理）
+  mountEgrTabs();      // 代理页子区（代理总览 / 设备与选号诊断）
 
   mountUiShell(); // v0.26.6：命令面板（⌘K）+ 全局快捷键 + 侧边栏过滤
   setupNav(document.body); // 初始页的实时轮询由 onNavChange 钩子按需启动

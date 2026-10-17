@@ -1193,47 +1193,46 @@ function run(pageFile, meOverride, plan) {
       // 「删掉了」与「还能用」两件事必须都验（只验其一会漏掉「删过头」）。
       textIn: [['#hostCards', '已入池']] },
     // v0.14.0：出口代理页（线路池 + 防封体检 + 批量分配）。
-    // v0.17.9：「出口代理」改名为「代理」，页内分 出口代理 / 账号代理 / 去哪弄代理 三子区。
+    // v0.17.9：「出口代理」改名为「代理」，页内拆子区。
+    // v0.31.36：**出口代理 + 账号代理合并成「代理总览」**，并删掉「去哪弄代理」子区。
+    //   合并的意义在行为上：两段同屏 + 线路卡的「账号数」可下钻过滤账号列表。
     { nav: 'egress', counts: [['egrCards', 1]],
       has: [['#egressAlert', 1], ['#egressBadge', 1], ['#egrName', 1], ['#egrUrl', 1], ['#egrRegion', 1],
         ['#btnEgrSave', 1], ['#btnEgrCheckAll', 1], ['#egrScope', 1], ['#egrMaxPer', 1], ['#egrIsolate', 1],
         ['#btnEgrDry', 1], ['#btnEgrApply', 1], ['#egrPlan', 1], ['#egrCards .ecard footer button', 4],
         // v0.14.1：支持直连 —— 批量「设为直连 / 清空出口」两个按钮。
         ['#btnEgrDirect', 1], ['#btnEgrClear', 1],
-        // 三个子区 + 子区导航，且线路池/账号代理/帮助三块都在同一文档里。
-        ['#egrTabs .seg', 4], ['[data-egr-sub="pool"]', 1],
+        // 合并后只剩两个子区；DOM 仍是三段（pool/accounts 属于同一子区）。
+        ['#egrTabs .seg', 2], ['[data-egr-sub="pool"]', 1],
         ['[data-egr-sub="accounts"]', 1], ['[data-egr-sub="device"]', 1],
-        ['[data-egr-sub="help"]', 1]],
+        // 账号区与线路区**同时**在页面上（这才叫合并）。
+        ['#egrAccKpis', 1], ['#egrAccCards', 1], ['#egrAccLineHint', 1]],
       textIn: [['#egressAlert', '出口异常'], ['#egrCards', '香港 01'], ['#egrCards', '203.0.113.7'],
         ['#egrCards', '探活'], ['#egressAlert', '显式直连'],
-        // 导航改名（旧名不能再出现）
         ['.nav-item[data-nav="egress"]', '代理'],
-        // 帮助子区：讲清「去哪弄代理」，且明确不背书
-        ['#egrTabs', '去哪弄代理'], ['[data-egr-sub="help"]', '先记一条硬约束'], ['[data-egr-sub="help"]', '自建'],
-        // 硬约束必须写出来：上游是国内域名 → 海外出口反而异常（与通用经验相反，最容易买错）
-        ['[data-egr-sub="help"]', '不要买海外住宅代理'], ['[data-egr-sub="help"]', '国内独享'],
-        ['[data-egr-sub="help"]', '不为任何服务商背书'],
-        // 随包验证工具与实测结论（避免管理员被服务商宣传带跑）
-        ['[data-egr-sub="help"]', 'tools/proxyscan'], ['[data-egr-sub="help"]', '免费代理测试报告.md']],
-      lacks: [['.nav-item[data-nav="egress"]', '出口代理']],
-      // 默认停在「出口代理」子区：公共层先给线路池，账号层按需切。
-      display: [['[data-egr-sub="pool"]', 'shown'], ['[data-egr-sub="accounts"]', 'none'],
-        ['[data-egr-sub="device"]', 'none'], ['[data-egr-sub="help"]', 'none']] },
-    // 切到「账号代理」：KPI 6 块 + 5 张账号卡 + 筛选段控件，且 pool 子区被藏起。
-    { clickText: [['#egrTabs .seg', '账号代理']],
-      counts: [['egrAccKpis', 6], ['egrAccCards', 5]],
+        // 子区名必须是合并后的两个；旧的三个名字不能再出现。
+        ['#egrTabs', '代理总览'], ['#egrTabs', '设备与选号诊断'],
+        // 账号区在同一页里，标题与说明都在。
+        ['[data-egr-sub="accounts"]', '逐账号出口'],
+        ['[data-egr-sub="accounts"]', '每个号']],
+      // 旧的「去哪弄代理」整体删除（用户要求），整页不应再有它的任何字样。
+      lacks: [['.pane[data-pane="egress"]', '去哪弄代理'], ['.pane[data-pane="egress"]', '方案 A：自建'],
+        ['.nav-item[data-nav="egress"]', '出口代理']],
+      // 默认停在合并后的总览：线路段与账号段都 shown，诊断段 hidden。
+      display: [['[data-egr-sub="pool"]', 'shown'], ['[data-egr-sub="accounts"]', 'shown'],
+        ['[data-egr-sub="device"]', 'none']] },
+    // 账号区（合并后不再需要切 tab）：KPI 6 块 + 5 张账号卡 + 筛选段控件。
+    { counts: [['egrAccKpis', 6], ['egrAccCards', 5]],
       has: [['#egrAccFilter .seg', 6], ['#egrAccQuery', 1], ['#egrAccCards .ecard footer button', 15]],
-      display: [['[data-egr-sub="accounts"]', 'shown'], ['[data-egr-sub="pool"]', 'none']],
       textIn: [['#egrAccKpis', '配置异常'], ['#egrAccKpis', '未指定 · 直连'],
         ['#egrAccCards', '香港 01'], ['#egrAccCards', '本机 IP 直连'],
         ['#egrAccCards', '继承默认'], ['#egrAccCards', '配置值'], ['#egrAccCards', '实际出口']] },
-    // 帮助子区可切换到达。
-    { clickText: [['#egrTabs .seg', '去哪弄代理']],
-      has: [['[data-egr-sub="help"] .egr-help-table', 1], ['[data-egr-sub="help"] .egr-help-list', 4]],
-      display: [['[data-egr-sub="help"]', 'shown'], ['[data-egr-sub="accounts"]', 'none']],
-      textIn: [['[data-egr-sub="help"]', '方案 A：自建'], ['[data-egr-sub="help"]', '3proxy'],
-        ['[data-egr-sub="help"]', '方案 B：买商业代理'], ['[data-egr-sub="help"]', '合规'],
-        ['[data-egr-sub="help"]', '别一次全量切过去']] },
+    // v0.31.36 下钻：点线路卡的「账号数」→ 账号列表只剩这条线上的号 + 出现清除按钮。
+    { clickText: [['#egrCards .chips .tag', '账号数']],
+      textIn: [['#egrAccLineHint', '只看线路']],
+      has: [['#egrAccLineHint button', 1]] },
+    { clickText: [['#egrAccLineHint button', '清除']],
+      textIn: [['#egrAccLineHint', '']] },
     // v0.26.3：消耗失败台账（统计 + 明细 + 处置策略表三块）。
     { nav: 'report',
       has: [['#cfHours', 1], ['#cfCode', 1], ['#cfStage', 1], ['#btnCfRefresh', 1],

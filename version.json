@@ -1,16 +1,16 @@
 {
-  "version": "0.31.35",
+  "version": "0.31.36",
   "min_supported": "0.24.0",
-  "notes": "v0.31.35：**出站统一走服务器 + 代理规则冲突排查 + 插件独立页面全覆盖**。① 新增出站口径开关（`GET/POST /api/admin/egress/policy`）：`mode=server` 把所有账号出口清成「跟随默认」并把全局默认清空 → 全部从服务器本机 IP 出站；`mode=restore` 从自动备份撤回。支持 `dry_run` 预览（返回受影响号数与原出口分布）；操作前把每个号的旧值写进 kv 备份；**不动线路池**（线路/探活/归属都保留）。生产已执行：清空 10 个账号出口（原 21160）、清空全局默认（原 11080），38 个号全部直连，出站 IP 47.103.194.103。② 修运行时不生效的坑：`SyncAccounts` 只重建账号级映射，`p.defaultEgress` 由 `ReloadSelection` 赋值 —— 只调前者会让「库里默认已空、运行时还在用 11080」，overview 同时显示「38 个未指定」和「默认 11080」自相矛盾。两个都调，并加断言（`ResolveEgress` 必须为空）。③ 代理规则冲突排查（三处真实漏洞）：（a）设置页「我的出口 → 应用到全部」此前**只校验格式**，手填别人的线路 URL 就能把号绑上去（assign 拦得住、设置页拦不住）；（b）`ensureUserEgressLine` 命中别人**已停用**的线路时无条件 `Enabled=true`，等于一个用户能把别人的线拉活；（c）`applyHomeEgress` 平台视角命中已被用户认领的 URL 时，仍会设默认并把自挂号全绑上去（用户视角同理）。三处统一收敛到 `hostEgressLineFor(u, norm, allowNew)`：assign 只允许池内线路、设置页允许用户新接自己的代理（allowNew=true），归属判定用**哨兵错误**而不是匹配文案（文案一改状态码就漂）。判定顺序也修正为「先归属、后启用」——「别人的」是别等了，「停用的」才是等一等。④ 插件独立页面全覆盖：claim / health / egress 三种形态都能打开独立页面（占满内容区 + 返回栏 + 标题改插件名 + 侧栏仍高亮插件）；`pluginFillPanel`/`pluginRun` 补 `pluginState` 兜底（不经卡片直接进面板不再 TypeError）。⑤ 测试：新增 `egress_outbound_test.go`（预览不写库 / 执行后账号与默认全空 + 运行时同步 + 备份存在 + 线路池未动 / 撤回只恢复当前为空的号；设置页填他人线路 403 且对方线路仍停用）；uitest 新增 `plugin-views`（逐个点开三种插件，断言 pane 激活、标题、内容、返回）。全量 go test 与 uitest 均通过。",
-  "released_at": 1792277174,
+  "notes": "v0.31.36：插件独立页面卡片化 + 管理后台「出口代理 / 账号代理」合并为一个「代理总览」，并删掉「去哪弄代理」。① 插件页面卡片化：新增 pluginCardBox(title,hint)，把 claim / health 的独立页面拆成三张功能卡 ——「执行口径 / 检测概览」（说明 + KPI 标签）、「选择账号并执行」（全选 + 计数 + 主按钮 + 刷新）、「账号与结果」（逐号勾选 + 结果徽标）；加载态也放进卡片（否则独立页面里一段裸文字像没渲染）。egress 视图的「我的账号出口」卡内加「线路一览 / 逐号分配」小节标题。② 管理端合并：原来的四个子区（出口代理 / 账号代理 / 设备诊断 / 去哪弄代理）收成两个 —— 代理总览 + 设备与选号诊断；「去哪弄代理」整块删除（用户要求）。合并方式不是搬 HTML，而是 EGR_SUB_GROUPS（一个子区可含多段 DOM）：proxy = [pool, accounts]，两段同时可见；showEgrSub 按分组显隐，另抽 applyEgrSubVisibility 供初始化用（loadEgress 首帧就摆正，避免出现「切到代理页只有线路、账号区不见了」）。③ 合并带来的实际能力（不只是视觉）：线路卡的「账号数」可下钻过滤下方账号列表（按实际生效的 resolved 值比，不是配置值，否则继承默认的号会被漏掉），并给「只看线路 X / 清除」提示条；账号区标题改为「逐账号出口 · 每个号实际从哪个 IP 出去」，与上面的线路区形成「能出哪些 IP / 每个号用了哪条」的对应。④ 顺带修正：egrSub 初值从 DOM 段名 pool 改成子区名 proxy（旧值会让 tabs 一个都不高亮）；账号卡的「账号数」chip 变为可点（悬停提示下钻）。⑤ 测试：uitest 代理页守卫重写（子区数 4→2、pool 与 accounts 同时 shown、help 零残留、去哪弄代理与「方案 A：自建」进 lacks、下钻点击 → 提示条 → 清除）；plugin-views 保持通过。全量 uitest PASS。",
+  "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.35/webapp.exe",
-      "sha256": "85ed5ff9018f4302979f67f055dbdf742206aae49298cbcbdfe2752e0c7c9eca",
-      "size": 15415296
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.36/webapp.exe",
+      "sha256": "1b927ad2637bd2d9dc1d86bd92bad0a5ed82cf77616e90db0f48b19a44347475",
+      "size": 15413760
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

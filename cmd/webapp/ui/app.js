@@ -2751,6 +2751,30 @@ function pluginKindLabel(kind) {
   }
 }
 
+// pluginCardBox 插件独立页面里的「功能卡」（v0.31.36）。
+//
+// 为什么插件页面要卡片化：以前是把所有东西平铺在一个 div 里 —— 说明、选号、
+// 按钮、结果混成一片，滚动时看不出"哪一段在做什么"。拆成
+// 「概览 / 操作 / 结果」三张卡之后，每张卡只回答一个问题，也天然对齐全站视觉。
+//
+// 返回 { card, body, head }：head 留给调用方往标题行塞状态标签。
+function pluginCardBox(title, hint) {
+  const card = el('div', 'card');
+  card.style.marginBottom = '14px';
+  const head = el('div', 'section-head');
+  head.appendChild(el('h2', null, title));
+  card.appendChild(head);
+  if (hint) {
+    const h = el('div', 'sub');
+    h.style.margin = '0 0 10px';
+    h.innerHTML = hint;
+    card.appendChild(h);
+  }
+  const body = el('div');
+  card.appendChild(body);
+  return { card, head, body };
+}
+
 function pluginCard(p) {
   // 状态容器：独立视图里的面板会复用（picked / targets / rows 跨开关保留）。
   const st = (pluginState[p.id] = pluginState[p.id] || {
@@ -2835,7 +2859,11 @@ function pluginCard(p) {
 async function pluginHealthPanel(p, card, panel) {
   const st = (pluginState[p.id] = pluginState[p.id] || { healthOpen: true });
   panel.textContent = '';
-  panel.appendChild(el('div', 'sub', '正在读取检测结果…'));
+
+  // 加载态也用卡片：否则"正在读取"是一段裸文字，切到独立页面时像没渲染。
+  const loading = pluginCardBox('检测概览');
+  loading.body.appendChild(el('div', 'sub', '正在读取检测结果…'));
+  panel.appendChild(loading.card);
 
   const isAdmin = pluginScope() === 'admin';
   const base = isAdmin ? '/api/admin/accounts/health' : '/api/host/accounts/health';
@@ -2844,12 +2872,14 @@ async function pluginHealthPanel(p, card, panel) {
     d = await api(base + '/last');
   } catch (e) {
     panel.textContent = '';
-    panel.appendChild(el('div', 'sub', '读取检测结果失败：' + (e && e.message ? e.message : e)));
+    const c = pluginCardBox('检测概览');
+    c.body.appendChild(el('div', 'sub', '读取检测结果失败：' + (e && e.message ? e.message : e)));
+    panel.appendChild(c.card);
     return;
   }
 
   // 两端返回形状不同（后台 results[]，用户端 accounts[]），在这里归一。
-  // 统一成 {uid, nickname, tokenDead, checked, result}，后面只按这个渲染。
+  // 统一成 {uid, nickname, tdead, checked, result}，后面只按这个渲染。
   let rows = [];
   if (Array.isArray(d.accounts)) {
     rows = d.accounts.map((a) => ({
@@ -2868,33 +2898,47 @@ async function pluginHealthPanel(p, card, panel) {
 
   panel.textContent = '';
   if (!rows.length) {
-    panel.appendChild(el('div', 'sub', isAdmin
+    const c = pluginCardBox('检测概览');
+    c.body.appendChild(el('div', 'hintbar', isAdmin
       ? '还没有可检测的账号。先到「账号池」导入账号。'
       : '你还没有代挂账号。先到「账号代挂」页添加一个，再回来体检。'));
+    panel.appendChild(c.card);
     return;
   }
 
   const sum = d.summary || {};
-  const head = el('div', 'sub');
-  head.style.margin = '8px 0';
-  head.appendChild(document.createTextNode(
-    '检测内容：凭证是否还有效 · 余额能否读到 · 对话通道是否通 · 出口是否正常。' +
-    '每号 1~3 秒、逐个串行，**只读**，不会停用或删除任何账号。'));
-  if (isAdmin) {
-    head.appendChild(document.createElement('br'));
-    head.appendChild(document.createTextNode(
-      '需要按策略处置（停用/复活/删除）请到左侧「健康检测」页 —— 那里才有写操作。'));
-  }
-  panel.appendChild(head);
+  const total = sum.total || rows.length;
+  const checked = sum.checked || 0;
+  const definite = sum.definite || 0;
 
-  // 汇总（只算本次能看到的号）
-  const kpi = el('div', 'sub');
-  kpi.style.margin = '6px 0 10px';
-  const stamp = sum.ended_at ? (' · 最近一次 ' + fmtClock(sum.ended_at)) : '';
-  kpi.textContent = '共 ' + (sum.total || rows.length) + ' 个号 · 已检测 ' + (sum.checked || 0)
-    + ' · 确定性异常 ' + (sum.definite || 0) + stamp;
-  panel.appendChild(kpi);
+  // ---- 卡 1：检测概览 ----
+  const c1 = pluginCardBox('检测概览',
+    '检测内容：凭证是否还有效 · 余额能否读到 · 对话通道是否通 · 出口是否正常。'
+    + '<b>每号 1~3 秒、逐个串行</b>，<b>只读</b>，不会停用或删除任何账号。'
+    + (isAdmin ? '<br>需要按策略处置（停用/复活/删除）请到左侧「健康检测」页 —— 那里才有写操作。' : ''));
+  const badge = el('span', 'tag ' + (definite ? 'warn' : 'ok'),
+    definite ? ('异常 ' + definite) : (checked ? '全部正常' : '待检测'));
+  badge.style.fontSize = '12px';
+  badge.style.marginLeft = '8px';
+  if (checked) c1.head.appendChild(badge);
 
+  const kv = el('div', 'row');
+  kv.style.cssText = 'flex-wrap:wrap;gap:8px;align-items:center;';
+  const kpi = (k, v, tone) => {
+    const t = el('span', 'tag ' + (tone || ''), k + v);
+    return t;
+  };
+  kv.appendChild(kpi('共 ', total));
+  kv.appendChild(kpi('已检测 ', checked, checked ? 'ok' : ''));
+  kv.appendChild(kpi('确定性异常 ', definite, definite ? 'err' : ''));
+  if (sum.ended_at) kv.appendChild(kpi('最近一次 ', fmtClock(sum.ended_at)));
+  c1.body.appendChild(kv);
+  panel.appendChild(c1.card);
+
+  // ---- 卡 2：选号与执行 ----
+  const c2 = pluginCardBox('选择账号并开始检测',
+    '勾选要体检的号，点「开始检测」。服务端逐号串行探活，本页会自动把结果接回来'
+    + '（每 15 秒刷新一次，最多 5 分钟）。');
   const row = el('div', 'row');
   row.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;';
   const all = el('label', 'pick-all');
@@ -2951,11 +2995,13 @@ async function pluginHealthPanel(p, card, panel) {
   const refresh = el('button', 'ghost', '刷新结果');
   refresh.onclick = () => pluginHealthPanel(p, card, panel);
   row.appendChild(refresh);
-  panel.appendChild(row);
+  c2.body.appendChild(row);
+  panel.appendChild(c2.card);
 
-  // 逐号结果
+  // ---- 卡 3：逐号结果 ----
+  const c3 = pluginCardBox('逐号检测结果',
+    '每行左侧的勾选决定「下一次检测」的范围；右侧是最近一次的结论（悬停可看补充说明）。');
   const list = el('div', 'cfg-list');
-  list.style.marginTop = '10px';
   for (const r of rows) {
     const line = el('div');
     line.style.cssText = 'display:flex;gap:8px;align-items:flex-start;padding:6px 0;'
@@ -3009,7 +3055,8 @@ async function pluginHealthPanel(p, card, panel) {
     line.appendChild(body);
     list.appendChild(line);
   }
-  panel.appendChild(list);
+  c3.body.appendChild(list);
+  panel.appendChild(c3.card);
 }
 
 // pluginFillPanel 填面板主体：按插件形态分流。
@@ -3027,7 +3074,11 @@ async function pluginFillPanel(p, card, panel) {
     targets: null, picked: null, running: false, rows: {},
   });
   panel.textContent = '';
-  panel.appendChild(el('div', 'sub', '正在读取可操作的账号…'));
+
+  // 加载态也放进卡片（v0.31.36）：独立页面里一段裸文字会像"没渲染出来"。
+  const loading = pluginCardBox('执行口径');
+  loading.body.appendChild(el('div', 'sub', '正在读取可操作的账号…'));
+  panel.appendChild(loading.card);
 
   let targets = st.targets;
   if (!targets) {
@@ -3040,7 +3091,9 @@ async function pluginFillPanel(p, card, panel) {
       st.targets = targets;
     } catch (e) {
       panel.textContent = '';
-      panel.appendChild(el('div', 'sub', '读取账号失败：' + (e && e.message ? e.message : e)));
+      const c = pluginCardBox('执行口径');
+      c.body.appendChild(el('div', 'sub', '读取账号失败：' + (e && e.message ? e.message : e)));
+      panel.appendChild(c.card);
       return;
     }
   }
@@ -3048,20 +3101,34 @@ async function pluginFillPanel(p, card, panel) {
 
   panel.textContent = '';
   if (!targets.length) {
-    panel.appendChild(el('div', 'sub', '没有可操作的账号。'));
+    const c = pluginCardBox('执行口径');
+    c.body.appendChild(el('div', 'hintbar', '没有可操作的账号。'));
+    panel.appendChild(c.card);
     return;
   }
 
-  const head = el('div', 'sub');
-  head.style.margin = '10px 0 8px';
-  head.appendChild(document.createTextNode('出站纪律：'));
-  const strong = el('b', null, '逐个串行');
-  head.appendChild(strong);
-  head.appendChild(document.createTextNode(
-    '执行（每次只发一个账号，间隔 ' + PLUGIN_GAP_MS + 'ms，服务端另有 30 秒/账号 的重复保护）。'
-    + '上游对「没有可领」的答复属正常态，不等于失败。'));
-  panel.appendChild(head);
+  // ---- 卡 1：执行口径 ----
+  const c1 = pluginCardBox('执行口径',
+    '对选中的号<b>逐个串行</b>执行一次领取（每次只发一个账号，间隔 ' + PLUGIN_GAP_MS
+    + 'ms，服务端另有 30 秒/账号 的重复保护）。<br>'
+    + '上游对「没有可领」的答复属<b>正常态</b>，不等于失败；「已领取过」是结论（不用再试），'
+    + '「无可领」是现状（等有活动再试）—— 两者都会在结果里分开显示，悬停可见上游原文。');
+  const kv = el('div', 'row');
+  kv.style.cssText = 'flex-wrap:wrap;gap:8px;align-items:center;';
+  const stTag = el('span', 'tag ' + (st.running ? 'warn' : 'ok'), st.running ? '执行中…' : '待执行');
+  stTag.style.fontSize = '12px';
+  c1.head.appendChild(stTag);
+  const done = Object.keys(st.rows || {}).length;
+  const kpi = (k, v, tone) => el('span', 'tag ' + (tone || ''), k + v);
+  kv.appendChild(kpi('可操作 ', targets.length));
+  kv.appendChild(kpi('已选 ', st.picked.size, st.picked.size ? 'ok' : ''));
+  kv.appendChild(kpi('已有结果 ', done, done ? 'accent' : ''));
+  c1.body.appendChild(kv);
+  panel.appendChild(c1.card);
 
+  // ---- 卡 2：选择与执行 ----
+  const c2 = pluginCardBox('选择账号并开始执行',
+    '勾选要领取的号 → 点「开始领取」。执行期间按钮与勾选会锁定，避免重复触发。');
   const row = el('div', 'row');
   row.style.flexWrap = 'wrap';
   row.style.alignItems = 'center';
@@ -3095,16 +3162,20 @@ async function pluginFillPanel(p, card, panel) {
     pluginFillPanel(p, card, panel);
   });
   row.appendChild(refresh);
-  panel.appendChild(row);
+  c2.body.appendChild(row);
+  panel.appendChild(c2.card);
 
-  const listBox = el('div');
-  listBox.style.marginTop = '10px';
+  // ---- 卡 3：账号与结果 ----
+  const c3 = pluginCardBox('账号与结果',
+    '勾选决定本次执行范围；右侧是最近一次的结果（悬停可见上游原文与 code）。');
+  const listBox = el('div', 'cfg-list');
   for (const t of targets) {
     const line = el('label');
     line.style.display = 'flex';
     line.style.alignItems = 'center';
     line.style.gap = '8px';
-    line.style.padding = '4px 0';
+    line.style.padding = '5px 0';
+    line.style.borderTop = '1px solid rgba(127,127,127,.15)';
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = st.picked.has(t.uid);
@@ -3119,9 +3190,6 @@ async function pluginFillPanel(p, card, panel) {
     if (r) {
       // 上游原文挂在 title 上（悬停可见）：这是区分「真的无可领」与「字段名猜错」
       // 的唯一事实，但直接铺在行里会把布局撑坏。
-      // 上游答复（code + msg）与返回原文都挂在 title 上：悬停可见、不撑坏布局。
-      // v0.31.19 起 "已领取过" 有独立状态，但**证据仍然只有上游原文**——
-      // 把 code 一起摆出来，用户就不必来问"到底是已领过还是没活动"。
       const tips = [];
       if (r.upstream_msg) tips.push('上游答复：' + r.upstream_msg + (r.code ? '（code=' + r.code + '）' : ''));
       if (r.detail) tips.push('上游返回原文：' + r.detail);
@@ -3130,7 +3198,8 @@ async function pluginFillPanel(p, card, panel) {
     }
     listBox.appendChild(line);
   }
-  panel.appendChild(listBox);
+  c3.body.appendChild(listBox);
+  panel.appendChild(c3.card);
 }
 
 // pluginResultBadge 一行结果徽标（颜色 + 文字，逐号可见）。
@@ -3533,6 +3602,14 @@ function renderHostEgress(d) {
   box.appendChild(bar);
 
   // ---- 线路一览（每条线路一个出口 IP；同 IP 的会合并提示）----
+  // 卡片内分区（v0.31.36）：一张卡里既有一览又有逐号表格时，加小节标题
+  // 才能一眼看出"这两段在回答不同问题"。
+  const secLines = el('div', 'section-head');
+  secLines.style.marginTop = '4px';
+  secLines.appendChild(el('h3', null, '线路一览'));
+  secLines.lastChild.style.fontSize = '13px';
+  box.appendChild(secLines);
+
   const byIP = {};
   for (const l of usable) (byIP[l.exit_ip || '未知'] = byIP[l.exit_ip || '未知'] || []).push(l);
   const lineRow = el('div', 'sub');
@@ -3595,6 +3672,13 @@ function renderHostEgress(d) {
   box.appendChild(lineRow);
 
   // ---- 逐号表格 ----
+  const secAcc = el('div', 'section-head');
+  secAcc.style.marginTop = '14px';
+  const h3 = el('h3', null, '逐号分配');
+  h3.style.fontSize = '13px';
+  secAcc.appendChild(h3);
+  box.appendChild(secAcc);
+
   const tbl = el('div', 'cfg-list');
   const head = el('div', 'gr-sub');
   head.style.cssText = 'display:flex;gap:8px;align-items:center;padding:6px 0;font-size:12px;color:#888;';
