@@ -59,7 +59,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.3"
+const agentVersion = "0.3.6"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -68,6 +68,19 @@ const pollInterval = 5 * time.Second
 
 // keepAliveInterval 子进程保活的检查间隔。
 const keepAliveInterval = 10 * time.Second
+
+// 出口 IP 探测间隔（v0.3.5）。
+//
+// 为什么要周期刷新，而不是"start 成功时探一次"（原做法，实测踩到）：
+// probeExitIP 在 startTunnel 返回后立刻跑，而 wbproxy 刚拉起、可能还没真正
+// listen → 连接被拒 → 直接 return，**之后再无重试**，于是状态里永远没有出口 IP，
+// 而界面上看起来和"这台机器没有出口"一样。
+//
+// 另外出口 IP 本身会漂移（宽带重播、运营商换池），一次性的值迟早会不准。
+const (
+	exitProbeOK   = 10 * time.Minute
+	exitProbeFail = 1 * time.Minute
+)
 
 type cmdSpec struct {
 	Action     string `json:"action"` // start / stop / none
@@ -127,6 +140,9 @@ type agent struct {
 	// authCandAt 上次扫描时刻：5 秒一次的 report 不该每次都去走目录。
 	authCand   []authFileCandidate
 	authCandAt time.Time
+	// exitNext 下次允许探测出口 IP 的时刻（v0.3.5）。
+	// 零值 = 立刻探测一次；成功后推到 10 分钟后，失败则 1 分钟后重试。
+	exitNext time.Time
 }
 
 func (a *agent) setMsg(f string, args ...any) {
@@ -332,16 +348,43 @@ func (a *agent) stopAll() {
 // 而不只是"进程起来了"。失败不是错误（有些网络不允许访问查询接口），
 // 留空即可 —— 但控制台会因此少一个可核对的证据。
 func (a *agent) probeExitIP(proxyPort int) {
+	// 无论成败都要记下次时刻：失败时 1 分钟后再来（wbproxy 可能刚起还没 listen），
+	// 不记就会在 10 秒一次的保活循环里把查询接口打到限速。
+	defer func() {
+		a.mu.Lock()
+		if a.exitIP != "" {
+			a.exitNext = time.Now().Add(exitProbeOK)
+		} else {
+			a.exitNext = time.Now().Add(exitProbeFail)
+		}
+		a.mu.Unlock()
+	}()
 	pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
 	if err != nil {
 		return
 	}
+	// DisableKeepAlives（v0.3.6）：wbproxy 是自研的极简 HTTP 代理，对 keep-alive
+	// 连接复用的处理不如 curl 宽容；探测是一次性的低频请求，每次建新连接代价可忽略，
+	// 却能把"复用连接被代理提前关掉"这一类失败直接排除。
 	cl := &http.Client{
-		Timeout:   12 * time.Second,
-		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
+		Timeout: 12 * time.Second,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(pu),
+			DisableKeepAlives: true,
+		},
 	}
-	resp, err := cl.Get("http://ip-api.com/json/?fields=query,country,regionName,city,isp")
+	req, err := http.NewRequest(http.MethodGet, "http://ip-api.com/json/?fields=query,country,regionName,city,isp", nil)
 	if err != nil {
+		log.Printf("[agent] 出口 IP 探测：构造请求失败 %v", err)
+		return
+	}
+	// 带一个常规 UA：部分公共接口对空 UA 直接 403，而 Go 默认会发 "Go-http-client/1.1"。
+	req.Header.Set("User-Agent", "wb2api-egress-agent/"+agentVersion)
+	resp, err := cl.Do(req)
+	if err != nil {
+		// 必须打日志（v0.3.6）：此前这里静默返回，于是"探测失败"与"还没探测过"
+		// 在状态里完全一样（都是空 exit_ip），排查时只能靠猜。
+		log.Printf("[agent] 出口 IP 探测失败（%s 后重试）：%v", exitProbeFail, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -353,12 +396,24 @@ func (a *agent) probeExitIP(proxyPort int) {
 		ISP        string `json:"isp"`
 	}
 	if json.Unmarshal(raw, &d) != nil || d.Query == "" {
+		log.Printf("[agent] 出口 IP 探测返回异常（HTTP %d）：%s", resp.StatusCode, snippet(raw, 120))
 		return
 	}
+	note := strings.TrimSpace(strings.Join([]string{d.RegionName, d.City, d.ISP}, " "))
 	a.mu.Lock()
 	a.exitIP = d.Query
-	a.exitNote = strings.TrimSpace(strings.Join([]string{d.RegionName, d.City, d.ISP}, " "))
+	a.exitNote = note
 	a.mu.Unlock()
+	log.Printf("[agent] 出口 IP = %s（%s）", d.Query, note)
+}
+
+// snippet 截断一段文本用于日志（避免把整页 HTML 打进日志）。
+func snippet(b []byte, n int) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func hostname() string {
@@ -574,9 +629,20 @@ func main() {
 			}
 			log.Printf("[agent] 已自举隧道密钥：%s（%s）", kp, note)
 		default:
-			log.Printf("[agent] 云端未下发私钥（平台机器）——需要 -key 指向部署用的私钥文件")
-			if note != "" {
-				log.Printf("[agent] %s", note)
+			// 平台机器：云端不下发私钥（用的是部署时那把）。此时 `-key` 的兜底
+			// 指向 `key.pem`，而平台部署目录里历来放的是 **ai.pem** —— 不认这个名字
+			// 就会出现"隧道每 10 秒重建一次、每次都是 Permission denied"，
+			// 而唯一线索只是 ssh 打印的那行 Warning（v0.3.3 实测踩到）。
+			// 认一下历史默认名，让平台机器零参数可跑。
+			legacy := filepath.Join(dir, "ai.pem")
+			if st, statErr := os.Stat(legacy); statErr == nil && !st.IsDir() {
+				*key = legacy
+				log.Printf("[agent] 云端未下发私钥（平台机器），改用同目录 %s", legacy)
+			} else {
+				log.Printf("[agent] 云端未下发私钥（平台机器）——需要 -key 指向部署用的私钥文件")
+				if note != "" {
+					log.Printf("[agent] %s", note)
+				}
 			}
 		}
 	}
@@ -616,7 +682,13 @@ func main() {
 	//
 	// 放在启动时而不是后台 goroutine：换文件后本进程会退出，逻辑必须能在主循环里
 	// 干净地"走到一半就不返回"，不必再操心并发退出。
-	lastUpdate := time.Now().Add(updateCheckInterval) // 启动时立刻检查一次
+	// 零值 = "从没检查过"，所以第一次循环就检查（v0.3.4 修）。
+	//
+	// 原写法 `time.Now().Add(interval)` 看似"从现在起算"，实际把首次检查推到了
+	// **6 小时后**：`time.Since(未来时刻)` 是负数，永远不 >= interval。
+	// 实测代价：装上后观察了半分钟一条 [update] 日志都没有，而它看起来
+	// 和"已经是最新版本"完全一样 —— 静默的初始化错误最难发现。
+	lastUpdate := time.Time{}
 	// auth 候选扫描（v0.31.42）：启动扫一次、之后每 5 分钟一次。
 	// 只上报元信息（路径/mtime/uid 前缀），不含任何令牌 —— 见 authscan.go 的边界说明。
 	scanAuth := func() {
@@ -705,6 +777,14 @@ func main() {
 				}
 				if !sshAlive {
 					_ = a.startTunnel(host, tp, pp)
+				}
+				// 出口 IP 定期刷新（v0.3.5）：只在"应为运行态"且到点时探一次。
+				// 这里用 exitNext 而不是固定 10 秒循环，避免把 ip-api 打到限速。
+				a.mu.Lock()
+				due := time.Now().After(a.exitNext)
+				a.mu.Unlock()
+				if due {
+					go a.probeExitIP(pp)
 				}
 			}
 		}

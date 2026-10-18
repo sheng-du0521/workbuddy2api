@@ -67,7 +67,14 @@ func (a *agent) maybeSelfUpdate() error {
 	if err != nil {
 		return err
 	}
-	if info.Disabled || strings.TrimSpace(info.Version) == "" || info.Version == agentVersion {
+	if info.Disabled {
+		log.Printf("[update] 服务端已关闭自动更新（disabled），保持当前 %s", agentVersion)
+		return nil
+	}
+	if strings.TrimSpace(info.Version) == "" || info.Version == agentVersion {
+		// 明确记一行（v0.3.4）：此前"没有更新"与"根本没检查"在日志里长得一样，
+		// 而这两件事的排查方向完全相反 —— 一个正常、一个是 bug。
+		log.Printf("[update] 版本检查：当前 %s，服务端 %s（无需更新）", agentVersion, info.Version)
 		return nil
 	}
 	if strings.TrimSpace(info.URL) == "" || strings.TrimSpace(info.SHA256) == "" {

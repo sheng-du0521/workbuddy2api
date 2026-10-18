@@ -2690,6 +2690,44 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.43：**探测结果必须能直接用于决策**，且现场踩到的两个坑不能回来。
+  //
+  // 实测（2026-10-18）暴露三件事，每件都是"看起来正常、其实是错的"：
+  //   ① 平台机器 `-key` 兜底是 key.pem，而部署目录放的是 ai.pem →
+  //      隧道每 10 秒重建、每次 Permission denied，界面只显示"隧道断开"；
+  //   ② 目录枚举是固定名单，本机装的是 `CodeBuddy CN` → 目录存在却扫不到；
+  //   ③ 升级后老记录（无指纹）留在机器表里 → 页面又变成"多了一台机器"。
+  const apBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const scan = read('cmd/egress-agent/authscan.go');
+    if (!scan.includes('strings.HasPrefix(low, strings.ToLower(p))')) {
+      apBad.push('扫描目录退回固定名单（CodeBuddy CN 这类带后缀的目录会被漏扫）');
+    }
+    if (!scan.includes('"号源"')) apBad.push('扫描范围没有覆盖桌面「号源」目录（自己导出的备份找不到）');
+    if (!/Kind\s+string\s+`json:"kind,omitempty"`/.test(scan)) {
+      apBad.push('候选结构没有 kind（导出备份与客户端登录态会被混为一谈）');
+    }
+    if (!scan.includes('func authFileKind(')) apBad.push('缺少 authFileKind 判定');
+    const am = read('cmd/egress-agent/main.go');
+    if (!am.includes('legacy := filepath.Join(dir, "ai.pem")')) {
+      apBad.push('平台机器没有 ai.pem 回退（隧道会一直 Permission denied）');
+    }
+    const ea = read('cmd/webapp/egress_agent.go');
+    if (!ea.includes('func pruneStaleMachines(')) apBad.push('缺少陈旧机器清理');
+    if (!ea.includes('Kind string `json:"kind,omitempty"`')) apBad.push('服务端候选没有 kind 字段');
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('库内已失效 · 可用它重新导入')) {
+      apBad.push('候选表没有与号池对照（看到文件也判断不出该拿它干什么）');
+    }
+    if (!adminHtml.includes("c.kind === 'exported'")) apBad.push('候选表没有类型列');
+  }
+  apBad.forEach((m) => console.log('  [FAIL] agent-probe: ' + m));
+  if (!apBad.length) {
+    console.log('  [ok] agent-probe: 前缀匹配目录 + ai.pem 回退 + 候选分类 + 库内对照 + 幽灵机器清理');
+  }
+
   // v0.31.42：**agent 自更新与登录态探测**的安全边界。
   //
   // 这条链路会在用户机器上执行代码，所以下面每一条都是"少了就出事"：
@@ -2709,8 +2747,11 @@ function run(pageFile, meOverride, plan) {
     // 候选结构里不许出现 token 字段（用正则抓结构体定义内的 access/refresh 字段）。
     const structStart = scan.indexOf('type authFileCandidate struct');
     const structEnd = scan.indexOf('}', structStart);
-    const structBody = scan.slice(structStart, structEnd);
-    if (/Access|Refresh|Token/i.test(structBody)) {
+    // 只检查**字段声明行**：先剥掉注释，否则注释里解释"不含 token 字段"这句话
+    // 本身就会被当成违规（v0.31.43 就这么误报过一次）。
+    const structBody = scan.slice(structStart, structEnd)
+      .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    if (/^\s*\w*(Access|Refresh|Token)\w*\s+string\b/mi.test(structBody)) {
       auBad.push('authFileCandidate 里出现了令牌字段（扫描结果不许带凭证）');
     }
     if (!scan.includes('hasKey("access_token"')) auBad.push('auth 探测没有用带引号的键名匹配（会把配置误判成登录态）');

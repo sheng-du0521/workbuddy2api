@@ -147,3 +147,53 @@ func TestWalkAuthRootDepthLimit(t *testing.T) {
 		t.Fatalf("扫到的应是 a.json，得 %s", out[0].Path)
 	}
 }
+
+// TestAuthFileKindSeparatesExportFromClient 「导出备份」与「客户端登录态」必须分得清。
+//
+// 两者都含两种 token，但用途相反：
+//   - exported（我们自己导出的）：可以拿来"某个号失效了用它重新导入"；
+//   - client（客户端正在用的）：**不能**当备份 —— 它就是我们正在躲的那条轮换链。
+//
+// 混为一谈的后果不是分类不准，而是**照错的方向处置**：拿客户端正在用的那份
+// 去重新导入，等于主动把冲突再制造一次。
+func TestAuthFileKindSeparatesExportFromClient(t *testing.T) {
+	exported := []byte(`{"uid":"u1","nickname":"n","access_token":"a","refresh_token":"r",
+		"access_token_valid":true,"token_parse_ok":true,"source_file":"auth.json"}`)
+	client := []byte(`{"access_token":"a","refresh_token":"r","scope":"openid"}`)
+	exportedMin := []byte(`{"access_token":"a","refresh_token":"r","plugin_tag":"wb2api/0.31.43 admin"}`)
+
+	if got := authFileKind(exported); got != "exported" {
+		t.Fatalf("导出结构应判为 exported，实得 %q", got)
+	}
+	if got := authFileKind(exportedMin); got != "exported" {
+		t.Fatalf("只带 plugin_tag 也应判为 exported，实得 %q", got)
+	}
+	if got := authFileKind(client); got != "client" {
+		t.Fatalf("极简结构应保守判为 client，实得 %q", got)
+	}
+	// 键名在但大小写不同：导出侧写的是小写下划线，客户端可能是 camelCase。
+	if got := authFileKind([]byte(`{"accessToken":"a","refreshToken":"r"}`)); got != "client" {
+		t.Fatalf("camelCase 客户端结构不该被判成导出的，实得 %q", got)
+	}
+}
+
+// TestAuthCandidateCarriesKind 候选结构里必须带 kind（前端据此决定能不能当备份用）。
+func TestAuthCandidateCarriesKind(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "workbuddy-12345678.json")
+	if err := os.WriteFile(p, []byte(`{"uid":"12345678","access_token":"a","refresh_token":"r","source_file":"x"}`), 0o644); err != nil {
+		t.Fatalf("写：%v", err)
+	}
+	var out []authFileCandidate
+	seen := map[string]bool{}
+	walkAuthRoot(root, 0, &out, seen)
+	if len(out) != 1 {
+		t.Fatalf("应扫到 1 个，得 %d", len(out))
+	}
+	if out[0].Kind != "exported" {
+		t.Fatalf("应标记为 exported，实得 %q", out[0].Kind)
+	}
+	if out[0].UIDPrefix != "12345678" {
+		t.Fatalf("uid 前 8 位取错：%q", out[0].UIDPrefix)
+	}
+}

@@ -33,7 +33,9 @@ import (
 
 const (
 	// authScanMaxFiles 最多上报几个候选（再多对"选一个"没有帮助，只是噪音）。
-	authScanMaxFiles = 8
+	// 12 而不是 8（v0.3.4）：实测一个"号源"目录常见就是十来个账号文件，
+	// 截到 8 会把最老的几个静默漏掉，而漏掉的恰好可能是唯一有备份的那个号。
+	authScanMaxFiles = 12
 	// authScanMaxSize 超过这个大小的文件不读（正常登录态是几百字节到几 KB）。
 	authScanMaxSize = 256 << 10
 	// authScanMaxDepth 目录递归深度上限（客户端状态目录通常不超过 3 层）。
@@ -47,7 +49,15 @@ type authFileCandidate struct {
 	Size      int64  `json:"size"`
 	UIDPrefix string `json:"uid_prefix,omitempty"`
 	Nickname  string `json:"nickname,omitempty"`
-	Note      string `json:"note,omitempty"`
+	// Kind 这份文件是什么（v0.3.4）：exported / client。
+	//
+	// 为什么必须分开：两者长得一样（都含两种 token），但**含义完全不同** ——
+	//   · exported = 我们自己导出的账号备份，值可能是旧的，用途是"某个号失效了用它重新导入"；
+	//   · client   = 号主本机客户端正在用的登录态，值可能是最新的，但拿它当凭证
+	//                等于跟客户端抢同一条轮换链（就是我们要解决的那个冲突本身）。
+	// 混成一个列表会让人误以为"随便选一个都能跟随"。
+	Kind string `json:"kind,omitempty"`
+	Note string `json:"note,omitempty"`
 }
 
 // authScanRoots 常见登录态目录（存在才扫）。
@@ -57,20 +67,43 @@ type authFileCandidate struct {
 // 猜错的结果是"探测不到"，让人以为这个方案不可用。
 func authScanRoots() []string {
 	var roots []string
-	if dir, err := os.UserConfigDir(); err == nil { // Windows: %APPDATA%
-		for _, n := range []string{"WorkBuddy", "CodeBuddy", "workbuddy", "codebuddy"} {
-			roots = append(roots, filepath.Join(dir, n))
+	// 前缀匹配而不是固定名单（v0.3.4）：实测本机装的是 `CodeBuddy CN`（带语言后缀），
+	// 固定名单里只有 `CodeBuddy` → 目录存在却一个候选都扫不到，而界面上看起来
+	// 和"这台机器确实没有登录态"完全一样。这类"看起来正常其实是漏扫"的失败最难查，
+	// 所以这里改成"凡是名字以它开头的目录都扫"。
+	pick := func(parent string, prefixes ...string) {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			return
 		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			low := strings.ToLower(e.Name())
+			for _, p := range prefixes {
+				if strings.HasPrefix(low, strings.ToLower(p)) {
+					roots = append(roots, filepath.Join(parent, e.Name()))
+					break
+				}
+			}
+		}
+	}
+	if dir, err := os.UserConfigDir(); err == nil { // Windows: %APPDATA%
+		pick(dir, "workbuddy", "codebuddy")
 	}
 	if dir, err := os.UserCacheDir(); err == nil { // Windows: %LOCALAPPDATA%
-		for _, n := range []string{"WorkBuddy", "CodeBuddy", "workbuddy", "codebuddy"} {
-			roots = append(roots, filepath.Join(dir, n))
-		}
+		pick(dir, "workbuddy", "codebuddy")
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		for _, n := range []string{".workbuddy", ".codebuddy", ".config/workbuddy", ".config/codebuddy"} {
-			roots = append(roots, filepath.Join(home, n))
+		pick(home, ".workbuddy", ".codebuddy")
+		// 我们自己导出的账号备份（文件名形如 workbuddy-<uid>.json）常被放在桌面。
+		// 只认几个明确叫"号源/账号/accounts"的目录，**不扫整个桌面** ——
+		// 桌面上的其它 JSON 与账号无关，扫它们只是把隐私面扩大。
+		for _, n := range []string{"号源", "账号", "accounts", "Accounts"} {
+			roots = append(roots, filepath.Join(home, "Desktop", n))
 		}
+		roots = append(roots, filepath.Join(home, ".workbuddy", "accounts"))
 	}
 	// agent 自己的目录也扫一遍：有些部署会把 auth 文件放在这里由 agent 代管。
 	if exe, err := os.Executable(); err == nil {
@@ -172,8 +205,25 @@ func inspectAuthFile(path string, info os.FileInfo) (authFileCandidate, bool) {
 		Size:      info.Size(),
 		UIDPrefix: prefix8(uid),
 		Nickname:  nick,
+		Kind:      authFileKind(raw),
 		Note:      "ok",
 	}, true
+}
+
+// authFileKind 判断这份文件是我们导出的账号备份，还是客户端自己的登录态。
+//
+// 判据只用**导出结构独有的字段名**（`source_file` / `access_token_valid` /
+// `token_parse_ok` / `exported_at` / `plugin_tag`）：这些是 buildExportRows
+// 写出来、客户端不会有的。反之（没有这些字段）归到 client —— 保守方向：
+// 提示"它可能是客户端正在用的"，别拿它当备份用。
+func authFileKind(raw []byte) string {
+	low := strings.ToLower(string(raw))
+	for _, k := range []string{"source_file", "access_token_valid", "token_parse_ok", "exported_at", "plugin_tag"} {
+		if strings.Contains(low, `"`+k+`"`) {
+			return "exported"
+		}
+	}
+	return "client"
 }
 
 // parseAuthMeta 从 JSON 里取 uid / nickname，并判定"是否同时含两种 token"。

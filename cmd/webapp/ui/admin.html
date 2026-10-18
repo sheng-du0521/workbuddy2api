@@ -7725,7 +7725,7 @@ function renderAuthCandidates() {
   const tbl = el('table');
   tbl.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;';
   const head = el('tr');
-  for (const h of ['机器', '账号（uid 前 8 位）', '最后修改', '大小', '路径']) {
+  for (const h of ['机器', '类型', '账号（uid 前 8 位）', '库内状态', '最后修改', '大小', '路径']) {
     const th = el('th', null, h);
     th.style.cssText = 'text-align:left;padding:4px 8px;border-bottom:1px solid rgba(127,127,127,.25);';
     head.appendChild(th);
@@ -7735,9 +7735,26 @@ function renderAuthCandidates() {
     const tr = el('tr');
     const c = r.c;
     const mtime = c.mtime ? new Date(c.mtime * 1000).toLocaleString() : '—';
+    // 库内状态（v0.31.43）：把候选的 uid 前 8 位与账号列表对照。
+    //
+    // 这是这张表真正的用处 —— 单看"这台机器上有个 auth 文件"没有决策价值，
+    // 一眼看到"它对应的号已经红牌了"才知道该拿它去重新导入。
+    // 匹配用前 8 位而不是完整 uid：上报里刻意只带前缀（列表要发给浏览器）。
+    const api = (c.uid_prefix || '').toLowerCase();
+    const hit = api ? (allAccounts || []).find((a) => (a.uid || '').toLowerCase().slice(0, 8) === api) : null;
+    let stateTxt = '—', stateColor = '';
+    if (!api) { stateTxt = '未解析出 uid'; }
+    else if (!hit) { stateTxt = '库中无此号'; }
+    else if (hit.token_dead) { stateTxt = '库内已失效 · 可用它重新导入'; stateColor = '#c0392b'; }
+    else if (hit.refresh_lost) { stateTxt = '库内仅剩 access'; stateColor = '#b9770e'; }
+    else if (hit.disabled) { stateTxt = '库内已停用'; stateColor = '#b9770e'; }
+    else { stateTxt = '库内已有（' + (hit.pool_state === 'in' ? '在池' : '未入池') + '）'; stateColor = '#1e8449'; }
+
     const cells = [
       r.machine + (r.ver ? '（agent ' + r.ver + '）' : ''),
-      (c.uid_prefix || '（未解析出 uid）') + (c.nickname ? ' · ' + c.nickname : ''),
+      c.kind === 'exported' ? '导出备份' : '客户端登录态',
+      (c.uid_prefix || '（未知）') + (c.nickname ? ' · ' + c.nickname : ''),
+      stateTxt,
       mtime,
       c.size ? Math.round(c.size / 1024) + ' KB' : '—',
       c.path || '',
@@ -7745,14 +7762,17 @@ function renderAuthCandidates() {
     for (let i = 0; i < cells.length; i++) {
       const td = el('td', null, cells[i]);
       td.style.cssText = 'padding:4px 8px;border-bottom:1px solid rgba(127,127,127,.12);'
-        + (i === 4 ? 'font-family:ui-monospace,Consolas,monospace;word-break:break-all;' : '');
+        + (i === 6 ? 'font-family:ui-monospace,Consolas,monospace;word-break:break-all;' : '')
+        + (i === 3 && stateColor ? 'color:' + stateColor + ';' : '');
       tr.appendChild(td);
     }
     tbl.appendChild(tr);
   }
   box.appendChild(tbl);
   box.appendChild(el('div', 'muted',
-    '（跟随某个文件的功能尚未开放：需要先在服务端确认该路径的读取与写回口径，见使用说明 v0.31.42）'));
+    '「导出备份」= 我们自己导出的 auth JSON（可拿来重新导入）；「客户端登录态」= 号主本机客户端正在用的那份 —— '
+    + '后者不能当备份用：它跟我们抢的就是同一条 refresh 轮换链。'
+    + '自动跟随尚未开放（需要先定清读/写口径），见使用说明 v0.31.43。'));
 }
 
 function renderEgressCards() {

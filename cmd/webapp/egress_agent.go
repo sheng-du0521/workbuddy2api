@@ -199,6 +199,11 @@ type agentAuthCandidate struct {
 	// 列表要发给浏览器；前缀足够人工对上号，也足够在库里做匹配提示。
 	UIDPrefix string `json:"uid_prefix,omitempty"`
 	Nickname  string `json:"nickname,omitempty"`
+	// Kind 这份文件是什么（v0.3.4）：exported（我们自己导出的账号备份）/ client（客户端登录态）。
+	//
+	// 分开放是因为**用途相反**：exported 可以拿来重新导入；client 是我们正在
+	// 想办法不要跟它抢轮换链的那一份，绝不能当备份用。
+	Kind string `json:"kind,omitempty"`
 	// Note 探测结论：ok / 无令牌 / 解析失败 / 太大 等。
 	Note string `json:"note,omitempty"`
 }
@@ -316,6 +321,67 @@ func (a *app) machinesSave(m map[string]*egressMachine) error {
 // 出站探测（egressTunnelReachable / egress.Probe）**不在锁内**：那是网络 IO，
 // 持锁做网络会让一个慢探测卡住所有 agent 的上报。
 var egressMachMu sync.Mutex
+
+// staleMachineAge 无指纹的陈旧机器记录保留多久（v0.31.43）。
+//
+// 1 天：agent 的 report 间隔是 5 秒，一条记录一整天没有任何上报，
+// 只可能是"这台机器已经换身份/不再装了"，留着的唯一效果是让页面显示幽灵机器。
+const staleMachineAge = 24 * 3600
+
+// pruneStaleMachines 清掉"同一台机器升级后留下的老记录"（v0.31.43）。
+//
+// 症状（2026-10-18 实测）：0.1.0 的 agent 不带 machine id / 指纹，登记成 `default`；
+// 升到 0.3.x 后带指纹，又登记成 `m-xxxx`。两条记录 hostname 相同、端口不同，
+// 页面上就是"多了一台机器" —— 正是 v0.31.31 花大力气修掉的那个错觉又回来了，
+// 而老那条永远不会再上报。
+//
+// 判据（**四条全中**才删，任一不满足都留着）：
+//  1. 记录**没有指纹** —— 有指纹的绝不能凭 hostname 推测身份（v0.31.31 的教训）；
+//  2. 同一 owner 下存在**有指纹且最近上报过**的记录；
+//  3. 两者 hostname 相同且非空；
+//  4. 老记录超过 staleMachineAge 没有上报。
+//
+// 为什么限制在"同 owner"：跨 owner 的 hostname 相同是正常的（同一台电脑上
+// 平台 agent 与用户 agent 并存），删掉别人的记录不是我们该做的清理。
+func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []string {
+	fresh := map[string]bool{}
+	for _, v := range m {
+		if v == nil || v.OwnerUserID != owner {
+			continue
+		}
+		if strings.TrimSpace(v.Fingerprint) == "" {
+			continue
+		}
+		if now-v.StateAt > staleMachineAge {
+			continue
+		}
+		if h := strings.ToLower(strings.TrimSpace(v.Hostname)); h != "" {
+			fresh[h] = true
+		}
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	var pruned []string
+	for k, v := range m {
+		if v == nil || v.OwnerUserID != owner {
+			continue
+		}
+		if strings.TrimSpace(v.Fingerprint) != "" {
+			continue
+		}
+		h := strings.ToLower(strings.TrimSpace(v.Hostname))
+		if h == "" || !fresh[h] {
+			continue
+		}
+		if now-v.StateAt <= staleMachineAge {
+			continue
+		}
+		delete(m, k)
+		pruned = append(pruned, k)
+	}
+	return pruned
+}
 
 // machineEnsure 取一台机器；不存在则登记并**分配端口**。返回值 created 表示本次新建。
 //
@@ -691,6 +757,13 @@ func (a *app) egressRegister(id, hostname, fp string, owner int64, st *egressAge
 	mm, created = a.machineEnsure(m, id, hostname, owner, fp)
 	// 老机器端口可能不在本账号段内（v0.31.24 全局分配 → v0.31.25 分段），迁回来。
 	moved := a.egressMigratePortsToSeg(m, owner)
+	// 顺手清掉同一台机器升级后留下的无指纹老记录（v0.31.43）。
+	// 放在这里而不是单独定时任务：机器表只在 agent 上报时才有新事实，
+	// 清理跟着上报走，就不需要再引入一个后台循环去猜"什么时候该清"。
+	pruned := pruneStaleMachines(m, time.Now().Unix(), owner)
+	for _, k := range pruned {
+		log.Printf("INFO: [egress] 清理陈旧机器记录 %s（无指纹且已有同机新记录）", k)
+	}
 
 	if st != nil {
 		mm.State, mm.StateAt = *st, st.At
@@ -710,7 +783,7 @@ func (a *app) egressRegister(id, hostname, fp string, owner int64, st *egressAge
 	// 它与普通记录本来就不同键，不能算"多装了一份"。
 	dupAgent = strings.TrimSpace(id) != "" && mm.ID != "" && !strings.EqualFold(rawID, mm.ID)
 
-	if created || moved > 0 || st != nil {
+	if created || moved > 0 || len(pruned) > 0 || st != nil {
 		if e := a.machinesSave(m); e != nil {
 			return mm, created, dupAgent, e
 		}

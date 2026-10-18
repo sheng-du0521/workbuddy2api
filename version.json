@@ -1,16 +1,16 @@
 {
-  "version": "0.31.42",
+  "version": "0.31.43",
   "min_supported": "0.24.0",
-  "notes": "v0.31.42：agent 自更新 + 本机登录态探测（「单刷新者」的第一半）。① agent 自更新：此前给 agent 加的所有能力**一个都到不了**用户机器 —— 现网还停在 0.1.0，因为升级只能人工拷 exe，而那个文件被占用时替换不掉。现在 agent 每 6 小时问一次 /api/agent/version，有新版就下载到同目录、校验 sha256 与大小、「旧 exe → .old → 新 exe 就位 → 起新进程退出自己」。Windows 允许重命名运行中的可执行文件，所以不需要重启系统；任一步失败都保留原状继续跑（绝不出现「agent 没了」），并可用 --no-update 关闭。首次仍需人工换成带该能力的版本（老版本不会来问版本）—— 从那一次之后就不需要人了。② 产物由**我们自己的服务端**下发（/api/agent/download，agent 令牌鉴权）：用户机器常常连不上 GitHub，且不该从第三方地址装可执行文件。版本清单是同目录的 agent-version.json；**没有清单时整条能力呈 disabled**（不猜版本号 —— 猜的后果是什么都不发生，而所有人都以为已经启用）。清单里的文件名必须是纯文件名（拒绝 ../ 穿越）。③ agent 探测本机登录态：按常见路径（%APPDATA% / %LOCALAPPDATA% / 家目录下的 workbuddy、codebuddy 及 agent 自身目录，深度 ≤3）扫 JSON，判定口径是**同时含 access_token 与 refresh_token 两个带引号的键名**（裸子串会把 access_token_hint 这类配置误判成登录态）。上报**只有元信息**：路径 / mtime / 大小 / uid 前 8 位 / 结论 —— 结构体里根本没有令牌字段。扫描是自动行为，自动上传凭证不可接受；真正的「跟随」必须是运维看过列表后显式选一个文件。④ 管理端「代理 · 设备诊断」新增「本机登录态候选」表：机器 / 账号 uid 前 8 位 / 最后修改 / 大小 / 路径，按修改时间倒序；空态也写明原因（agent 版本低 / 没扫到 / 还没上报），否则「没上报」与「确实没有」看不出区别。⑤ 测试：agent_dist_test.go（令牌鉴权 / 缺清单 disabled / 版本+sha256+size 一致 / 目录穿越被拒 / 产物变了必须重算哈希）与 authscan_test.go（两种 token 缺一不可 / 嵌套与扁平解析 / 只上报前 8 位 / 无关 JSON 不入选 / 深度限制）；uitest 新增 agent-update 守卫（sha256、可回滚、候选无令牌字段、面板存在）。",
+  "notes": "v0.31.43：agent 真机替换 + 探测链路三处实测缺陷（agent 0.3.4）。本轮把 agent 从 0.1.0 真机换到 0.3.x 时，暴露了三个\"看起来正常、其实是错的\"缺陷，全部修掉：① 平台机器私钥兜底错：`-key` 默认 key.pem，而平台部署目录放的是 ai.pem → 隧道每 10 秒重建、每次 Permission denied，界面上只显示\"隧道断开\"。现在自举未下发私钥时回退同目录 ai.pem（零参数可跑）。② 扫描目录是固定名单：实测本机装的是 `CodeBuddy CN`（带语言后缀），固定名单只有 `CodeBuddy` → 目录存在却一个候选都扫不到，而界面上与\"确实没有登录态\"完全一样。改为前缀匹配；并把桌面「号源/账号/accounts」纳入（只认这几个明确目录，不扫整个桌面——桌面其它 JSON 与账号无关，扫它们只是扩大隐私面）。③ 候选不分类型：导出备份与客户端登录态长得一样（都含两种 token），但用途相反——前者可用来重新导入，后者正是我们要躲的那条轮换链。新增 kind（exported/client），判据只用导出结构独有字段名；界面加「类型」列与「库内状态」对照（uid 前 8 位与号池比对：已失效/仅剩 access/已有/无此号），让人一眼看出\"这个备份对应哪个号、那个号是不是坏了\"。④ 幽灵机器清理：0.1.0 不带指纹登记成 default，升级后又登记成 m-xxxx，同 hostname 两条记录 → 页面又变成\"多了一台机器\"。新增 pruneStaleMachines（四条判据全中才删：无指纹 + 同 owner 存在有指纹且最近上报的记录 + hostname 相同非空 + 老记录超 1 天未上报），跨 owner 一律不动。⑤ 结论修正（重要）：实测本机把 WorkBuddy/CodeBuddy 的 AppData 全翻了一遍——**客户端不落明文登录态**（无 auth JSON、无 state.vscdb）。所以\"让本机成为唯一刷新者\"这条路在**代挂号**场景不成立：agent 跑在我们机器上，扫不到号主电脑；号主自己机器上也没有可跟随的文件。真正可行的只有两条：v0.31.40 的 passive（我方停手）与人工约束（号主退出客户端）。探测能力的正确定位因此调整为\"auth 备份发现\"（用于失效号重新导入），不是\"跟随写回\"的前置。测试：agent_prune_test.go（清理四条判据 + 六个反例 + 跨 owner）、authscan_test.go 新增 kind 两例；uitest 新增 agent-probe 守卫（并修掉 agent-update 把注释当字段的误报）。⑥ agent 真机替换（由运维代做，0.1.0 → 0.3.6）：实测暴露并修掉两处，自更新\"启动即检查\"写成了 now+interval（首次检查被推迟整整 6 小时，日志里与\"已是最新\"完全一样）→ 改零值初始化，并在\"无需更新/已 disabled\"时也留一行日志；出口 IP 探测只在 start 时跑一次且早于 wbproxy listen（connection refused 后永不重试）→ 改为保活循环定期刷新（成功 10 分钟、失败 1 分钟），并给失败加日志与新连接。真机结果：0.3.4 自更新到 0.3.5 一次成功（日志可见下载→改名校验→新进程接管），0.3.6 起 exit_ip=39.91.80.16 / tunnel_ok / 12 个候选。⑦ 常驻方式：本机用「启动」文件夹的 start-agent.bat（schtasks 与 reg 被安全策略禁用），token 移入 egress.json 而不再出现在命令行。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.42/webapp.exe",
-      "sha256": "eadc7359975b80037d339d0a678c4ad16af6f616472ade0808ae58156d271110",
-      "size": 15494656
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.43/webapp.exe",
+      "sha256": "05b3fb19d6d4f1ef22473a972cf03e3ff6ded7d71ede2811da452ec529fee57c",
+      "size": 15498240
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
