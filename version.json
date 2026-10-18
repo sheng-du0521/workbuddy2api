@@ -1,16 +1,16 @@
 {
-  "version": "0.31.40",
+  "version": "0.31.41",
   "min_supported": "0.24.0",
-  "notes": "v0.31.40：会话冲突自动降级（只消费）+ 登录/运行同一份设备身份。① 问题定义：上游 refresh 是轮换制，同一个号在号主本机客户端上也登着时两边共用一条链 —— 谁先刷谁把对方打掉，严重时上游按重放判定连带作废刚签发的新 token。本机那一半代码碰不到，所以本版只做代码能消除的那一半：确认冲突后我方停手。② 冲突自动降级：12153 分档中「access 仍有效」的分支就是冲突现场证据（对方刚刷过，我们的票成废票）。此时自动置 accounts.refresh_mode=passive 并同步池内标记：保活与「签到前补刷新」全部跳过，只用 access 服务到过期。passive 不是停用 —— 不冷却、不摘号、照常参与选号，由 pool.PassiveRefresh / Status.passive_refresh 单独表达（第四个状态维度）。③ 反向开关：POST /api/admin/accounts/{uid}/refresh-mode（auto|passive）。没有它自动降级就是单向棘轮，号只能靠人工重登续命。前端账号卡给「恢复主动续期」按钮，确认弹窗直说「号主是否已退出本机客户端」。④ 登录身份同源：此前运行期每条出站都带 X-Machine-ID / X-Session-ID / X-Device-Token（按 uid 派生），唯独登录链路一条都不带 —— 上游看到的是「无身份客户端创建会话、随后被设备 X 使用」。现在 StartOAuth 在发 auth/state 之前就定下设备身份并贯穿 token / login-account 三次请求；有 uid 提示（从账号卡重登）时用该号稳定派生身份（重登前后连续），无提示时随机并在成功后随账号落库 —— 登录时发出的与之后使用的是同一份，构造上成立。⑤ 测试：refresh_mode_test.go（归一默认 auto / 老库迁移 / 库到池镜像 / 证据充分才降级 / 真死不降级 / 登录身份同源）与 scheduler/passive_test.go（passive 保活零出站 / passive 仍可调度）；uitest 新增 conflict-degrade 守卫（含「降级必须早于真死分支」）。",
+  "notes": "v0.31.41：错误处置与响应状态码同源 —— 请求级错误不罚号 + 401 按证据分流。① 未细分的 4xx 不再罚号：此前 isClientFaultKind 决定「这类错误回 4xx 给客户端」，而 reportUpstreamError 的 default 分支另写一份清单，只要不是那 4 个具名 kind 就 NoteError（喂熔断，30min 起封顶 6h）。于是同一个 ErrClient 在响应上被判定为「客户端过错」，在账号处置上却算「账号故障」。后果是真实的：客户端发一批参数不对的请求（工具 schema 缺字段、参数组合不支持、版本差异），每个请求轮转 3 个账号 → 健康号被按次累计熔断 → 小号池进入「本地误判没有可用账号」（同类项目 xiaofan6ya 1.0.7 修的正是这条）。现在 default 直接复用 isClientFaultKind 这一个判据；仍继续轮转（小概率渠道配置差异），证据不丢（consume failure 台账逐条落账）。② 401 按证据分流：body 带 12153 / Offline user session not found → 与 code==12153 走同一套 handleSessionDead（分档 + 标红 + 被动降级）；没有会话失效证据的 401（典型是 WAF / APISIX 的 HTML 页）仍只做「疑似」计数。此前两者都只计数：真失效的号计数到 3 次被停掉，但卡片上什么都不显示 —— 不标红、不给重登按钮、不给探活复活，运维只看到「号突然不能用了」。③ 测试：client_fault_policy_test.go 六例 —— 未细分 4xx 连发 6 次不产生任何惩罚位 / 5xx 照常累计 / 11140 仍软冷却 / 11102 仍有模型级避让 / 401 带证据 → 仅剩 access + 被动降级 / 401 无证据 → 零改动；uitest 新增 error-policy 守卫（default 必须引用同一判据、401 必须双路存在）。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.40/webapp.exe",
-      "sha256": "dd8a708abd95b758294523c3a545efa62d45062a756aa38ab77f5444750bb2fc",
-      "size": 15469568
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.41/webapp.exe",
+      "sha256": "ab86ffaf63cd08c39c3e1197d30ac1eb79b471f2dab05ecdee265ae5b707835b",
+      "size": 15470080
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

@@ -2043,7 +2043,19 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 	case status == 403:
 		p.pool.CooldownSoftRate(uid, softCooldown, resetAt, "waf 403 block"+resetSrcSuffix(resetSrc))
 	case status == 401:
-		p.pool.NoteSessionDead(uid)
+		// 401 有两种完全不同的东西（v0.31.41 统一）：
+		//   · body 里带 "12153" / "Offline user session not found" → 会话真失效，
+		//     与 code==12153 是**同一件事**，必须走同一套处置（分档 + 标红 + 被动降级）。
+		//     此前这里只做 NoteSessionDead：计数到 3 次就把号停掉，但卡片上**什么都没有**
+		//     （不标红、不给重登按钮、不给探活复活）—— 运维只会看到"号突然不能用了"。
+		//     同一个事件两条纪律，正是本仓反复复发的那个错。
+		//   · 401 但没有会话失效证据（典型是 WAF / APISIX 的 HTML 页）→ 只能按"疑似"
+		//     计数，不标红、不硬冷却：把风控页判成会话失效，代价比漏判更高。
+		if kind == upstream.ErrSessionDead {
+			p.handleSessionDead(uid)
+		} else {
+			p.pool.NoteSessionDead(uid)
+		}
 	case status >= 500:
 		p.pool.NoteFailures(uid)
 	default:
@@ -2061,6 +2073,26 @@ func (p *Proxy) reportUpstreamError(uid, model string, status int, body []byte, 
 			// 404 偶发路径缺失：固定短冷却防雪崩，不随 soft_rate 退避、不喂熔断。
 			p.pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 		default:
+			// 请求级错误**不罚号**（v0.31.41）。
+			//
+			// 这里用 isClientFaultKind 作判据，而不是再列一份清单 —— 因为那个函数
+			// 已经在别处决定「这类错误该不该回 4xx 给客户端」。此前两处各写一份：
+			// 同一个 ErrClient 在**响应**上被判定为"客户端过错、回 400"，
+			// 在**账号处置**上却落进 NoteError 喂熔断（30min 起、封顶 6h）。
+			//
+			// 后果不是理论问题：客户端发来一批参数不对的请求（工具 schema 缺字段、
+			// 参数组合不被支持、客户端版本差异），每个请求轮转 3 个账号，
+			// 于是**健康号被按次累计熔断**，小号池会直接进入"本地误判没有可用账号"
+			// 的状态（同类项目 xiaofan6ya 1.0.7 修的就是这条）。
+			//
+			// 边界（有意保留的不对称）：
+			//   · 仍**继续轮转** —— 小概率存在"这个号的渠道配置不同"，
+			//     而轮转预算本来就有限，代价可控；
+			//   · 证据不丢 —— recordConsumeFailure 已在函数开头逐条落账
+			//     （code / kind / 请求形状），排障不依赖"账号失败计数"这一条线。
+			if isClientFaultKind(kind) {
+				break
+			}
 			p.pool.NoteError(uid)
 		}
 	}

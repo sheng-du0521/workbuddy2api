@@ -2690,6 +2690,42 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.41：**同一个判据只能有一份清单**（错误处置与响应状态码必须同源）。
+  //
+  // 这一版修的是两处"同一件事两套纪律"：
+  //   ① 未细分的 4xx 在响应上是"客户端过错、回 400"，在账号处置上却喂熔断；
+  //   ② 会话失效有两个入口（code=12153 / 401+失效文案），后者只计数不标红。
+  const epBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const proxy = fs.readFileSync(path.join(ROOT, 'cmd/webapp/proxy.go'), 'utf8');
+    // ① default 分支必须用共享判据，不能再自己列清单。
+    const defIdx = proxy.indexOf('请求级错误**不罚号**');
+    if (defIdx < 0) {
+      epBad.push('reportUpstreamError 的 default 分支没有按 isClientFaultKind 豁免罚号');
+    } else if (!proxy.slice(defIdx, defIdx + 700).includes('isClientFaultKind(kind)')) {
+      epBad.push('default 分支的豁免没有引用 isClientFaultKind（会再次出现两份清单）');
+    }
+    if (!/func isClientFaultKind\(/.test(proxy)) epBad.push('缺少 isClientFaultKind 单一判据');
+    // ② 401 必须按"有无会话失效证据"分流，而不是一律只计数。
+    const st401 = proxy.indexOf('case status == 401:');
+    if (st401 < 0) {
+      epBad.push('缺少 status == 401 分支');
+    } else {
+      const seg = proxy.slice(st401, st401 + 900);
+      if (!seg.includes('handleSessionDead')) {
+        epBad.push('401 + 会话失效证据没有走 handleSessionDead（不标红、不给重登入口）');
+      }
+      if (!seg.includes('NoteSessionDead')) {
+        epBad.push('401 无证据时仍应有"疑似"计数路径（不能一律当会话失效）');
+      }
+    }
+  }
+  epBad.forEach((m) => console.log('  [FAIL] error-policy: ' + m));
+  if (!epBad.length) {
+    console.log('  [ok] error-policy: 请求级错误不罚号（同一判据）+ 401 按证据分流');
+  }
+
   // v0.31.40：**会话冲突自动降级**必须"只在有证据时降、降了能回来、降级不等于停用"。
   //
   // 背景：上游 refresh 轮换制下，同一个号在号主本机客户端上也登着时两边共链互顶。
