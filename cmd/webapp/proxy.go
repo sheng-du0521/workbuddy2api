@@ -425,6 +425,17 @@ func (p *Proxy) SyncAccountsReport() (SyncReport, error) {
 		}
 		p.pool.SetManualDisabled(au.UID, disabled, "web ui")
 	}
+	// 「只消费」标记（v0.31.40）：以库为准下发到池。
+	//
+	// 为什么放在 SyncAccounts 而不是每处刷新点现查库：刷新入口分布在 scheduler / proxy / checkin
+	// 三处（scheduler 只拿得到 *auth.Auth 与 pool.Status，拿不到 store），
+	// 放进池状态才能让"三处纪律一致"成为结构性事实，而不是靠每处记得查一次。
+	passive := p.store.RefreshModeMap()
+	for _, au := range auths {
+		if _, changed := p.pool.SetPassiveRefresh(au.UID, passive[au.UID]); changed && passive[au.UID] {
+			log.Printf("INFO: [refresh] %s 进入「只消费」模式（不再主动续期）", au.UID)
+		}
+	}
 	// 重建 uid → 分组 / 出站代理 / 代挂归属 映射（反代选号过滤、出站路由、分成用）。
 	gm := make(map[string]string, len(all))
 	em := make(map[string]string, len(all))
@@ -2134,6 +2145,25 @@ func (p *Proxy) handleSessionDead(uid string) {
 		p.pool.Cooldown(uid, pool.CoolSoft, softCooldown, "refresh 已失效，仅剩 access（需尽快重登）")
 		if err := p.store.MarkRefreshLost(uid); err != nil {
 			log.Printf("WARN: 标记 refresh 丢失失败 uid=%s: %v", uid, err)
+		}
+		// ---- 冲突自动降级（v0.31.40）----
+		//
+		// 这个分支的含义是确定的：**我们的 refresh 被上游作废了，但 access 还活着**。
+		// 在"同一个号两边都在用"的场景里，这就是冲突的现场证据 —— 对方刚刷过，
+		// 我们手里的票成了废票。
+		//
+		// 此时继续主动刷新只会做两件事：① 每次都去撞一次已经作废的票（可能触发
+		// 上游的重放判定，把新签发的那份也一起作废）；② 一旦我们刷成功，
+		// 反过来把对方的票打掉，形成"互相顶"的循环。
+		//
+		// 所以自动降到「只消费」：从此只用 access、不再主动刷。这样冲突的**我方这一半**
+		// 就被消除了 —— 之后只有本机客户端在刷，我们只是读者。
+		// 代价（必须让运维看见）：access 到期就断，需要在到期前重登一次。
+		if err := p.store.SetRefreshMode(uid, refreshModePassive); err != nil {
+			log.Printf("WARN: [refresh] %s 自动降级失败：%v", uid, err)
+		} else {
+			p.pool.SetPassiveRefresh(uid, true)
+			log.Printf("WARN: [refresh] %s 检测到会话冲突（refresh 已废 / access 仍有效）→ 自动降级为「只消费」，不再主动续期；请号主退出本机客户端后手动切回", uid)
 		}
 		log.Printf("WARN: [token] %s refresh 12153 但 access 仍有效（exp=%d），按「仅剩 access」处理",
 			logfmt.Label(uid, acc.Nickname), acc.ExpiresAt)

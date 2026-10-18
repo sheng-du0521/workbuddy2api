@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.39"
+const version = "0.31.40"
 
 type app struct {
 	store  *Store
@@ -691,6 +691,12 @@ type accountView struct {
 	// 只给一个布尔会把"还有一个月可用"的号渲染成红牌，那正是"莫名掉线"的来源。
 	RefreshLost   bool  `json:"refresh_lost"`
 	RefreshLostAt int64 `json:"refresh_lost_at,omitempty"`
+	// RefreshMode 刷新模式（v0.31.40）：auto / passive。
+	//
+	// passive = 只消费 access、不主动续期。它与 TokenDead/RefreshLost 是三个独立维度：
+	// 能不能服务（TokenDead）、续期票还在不在（RefreshLost）、**我们还要不要主动去续**（RefreshMode）。
+	// 合成两个会让"只消费但续期票还好"这种状态无法表达。
+	RefreshMode string `json:"refresh_mode"`
 	// RunState 运行态枚举（R9）：把布尔位与自由文案收敛成九态，见 runstate.go。
 	// 存在的理由：区分「风控冷却」与「限流冷却」—— 两者处置方向相反，此前都显示"冷却中"。
 	RunState string `json:"run_state"`
@@ -990,6 +996,7 @@ func (a *app) allAccountViewsErr() ([]accountView, error) {
 	// 仅剩 access 标记 / 来源（同为轻查询，理由同上）。
 	lostMap := a.store.RefreshLostMap()
 	srcMap := a.store.SourceMap()
+	passiveMap := a.store.RefreshModeMap()
 	out := make([]accountView, 0, len(dbAccounts))
 	for _, acc := range dbAccounts {
 		st, ok := statusByUID[acc.UID]
@@ -1006,6 +1013,10 @@ func (a *app) allAccountViewsErr() ([]accountView, error) {
 			v.RefreshLostAt = at
 		}
 		v.Source = srcMap[acc.UID]
+		v.RefreshMode = refreshModeAuto
+		if passiveMap[acc.UID] {
+			v.RefreshMode = refreshModePassive
+		}
 		if acc.OwnerUserID > 0 {
 			v.OwnerName = names[acc.OwnerUserID]
 		}
@@ -1155,9 +1166,11 @@ func (a *app) handleDisable(disabled bool) http.HandlerFunc {
 func (a *app) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Realm string `json:"realm"`
+		// UID 可选（v0.31.40）：管理员针对某个号重新登录时带上，沿用该号的设备身份。
+		UID string `json:"uid"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	sess, err := StartOAuth(req.Realm)
+	sess, err := StartOAuth(req.Realm, strings.TrimSpace(req.UID))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
@@ -1695,6 +1708,8 @@ func (a *app) routes() *http.ServeMux {
 	// 路径注意：`/accounts/revive-dead` 是静态段，必须注册在 `/accounts/{uid}/...` 之前。
 	mux.HandleFunc("POST /api/admin/accounts/revive-dead", a.adminGuard(a.handleReviveDead))
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/revive", a.adminGuard(a.handleReviveAccount))
+	// 刷新模式切换（v0.31.40）：冲突自动降级后的**反向开关**。
+	mux.HandleFunc("POST /api/admin/accounts/{uid}/refresh-mode", a.adminGuard(a.handleSetRefreshMode))
 	mux.HandleFunc("GET /api/admin/accounts/health/last", a.adminGuard(a.handleHealthLast))
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/health", a.adminGuard(a.handleCheckAccountHealth))
 	// 账号卡片「任务完成情况」（只读：今日签到 + 猫猫旅行状态）。

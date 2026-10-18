@@ -62,7 +62,10 @@ type Status struct {
 	// 叠加态分别透出不合并（面板据此区分「系统判定坏了」与「我主动摘的」，
 	// 两种可用操作不同：前者可 revive，后者该 enable）。
 	// 零值也显式写出（运维口径，同 consecutive_fails：缺失会让人误以为"没记录"）。
-	ManualDisabled  bool      `json:"manual_disabled"`
+	ManualDisabled bool `json:"manual_disabled"`
+	// PassiveRefresh 只消费 access、不主动续期（v0.31.40）。
+	// 与 ManualDisabled / Disabled 都无关：账号**照常服务**，只是不再主动刷新。
+	PassiveRefresh  bool      `json:"passive_refresh"`
 	ManualReason    string    `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
@@ -184,6 +187,14 @@ type entry struct {
 	// 持久化（stateAccount.ManualDisabled）：重启保留运维意图。
 	manualDisabled bool
 	manualReason   string
+	// passiveRefresh 只消费 access、不主动续期（v0.31.40）。
+	//
+	// 语义与"停用"完全无关：账号照常参与选号与服务，只是**不再主动刷新**。
+	// 存在的理由：上游 refresh 是轮换制，同一账号在号主本机客户端上也登着时，
+	// 两边共用一条链 —— 谁先刷谁把对方打掉。检测到这种冲突后把本方降级为只消费，
+	// 是代码唯一能"消除"的那一半（另一半在本机客户端手里，我们控制不了）。
+	// 不持久化：以 `accounts.refresh_mode` 为准，每次 SyncAccounts 重新下发。
+	passiveRefresh bool
 	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个

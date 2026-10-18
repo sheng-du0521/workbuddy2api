@@ -158,9 +158,19 @@ func (a *app) hostViewP(acc *Account, cp cachedCreditPacks) hostAccountView {
 func (a *app) handleHostOAuthStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Realm string `json:"realm"`
+		// UID 可选：从某张账号卡点「重新登录」时带上，让登录沿用该号的设备身份
+		// （重登前后身份连续，见 oauthDeviceIdentity）。只接受**本人名下**的号 ——
+		// 这个参数会进入上游请求头，不能成为探测别人账号是否存在的手段。
+		UID string `json:"uid"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	sess, err := StartOAuth(req.Realm)
+	hint := ""
+	if u := userFrom(r); u != nil && strings.TrimSpace(req.UID) != "" {
+		if acc, err := a.store.GetAccount(req.UID); err == nil && acc != nil && acc.OwnerUserID == u.ID {
+			hint = acc.UID
+		}
+	}
+	sess, err := StartOAuth(req.Realm, hint)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return

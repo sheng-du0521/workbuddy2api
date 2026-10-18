@@ -156,6 +156,36 @@ func (a *app) reviveOne(uid string, dryRun bool) reviveResult {
 	return res
 }
 
+// handleSetRefreshMode POST /api/admin/accounts/{uid}/refresh-mode
+//
+// body: {"mode":"auto"|"passive"}
+//
+// 存在理由：检测到会话冲突后系统会自动降到 passive（只消费），但那是**保守方向**的
+// 自愈。运维在"号主已经退出本机客户端"之后要能把号切回主动续期 —— 否则这个号就
+// 只能靠人工重登续命。没有这个反向开关，自动降级就变成了单向棘轮。
+func (a *app) handleSetRefreshMode(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing uid"})
+		return
+	}
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	mode := normRefreshMode(req.Mode)
+	if err := a.store.SetRefreshMode(uid, mode); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	a.proxy.pool.SetPassiveRefresh(uid, mode == refreshModePassive)
+	log.Printf("INFO: [refresh] %s 刷新模式 → %s（管理员操作）", uid, mode)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"uid": uid, "mode": mode,
+		"note": "auto = 主动续期；passive = 只消费 access、不主动刷新（到期需重登）",
+	})
+}
+
 // handleReviveAccount POST /api/admin/accounts/{uid}/revive
 //
 // 单号复活。对**已确认可服务**的号执行；不可服务的号原样返回失败原因，不改任何状态。

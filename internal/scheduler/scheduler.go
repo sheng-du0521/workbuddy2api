@@ -824,8 +824,12 @@ func (s *Scheduler) checkinFiltered(only map[string]bool) ([]CheckinOutcome, err
 			out = append(out, oc)
 			continue
 		}
+		// 只消费（v0.31.40）：不做"签到前补刷新"。
+		// 这条也是主动刷新（10 分钟窗口），同样会与号主本机客户端抢同一条轮换链。
+		// token 若已过期，签到本来就会 401 —— 那时会走 HTTP 层，不需要在这里提前动它。
+		passive := s.cfg.Pool != nil && s.cfg.Pool.PassiveRefresh(st.UID)
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
-		if a.NeedsRefresh(checkinRefreshSkew) {
+		if !passive && a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 				log.Printf("checkin %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
 				var ue *upstream.Error
@@ -1215,6 +1219,15 @@ func (s *Scheduler) runKeepalive(trigger string) {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			t.skipped++
+			continue
+		}
+		// 只消费（v0.31.40）：这个号已被判定存在会话冲突，不再主动续期。
+		//
+		// 为什么放在最前面（连"还很久才过期"都不用判）：主动刷新本身就是冲突源 ——
+		// 我们刷成功就会把号主本机那份打掉，刷失败则白撞一次已作废的票。
+		// 既然已经确认冲突，唯一正确的行为是**停手**。
+		if st.PassiveRefresh {
 			t.skipped++
 			continue
 		}

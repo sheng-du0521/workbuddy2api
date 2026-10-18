@@ -191,6 +191,34 @@ func (p *Pool) Activate(uid string) bool {
 	return true
 }
 
+// SetPassiveRefresh 设置「只消费」标记（v0.31.40）。
+//
+// 返回 changed：状态无变化时 false，便于调用方只在真正切换时打日志 ——
+// 这个位每次 SyncAccounts 都会被重下发，若无条件打日志会刷屏。
+func (p *Pool) SetPassiveRefresh(uid string, passive bool) (found, changed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false, false
+	}
+	if e.passiveRefresh == passive {
+		return true, false
+	}
+	e.passiveRefresh = passive
+	return true, true
+}
+
+// PassiveRefresh 读单账号的「只消费」态。uid 不存在时 false。
+func (p *Pool) PassiveRefresh(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.passiveRefresh
+	}
+	return false
+}
+
 // SetManualDisabled 运维手动停用/恢复（issue #138/#118）：置位时只摘除选号流量，
 // 账号仍在池里——签到、token 保活、排程任务照常执行，凭证与积分是活的。
 // 与自动禁用（Disabled）互相独立：本方法不清 disabled，也不清冷却/熔断维度；
@@ -715,6 +743,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Reason:           reason,
 		Disabled:         e.disabled,
 		ManualDisabled:   e.manualDisabled,
+		PassiveRefresh:   e.passiveRefresh,
 		SuccessCount:     e.successCount,
 		ErrTotal:         e.errTotal,
 		LastSuccessTime:  e.lastSuccess,

@@ -1,16 +1,16 @@
 {
-  "version": "0.31.39",
+  "version": "0.31.40",
   "min_supported": "0.24.0",
-  "notes": "v0.31.39：探活复活 + 保活给在途对话让路。① 探活复活（core）：v0.31.30 加了 token_dead 标记之后，一个号被判失效就**没有任何代码会再去验证它** —— 健康检测不清该标记、重新登录要号主再扫一次码，于是判错的代价是永久的（生产实况：38 号里 10 个带红牌，而它们的 expires_at 全在一个月之后）。新增 revive.go：POST /api/admin/accounts/{uid}/revive（单号）与 POST /api/admin/accounts/revive-dead（批量，默认 dry_run）。口径三条：复活依据**只有对话探活**（余额/refresh 通过都不算，v0.24.3 的教训）；探活失败**什么都不改**（不累计 sessionDeadFails、不冷却、不清标记 —— 它已被排除在服务外，再罚一次只会误杀）；复活后**置 refresh_lost**（唯一证据是 refresh 曾被 12153 判过），等 access 到期前保活刷新成功会自动清掉。批量默认 dry_run 且零出站（只列候选），逐号串行 + 250~600ms 抖动 + 走探活总闸（并发≤3、同号 30s）。② 新增 pool.Activate：一次清掉 entry 的 7 个可逆阻塞位（until/coolKind/breakerUntil/degradeUntil/softStreak/sessionDeadFails/faultFails），**不动** disabled 与 manualDisabled。只清几个会造出「点了复活、界面已复活、选号仍跳过」的半个动作。③ 保活出口保护（借鉴 xiaofan6ya）：st.InFlight>0 的号本轮跳过刷新 —— 保活是 discretionary 动作，撞上在途对话没有任何收益，而 refresh 轮换会让紧接着的续写拿到新 token。④ 前端：账号池工具行「复活失效号」（dry_run 预览 → 确认 → 执行，回落汇总）；失效账号卡上「探活复活」排在「重新登录」之前（先给成本最低的那条路）。⑤ 测试：revive_token_test.go 六个用例钉住 dry_run 零出站 / 探活通过才清标记且保留「仅剩 access」/ 探活失败零改动 / 无标记不出站 / 候选只含 token_dead；uitest 新增 revive-path 守卫。",
+  "notes": "v0.31.40：会话冲突自动降级（只消费）+ 登录/运行同一份设备身份。① 问题定义：上游 refresh 是轮换制，同一个号在号主本机客户端上也登着时两边共用一条链 —— 谁先刷谁把对方打掉，严重时上游按重放判定连带作废刚签发的新 token。本机那一半代码碰不到，所以本版只做代码能消除的那一半：确认冲突后我方停手。② 冲突自动降级：12153 分档中「access 仍有效」的分支就是冲突现场证据（对方刚刷过，我们的票成废票）。此时自动置 accounts.refresh_mode=passive 并同步池内标记：保活与「签到前补刷新」全部跳过，只用 access 服务到过期。passive 不是停用 —— 不冷却、不摘号、照常参与选号，由 pool.PassiveRefresh / Status.passive_refresh 单独表达（第四个状态维度）。③ 反向开关：POST /api/admin/accounts/{uid}/refresh-mode（auto|passive）。没有它自动降级就是单向棘轮，号只能靠人工重登续命。前端账号卡给「恢复主动续期」按钮，确认弹窗直说「号主是否已退出本机客户端」。④ 登录身份同源：此前运行期每条出站都带 X-Machine-ID / X-Session-ID / X-Device-Token（按 uid 派生），唯独登录链路一条都不带 —— 上游看到的是「无身份客户端创建会话、随后被设备 X 使用」。现在 StartOAuth 在发 auth/state 之前就定下设备身份并贯穿 token / login-account 三次请求；有 uid 提示（从账号卡重登）时用该号稳定派生身份（重登前后连续），无提示时随机并在成功后随账号落库 —— 登录时发出的与之后使用的是同一份，构造上成立。⑤ 测试：refresh_mode_test.go（归一默认 auto / 老库迁移 / 库到池镜像 / 证据充分才降级 / 真死不降级 / 登录身份同源）与 scheduler/passive_test.go（passive 保活零出站 / passive 仍可调度）；uitest 新增 conflict-degrade 守卫（含「降级必须早于真死分支」）。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.39/webapp.exe",
-      "sha256": "ee74a0023f7118d4b4d143f99f819d61ec4b4022293eeb4083cdd8e3d61ab6af",
-      "size": 15457792
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.40/webapp.exe",
+      "sha256": "dd8a708abd95b758294523c3a545efa62d45062a756aa38ab77f5444750bb2fc",
+      "size": 15469568
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

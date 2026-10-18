@@ -2690,6 +2690,50 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.40：**会话冲突自动降级**必须"只在有证据时降、降了能回来、降级不等于停用"。
+  //
+  // 背景：上游 refresh 轮换制下，同一个号在号主本机客户端上也登着时两边共链互顶。
+  // 本机那一半控制不了，代码能消除的只有我方这一半（确认冲突后停止主动刷新）。
+  const cdBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const store = read('cmd/webapp/store.go');
+    if (!store.includes('ADD COLUMN refresh_mode')) cdBad.push('store.go 缺 refresh_mode 增量列');
+    if (!/func normRefreshMode\(/.test(store)) cdBad.push('store.go 缺 normRefreshMode');
+    // 默认必须是 auto：passive 做成默认 = 所有号 30 天后集体失效。
+    const nm = store.slice(store.indexOf('func normRefreshMode('));
+    if (!nm.slice(0, 400).includes('refreshModeAuto')) {
+      cdBad.push('normRefreshMode 未默认 auto（passive 不能是默认值）');
+    }
+    const proxy = read('cmd/webapp/proxy.go');
+    const degradeIdx = proxy.indexOf('SetRefreshMode(uid, refreshModePassive)');
+    const deadCoolIdx = proxy.indexOf('CooldownUntilTomorrow4AM(uid, "12153 会话失效（需重新登录）")');
+    if (degradeIdx < 0) cdBad.push('proxy.go 没有在冲突分支自动降级 passive');
+    if (degradeIdx > 0 && deadCoolIdx > 0 && degradeIdx > deadCoolIdx) {
+      cdBad.push('自动降级必须发生在「真死」分支之前（access 有效时才降级）');
+    }
+    if (!proxy.includes('RefreshModeMap()')) cdBad.push('SyncAccounts 没有把刷新模式下发到池');
+    const sch = read('internal/scheduler/scheduler.go');
+    if (!sch.includes('st.PassiveRefresh')) cdBad.push('保活没有跳过 passive 号（主动刷新就是冲突源）');
+    const rt = read('cmd/webapp/revive.go');
+    if (!rt.includes('refresh-mode')) cdBad.push('缺少 refresh-mode 反向开关（自动降级会变单向棘轮）');
+    const mainGo = read('cmd/webapp/main.go');
+    if (!mainGo.includes('/accounts/{uid}/refresh-mode')) cdBad.push('refresh-mode 端点未注册');
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes("a.refresh_mode === 'passive'")) cdBad.push('账号卡没有「只消费」徽标');
+    if (!adminHtml.includes('恢复主动续期')) cdBad.push('账号卡没有「恢复主动续期」反向开关');
+    // 登录链路必须带设备身份（创建会话的与使用它的必须是同一份）。
+    const oauth = read('cmd/webapp/oauth.go');
+    if (!oauth.includes('loginHeadersDev')) cdBad.push('登录链路没有设备身份头');
+    if (!oauth.includes('oauthDeviceIdentity')) cdBad.push('缺少登录身份决定逻辑');
+    if (!oauth.includes('DeviceToken:  devToken')) cdBad.push('登录成功没有把实际发出的设备凭证落库');
+  }
+  cdBad.forEach((m) => console.log('  [FAIL] conflict-degrade: ' + m));
+  if (!cdBad.length) {
+    console.log('  [ok] conflict-degrade: 只在 access 仍有效时自动降级 + 保活停手 + 反向开关 + 登录身份同源');
+  }
+
   // v0.31.39：**探活复活**必须是一条"有证据才放行"的路，而不是一键橡皮擦。
   //
   // 四条不变量：

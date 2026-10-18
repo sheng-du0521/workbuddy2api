@@ -2512,8 +2512,18 @@ function accountCard(a) {
   if (a.source === 'qr') chips.appendChild(chipWithTitle('扫码登录', 'accent', '通过设备授权扫码进来的号。这类号通常号主本机也在用，两边共用同一条 refresh 轮换链，更容易出现"续期凭证被对方刷走"。'));
   else if (a.source === 'import') chips.appendChild(chipWithTitle('JSON 导入', '', '通过 auth JSON 导入（桌面端导出/备份恢复）。'));
   else chips.appendChild(chipWithTitle('来源未知', '', '该账号在 v0.31.37 之前入库，没有来源标记。'));
+  if (a.refresh_mode === 'passive') chips.appendChild(chipWithTitle('只消费 · 不主动续期', 'warn', '检测到与号主本机客户端的会话冲突后，服务器已停止主动刷新 refresh token（我们一刷就会把对方打掉，反之亦然）。账号照常服务到 access 过期；到期前需重登一次，或确认号主已退出本机客户端后点「恢复主动续期」。'));
   if (a.token_dead) chips.appendChild(chipWithTitle('登录失效 · 需重新登录', 'err', 'refresh token 已被上游作废（12153）且 access 也已过期。等下去不会好，只能重新导入该账号的 auth 文件。'));
-  else if (a.refresh_lost) chips.appendChild(chipWithTitle('仅剩 access · 需尽快重登', 'warn', 'refresh token 已失效（通常是号主本机客户端刷新时轮换走了），但 access 仍可用。现在还能服务，**不会自动续期**，请在 access 过期前重新登录一次。'));
+  else if (a.refresh_lost) {
+    // 带倒计时（v0.31.40）：只说"请在过期前重登"等于没说 —— 人不会算日子。
+    // 剩余天数取 expires_at，0/负值按"已到期"处理（那是真死路径，不会走到这里）。
+    const left = a.expires_at ? Math.max(0, Math.floor((a.expires_at * 1000 - Date.now()) / 86400000)) : null;
+    const leftTxt = (left === null) ? '到期时间未知' : ('剩 ' + left + ' 天');
+    chips.appendChild(chipWithTitle('仅剩 access · ' + leftTxt,
+      left !== null && left <= 3 ? 'err' : 'warn',
+      'refresh token 已失效（通常是号主本机客户端刷新时轮换走了），但 access 仍可用。'
+      + '现在还能服务，不会自动续期；过了这个时间就必须重新登录，否则直接失效。'));
+  }
   else if (off) chips.appendChild(el('span', 'tag err', '已停用'));
   else if (a.cooling_for > 0) chips.appendChild(el('span', 'tag warn', (a.cool_kind === 'hard' ? '硬' : '软') + '冷却 ' + a.cooling_for + 's'));
   else chips.appendChild(el('span', 'tag ok', '可用'));
@@ -2680,6 +2690,22 @@ function accountCard(a) {
       }
     };
     foot.appendChild(rv);
+    // 反向开关（v0.31.40）：只有自动降级过（或被动）的号才需要它。
+    if (a.refresh_mode === 'passive') {
+      const back = el('button', 'ghost', '恢复主动续期');
+      back.title = '确认号主已退出本机客户端后再点。切回后服务器恢复定时保活刷新（会重新参与轮换链）。';
+      back.onclick = async () => {
+        if (!(await confirmAsk('确认号主已在本机客户端退出该账号？\n\n'
+          + '· 是 → 切回主动续期，服务器恢复保活刷新；\n'
+          + '· 否 → 两边会继续互相顶掉对方的会话（这正是刚才被降级的原因）。'))) return;
+        try {
+          await post('/api/admin/accounts/' + encodeURIComponent(a.uid) + '/refresh-mode', { mode: 'auto' });
+          toast('已切回主动续期', 'ok');
+          loadAccounts();
+        } catch (e) { toast('切换失败：' + e.message, 'err'); }
+      };
+      foot.appendChild(back);
+    }
     const re = el('button', 'danger', '重新登录');
     re.title = '在 WorkBuddy 桌面端重新登录该账号 → 导出 auth 文件 → 粘贴到「批量导入 JSON」（会覆盖旧凭证并自动清掉红标）';
     re.onclick = () => {

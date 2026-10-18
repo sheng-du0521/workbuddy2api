@@ -335,6 +335,16 @@ func (s *Store) migrate() error {
 		// 现在分成两档：refresh 丢了 → 记本列 + 软冷却（提前预警）；
 		// access 也过期了 → 才写 token_dead_at（真死，必须重登）。
 		`ALTER TABLE accounts ADD COLUMN refresh_lost_at INTEGER NOT NULL DEFAULT 0`,
+		// 刷新模式（v0.31.40）：'' = auto（主动续期），'passive' = 只消费（不主动刷）。
+		//
+		// 为什么需要"只消费"：上游 refresh 是轮换制，同一个号在号主本机客户端上也登着时，
+		// 两边共用一条链 —— 谁先刷谁把对方打掉。**我们控制不了本机客户端**，所以我们能
+		// 消除的只有"我方这一半"：检测到冲突后停止主动刷新，从此只消费 access。
+		//
+		// 代价必须写在明面上：只消费 = access 到期就断（refresh 已废，续不了），
+		// 需要在到期前人工重登。所以它**不是默认**，而是"检测到冲突后自动降级"，
+		// 且可以一键切回 auto（号主退出本机客户端之后）。
+		`ALTER TABLE accounts ADD COLUMN refresh_mode TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate add column: %w", err)
@@ -824,6 +834,50 @@ func normSource(s string) string {
 		return sourceImport
 	}
 	return ""
+}
+
+// 刷新模式取值（v0.31.40）。空串 = auto（主动续期）。
+const (
+	refreshModeAuto    = "auto"
+	refreshModePassive = "passive"
+)
+
+// normRefreshMode 归一刷新模式：只认 passive，其余一律 auto。
+//
+// 为什么默认 auto：passive 意味着"到期即断、必须人工重登"。把它做成默认等于
+// 让所有号 30 天后集体失效 —— 那是把冲突换成更大的问题。
+func normRefreshMode(s string) string {
+	if strings.EqualFold(strings.TrimSpace(s), refreshModePassive) {
+		return refreshModePassive
+	}
+	return refreshModeAuto
+}
+
+// SetRefreshMode 写刷新模式（空值按 auto 处理）。
+func (s *Store) SetRefreshMode(uid, mode string) error {
+	if strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE accounts SET refresh_mode = ?, updated_at = ? WHERE uid = ?`,
+		normRefreshMode(mode), time.Now().Unix(), uid)
+	return err
+}
+
+// RefreshModeMap 返回 uid → 是否 passive（auto 不入表）。
+func (s *Store) RefreshModeMap() map[string]bool {
+	out := map[string]bool{}
+	rows, err := s.db.Query(`SELECT uid FROM accounts WHERE refresh_mode = 'passive'`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid string
+		if rows.Scan(&uid) == nil {
+			out[uid] = true
+		}
+	}
+	return out
 }
 
 // SetAccountSource 写入账号来源。空值不覆盖已有值（避免一次重同步把来源洗掉）。
