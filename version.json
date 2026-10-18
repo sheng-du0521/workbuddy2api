@@ -1,16 +1,16 @@
 {
-  "version": "0.31.38",
+  "version": "0.31.39",
   "min_supported": "0.24.0",
-  "notes": "v0.31.38（v0.31.37 的收尾）：用户端「我的账号出口」行补上 refresh_lost 字段与「仅剩 access」预警。v0.31.37 只在管理端账号卡渲染了这条预警，用户端的线路行仍只认 token_dead —— 于是「号主自己看得到号快掉线了」这件事其实没做到（前端判断存在、后端没下发字段）。本次把 lost 一并取回并传进 hostEgressAccountOf，真死优先（MarkTokenDead 已清 lost 位，这里只防御历史行两位并存）。其余同 v0.31.37：v0.31.37：账号来源可度量 + 扫码登录=导入同构 + 「假掉线」分档（附同类项目比对）。① 来源列（core）：accounts 新增 source（qr/import/空=历史）与 refresh_lost_at 两条增量列 + 老库迁移。三条写入路径都记来源：扫码（PollOAuth→qr）、桌面 JSON 导入（→import）、用户端代挂导入（→import）；只允许「空→值」，重新导入/重新登录不会改写首次来源（否则「扫码号失效更多」的结论会被抢救动作自动擦掉）。② 扫码登录规范化落库：新增 oauth_pool.go —— 扫码成功后按导入同构补齐 device_token（运行期同源派生值，显式落库，写 device_token_at）、记 source=qr、按 kv qr_auto_pool（默认开，设 0 回滚到邀请制）自动入池并写备注，并把与导出逐字同构的 auth JSON 随 poll 响应返回（前端「下载 auth JSON」，当场留一份可直接再导入的凭据）。materialize 必须跑在 SyncAccounts 之前（否则界面显示已入池、选号仍跳过）。③ 「假掉线」分档（重要）：12153 到来时先看 access 是否仍有效 —— 有效则只记 refresh_lost_at + 软冷却、卡片给「仅剩 access · 需尽快重登」，不写 token_dead_at、不进次日 04:00 硬冷却、不累计 sessionDeadFails；access 也过期才走原判死路径。依据：上游 refresh 是轮换制，号主本机客户端一刷新就会把我们手里的 refresh 打掉，但 access 往往还剩几十天（生产实测 10 个被判死的号 expires_at 全在 11-14 之后）。④ refresh 闸门修正：单飞键从 *auth.Auth 指针改为 (client, uid, refresh_token) 派生值 —— 同一个号存在两份凭据对象时旧实现是两把互不可见的闸门，等于把同一张票双花；等待者现在**同时拿到新凭据**（旧实现只传 error，等待者会拿着已作废的 token 继续跑）。新增 60s 宽限：前后脚的串行调用直接回放上次结果；但调用方凭据已是最新时不回放（那是刻意重刷，吞掉它就等于 keepalive 记成功、上游其实没被打）。缓存带 2×宽限清扫，避免含明文凭证的结果快照只增不减。⑤ 观测：新增 GET /api/admin/accounts/source-stats（只读、零出站）按来源聚合 号数/在池/失效/仅剩 access/失效率，口径写死在 buildSourceStats（分母=该来源全部账号；refresh_lost 单列不并入 dead，否则会把要验证的判断做假）；管理端账号池顶部新增「来源健康度」卡，账号卡加来源标签与「仅剩 access」徽标；用户端出口行同步预警。⑥ 测试：account_source_test.go（老库迁移/只写一次/三态互斥/统计口径/normSource 封闭取值）与 refresh_grace_test.go（按 RT 单飞/双对象同票/宽限回放/宽限过期/键派生）；uitest 新增 account-source 守卫。调研全文见 docs/同类项目比对-20261018.md。",
+  "notes": "v0.31.39：探活复活 + 保活给在途对话让路。① 探活复活（core）：v0.31.30 加了 token_dead 标记之后，一个号被判失效就**没有任何代码会再去验证它** —— 健康检测不清该标记、重新登录要号主再扫一次码，于是判错的代价是永久的（生产实况：38 号里 10 个带红牌，而它们的 expires_at 全在一个月之后）。新增 revive.go：POST /api/admin/accounts/{uid}/revive（单号）与 POST /api/admin/accounts/revive-dead（批量，默认 dry_run）。口径三条：复活依据**只有对话探活**（余额/refresh 通过都不算，v0.24.3 的教训）；探活失败**什么都不改**（不累计 sessionDeadFails、不冷却、不清标记 —— 它已被排除在服务外，再罚一次只会误杀）；复活后**置 refresh_lost**（唯一证据是 refresh 曾被 12153 判过），等 access 到期前保活刷新成功会自动清掉。批量默认 dry_run 且零出站（只列候选），逐号串行 + 250~600ms 抖动 + 走探活总闸（并发≤3、同号 30s）。② 新增 pool.Activate：一次清掉 entry 的 7 个可逆阻塞位（until/coolKind/breakerUntil/degradeUntil/softStreak/sessionDeadFails/faultFails），**不动** disabled 与 manualDisabled。只清几个会造出「点了复活、界面已复活、选号仍跳过」的半个动作。③ 保活出口保护（借鉴 xiaofan6ya）：st.InFlight>0 的号本轮跳过刷新 —— 保活是 discretionary 动作，撞上在途对话没有任何收益，而 refresh 轮换会让紧接着的续写拿到新 token。④ 前端：账号池工具行「复活失效号」（dry_run 预览 → 确认 → 执行，回落汇总）；失效账号卡上「探活复活」排在「重新登录」之前（先给成本最低的那条路）。⑤ 测试：revive_token_test.go 六个用例钉住 dry_run 零出站 / 探活通过才清标记且保留「仅剩 access」/ 探活失败零改动 / 无标记不出站 / 候选只含 token_dead；uitest 新增 revive-path 守卫。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.38/webapp.exe",
-      "sha256": "0642091b65f9fb2bbe3faacffe385fee49e00152d013a8d226d98177f70db239",
-      "size": 15441920
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.39/webapp.exe",
+      "sha256": "ee74a0023f7118d4b4d143f99f819d61ec4b4022293eeb4083cdd8e3d61ab6af",
+      "size": 15457792
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

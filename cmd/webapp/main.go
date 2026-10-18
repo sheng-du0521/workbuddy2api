@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.38"
+const version = "0.31.39"
 
 type app struct {
 	store  *Store
@@ -1690,6 +1690,11 @@ func (a *app) routes() *http.ServeMux {
 	// 之前吗？—— 不必：Go 1.22+ 的 ServeMux 按「更具体的模式优先」匹配，静态段
 	// 天然优先于通配段，故顺序无关（此处仍聚在一起便于阅读）。
 	mux.HandleFunc("POST /api/admin/accounts/health", a.adminGuard(a.handleCheckHealthBatch))
+	// 探活复活（v0.31.39）：给被判失效的号一条可验证的复活路。
+	// 批量端点默认 dry_run（只列候选、零出站），真正执行才逐号做对话探活。
+	// 路径注意：`/accounts/revive-dead` 是静态段，必须注册在 `/accounts/{uid}/...` 之前。
+	mux.HandleFunc("POST /api/admin/accounts/revive-dead", a.adminGuard(a.handleReviveDead))
+	mux.HandleFunc("POST /api/admin/accounts/{uid}/revive", a.adminGuard(a.handleReviveAccount))
 	mux.HandleFunc("GET /api/admin/accounts/health/last", a.adminGuard(a.handleHealthLast))
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/health", a.adminGuard(a.handleCheckAccountHealth))
 	// 账号卡片「任务完成情况」（只读：今日签到 + 猫猫旅行状态）。

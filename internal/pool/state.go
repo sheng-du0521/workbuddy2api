@@ -155,6 +155,42 @@ func (p *Pool) ReviveDisabled(uid string) bool {
 	return true
 }
 
+// Activate 「探活通过」后清空该账号的一切**可逆阻塞位**（v0.31.39）。
+//
+// 与 ReviveDisabled 的区别只有一个但很关键：ReviveDisabled 要求 `disabled == true`，
+// 而本方法对**未禁用但被冷却/失效标记挡住**的号也生效 —— 生产里最常见的就是这一类：
+// token_dead 的号 `disabled=0`，界面上却挂着红牌、既不服务也不会自己好。
+//
+// 为什么需要一个新原语而不是让调用方挨个清：entry 有 7 个互相独立的阻塞位
+// （until / coolKind / breakerUntil / degradeUntil / softStreak / sessionDeadFails /
+// faultFails）。只清其中几个会造出"点了复活、状态显示已复活、但选号仍跳过"的半个动作 ——
+// 这正是本仓反复记录的「两个停用位」那类最难查的缺陷。
+//
+// 边界：
+//   - **不动 disabled**（系统裁决）与 **manualDisabled**（运维裁决）—— 复活不等于提权；
+//   - 只应在"上游已被证明可用"时调用（对话探活通过）。它清的是运行态，
+//     不代表账号属性有任何变化。
+func (p *Pool) Activate(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.clearCoolingLocked()
+	e.reason = ""
+	e.fails = 0
+	e.retryCount = 0
+	e.breakerUntil = time.Time{}
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
+	e.softStreak = 0
+	e.sessionDeadFails = 0
+	e.faultFails = 0
+	p.dirty.Store(true)
+	return true
+}
+
 // SetManualDisabled 运维手动停用/恢复（issue #138/#118）：置位时只摘除选号流量，
 // 账号仍在池里——签到、token 保活、排程任务照常执行，凭证与积分是活的。
 // 与自动禁用（Disabled）互相独立：本方法不清 disabled，也不清冷却/熔断维度；

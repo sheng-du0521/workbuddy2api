@@ -2690,6 +2690,47 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.39：**探活复活**必须是一条"有证据才放行"的路，而不是一键橡皮擦。
+  //
+  // 四条不变量：
+  //   ① 批量端点默认 dry_run（零出站）—— 否则这个按钮本身就是一次批量出站；
+  //   ② 复活依据只有对话探活（余额/refresh 通过都不算）；
+  //   ③ 探活失败**什么都不改**（不累计、不冷却、不清标记）；
+  //   ④ 复活后置 refresh_lost（我们唯一掌握的证据是 refresh 曾被 12153 判过）。
+  const rvBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const rev = fs.readFileSync(path.join(ROOT, 'cmd/webapp/revive.go'), 'utf8');
+    if (!/dry := true/.test(rev)) rvBad.push('批量复活没有默认 dry_run（一次误点就是号池规模的出站）');
+    if (!rev.includes('hcChatProbe')) rvBad.push('复活没有走对话探活（只探余额会给出虚假的安心结论）');
+    if (!rev.includes('MarkRefreshLost')) rvBad.push('复活后没有置「仅剩 access」——会把"续期已失效"报成一切正常');
+    if (!rev.includes('Activate(')) rvBad.push('复活没有清池内阻塞位（会出现"界面已复活、选号仍跳过"）');
+    // 失败分支必须在清标记**之前** return。
+    // 用带括号的调用形态定位（`ClearTokenDead(`），否则会撞上文件头注释里提到的同名字符串。
+    const failIdx = rev.indexOf('if !cp.OK');
+    const clearIdx = rev.indexOf('ClearTokenDead(');
+    if (failIdx < 0 || clearIdx < 0 || failIdx > clearIdx) {
+      rvBad.push('探活失败必须早于清标记返回（否则等于无条件复活）');
+    }
+    if (!/if !cp\.OK \{[\s\S]{0,400}?return res/.test(rev)) {
+      rvBad.push('探活失败分支必须直接 return（不能继续往下走）');
+    }
+    const pl = fs.readFileSync(path.join(ROOT, 'internal/pool/state.go'), 'utf8');
+    if (!pl.includes('func (p *Pool) Activate(')) rvBad.push('pool 缺少 Activate 原语');
+    if (!pl.includes('e.manualDisabled')) rvBad.push('（提示）Activate 不得动 manualDisabled');
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('btnReviveDead')) rvBad.push('账号池工具行没有「复活失效号」入口');
+    if (!adminHtml.includes('探活复活')) rvBad.push('账号卡没有单号「探活复活」按钮');
+    const sch = fs.readFileSync(path.join(ROOT, 'internal/scheduler/scheduler.go'), 'utf8');
+    if (!sch.includes('st.InFlight > 0')) {
+      rvBad.push('保活没有跳过在途对话的号（维护任务与用户请求抢同一个号）');
+    }
+  }
+  rvBad.forEach((m) => console.log('  [FAIL] revive-path: ' + m));
+  if (!rvBad.length) {
+    console.log('  [ok] revive-path: dry_run 零出站 + 只认对话探活 + 失败不改状态 + 复活置「仅剩 access」+ 保活让路');
+  }
+
   // v0.31.37：**来源可度量 + 扫码=导入 + 假掉线分档**必须结构性成立。
   //
   // 这一版要回答的问题是"掉线是不是集中在扫码登录的号"。答案的前提是三件事都在：

@@ -1218,6 +1218,21 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			t.skipped++
 			continue
 		}
+		// 出口保护（v0.31.39，借鉴同类项目 xiaofan6ya 的 "出口保护"）：
+		// 这个号**正在服务用户请求**时不做保活刷新。
+		//
+		// 为什么不只是"礼貌"：refresh 是轮换制，刷新成功会写回新凭据，
+		// 而正在跑的那条请求手里握的是旧 access —— 它本身不受影响（已发出的请求
+		// 不会因为刷新而失败），但**紧接着的重试/续写**会拿到新 token，
+		// 与上游已记录的会话状态产生一次没必要的对接。更实际的理由是成本：
+		// 保活是" discretionary"的动作，撞上在途对话时让一秒就好，没有任何收益。
+		//
+		// 判据用 InFlight（池内已分配未释放），不是"最近有请求"的时间窗 ——
+		// 前者是精确的，后者要靠猜窗口大小。
+		if st.InFlight > 0 {
+			t.skipped++
+			continue
+		}
 		// 惰性刷新：token 还剩很久才过期时跳过（保活阈值/惰性刷新窗口，0=关闭该判据）。
 		if s.keepaliveSkip(a) {
 			t.skipped++

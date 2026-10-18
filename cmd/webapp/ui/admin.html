@@ -283,6 +283,11 @@
              文件里是 access_token/refresh_token 明文，等同账号钥匙。 -->
         <button class="ghost sm" id="btnAccExport"
           title="导出账号 JSON（可与「导入账号」闭环：导出的文件能直接再导入）。⚠ 文件里是凭证明文，等同账号钥匙">导出 JSON</button>
+        <!-- 探活复活（v0.31.39）：被判失效的号此前**没有任何代码会再去验证它** ——
+             健康检测不清这个标记、重新登录要号主再扫一次码，于是判错的代价是永久的。
+             默认 dry_run（只列候选、零出站），确认后才逐号探活。 -->
+        <button class="ghost sm" id="btnReviveDead"
+          title="对带「登录失效」标记的账号做一次对话探活：通过则清标记（转为「仅剩 access」），不通过不改任何状态。会逐号出站一次。">复活失效号</button>
       </div>
 
       <!-- 健康检测（v0.23.0 起，v0.23.2 独立成页）：面板不再压在本页账号列表之上 ——
@@ -1645,6 +1650,40 @@ let selectedUIDs = new Set();
 // 导出账号 JSON（v0.31.29）。勾选优先；没有勾选就导全部 —— 与「批量设置」的
 // 兜底语义一致，但这里额外弹一次确认：导出是**读**操作（不会改账号），
 // 真正需要提醒的是"文件本身就等于账号钥匙"。
+if ($('btnReviveDead')) {
+  $('btnReviveDead').onclick = async () => {
+    const btn = $('btnReviveDead');
+    btn.disabled = true;
+    const old = btn.textContent;
+    try {
+      // 第一步：dry_run（零出站）—— 先把"要动几个号"摆出来。
+      const d = await post('/api/admin/accounts/revive-dead', { dry_run: true });
+      if (!d || !d.count) {
+        toast('没有带「登录失效」标记的账号', 'ok');
+        return;
+      }
+      const ok = await confirmAsk('将对 ' + d.count + ' 个「登录失效」账号逐号做一次对话探活。\n\n'
+        + '· 每个号一次上游请求（极小：单轮 / max_tokens=1），约 0.3~0.6s 间隔；\n'
+        + '· 通过 → 清失效标记，转为「仅剩 access」；\n'
+        + '· 不通过 → 不改任何状态，也不累计失败次数。\n\n继续？');
+      if (!ok) return;
+      btn.textContent = '探活中…';
+      const r = await post('/api/admin/accounts/revive-dead', { dry_run: false });
+      const s = (r && r.summary) || {};
+      const revived = s.revived || 0;
+      const failed = s['probe-failed'] || 0;
+      toast('复活完成：成功 ' + revived + ' 个、探活未通过 ' + failed + ' 个'
+        + (r && r.count ? '（共 ' + r.count + ' 个）' : ''), revived ? 'ok' : 'warn');
+      loadAccounts();
+    } catch (e) {
+      toast('批量复活失败：' + e.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  };
+}
+
 if ($('btnAccExport')) {
   $('btnAccExport').onclick = async () => {
     const uids = Array.from(selectedUIDs || []);
@@ -2615,6 +2654,32 @@ function accountCard(a) {
 
   const foot = el('footer');
   if (a.token_dead) {
+    // 顺序有意：先给**成本最低**的那条路。判错的号（refresh 丢了但 access 还活着）
+    // 点一下就能回来；只有真死了才需要号主再扫一次码。
+    const rv = el('button', '', '探活复活');
+    rv.title = '发一次极小对话请求验证这个号是否真不能用（单轮 / max_tokens=1 / 非流式）。'
+      + '通过 → 清失效标记并转为「仅剩 access」；不通过 → 不改任何状态、不累计失败次数。';
+    rv.onclick = async () => {
+      rv.disabled = true;
+      const old = rv.textContent;
+      rv.textContent = '探活中…';
+      try {
+        const d = await post('/api/admin/accounts/' + encodeURIComponent(a.uid) + '/revive', {});
+        const r = d.result || {};
+        if (r.state === 'revived') {
+          toast('已复活：探活通过，失效标记已清除（现为「仅剩 access」，建议尽快重登一次）', 'ok');
+          loadAccounts();
+        } else {
+          toast('未复活：' + (r.note || r.state || '未知原因'), 'warn');
+        }
+      } catch (e) {
+        toast('探活失败：' + e.message, 'err');
+      } finally {
+        rv.disabled = false;
+        rv.textContent = old;
+      }
+    };
+    foot.appendChild(rv);
     const re = el('button', 'danger', '重新登录');
     re.title = '在 WorkBuddy 桌面端重新登录该账号 → 导出 auth 文件 → 粘贴到「批量导入 JSON」（会覆盖旧凭证并自动清掉红标）';
     re.onclick = () => {
