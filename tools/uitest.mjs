@@ -2690,6 +2690,45 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.42：**agent 自更新与登录态探测**的安全边界。
+  //
+  // 这条链路会在用户机器上执行代码，所以下面每一条都是"少了就出事"：
+  //   · 下发的产物必须校验 sha256（否则一次中间人 = 任意代码执行）；
+  //   · 清单里的文件名不许穿越目录；
+  //   · 探测结果**不许含令牌**（扫描是自动行为，自动上传凭证不可接受）。
+  const auBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const upd = read('cmd/egress-agent/update.go');
+    if (!upd.includes('sha256')) auBad.push('agent 自更新没有校验 sha256');
+    if (!upd.includes('os.Rename(exe, old)')) auBad.push('agent 自更新没有"先改名再就位"（Windows 覆盖不了运行中的 exe）');
+    if (!upd.includes('回滚')) auBad.push('agent 自更新就地失败时没有回滚');
+    if (!upd.includes('noUpdate')) auBad.push('agent 自更新没有 --no-update 逃生门');
+    const scan = read('cmd/egress-agent/authscan.go');
+    // 候选结构里不许出现 token 字段（用正则抓结构体定义内的 access/refresh 字段）。
+    const structStart = scan.indexOf('type authFileCandidate struct');
+    const structEnd = scan.indexOf('}', structStart);
+    const structBody = scan.slice(structStart, structEnd);
+    if (/Access|Refresh|Token/i.test(structBody)) {
+      auBad.push('authFileCandidate 里出现了令牌字段（扫描结果不许带凭证）');
+    }
+    if (!scan.includes('hasKey("access_token"')) auBad.push('auth 探测没有用带引号的键名匹配（会把配置误判成登录态）');
+    const dist = read('cmd/webapp/agent_dist.go');
+    if (!dist.includes('filepath.Base(name)')) auBad.push('server 侧没有拒绝清单里的目录穿越');
+    if (!dist.includes('disabled')) auBad.push('缺清单时没有明确 disabled（会让人以为自动更新已启用）');
+    const mainGo = read('cmd/webapp/main.go');
+    if (!mainGo.includes('/api/agent/version') || !mainGo.includes('/api/agent/download')) {
+      auBad.push('agent 版本/下载端点未注册');
+    }
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('authCandRows')) auBad.push('管理端没有「本机登录态候选」面板');
+  }
+  auBad.forEach((m) => console.log('  [FAIL] agent-update: ' + m));
+  if (!auBad.length) {
+    console.log('  [ok] agent-update: 产物校验 sha256 + 改名换文件可回滚 + 探测不含令牌 + 面板可读');
+  }
+
   // v0.31.41：**同一个判据只能有一份清单**（错误处置与响应状态码必须同源）。
   //
   // 这一版修的是两处"同一件事两套纪律"：

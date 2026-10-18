@@ -174,6 +174,33 @@ type egressAgentState struct {
 	LocalIP string `json:"local_ip,omitempty"`
 	// Message 最近一条人话状态（错误原文也放这里）。
 	Message string `json:"message,omitempty"`
+	// AuthCandidates 这台机器上**探测到的**客户端登录态文件（v0.31.42）。
+	//
+	// 为什么需要它：号主本机客户端与我们共用同一条 refresh 轮换链，谁先刷谁把对方
+	// 打掉。要彻底消除这个冲突只有一条路 —— **让本机成为唯一刷新者，服务器只读**。
+	// 而服务器看不到对方机器上的文件，只能由 agent 去扫、把"有哪些候选"报上来。
+	//
+	// 边界（刻意）：这里**只有元信息**（路径 / 修改时间 / 大小 / 账号 uid 前几位），
+	// **不含任何令牌**。要不要跟随某个文件，是运维看过列表之后显式选的；
+	// 上报令牌是"跟随"动作的结果，不是扫描的副作用。
+	AuthCandidates []agentAuthCandidate `json:"auth_candidates,omitempty"`
+}
+
+// agentAuthCandidate agent 在本机探测到的一个候选登录态文件。
+//
+// 字段全部是"能不泄露凭证地回答这是哪个号"的最小集合：路径用于人在自己电脑上找到它，
+// UIDPrefix 用于和云端的账号对上号，其余用于判断"这个文件多久没动过"。
+type agentAuthCandidate struct {
+	Path string `json:"path"`
+	// MTime 文件修改时间（unix 秒）。它几乎等于"这个客户端的令牌最后一次换新是在什么时候"。
+	MTime int64 `json:"mtime"`
+	Size  int64 `json:"size"`
+	// UIDPrefix 账号 uid 的前 8 位（没有则空）。**只放前缀**：完整 uid 是账号标识，
+	// 列表要发给浏览器；前缀足够人工对上号，也足够在库里做匹配提示。
+	UIDPrefix string `json:"uid_prefix,omitempty"`
+	Nickname  string `json:"nickname,omitempty"`
+	// Note 探测结论：ok / 无令牌 / 解析失败 / 太大 等。
+	Note string `json:"note,omitempty"`
 }
 
 // egressMachine 一台跑过 agent 的机器（指令 + 状态 + 端口）。
@@ -820,6 +847,11 @@ type egressMachineView struct {
 	// **部分绑定**是最容易被忽略的中间状态（新挂了一个号、或换了线路）。
 	HostBound int `json:"host_bound"`
 	HostTotal int `json:"host_total"`
+	// AuthCandidates 这台机器上探测到的客户端登录态候选（v0.31.42）。
+	//
+	// 只有元信息（路径 / 修改时间 / uid 前 8 位）。用途是回答"这个号的本机
+	// 客户端登录态在哪" —— 那是"让本机成为唯一刷新者"这条路的第一步。
+	AuthCandidates []agentAuthCandidate `json:"auth_candidates,omitempty"`
 	// CurrentCmd 当前待执行指令（none / start / stop）。
 	CurrentCmd string `json:"current_cmd,omitempty"`
 	LastAt     int64  `json:"last_at"`
@@ -1182,12 +1214,13 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 			ProxyID:   proxyIDByURL[url],
 			Applied:   applied,
 			HostBound: bound[url], HostTotal: hostTotal,
-			CurrentCmd:   mm.Cmd,
-			LastAt:       mm.StateAt,
-			IsDefault:    key == egressDefaultMachine,
-			Fingerprint:  strings.TrimSpace(mm.Fingerprint),
-			AltIDs:       append([]string(nil), mm.AltIDs...),
-			TunnelExitIP: proxyLastIP[url],
+			AuthCandidates: append([]agentAuthCandidate(nil), mm.State.AuthCandidates...),
+			CurrentCmd:     mm.Cmd,
+			LastAt:         mm.StateAt,
+			IsDefault:      key == egressDefaultMachine,
+			Fingerprint:    strings.TrimSpace(mm.Fingerprint),
+			AltIDs:         append([]string(nil), mm.AltIDs...),
+			TunnelExitIP:   proxyLastIP[url],
 		}
 		// 两条链路对不上 = 隧道没落到这台机器上（v0.31.31）。
 		// 只在两边都有值时才判：任一侧缺值（线路还没探过 / agent 还没探到）

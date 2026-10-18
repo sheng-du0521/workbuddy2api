@@ -1,16 +1,16 @@
 {
-  "version": "0.31.41",
+  "version": "0.31.42",
   "min_supported": "0.24.0",
-  "notes": "v0.31.41：错误处置与响应状态码同源 —— 请求级错误不罚号 + 401 按证据分流。① 未细分的 4xx 不再罚号：此前 isClientFaultKind 决定「这类错误回 4xx 给客户端」，而 reportUpstreamError 的 default 分支另写一份清单，只要不是那 4 个具名 kind 就 NoteError（喂熔断，30min 起封顶 6h）。于是同一个 ErrClient 在响应上被判定为「客户端过错」，在账号处置上却算「账号故障」。后果是真实的：客户端发一批参数不对的请求（工具 schema 缺字段、参数组合不支持、版本差异），每个请求轮转 3 个账号 → 健康号被按次累计熔断 → 小号池进入「本地误判没有可用账号」（同类项目 xiaofan6ya 1.0.7 修的正是这条）。现在 default 直接复用 isClientFaultKind 这一个判据；仍继续轮转（小概率渠道配置差异），证据不丢（consume failure 台账逐条落账）。② 401 按证据分流：body 带 12153 / Offline user session not found → 与 code==12153 走同一套 handleSessionDead（分档 + 标红 + 被动降级）；没有会话失效证据的 401（典型是 WAF / APISIX 的 HTML 页）仍只做「疑似」计数。此前两者都只计数：真失效的号计数到 3 次被停掉，但卡片上什么都不显示 —— 不标红、不给重登按钮、不给探活复活，运维只看到「号突然不能用了」。③ 测试：client_fault_policy_test.go 六例 —— 未细分 4xx 连发 6 次不产生任何惩罚位 / 5xx 照常累计 / 11140 仍软冷却 / 11102 仍有模型级避让 / 401 带证据 → 仅剩 access + 被动降级 / 401 无证据 → 零改动；uitest 新增 error-policy 守卫（default 必须引用同一判据、401 必须双路存在）。",
+  "notes": "v0.31.42：agent 自更新 + 本机登录态探测（「单刷新者」的第一半）。① agent 自更新：此前给 agent 加的所有能力**一个都到不了**用户机器 —— 现网还停在 0.1.0，因为升级只能人工拷 exe，而那个文件被占用时替换不掉。现在 agent 每 6 小时问一次 /api/agent/version，有新版就下载到同目录、校验 sha256 与大小、「旧 exe → .old → 新 exe 就位 → 起新进程退出自己」。Windows 允许重命名运行中的可执行文件，所以不需要重启系统；任一步失败都保留原状继续跑（绝不出现「agent 没了」），并可用 --no-update 关闭。首次仍需人工换成带该能力的版本（老版本不会来问版本）—— 从那一次之后就不需要人了。② 产物由**我们自己的服务端**下发（/api/agent/download，agent 令牌鉴权）：用户机器常常连不上 GitHub，且不该从第三方地址装可执行文件。版本清单是同目录的 agent-version.json；**没有清单时整条能力呈 disabled**（不猜版本号 —— 猜的后果是什么都不发生，而所有人都以为已经启用）。清单里的文件名必须是纯文件名（拒绝 ../ 穿越）。③ agent 探测本机登录态：按常见路径（%APPDATA% / %LOCALAPPDATA% / 家目录下的 workbuddy、codebuddy 及 agent 自身目录，深度 ≤3）扫 JSON，判定口径是**同时含 access_token 与 refresh_token 两个带引号的键名**（裸子串会把 access_token_hint 这类配置误判成登录态）。上报**只有元信息**：路径 / mtime / 大小 / uid 前 8 位 / 结论 —— 结构体里根本没有令牌字段。扫描是自动行为，自动上传凭证不可接受；真正的「跟随」必须是运维看过列表后显式选一个文件。④ 管理端「代理 · 设备诊断」新增「本机登录态候选」表：机器 / 账号 uid 前 8 位 / 最后修改 / 大小 / 路径，按修改时间倒序；空态也写明原因（agent 版本低 / 没扫到 / 还没上报），否则「没上报」与「确实没有」看不出区别。⑤ 测试：agent_dist_test.go（令牌鉴权 / 缺清单 disabled / 版本+sha256+size 一致 / 目录穿越被拒 / 产物变了必须重算哈希）与 authscan_test.go（两种 token 缺一不可 / 嵌套与扁平解析 / 只上报前 8 位 / 无关 JSON 不入选 / 深度限制）；uitest 新增 agent-update 守卫（sha256、可回滚、候选无令牌字段、面板存在）。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.41/webapp.exe",
-      "sha256": "ab86ffaf63cd08c39c3e1197d30ac1eb79b471f2dab05ecdee265ae5b707835b",
-      "size": 15470080
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.42/webapp.exe",
+      "sha256": "eadc7359975b80037d339d0a678c4ad16af6f616472ade0808ae58156d271110",
+      "size": 15494656
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

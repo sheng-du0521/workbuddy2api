@@ -673,6 +673,26 @@
 
       <!-- ========== 子区 ④：设备与选号诊断（v0.26.1） ========== -->
       <div class="egr-sub" data-egr-sub="device" style="display:none;">
+        <!-- 本机登录态候选（v0.31.42）：agent 在自己那台机器上探测到的客户端登录态文件。
+             这是「让本机成为唯一刷新者、服务器只读」的第一步 —— 服务器看不到对方机器，
+             只能由 agent 去扫并把候选报上来。**这里只有路径与元信息，没有任何令牌**。 -->
+        <div class="card">
+          <div class="section-head">
+            <h2>本机登录态候选（agent 探测）</h2>
+            <button class="ghost" id="btnAuthCandRefresh">刷新</button>
+          </div>
+          <div class="sub" style="margin:0 0 12px;">
+            号主本机客户端与服务器共用同一条 <b>refresh 轮换链</b>：谁先刷新谁把对方打掉。
+            彻底消除这个冲突只有一条路 —— <b>让本机成为唯一刷新者，服务器只读</b>。
+            服务器看不到对方电脑上的文件，所以由 agent 在自己的机器上按常见路径探测，
+            把<b>候选文件的路径与元信息</b>报上来（<b>不含任何令牌</b>）。
+            <br>看到候选之后，核对 <b>uid 前 8 位</b>与账号是否一致、<b>修改时间</b>是否新鲜，
+            再决定跟随哪一个。
+            <br>⚠️ 需要 agent <b>0.3.3+</b>：老版本不会上报。agent 会自己检查更新（每 6 小时一次），
+            首次仍需人工换成带该能力的版本。
+          </div>
+          <div id="authCandRows" class="sub" style="margin:0;"></div>
+        </div>
         <div class="card">
           <div class="section-head">
             <h2>设备凭证（X-Device-Token）</h2>
@@ -1650,6 +1670,14 @@ let selectedUIDs = new Set();
 // 导出账号 JSON（v0.31.29）。勾选优先；没有勾选就导全部 —— 与「批量设置」的
 // 兜底语义一致，但这里额外弹一次确认：导出是**读**操作（不会改账号），
 // 真正需要提醒的是"文件本身就等于账号钥匙"。
+if ($('btnAuthCandRefresh')) {
+  $('btnAuthCandRefresh').onclick = async () => {
+    await loadEgress();
+    renderAuthCandidates();
+    toast('已刷新（数据来自 agent 最近一次上报，最多滞后 5 分钟）', 'ok');
+  };
+}
+
 if ($('btnReviveDead')) {
   $('btnReviveDead').onclick = async () => {
     const btn = $('btnReviveDead');
@@ -7494,6 +7522,7 @@ async function loadEgress(silent) {
     mountEgrTabs();
     renderEgressAlert();
     renderEgressCards();
+    renderAuthCandidates();
     renderEgrAssignHint();
     renderEgrAccKpis();
     renderEgrAccCards();
@@ -7668,6 +7697,62 @@ function renderEgrPoolHint() {
     box.appendChild(el('b', 'err', '；有 ' + dups.length + ' 台机器上跑着多份 agent（同一台电脑，出口不会变多）'));
   }
   box.appendChild(document.createTextNode('。每条卡片右侧可直接「分配」到指定范围。'));
+}
+
+// renderAuthCandidates 渲染「本机登录态候选」（v0.31.42）。
+//
+// 数据来源是各机器最近一次 report 里带的 auth_candidates（只有路径/元信息）。
+// 刻意**不做任何自动动作**：跟随哪个文件是人的决定，这里只负责把事实摆清楚。
+// 空态也要说话 —— 否则"agent 没上报"和"这台机器上确实没有"看起来一模一样。
+function renderAuthCandidates() {
+  const box = $('authCandRows');
+  if (!box) return;
+  box.textContent = '';
+  const rows = [];
+  for (const url of Object.keys(egrMachines || {})) {
+    const m = egrMachines[url] || {};
+    for (const c of (m.auth_candidates || [])) {
+      rows.push({ machine: m.hostname || m.id || url, ver: m.agent_version || '', c });
+    }
+  }
+  if (!rows.length) {
+    box.appendChild(el('div', 'muted',
+      '暂无候选。可能原因：agent 低于 0.3.3（不上报）、这台机器上没有客户端登录态、'
+      + '或 agent 还没上报过（最多等一个扫描周期 5 分钟）。'));
+    return;
+  }
+  rows.sort((a, b) => (b.c.mtime || 0) - (a.c.mtime || 0));
+  const tbl = el('table');
+  tbl.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;';
+  const head = el('tr');
+  for (const h of ['机器', '账号（uid 前 8 位）', '最后修改', '大小', '路径']) {
+    const th = el('th', null, h);
+    th.style.cssText = 'text-align:left;padding:4px 8px;border-bottom:1px solid rgba(127,127,127,.25);';
+    head.appendChild(th);
+  }
+  tbl.appendChild(head);
+  for (const r of rows) {
+    const tr = el('tr');
+    const c = r.c;
+    const mtime = c.mtime ? new Date(c.mtime * 1000).toLocaleString() : '—';
+    const cells = [
+      r.machine + (r.ver ? '（agent ' + r.ver + '）' : ''),
+      (c.uid_prefix || '（未解析出 uid）') + (c.nickname ? ' · ' + c.nickname : ''),
+      mtime,
+      c.size ? Math.round(c.size / 1024) + ' KB' : '—',
+      c.path || '',
+    ];
+    for (let i = 0; i < cells.length; i++) {
+      const td = el('td', null, cells[i]);
+      td.style.cssText = 'padding:4px 8px;border-bottom:1px solid rgba(127,127,127,.12);'
+        + (i === 4 ? 'font-family:ui-monospace,Consolas,monospace;word-break:break-all;' : '');
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  }
+  box.appendChild(tbl);
+  box.appendChild(el('div', 'muted',
+    '（跟随某个文件的功能尚未开放：需要先在服务端确认该路径的读取与写回口径，见使用说明 v0.31.42）'));
 }
 
 function renderEgressCards() {

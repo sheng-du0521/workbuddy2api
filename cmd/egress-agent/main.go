@@ -59,7 +59,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.2"
+const agentVersion = "0.3.3"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -93,6 +93,9 @@ type agentState struct {
 	// LocalIP 本机首选内网地址（人眼核对"这是哪台电脑"）。
 	LocalIP string `json:"local_ip,omitempty"`
 	Message string `json:"message,omitempty"`
+	// AuthCandidates 本机探测到的客户端登录态候选（v0.31.42）。
+	// **只有元信息**：路径 / 修改时间 / 大小 / uid 前 8 位 / 结论。不含任何令牌。
+	AuthCandidates []authFileCandidate `json:"auth_candidates,omitempty"`
 }
 
 type agent struct {
@@ -118,6 +121,12 @@ type agent struct {
 	// 每 5 秒重算一遍只是白白遍历网卡。
 	fp      string
 	localIP string
+	// noUpdate 关闭自动更新（--no-update）。
+	noUpdate bool
+	// authCand 最近一次扫到的登录态候选（只含元信息，见 authscan.go）。
+	// authCandAt 上次扫描时刻：5 秒一次的 report 不该每次都去走目录。
+	authCand   []authFileCandidate
+	authCandAt time.Time
 }
 
 func (a *agent) setMsg(f string, args ...any) {
@@ -196,6 +205,9 @@ func (a *agent) report() {
 	a.mu.Unlock()
 	st.Fingerprint = a.fp
 	st.LocalIP = a.localIP
+	a.mu.Lock()
+	st.AuthCandidates = a.authCand
+	a.mu.Unlock()
 	_ = a.post("/api/agent/report?machine="+url.QueryEscape(a.machine), st, nil)
 }
 
@@ -490,14 +502,15 @@ func portOr(v, def int) int {
 
 func main() {
 	var (
-		server  = flag.String("server", "", "云端服务地址，如 http://1.2.3.4:8780（必填）")
-		token   = flag.String("token", "", "控制台「代理」页给出的 agent 令牌（必填）")
-		proxy   = flag.String("proxy", "", "wbproxy 可执行文件路径（默认同目录 wbproxy.exe）")
-		key     = flag.String("key", "", "SSH 私钥路径（默认同目录 ai.pem）")
-		user    = flag.String("user", "root", "SSH 用户名")
-		machine = flag.String("machine", "", "覆盖机器标识（默认同目录 machine.id）")
-		once    = flag.Bool("once", false, "只跑一轮就退出（自检用：验证令牌与网络是否可用）")
-		cfgPath = flag.String("config", "", "配置文件路径（一键安装会写 egress.json，含 server/token）")
+		server   = flag.String("server", "", "云端服务地址，如 http://1.2.3.4:8780（必填）")
+		token    = flag.String("token", "", "控制台「代理」页给出的 agent 令牌（必填）")
+		proxy    = flag.String("proxy", "", "wbproxy 可执行文件路径（默认同目录 wbproxy.exe）")
+		key      = flag.String("key", "", "SSH 私钥路径（默认同目录 ai.pem）")
+		user     = flag.String("user", "root", "SSH 用户名")
+		machine  = flag.String("machine", "", "覆盖机器标识（默认同目录 machine.id）")
+		once     = flag.Bool("once", false, "只跑一轮就退出（自检用：验证令牌与网络是否可用）")
+		cfgPath  = flag.String("config", "", "配置文件路径（一键安装会写 egress.json，含 server/token）")
+		noUpdate = flag.Bool("no-update", false, "关闭自动更新（排查/回滚时用）")
 	)
 	flag.Parse()
 
@@ -574,7 +587,7 @@ func main() {
 
 	a := &agent{
 		server: base, token: *token, proxy: *proxy, key: *key, user: *user, machine: mid,
-		fp: machineFingerprint(), localIP: localIPv4(),
+		fp: machineFingerprint(), localIP: localIPv4(), noUpdate: *noUpdate,
 	}
 	log.Printf("wb2api-egress-agent %s 启动 | 云端=%s | 机器=%s(%s) | 指纹=%s | 内网=%s | 代理=%s | 私钥=%s",
 		agentVersion, base, mid, hostname(), a.fp, a.localIP, *proxy, *key)
@@ -599,8 +612,39 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// 自更新（v0.31.42）：启动先看一眼，之后每 6 小时一次。
+	//
+	// 放在启动时而不是后台 goroutine：换文件后本进程会退出，逻辑必须能在主循环里
+	// 干净地"走到一半就不返回"，不必再操心并发退出。
+	lastUpdate := time.Now().Add(updateCheckInterval) // 启动时立刻检查一次
+	// auth 候选扫描（v0.31.42）：启动扫一次、之后每 5 分钟一次。
+	// 只上报元信息（路径/mtime/uid 前缀），不含任何令牌 —— 见 authscan.go 的边界说明。
+	scanAuth := func() {
+		c := scanAuthFiles()
+		a.mu.Lock()
+		a.authCand, a.authCandAt = c, time.Now()
+		a.mu.Unlock()
+		if len(c) > 0 {
+			log.Printf("[authscan] 探测到 %d 个候选登录态文件（只上报路径与元信息，不上传令牌）", len(c))
+		}
+	}
+	scanAuth()
+
 	lastKeepAlive := time.Now()
 	for {
+		if time.Since(lastUpdate) >= updateCheckInterval {
+			lastUpdate = time.Now()
+			if err := a.maybeSelfUpdate(); err != nil {
+				// 更新失败**不影响主功能**：继续跑当前版本，6 小时后再试。
+				log.Printf("[update] 自动更新未完成：%v", err)
+			}
+		}
+		a.mu.Lock()
+		needScan := time.Since(a.authCandAt) > 5*time.Minute
+		a.mu.Unlock()
+		if needScan {
+			scanAuth()
+		}
 		spec, err := a.poll()
 		if err != nil {
 			a.setMsg("轮询云端失败（将自动重试）：%v", err)

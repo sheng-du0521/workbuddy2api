@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.41"
+const version = "0.31.42"
 
 type app struct {
 	store  *Store
@@ -98,6 +98,9 @@ type app struct {
 	// dataDir 数据目录（webapp.db / secret.key / admin.key 所在）。
 	// 导入白名单**永远**不允许覆盖到这里（v0.24.2，P3-8，见 resolveImportPath）。
 	dataDir string
+	// agentDir agent 产物目录（-agent-dir，v0.31.42）。空 = 可执行文件同级 egress-agent/。
+	// 服务端从这里读 agent-version.json 与二进制，供 agent 自更新下载（见 agent_dist.go）。
+	agentDir string
 	// authKeysPath 覆盖 authorized_keys 的写入位置（v0.31.25，仅测试与特殊部署用）。
 	//
 	// 空 = 走 egressAuthorizedKeysPath() 的常规推导（/root/.ssh/authorized_keys）。
@@ -208,6 +211,9 @@ func main() {
 	modelProbeGlobal := flag.Duration("model-probe-global", 5*time.Minute,
 		"模型级冷却的半开探测**全池**间隔（同一模型两次探测之间的全局最小间隔）。\n"+
 			"这是出站强度的主闸门：没有它，池里 N 个冷却号会被客户端连续请求逐个探一遍")
+	agentDir := flag.String("agent-dir", "",
+		"agent 产物目录（含 agent-version.json 与 wb2api-egress-agent.exe），供 agent 自更新下载。"+
+			"留空 = 可执行文件同级 egress-agent/；目录不存在时自动更新对 agent 呈 disabled")
 	checkUpdate := flag.Bool("check-update", false,
 		"只做一次版本更新检查并打印结果，然后退出（不启动服务）。\n"+
 			"供运维脚本/定时巡检使用；退出码 0=已最新 1=有新版 2=检查失败")
@@ -344,6 +350,7 @@ func main() {
 		trustedProxies:  proxySet,
 		metricsPublic:   *metricsPublic,
 		dataDir:         dataDir,
+		agentDir:        *agentDir,
 		importRoots:     importRootList(*importRoots, defaultDesktopAccountsPath()),
 		probes:          &probeGate{},
 		registerLimiter: newRateLimiter(10, time.Hour),
@@ -1453,6 +1460,10 @@ func (a *app) routes() *http.ServeMux {
 	// agent 自举（v0.31.25）：首次启动时凭令牌取回服务地址与自己的受限私钥，
 	// 于是"一键安装"的脚本里**不需要包含任何密钥材料**。
 	mux.HandleFunc("GET /api/agent/config", a.handleEgressAgentConfig)
+	// agent 自更新（v0.31.42）：版本清单 + 产物下载。同样只认 agent 令牌 ——
+	// 不让公网探测版本，也不让 agent 从第三方地址装可执行文件。
+	mux.HandleFunc("GET /api/agent/version", a.handleAgentVersion)
+	mux.HandleFunc("GET /api/agent/download", a.handleAgentDownload)
 	// 控制台「代理」页：状态对登录用户开放（**只列他自己的机器**）。
 	mux.HandleFunc("GET /api/egress/home", a.userGuard(a.handleEgressHome))
 	// 三个**执行**端点挂 egressActorGuard（v0.31.24 取代 adminGuard）：
