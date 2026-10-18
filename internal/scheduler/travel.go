@@ -139,7 +139,7 @@ func (s *Scheduler) runTravel(ctx context.Context, trigger string) {
 		case travelOK:
 			t.ok++
 		case travelFailed:
-			t.fail++
+			t.failWith(logfmt.Label(a.UID, a.Nickname)+" travel", nil)
 		default:
 			t.skipped++
 		}

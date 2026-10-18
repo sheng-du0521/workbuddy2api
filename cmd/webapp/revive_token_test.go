@@ -104,6 +104,15 @@ func TestReviveProbePassClearsDeadButKeepsRefreshLost(t *testing.T) {
 	if _, ok := store.RefreshLostMap()["u-1"]; !ok {
 		t.Fatal("复活后必须置 refresh_lost —— 它的 refresh 确实被 12153 判过，不能报成一切正常")
 	}
+	// 必须同时降到「只消费」（v0.31.44）：refresh 已判废的号继续主动刷新，
+	// 等于每小时去撞一张废票 —— 按上游轮换制，用废票重刷可能把对方新签发的
+	// 那份也一起作废。生产 2026-10-18 就是"有 refresh_lost、mode 仍是 auto"。
+	if !a.proxy.pool.PassiveRefresh("u-1") {
+		t.Fatal("复活后应同时置「只消费」——否则保活会继续拿废票刷新")
+	}
+	if !store.RefreshModeMap()["u-1"] {
+		t.Fatal("「只消费」必须落库（否则下次重启 SyncAccounts 会把它改回 auto）")
+	}
 	// 池内阻塞位必须被清：否则会出现"界面已复活、选号仍跳过"。
 	if st, ok := a.proxy.pool.Status("u-1"); ok {
 		if st.Cooling || st.ManualDisabled || st.Disabled {

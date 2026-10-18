@@ -1,15 +1,15 @@
 {
-  "version": "0.31.43",
+  "version": "0.31.44",
   "min_supported": "0.24.0",
-  "notes": "v0.31.43：agent 真机替换 + 探测链路三处实测缺陷（agent 0.3.4）。本轮把 agent 从 0.1.0 真机换到 0.3.x 时，暴露了三个\"看起来正常、其实是错的\"缺陷，全部修掉：① 平台机器私钥兜底错：`-key` 默认 key.pem，而平台部署目录放的是 ai.pem → 隧道每 10 秒重建、每次 Permission denied，界面上只显示\"隧道断开\"。现在自举未下发私钥时回退同目录 ai.pem（零参数可跑）。② 扫描目录是固定名单：实测本机装的是 `CodeBuddy CN`（带语言后缀），固定名单只有 `CodeBuddy` → 目录存在却一个候选都扫不到，而界面上与\"确实没有登录态\"完全一样。改为前缀匹配；并把桌面「号源/账号/accounts」纳入（只认这几个明确目录，不扫整个桌面——桌面其它 JSON 与账号无关，扫它们只是扩大隐私面）。③ 候选不分类型：导出备份与客户端登录态长得一样（都含两种 token），但用途相反——前者可用来重新导入，后者正是我们要躲的那条轮换链。新增 kind（exported/client），判据只用导出结构独有字段名；界面加「类型」列与「库内状态」对照（uid 前 8 位与号池比对：已失效/仅剩 access/已有/无此号），让人一眼看出\"这个备份对应哪个号、那个号是不是坏了\"。④ 幽灵机器清理：0.1.0 不带指纹登记成 default，升级后又登记成 m-xxxx，同 hostname 两条记录 → 页面又变成\"多了一台机器\"。新增 pruneStaleMachines（四条判据全中才删：无指纹 + 同 owner 存在有指纹且最近上报的记录 + hostname 相同非空 + 老记录超 1 天未上报），跨 owner 一律不动。⑤ 结论修正（重要）：实测本机把 WorkBuddy/CodeBuddy 的 AppData 全翻了一遍——**客户端不落明文登录态**（无 auth JSON、无 state.vscdb）。所以\"让本机成为唯一刷新者\"这条路在**代挂号**场景不成立：agent 跑在我们机器上，扫不到号主电脑；号主自己机器上也没有可跟随的文件。真正可行的只有两条：v0.31.40 的 passive（我方停手）与人工约束（号主退出客户端）。探测能力的正确定位因此调整为\"auth 备份发现\"（用于失效号重新导入），不是\"跟随写回\"的前置。测试：agent_prune_test.go（清理四条判据 + 六个反例 + 跨 owner）、authscan_test.go 新增 kind 两例；uitest 新增 agent-probe 守卫（并修掉 agent-update 把注释当字段的误报）。⑥ agent 真机替换（由运维代做，0.1.0 → 0.3.6）：实测暴露并修掉两处，自更新\"启动即检查\"写成了 now+interval（首次检查被推迟整整 6 小时，日志里与\"已是最新\"完全一样）→ 改零值初始化，并在\"无需更新/已 disabled\"时也留一行日志；出口 IP 探测只在 start 时跑一次且早于 wbproxy listen（connection refused 后永不重试）→ 改为保活循环定期刷新（成功 10 分钟、失败 1 分钟），并给失败加日志与新连接。真机结果：0.3.4 自更新到 0.3.5 一次成功（日志可见下载→改名校验→新进程接管），0.3.6 起 exit_ip=39.91.80.16 / tunnel_ok / 12 个候选。⑦ 常驻方式：本机用「启动」文件夹的 start-agent.bat（schtasks 与 reg 被安全策略禁用），token 移入 egress.json 而不再出现在命令行。",
+  "notes": "v0.31.44：部署链路可用化（三个一键入口 + 双平台发布包）+ 生产检查发现的任务失败不可见。① 发布件长期残缺：README 写着「下载对应平台的压缩包（附 SHA256SUMS.txt 可核对）」，而 Release 里只有一个裸 webapp.exe —— 压缩包、校验和、Linux 版三样都不存在，用户拿到的是一个双击弹黑框、不知道密钥在哪、也不知道怎么停的可执行文件。新增 scripts/package.py：一次产出 windows zip（exe + start-webapp.bat + 快速开始 + 完整说明）、linux tar.gz（二进制 + install.sh + 文档）与 SHA256SUMS.txt；打包前有敏感文件黑名单与白名单断言，包内版本号由脚本从 version.json 注入（手写版本一定会漂，旧脚本里还写着 v0.31.25）。② 三个一键入口（都在仓库里，包内也自带）：deploy/quickstart-windows.bat（双击：查版本→下载→解压→启动，每步失败都给出下一步，含 GitHub 不通时的替代路径）、deploy/install-linux.sh（装 systemd、幂等、覆盖前备份旧二进制、端口占用预检、--no-systemd 供容器）、deploy/start-webapp.bat（精简启动脚本，默认监听 127.0.0.1 而不是 0.0.0.0 —— 管理后台与网关同端口，绑 0.0.0.0 等于把它摆到局域网）。③ README 快速开始重写：一键部署优先、Docker/源码在后、补「装完四步」与「出问题先看这里」表格、旧网关迁移降级为「只有老部署需要看」；并修掉指向已删除 config.example.json 的死链。④ 生产检查发现（真问题）：cat（夜猫子）任务 38 个号失败 12 个，全部是 upstream client (http 401): <html>，而台账只记「fail 12」—— 要查原因只能翻 journalctl（会轮转、页面看不到），于是这件事一整天没被注意到。新增 runTally.failWith(label, err) 与 taskledger.Run.FailSamples（最多 6 条 + 显式截断说明），7 处失败点全部接入；管理端任务卡新增「失败原因」折叠区。⑤ 修一处口径不一致：revive 复活后置了 refresh_lost 却把 refresh_mode 留在 auto，保活仍每小时拿废票刷一次（生产 10 个号全是这状态）。现在复活同时降为 passive，可一键切回。测试：ledger_failsample_test.go（样本保留/截断/空数组）+ revive_token_test.go 补 passive 断言；uitest 新增 deploy-path 守卫。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.43/webapp.exe",
-      "sha256": "05b3fb19d6d4f1ef22473a972cf03e3ff6ded7d71ede2811da452ec529fee57c",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.44/webapp.exe",
+      "sha256": "32cb471f7da58c247124c45e0c70bdd4194bf4bccfa112bc27bdbb7107451e4d",
       "size": 15498240
     }
   ],

@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -735,7 +736,7 @@ func (s *Scheduler) runCheckin(trigger string) ([]CheckinOutcome, error) {
 		case CheckinSkipped:
 			t.skipped++
 		case CheckinFail:
-			t.fail++
+			t.failWith(logfmt.Label(oc.UID, oc.Nickname)+" "+strings.TrimSpace(oc.Detail), nil)
 		}
 	}
 	s.recordRun(taskCheckin, trigger, started, t)
@@ -986,7 +987,7 @@ func (s *Scheduler) runActivity(ctx context.Context, trigger string) {
 			}
 		}
 		if ok < count {
-			t.fail++
+			t.failWith(logfmt.Label(a.UID, a.Nickname)+" 活跃上报未发满", nil)
 			continue // N 条未发满：streak 自检与领养均无意义，下个账号
 		}
 		t.ok++
@@ -1258,7 +1259,7 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			time.Sleep(time.Duration(rand.Intn(s.cfg.KeepaliveJitterMs)+50) * time.Millisecond)
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			t.fail++
+			t.failWith(logfmt.Label(a.UID, a.Nickname), err)
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {

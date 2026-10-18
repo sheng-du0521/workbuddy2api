@@ -9,7 +9,9 @@
 package scheduler
 
 import (
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/taskledger"
@@ -26,12 +28,56 @@ const (
 //
 // 各任务在自己的遍历里累加，结束后交给 recordRun 一次性落账——不在这里做任何
 // 二次推断（比如从日志行反推成功数），避免口径分叉。
+// runFailSampleMax 台账里最多留几条失败样本。
+//
+// 6 条足够看出"是同一类错误还是各不相同的错误"，再多只是把 JSON 撑大。
+const runFailSampleMax = 6
+
 type runTally struct {
 	total, ok, already, fail, skipped int
 	note                              string
+	// fails / moreFails 失败样本与其被截断的条数（见 Run.FailSamples）。
+	fails     []string
+	moreFails int
 	// interrupted 本轮被 ctx 取消打断（优雅停机），计数是**部分**的。
 	// 此时不判全灭、不排重试：一轮只跑了 3 个号就停机，不代表上游全挂。
 	interrupted bool
+}
+
+// failWith 记一次失败，并留下「是哪个号、什么错」的样本。
+//
+// 所有 `t.fail++` 都应换成它 —— 只加计数不留原因的调用点，等于让下一次排查
+// 重新从 journalctl 里翻（那里会轮转）。err 可为 nil（失败原因在别处已记），
+// 此时只留 label。
+func (t *runTally) failWith(label string, err error) {
+	t.fail++
+	if len(t.fails) >= runFailSampleMax {
+		t.moreFails++
+		return
+	}
+	s := strings.TrimSpace(label)
+	if err != nil {
+		if s != "" {
+			s += ": "
+		}
+		s += err.Error()
+	}
+	if s == "" {
+		s = "（未提供原因）"
+	}
+	t.fails = append(t.fails, s)
+}
+
+// failSamples 交给台账的样本列表（含截断说明）。
+func (t *runTally) failSamples() []string {
+	if len(t.fails) == 0 {
+		return nil
+	}
+	out := append([]string(nil), t.fails...)
+	if t.moreFails > 0 {
+		out = append(out, fmt.Sprintf("…另有 %d 个失败未列出", t.moreFails))
+	}
+	return out
 }
 
 // recordRun 结束一轮执行：写台账，必要时排定当日失败重试，并返回这条记录。
@@ -54,7 +100,8 @@ func (s *Scheduler) recordRun(kind taskKind, trigger string, started time.Time, 
 		Started: started, Finished: finished,
 		Elapsed: finished.Sub(started).Round(time.Millisecond).String(),
 		Total:   t.total, OK: t.ok, Already: t.already, Fail: t.fail, Skipped: t.skipped,
-		Note: t.note,
+		Note:        t.note,
+		FailSamples: t.failSamples(),
 	}
 	r.AllFailed = !t.interrupted && r.Fail > 0 && r.OK+r.Already == 0
 	if t.interrupted {

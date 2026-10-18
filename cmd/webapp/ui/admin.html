@@ -4658,6 +4658,24 @@ function runCard(r) {
   pill('跳过', r.skipped);
   card.appendChild(pills);
   if (r.note) card.appendChild(el('div', 'muted', '备注：' + r.note));
+  // 失败样本（v0.31.44）：只显示「fail N」等于让运维去翻 journalctl ——
+  // 而那里会轮转、也不在页面上。生产 2026-10-18 的 cat 任务 38 个号挂 12 个，
+  // 就是因为在页面上只看到「失败 12」，一整天没人发现是 401。
+  if (r.fail_samples && r.fail_samples.length) {
+    const box = el('details');
+    box.style.marginTop = '6px';
+    const sum = el('summary', 'muted', '失败原因（前 ' + r.fail_samples.length + ' 条）');
+    sum.style.fontSize = '12px';
+    sum.style.cursor = 'pointer';
+    box.appendChild(sum);
+    for (const line of r.fail_samples) {
+      const d = el('div');
+      d.textContent = '· ' + line;
+      d.style.cssText = 'font-size:11px;color:#c0392b;word-break:break-all;margin-top:3px;';
+      box.appendChild(d);
+    }
+    card.appendChild(box);
+  }
   return card;
 }
 

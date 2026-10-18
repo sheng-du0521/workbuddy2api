@@ -429,40 +429,57 @@ v0.31.5 起本仓**只有一个产品**（`cmd/webapp`）。下列口径当年�
 
 ## 快速开始
 
-**一个产品：`webapp`** —— 网站 + 管理后台 + OpenAI 兼容网关，一个可执行文件。
+**一个可执行文件**：网站 + 管理后台 + OpenAI 兼容网关，共用 8780 端口。
 
 | 项 | 值 |
 |---|---|
 | 端口 | 8780（网站 / 管理后台 / `/v1` 网关共用） |
 | 入口 | `./webapp -addr 127.0.0.1:8780 -db ./data/webapp.db` |
-| 账号存储 | SQLite（`data/webapp.db`），支持桌面端 / 旧网关 `auths/*.json` 批量导入 |
-| 配置 | 命令行参数 + `WB2API_*` 环境变量（不再需要 `config.json`） |
+| 账号存储 | SQLite（`data/webapp.db`），可导入桌面端 / 旧网关的 `auths/*.json` |
+| 配置 | 命令行参数 + `WB2API_*` 环境变量（**没有** `config.json`） |
 
-> 🔀 **从旧网关 `wb2api`（7863）迁移**：
-> 1. 起 `webapp`，用管理密钥登录；
-> 2. 把 `auths/*.json` 逐个导入（页面「账号管理 → 导入」或接口）：
->    `curl -X POST http://127.0.0.1:8780/api/admin/accounts/import-desktop \
->      -H "X-Admin-Key: $(cat data/admin.key)" -H 'Content-Type: application/json' \
->      -d "{\"json\": $(cat auths/xxx.json), \"force\": true}"`
->    （`expiresAt` 写秒或毫秒都能吃，见 `cmd/webapp/import_desktop.go`）；
-> 3. **老命令与老脚本不用改**：`/status`、`/admin/accounts/{uid}/{disable,enable,revive}`、
->    `/admin/tasks/{name}/run` 这些旧网关接口在 webapp 上**同名同形状**实现（见 `cmd/webapp/compat.go`），
->    把 `cmd/acct` / `checkin.sh` 的地址指向 8780 即可；
-> 4. **旧网关已经删掉了**（v0.31.5 完成合并第二步）：`cmd/server`、`internal/server`、
->    `config.example.json`、`dist/wb2api.exe` 都不再存在；它的**对外契约**（`/status`、`/admin/*`、
->    任务触发）以兼容层形式保留在 webapp 里，所以老脚本/老命令照旧可用。Dockerfile / CI /
->    各构建脚本 / issue 模板也已全部切到单产品形态。
+### 方式一：一键部署（推荐，不用装 Go）
 
-**方式一：下载发布包（推荐，Web 版）**
+**Windows** —— 双击仓库里的 [`deploy/quickstart-windows.bat`](deploy/quickstart-windows.bat)：
+它会查最新版本 → 下载 → 解压到 `wb2api\` → 启动。全程不需要命令行。
+也可以手动下载 Releases 里的 `wb2api-<版本>-windows-amd64.zip`，解压后双击 `start-webapp.bat`。
 
-1. 从 [Releases](https://github.com/sheng-du0521/workbuddy2api/releases) 下载对应平台的压缩包（附 `SHA256SUMS.txt` 可核对）；
-2. 解压后双击 `start-webapp.bat`（Windows）或执行 `./webapp`；
-3. 浏览器打开 `http://127.0.0.1:8780`，用**管理密钥**登录。密钥按
-   **环境变量 `WB2API_ADMINKEY` → `data/admin.key` → 首次启动随机生成并落盘** 的顺序取，
-   启动日志里会打印一行提示（**取值为脱敏显示**）；
-4. 面板「账号管理 → 添加账号」扫码授权，账号自动入池。
+**Linux** —— 下载 Releases 里的 linux 包，解压后一条命令装成系统服务：
 
-**方式二：源码构建**
+```bash
+V=0.31.44   # 换成 Releases 里的最新版本号
+curl -LO "https://github.com/sheng-du0521/workbuddy2api/releases/download/v$V/wb2api-$V-linux-amd64.tar.gz"
+tar -xzf "wb2api-$V-linux-amd64.tar.gz" && cd "wb2api-$V"
+sudo ./install.sh            # 装到 /opt/wb2api + systemd，自动打印管理密钥
+# 容器里没有 systemd：./install.sh --no-systemd
+```
+
+装完浏览器打开 `http://127.0.0.1:8780/admin.html`，管理密钥在启动日志里，
+也保存在 `data/admin.key`（Windows 是 `data\admin.key`）。
+
+> 包内 `快速开始.txt` 是最短路径；`Web应用使用说明.md` 是完整说明（含各版本变更与排查）。
+> **默认只监听 127.0.0.1**：别的机器访问不到，这是有意的安全默认值。要对外提供服务，
+> 先改管理密钥、再加反向代理与 HTTPS，别直接把 `-addr` 改成 `0.0.0.0` 就扔公网。
+
+校验发布包（每个包都附 `SHA256SUMS.txt`）：
+
+```bash
+sha256sum -c SHA256SUMS.txt                    # Linux
+certutil -hashfile wb2api-*.zip SHA256         # Windows
+```
+
+### 方式二：Docker
+
+```bash
+docker compose up -d        # 8780 端口，数据在 ./data 卷
+```
+
+> 容器入口就是 `webapp`（网站 + 后台 + 网关）。迁移期沿用了 `./auths` 卷：
+> 把旧网关的账号目录挂进来一次性导入 SQLite，搬完即可删掉该挂载。
+> 国内构建建议 `--build-arg GOPROXY=https://goproxy.cn,direct`（官方 proxy 在大陆不可达，
+> 第一步 `go mod download` 会卡住）。
+
+### 方式三：源码构建
 
 ```bash
 git clone https://github.com/sheng-du0521/workbuddy2api.git
@@ -472,19 +489,38 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o webapp ./cmd/webapp
 ```
 
 > 要求 Go **1.26+**（`go.mod` 已声明，缺工具链时 `go` 会自动下载）。
-> `build.bat` 一次编译全部可执行文件（含 Web 版与命令行工具）。
+> `build.bat` 一次编译全部可执行文件；`scripts/package.py` 生成发布包（Windows/Linux + SHA256SUMS）。
 
-**方式三：Docker**
+### 装完这四步就能用
 
-```bash
-docker compose up -d        # 8780 端口（v0.31.4 起容器入口就是 webapp）
-```
+1. 用管理密钥登录 `/admin.html`（**首个管理员**注册时要填这个密钥，别人抢先注册也拿不到后台）；
+2. 「账号管理 → 添加账号」扫码授权，或导入桌面端导出的 auth JSON；
+3. 「API 密钥」为每个下游建一把 Key（各自独立计费与额度）；
+4. 下游的 Base URL 填 `http://<你的地址>:8780/v1`。
 
-> 容器入口 = `webapp`（网站 + 管理后台 + 网关），数据在 `./data` 卷（SQLite + 管理密钥）。
-> 迁移期沿用了 `./auths` 卷：把旧网关的账号目录挂进来，用 `docker-compose.yml` 里的导入命令
-> 一次性搬进 SQLite，搬完即可删掉该挂载（`config.json` 已不再挂载：webapp 用参数 + 环境变量）。
-> 国内构建建议 `--build-arg GOPROXY=https://goproxy.cn,direct`（官方 proxy 在大陆不可达，
-> 构建第一步 `go mod download` 会卡住）。
+### 出问题先看这里
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 浏览器打不开 | 服务没起来或端口被占。看启动窗口/`journalctl -u webapp -n 50`；换端口改 `-addr` |
+| 提示需要管理密钥但不知道是什么 | `data/admin.key` 的内容；或启动日志里「本次管理密钥」那一行 |
+| 换电脑 / 重装 | 整个 `data/` 目录拷过去即可（数据库 + 主密钥 + 管理密钥都在里面） |
+| 数据备份 | 停服务后拷 `data/webapp.db*`（含 `-wal`/`-shm`）；运行时直接拷可能少最后几条写入 |
+| 装完 `systemctl status` 是 failed | 多数是端口占用或 `data/` 不可写；`journalctl -u webapp -n 50 --no-pager` 有原文 |
+
+### 从旧网关 `wb2api`（7863）迁移
+
+> 只有 2026 年 10 月前就在用的老部署需要看这一节；新部署直接跳过。
+
+1. 起 `webapp`，用管理密钥登录；
+2. 把 `auths/*.json` 导入（页面「账号管理 → 导入」或接口）：
+   `curl -X POST http://127.0.0.1:8780/api/admin/accounts/import-desktop -H "X-Admin-Key: $(cat data/admin.key)" -H 'Content-Type: application/json' -d "{\"json\": $(cat auths/xxx.json), \"force\": true}"`
+   （`expiresAt` 写秒或毫秒都认）；
+3. **老脚本不用改**：`/status`、`/admin/accounts/{uid}/{disable,enable,revive}`、
+   `/admin/tasks/{name}/run` 在 webapp 上同名同形状实现（兼容层在 `cmd/webapp/compat.go`），
+   把 `cmd/acct` / `checkin.sh` 的地址指向 8780 即可；
+4. 旧网关已删除（v0.31.5）：`cmd/server`、`internal/server`、`config.example.json` 都不再存在，
+   但它的**对外契约**以兼容层形式保留。
 
 ---
 
@@ -621,7 +657,7 @@ curl http://127.0.0.1:8780/v1/chat/completions \
 |---|---|
 | 法律声明与边界 | [`NOTICE`](NOTICE) |
 | 开源协议 | [`LICENSE`](LICENSE) |
-| 配置样例 | [`config.example.json`](config.example.json) |
+| 一键部署脚本 | [`deploy/`](deploy)（Windows 双击 / Linux `install.sh`） |
 | 版本清单（供更新提醒） | [`version.json`](version.json) |
 | Web 版使用说明（含各版本变更 / 验证 / 诚实边界） | 随发布包分发（`Web应用使用说明.md`） |
 

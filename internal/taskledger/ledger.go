@@ -67,6 +67,14 @@ type Run struct {
 	Skipped   int       `json:"skipped"`
 	AllFailed bool      `json:"all_failed"`
 	Note      string    `json:"note,omitempty"`
+	// FailSamples 失败样本（前几条「谁 + 什么错」）。
+	//
+	// 为什么不能只记 Fail 计数（v0.31.44）：生产 2026-10-18 的 cat 任务
+	// 38 个号失败 12 个，而台账上只有「fail 12」。要查原因得去翻 journalctl，
+	// 而 journalctl 会轮转、也不在页面上 —— 于是"12 个号失败"这件事整整一天
+	// 没有被任何人注意到。**失败数量决定要不要重试，失败原因决定要不要处置账号**，
+	// 两者缺一不可。
+	FailSamples []string `json:"fail_samples,omitempty"`
 }
 
 // RetryState 一类任务的当日重试状态（按 CST 自然日惰性滚动）。

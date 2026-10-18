@@ -2690,6 +2690,65 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.44：**部署链路必须自解释**（小白能跑起来 + 发布包不缺件），
+  // 以及**任务失败必须留下原因**（只记数量等于让运维去翻会轮转的日志）。
+  const dpBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const exists = (rel) => fs.existsSync(path.join(ROOT, rel));
+
+    // 三个一键入口都必须在仓库里（去 Releases 下载的人拿不到仓库文件，
+    // 所以包内脚本也要有 —— 由 package.py 打进去）。
+    for (const f of ['deploy/start-webapp.bat', 'deploy/install-linux.sh',
+                     'deploy/quickstart-windows.bat', 'deploy/快速开始.txt', 'scripts/package.py']) {
+      if (!exists(f)) dpBad.push('缺少部署入口：' + f);
+    }
+    if (exists('deploy/start-webapp.bat')) {
+      const bat = read('deploy/start-webapp.bat');
+      // 默认绑定 127.0.0.1：管理后台与网关同端口，0.0.0.0 等于把它摆到局域网/公网。
+      if (!bat.includes('set "ADDR=127.0.0.1:8780"')) {
+        dpBad.push('start-webapp.bat 默认不是 127.0.0.1（管理后台会被暴露）');
+      }
+      if (!bat.includes('@VERSION@')) dpBad.push('start-webapp.bat 没有版本占位（会写死过期版本号）');
+    }
+    if (exists('deploy/install-linux.sh')) {
+      const sh = read('deploy/install-linux.sh');
+      if (!sh.includes('webapp.bak-')) dpBad.push('install.sh 覆盖二进制前没有备份');
+      if (!sh.includes('--no-systemd')) dpBad.push('install.sh 缺 --no-systemd（容器里没法用）');
+      if (!sh.includes('ss -lnt')) dpBad.push('install.sh 没有端口占用预检');
+    }
+    if (exists('scripts/package.py')) {
+      const pk = read('scripts/package.py');
+      if (!pk.includes('SHA256SUMS.txt')) dpBad.push('打包脚本不产 SHA256SUMS（README 承诺过它）');
+      if (!pk.includes('linux-amd64.tar.gz')) dpBad.push('打包脚本不产 Linux 包（服务器用户没东西可下）');
+      if (!pk.includes('FORBIDDEN')) dpBad.push('打包脚本没有敏感文件黑名单');
+      if (!pk.includes('@VERSION@')) dpBad.push('打包脚本没有注入版本号');
+    }
+    const readme = read('README.md');
+    if (!readme.includes('quickstart-windows.bat')) dpBad.push('README 没有指向一键部署入口');
+    if (readme.includes('(config.example.json)')) dpBad.push('README 仍链到已删除的 config.example.json');
+
+    // 任务失败样本：结构 → 收集 → 落账 → 页面，四段都要在。
+    if (!read('internal/taskledger/ledger.go').includes('FailSamples')) {
+      dpBad.push('台账没有 FailSamples 字段');
+    }
+    if (!read('internal/scheduler/ledger.go').includes('func (t *runTally) failWith(')) {
+      dpBad.push('缺少 failWith（失败原因没有收集入口）');
+    }
+    const sch = read('internal/scheduler/scheduler.go') + read('internal/scheduler/school.go')
+      + read('internal/scheduler/travel.go') + read('internal/scheduler/growth.go');
+    if (/t\.fail\+\+(?!\s*$)/m.test(sch) && !sch.includes('failWith')) {
+      dpBad.push('仍有裸 t.fail++（只计数不留原因）');
+    }
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('r.fail_samples')) dpBad.push('任务卡没有展示失败原因');
+  }
+  dpBad.forEach((m) => console.log('  [FAIL] deploy-path: ' + m));
+  if (!dpBad.length) {
+    console.log('  [ok] deploy-path: 三个一键入口齐备 + 包内脚本不写死版本 + 失败原因可读');
+  }
+
   // v0.31.43：**探测结果必须能直接用于决策**，且现场踩到的两个坑不能回来。
   //
   // 实测（2026-10-18）暴露三件事，每件都是"看起来正常、其实是错的"：

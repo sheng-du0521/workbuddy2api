@@ -151,6 +151,22 @@ func (a *app) reviveOne(uid string, dryRun bool) reviveResult {
 	if a.proxy.pool.Activate(uid) {
 		res.Actions = append(res.Actions, "activate")
 	}
+	// 同步降到「只消费」（v0.31.44 修）。
+	//
+	// 与 handleSessionDead 的分档保持一致：走到这里说明这个号的 refresh 已被上游判废
+	// （我们唯一的证据就是那次 12153），那它**不该继续主动刷新** —— 每刷一次都在撞
+	// 一张废票，而按上游的轮换制，用废票重刷可能触发"旧票重放"判定，把对方新签发的
+	// 那份也一起作废。
+	//
+	// 生产实测（2026-10-18）：复活后 10 个号都带 refresh_lost，但 refresh_mode 全是
+	// auto —— 保活仍在每小时尝试刷新一次，日志里不断出现失败。两处口径不一致的典型。
+	// 运维在号主退出本机客户端后可以点「恢复主动续期」切回 auto。
+	if err := a.store.SetRefreshMode(uid, refreshModePassive); err != nil {
+		log.Printf("WARN: [revive] %s 置「只消费」失败：%v", uid, err)
+	} else {
+		a.proxy.pool.SetPassiveRefresh(uid, true)
+		res.Actions = append(res.Actions, "passive")
+	}
 	res.State = "revived"
 	res.Note = "对话探活通过，已清失效标记；按「仅剩 access」提示在过期前重登一次即可完全恢复"
 	return res

@@ -450,7 +450,7 @@ func (s *Scheduler) runCat(trigger string) {
 				continue
 			}
 			log.Printf("cat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-			t.fail++
+			t.failWith(logfmt.Label(a.UID, a.Nickname), err)
 			continue
 		}
 		t.ok++

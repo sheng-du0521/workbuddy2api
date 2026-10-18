@@ -180,7 +180,7 @@ func (s *Scheduler) RunGrowthFor(ctx context.Context, uids []string) (int, int) 
 
 	creds, err := s.cfg.Growth.GrowthCredsByUID(uids)
 	if err != nil {
-		t.fail++
+		t.failWith("growth: 读取账号凭据失败", err)
 		t.note = "拉取账号凭证失败：" + err.Error()
 		log.Printf("growth: %s", t.note)
 		return 0, 0
@@ -218,7 +218,8 @@ func (s *Scheduler) RunGrowthFor(ctx context.Context, uids []string) (int, int) 
 				log.Printf("growth: 记录 %s 执行时间失败：%v", logfmtUID(cred), err)
 			}
 		} else {
-			t.fail++
+			// 具体原因在 runGrowthForAccount 里已打日志；台账只留"是哪个号"。
+			t.failWith(logfmtUID(cred), nil)
 			fails++
 			// 失败不重试本号：连续失败往往意味着账号本身有问题（token 失效 /
 			// 被风控），立刻重试只会把失败写得更密。由管理员决定是否再选一次。
