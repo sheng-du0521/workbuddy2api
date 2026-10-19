@@ -402,7 +402,16 @@ func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []s
 		// 相同，会把 default 改名接管（v0.31.18 幽灵机器防护）。两处都做，等于
 		// 一边删一边建。
 		if k == egressDefaultMachine {
-			continue
+			// default 桶的两种情形要分开（v0.31.48）：
+			//   · StateAt == 0：**只 poll、不上报状态**的老 agent —— 它每 5 秒建一次、
+			//     按时间判一定"很老"，删了就被下一次 poll 重建（v0.31.46 的无限循环）。
+			//     一律不碰。
+			//   · StateAt > 0：**曾经上报过状态**的 default = 升级前的旧身份。
+			//     若同一台机器已有带指纹的活跃记录，它就是幽灵，按下面的通用判据清掉
+			//     （它不会再上报，留着只会让页面显示"两台机器"）。
+			if v.StateAt == 0 {
+				continue
+			}
 		}
 		if strings.TrimSpace(v.Fingerprint) != "" {
 			continue
@@ -1832,6 +1841,15 @@ type egressHomeApplyResult struct {
 	// 拉一次，第一台电脑上那些号就被**静默搬走了** —— 两台机器最后都只有一台
 	// 在真正承重，看到的自然是同一个出口 IP。
 	Skipped int `json:"skipped,omitempty"`
+	// SkippedDirect 其中被**显式设为直连**（`direct` 哨兵）的号数（v0.31.48）。
+	//
+	// 单列出来是因为它和"绑在别的线路上"是**完全不同的两件事**：
+	//   · 绑在别的线路 → 那个人/那次操作已经做过选择，跳过是对的；
+	//   · 显式直连     → 这个号根本不会走任何代理，用户拉起代理后会发现
+	//     "号还在裸奔"。而直连很可能是**系统批量设置**的（比如统一走服务器那次），
+	//     不是号主的决定。
+	// 不分开说，用户只会看到"跳过 4 个"，然后以为代理没生效。
+	SkippedDirect int `json:"skipped_direct,omitempty"`
 	// RebindAll 本次是否强制改绑（用户显式要求）。
 	RebindAll bool   `json:"rebind_all,omitempty"`
 	Probed    bool   `json:"probed"`
@@ -2042,7 +2060,14 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 		}
 		res.HostTotal++
 		cur := strings.TrimSpace(acc.EgressProxy)
-		if cur == url {
+		// 本次要写的值（见下方注释）：平台视角且这条线路成为全局默认时写空。
+		// 先算出来再比较，否则"已经是跟随默认"的号每轮都会被算作一次"本次绑定" ——
+		// 幂等的结果对，但计数会虚高，运维会以为每次点都在改动号。
+		writeTo := url
+		if scope.Platform && res.DefaultOK {
+			writeTo = ""
+		}
+		if cur == writeTo {
 			res.HostBound++
 			continue
 		}
@@ -2054,9 +2079,23 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 		// 需要整体改绑时由调用方显式传 rebind_all=true（按钮文案也会写明）。
 		if !rebindAll && cur != "" {
 			res.Skipped++
+			if egress.IsDirect(cur) {
+				res.SkippedDirect++
+			}
 			continue
 		}
-		if err := a.store.SetAccountEgress(acc.UID, url); err != nil {
+		// 写到账号上的值：**如果这条线路刚被设为全局默认出口，就写空串**（v0.31.48）。
+		//
+		// 写死 URL 看似等价（都走这条线），但语义完全不同：
+		//   · 空串 = 跟随默认 → 默认变它就跟着变，且算"没做过决定"；
+		//   · URL  = 显式指定 → 之后用户拉起自己的线路、再点应用时，
+		//     「非破坏式绑定」会把它当成"已做过决定"而**跳过** ——
+		//     现场表现就是"我拉起了代理，也点了应用，可这些号还是从平台出口出去"。
+		//
+		// 平台视角最容易踩这个：它会把所有"跟随默认"的代挂号写成平台出口的 URL，
+		// 等于一次性把一批号标成"已决定"。rehome 那边已经改成写空（v0.31.47），
+		// 这里是同一条纪律的另一个入口。
+		if err := a.store.SetAccountEgress(acc.UID, writeTo); err != nil {
 			// 单个号失败不回滚整体：出口是一个"尽量覆盖"的配置，
 			// 回滚会让已经生效的部分也退回去（更难诊断）。如实计数即可。
 			log.Printf("WARN: [egress] 绑定自挂号出口失败 acct=%s: %v", acc.UID, err)

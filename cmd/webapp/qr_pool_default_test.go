@@ -159,3 +159,40 @@ func TestPruneNeverTouchesDefaultBucket(t *testing.T) {
 		t.Fatal("default 记录被删了 —— 老 agent 会每 5 秒重建一次")
 	}
 }
+
+// TestPruneRemovesGhostDefaultWithState 上报过状态的 default 幽灵要清，但只 poll 的不清。
+//
+// 两种 default 长得一样，区别在 StateAt：
+//   - 老 agent 只 poll、不带 state → StateAt=0 → 按时间判一定"很老"，
+//     删了立刻被下一次 poll 重建（v0.31.46 的无限循环）。绝不能碰。
+//   - 升级前的旧身份会上报过 state → StateAt>0，且同机已有带指纹的新记录 →
+//     它不会再上报，就是幽灵，不清就会让页面显示"两台机器"。
+func TestPruneRemovesGhostDefaultWithState(t *testing.T) {
+	now := time.Now().Unix()
+
+	// 情形一：default 有 StateAt、超期、同机有活跃新记录 → 清。
+	m := map[string]*egressMachine{
+		"default": {ID: "default", Hostname: "PC-A", StateAt: now - 3*staleMachineAge},
+		"m-new":   {ID: "m-new", Hostname: "PC-A", Fingerprint: "fp1", StateAt: now},
+	}
+	if got := pruneStaleMachines(m, now, 0); len(got) != 1 || got[0] != "default" {
+		t.Fatalf("应清掉幽灵 default，实得 %v", got)
+	}
+
+	// 情形二：default 只有 CreatedAt（老 agent 只 poll）→ 永不清。
+	m2 := map[string]*egressMachine{
+		"default": {ID: "default", Hostname: "PC-A", CreatedAt: now - 30*staleMachineAge},
+		"m-new":   {ID: "m-new", Hostname: "PC-A", Fingerprint: "fp1", StateAt: now},
+	}
+	if got := pruneStaleMachines(m2, now, 0); len(got) != 0 {
+		t.Fatalf("只 poll 的 default 不该被清（会无限删建），实得 %v", got)
+	}
+
+	// 情形三：default 有 StateAt 但**没有**同机新记录 → 不清（它可能就是唯一的那台）。
+	m3 := map[string]*egressMachine{
+		"default": {ID: "default", Hostname: "PC-B", StateAt: now - 3*staleMachineAge},
+	}
+	if got := pruneStaleMachines(m3, now, 0); len(got) != 0 {
+		t.Fatalf("没有替代记录时不该清，实得 %v", got)
+	}
+}

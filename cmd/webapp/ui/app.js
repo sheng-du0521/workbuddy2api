@@ -4067,6 +4067,13 @@ function renderEgressHome(box, v) {
         const ap = (d && d.applied) || {};
         let msg = '已应用：绑定 ' + (ap.host_bound || 0) + ' 个号';
         if (ap.skipped) msg += '，跳过 ' + ap.skipped + ' 个（已显式绑在别的线路上）';
+        // 显式直连要**单独说**（v0.31.48）：这些号根本不会走任何代理，
+        // 用户拉起代理后会以为"已经生效"，其实号还在裸奔。而 direct 很可能是
+        // 系统批量设的（统一走服务器那次），不是号主的选择 —— 必须让他知道要改。
+        if (ap.skipped_direct) {
+          msg += '；其中 ' + ap.skipped_direct + ' 个被设为「直连」（不走代理），'
+            + '要让它们走这条线路请点「全部改绑」';
+        }
         if (isPlatform) msg += '；默认出口 ' + (ap.default_ok ? '已设置' : '未设置');
         toast(msg, 'ok');
         if (ap.skipped) {
@@ -4297,7 +4304,12 @@ async function egressPull(v) {
       egressTimer = null;
       try {
         const d = await post('/api/egress/home/apply', { machine });
-        toast('已就绪并自动应用：自挂号绑定 ' + (d.applied ? d.applied.host_bound : 0) + ' 个', 'ok');
+        const ap = (d && d.applied) || {};
+        let msg = '已就绪并自动应用：自挂号绑定 ' + (ap.host_bound || 0) + ' 个';
+        if (ap.skipped_direct) {
+          msg += '；但 ' + ap.skipped_direct + ' 个号是「直连」（不走代理），需点「全部改绑」才会走本机出口';
+        }
+        toast(msg, ap.skipped_direct ? 'warn' : 'ok');
       } catch (e) {
         toast(egressMsg('已就绪，但自动应用失败：' + (e && e.message ? e.message : e)), 'bad');
       }

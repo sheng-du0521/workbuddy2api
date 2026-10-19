@@ -295,8 +295,14 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	for _, acc := range accs {
 		byUID[acc.UID] = acc.EgressProxy
 	}
-	if byUID["ea-host"] != "http://127.0.0.1:11080" {
-		t.Fatalf("自挂号应被显式绑定到本地线路，得 %q", byUID["ea-host"])
+	// 平台视角 apply 的口径（v0.31.48）：这条线路**成为全局默认出口**时，
+	// 自挂号写**空串**（= 跟随默认）而不是写死 URL。
+	//
+	// 两者"现在都走这条线"，但语义不同：写空算"没做过决定"，
+	// 之后用户拉起自己的线路再点应用时会被正常接管；写死 URL 会被
+	// 「非破坏式绑定」当成"已决定"跳过 —— 现场就是"拉起了、点了应用，号还在平台出口"。
+	if byUID["ea-host"] != "" {
+		t.Fatalf("平台 apply 后自挂号应为「跟随默认」（空串），得 %q", byUID["ea-host"])
 	}
 	if byUID["ea-plat"] != "" {
 		t.Fatalf("平台号不该被写显式绑定（跟随全局默认即可），得 %q", byUID["ea-plat"])
