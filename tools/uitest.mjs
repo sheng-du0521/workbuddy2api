@@ -2447,7 +2447,7 @@ function run(pageFile, meOverride, plan) {
               { id: 'health-check', name: '账号健康检测', desc: '桩',
                 audience: 'both', builtin: true, enabled: true, active: true, kind: 'health' },
               { id: 'host-egress', name: '平台直属出口', desc: '桩',
-                audience: 'admin', builtin: true, enabled: true, active: true, kind: 'egress' },
+                audience: 'admin', scope: 'platform', builtin: true, enabled: true, active: true, kind: 'egress' },
             ] };
             return Promise.resolve({ ok: true, status: 200,
               text: () => Promise.resolve(JSON.stringify(PLUG)),
@@ -2481,6 +2481,15 @@ function run(pageFile, meOverride, plan) {
     } else {
       const openBtn = Array.from(egrCard.querySelectorAll('button'))
         .find((b) => String(b.textContent).trim() === '打开');
+      const cardTxt = String(egrCard.textContent);
+      // v0.31.57：管理员在**控制台**里看到平台插件，必须能看出它不是个人插件。
+      // 少了这两条，他会以为关掉只影响自己 —— 实际会影响所有管理员与运维脚本。
+      if (cardTxt.indexOf('平台能力') < 0) {
+        egrAdminBad.push('平台插件卡没有「平台能力」标签（会被误当成个人偏好）');
+      }
+      if (cardTxt.indexOf('全局启用（平台级）') < 0) {
+        egrAdminBad.push('平台插件卡没有平台级开关文案');
+      }
       if (!openBtn) egrAdminBad.push('「平台直属出口」卡上没有「打开」按钮');
       else {
         openBtn.click();
@@ -2507,6 +2516,36 @@ function run(pageFile, meOverride, plan) {
   egrAdminBad.forEach((m) => console.log('  [FAIL] egress-admin: ' + m));
   if (!egrAdminBad.length) {
     console.log('  [ok] egress-admin: 管理员仍可打开平台直属出口（立线路/看承重），且不提供逐号分配');
+  }
+
+  // v0.31.57：入口**在服务端**也必须成立（不能只靠前端桩）。
+  // 两条不变量：
+  //   ① 控制台接口对管理员必须下发 admin 插件（否则界面上永远没有入口）；
+  //   ② 插件停用必须真的拦住出口端点（否则那个开关只是把按钮变灰）。
+  const egrPluginBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const src = fs.readFileSync(path.join(ROOT, 'cmd/webapp/plugins.go'), 'utf8');
+    if (src.indexOf('isAdmin && def.Audience == "admin"') < 0) {
+      egrPluginBad.push('控制台插件列表没有把 admin 插件下发给管理员（入口会再次消失）');
+    }
+    if (src.indexOf('Scope: scope') < 0) {
+      egrPluginBad.push('插件视图没有下发 scope（前端只能猜启停通道，会写错键）');
+    }
+    const ag = fs.readFileSync(path.join(ROOT, 'cmd/webapp/egress_agent.go'), 'utf8');
+    const gate = fs.readFileSync(path.join(ROOT, 'cmd/webapp/egress_ssh.go'), 'utf8');
+    if (ag.indexOf('func (a *app) egressPluginGate(') < 0) {
+      egrPluginBad.push('缺少 egressPluginGate（停用插件后接口仍可执行）');
+    }
+    // gate 至少要在 4 个地方被调用：平台守卫、home、install（ssh 文件里第 3 处）。
+    const calls = (ag.split('a.egressPluginGate(w)').length - 1) + (gate.split('a.egressPluginGate(w)').length - 1);
+    if (calls < 4) {
+      egrPluginBad.push('egressPluginGate 调用点只有 ' + calls + ' 处（拉起/应用/修复/安装包都要拦）');
+    }
+  }
+  egrPluginBad.forEach((m) => console.log('  [FAIL] egress-plugin: ' + m));
+  if (!egrPluginBad.length) {
+    console.log('  [ok] egress-plugin: 管理员可见 + scope 下发 + 停用真的拦住出口端点');
   }
 
   // v0.31.55：用户端必须有「模型可用状态」（模型冷却）卡片。
@@ -2618,7 +2657,7 @@ function run(pageFile, meOverride, plan) {
         builtin: true, enabled: true, active: true, kind: 'claim' },
       { id: 'health-check', name: '账号健康检测', desc: '桩', audience: 'both',
         builtin: true, enabled: true, active: true, kind: 'health' },
-      { id: 'host-egress', name: '平台直属出口', desc: '桩', audience: 'admin',
+      { id: 'host-egress', name: '平台直属出口', desc: '桩', audience: 'admin', scope: 'platform',
         builtin: true, enabled: true, active: true, kind: 'egress' },
     ] };
     const HEALTH = {
@@ -3322,7 +3361,7 @@ function run(pageFile, meOverride, plan) {
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
     && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
-    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && mcBad.length === 0;
+    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && egrPluginBad.length === 0 && mcBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

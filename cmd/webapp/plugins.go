@@ -208,6 +208,15 @@ type pluginView struct {
 	// 散在两个前端文件里各拼一遍，迟早有一边忘了 && 另一边。服务端算一次，
 	// 前端只渲染。
 	Active bool `json:"active"`
+	// Scope 这个插件的**启停归属**："platform" / "user"（v0.31.57）。
+	//
+	// 为什么需要它：用户控制台里现在也会出现平台级插件（管理员登录时），
+	// 而"启用/停用"这个动作对两类插件走的是**不同的键**：
+	//   · platform → 平台级 kv `plugin_enabled_<id>`（影响所有人）
+	//   · user     → 用户级 kv `plugin_user_off_<uid>_<id>`（只影响自己）
+	// 前端如果按 `audience` 自己猜，猜错就会写出"看起来点过了、其实没生效"的偏好；
+	// 服务端下发这个字段，前端只负责按它选通道。
+	Scope string `json:"scope"`
 }
 
 // audienceVisible 该插件对某个端是否可见。
@@ -215,31 +224,53 @@ func audienceVisible(def pluginDef, want string) bool {
 	return def.Audience == "both" || def.Audience == want
 }
 
-// handlePluginList 插件列表。
+// pluginListView 组装插件列表。
 //
-// 管理端（wantAdmin=true）拿到 admin/both 的插件与**启停**信息；
-// 用户端只拿到 user/both 的插件，且**不下发 audience/builtin/enabled 以外的
-// 平台运维信息**（用户不需要知道平台还有哪些插件）。
-func (a *app) pluginListView(wantAdmin bool, userID int64) []pluginView {
+// vis 是**页面视角**，不是"能不能看"：
+//   - "admin"   管理后台：admin/both（不含 user-only，那个在控制台）
+//   - "console" 用户控制台：user/both；**登录者是管理员时再加上 admin**
+//
+// 为什么控制台要给管理员看 admin 插件（v0.31.57）：
+// 产品把出口代理收敛成平台能力后，管理员仍需要一条**人能在界面上走通**的路
+// 去拉起平台机器。只在管理后台「代理」页做，等于让"拉起"与"分配"混在一屏；
+// 而插件是"持续运行的基础设施"的天然位置。此前的实现把 `Audience=admin`
+// 直接当成"控制台一律不显示"，于是管理员登录控制台也看不到那个插件 ——
+// 入口在代码里存在、在界面上不存在，用户报的就是这件事。
+//
+// 但"可见"不等于"可共用一套启停语义"：平台插件的启停是**平台级决定**，
+// 不能落进某个管理员的用户级偏好里，所以逐条下发 Scope 由前端选通道。
+func (a *app) pluginListView(vis string, userID int64, isAdmin bool) []pluginView {
 	out := make([]pluginView, 0, len(pluginRegistry))
 	for _, def := range pluginRegistry {
-		if wantAdmin {
-			if !audienceVisible(def, "admin") {
-				continue
-			}
-		} else if !audienceVisible(def, "user") {
+		include := false
+		switch vis {
+		case "admin":
+			include = audienceVisible(def, "admin")
+		default: // console
+			include = audienceVisible(def, "user") || (isAdmin && def.Audience == "admin")
+		}
+		if !include {
 			continue
 		}
+
 		globalOn := a.pluginEnabled(def.ID)
-		// 管理端没有"某个用户"这个上下文 → user_enabled 恒 true（见 pluginView 注释）。
+		scope := "user"
 		userOn := true
-		if !wantAdmin {
+		switch {
+		case vis == "admin":
+			// 管理端没有"某个用户"这个上下文（见 pluginView 注释）。
+			scope = "platform"
+		case def.Audience == "admin":
+			// 管理员在控制台里看到的平台插件：启停即平台级。
+			scope = "platform"
+		default:
 			userOn = a.pluginUserEnabled(userID, def.ID)
 		}
 		out = append(out, pluginView{
 			ID: def.ID, Name: def.Name, Desc: def.Desc,
 			Audience: def.Audience, Builtin: def.Builtin, Kind: def.Kind,
-			Enabled: globalOn, UserEnabled: userOn, Active: globalOn && userOn,
+			Enabled: globalOn, UserEnabled: userOn,
+			Active: globalOn && userOn, Scope: scope,
 		})
 	}
 	return out
@@ -247,16 +278,33 @@ func (a *app) pluginListView(wantAdmin bool, userID int64) []pluginView {
 
 // handleAdminPluginList GET /api/admin/plugins
 func (a *app) handleAdminPluginList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView(true, 0)})
+	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView("admin", 0, true)})
 }
 
 // handleUserPluginList GET /api/plugins （控制台）
 func (a *app) handleUserPluginList(w http.ResponseWriter, r *http.Request) {
 	var uid int64
+	isAdmin := false
 	if u := userFrom(r); u != nil {
 		uid = u.ID
+		// 只有**活跃**管理员才看得到平台插件：停用中的管理员账号不该在
+		// 控制台里继续拿到平台能力的入口（服务端各端点另有守卫，这里是第一道）。
+		isAdmin = u.IsAdmin() && u.Status == StatusActive
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView(false, uid)})
+	writeJSON(w, http.StatusOK, map[string]any{"plugins": a.pluginListView("console", uid, isAdmin)})
+}
+
+// setPluginEnabled 写**平台级**启停（唯一入口，v0.31.57）。
+//
+// 抽出来的理由：同一个决定现在有两个入口 —— 管理后台「插件」页，
+// 以及管理员在控制台里对平台插件点开关。两处各写一遍 kv 拼接，
+// 迟早有一处漏了 trim/默认值，表现成"在这个页面能关、在那个页面关不掉"。
+func (a *app) setPluginEnabled(id string, on bool) error {
+	v := "0"
+	if on {
+		v = "1"
+	}
+	return a.store.SetKV(pluginEnabledKV+id, v)
 }
 
 // handlePluginToggle POST /api/admin/plugins/{id}/enabled  body {"enabled":bool}
@@ -277,11 +325,7 @@ func (a *app) handlePluginToggle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误（需要 enabled 布尔）"})
 		return
 	}
-	v := "0"
-	if *req.Enabled {
-		v = "1"
-	}
-	if err := a.store.SetKV(pluginEnabledKV+id, v); err != nil {
+	if err := a.setPluginEnabled(id, *req.Enabled); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -309,10 +353,6 @@ func (a *app) handlePluginUserToggle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "插件不存在"})
 		return
 	}
-	if !audienceVisible(def, "user") {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "该插件对本端不可用"})
-		return
-	}
 	u := userFrom(r)
 	if u == nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
@@ -323,6 +363,34 @@ func (a *app) handlePluginUserToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enabled == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误（需要 enabled 布尔）"})
+		return
+	}
+	// 平台级插件（Audience=admin）在控制台里的开关 = **平台开关**（v0.31.57）。
+	//
+	// 为什么不是"拒绝"：管理员在控制台里打开「平台直属出口」面板后，
+	// 如果这个开关点了报 403，他会以为"控制台里这个插件坏了"；
+	// 而语义上他要的确实是"把这项平台能力开起来/关掉"。
+	//
+	// 为什么普通人仍然拒绝：非管理员看到这个插件的前端入口都不会有，
+	// 直接调接口更是越权 —— 平台级开关影响所有人，不能由单个用户动。
+	if !audienceVisible(def, "user") {
+		if !u.IsAdmin() || u.Status != StatusActive {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "该插件是平台能力，仅管理员可启停",
+				"code":  "platform_only",
+			})
+			return
+		}
+		if err := a.setPluginEnabled(def.ID, *req.Enabled); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		log.Printf("INFO: [plugins] %s 已%s（管理员在控制台操作，平台级）", def.ID,
+			map[bool]string{true: "启用", false: "停用"}[*req.Enabled])
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": def.ID, "enabled": *req.Enabled, "user_enabled": true,
+			"scope": "platform",
+		})
 		return
 	}
 	// 平台已停用时，用户点"启用"没有意义 —— 明确拒绝，而不是静默写一条永远不生效的

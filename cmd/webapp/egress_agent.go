@@ -1392,6 +1392,11 @@ func (s egressScope) label() string {
 func (a *app) egressPlatformGuard(next func(http.ResponseWriter, *http.Request, egressScope)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.authorized(r) { // X-Admin-Key 通道（运维 / 脚本）
+			// v0.31.57：运维通道同样受平台开关约束 —— 停用插件的语义是
+			// "这项能力现在不提供"，不是"只对浏览器不提供"。
+			if a.egressPluginGate(w) {
+				return
+			}
 			next(w, r, egressScope{Platform: true})
 			return
 		}
@@ -1411,8 +1416,32 @@ func (a *app) egressPlatformGuard(next func(http.ResponseWriter, *http.Request, 
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "账号已被停用"})
 			return
 		}
+		if a.egressPluginGate(w) {
+			return
+		}
 		next(w, withUser(r, u), egressScope{UserID: u.ID, Platform: true})
 	}
+}
+
+// egressPluginGate 插件停用时**真的**拒绝执行（v0.31.57）。
+//
+// 为什么必须有这一层：此前「停用插件」只做到"列表里标灰 + 打开按钮禁用"，
+// 而 egress 系列是独立界面，不经过 handlePluginClaim，于是停用之后
+// 直接调 /api/egress/home/pull 仍然能把隧道拉起来 —— 那个开关是假的。
+//
+// 口径与 handlePluginClaim 一致：**平台停用 = 一律不可用**。
+// 返回 true 表示已经写过响应，调用方直接 return。
+func (a *app) egressPluginGate(w http.ResponseWriter) bool {
+	if a.pluginEnabled(pluginIDHostEgress) {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]any{
+		"error":  "「平台直属出口」插件已被停用：请先在「插件」页启用后再操作",
+		"code":   "plugin_disabled",
+		"plugin": pluginIDHostEgress,
+		"hint":   "管理员可在用户控制台「插件」页（或管理后台「插件」页）重新启用；停用期间已建立的隧道不受影响，但不能拉起/应用/修复",
+	})
+	return true
 }
 
 // egressMachineFor 取一台机器并按视角校验归属。
@@ -1631,6 +1660,9 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 
 // handleEgressHome GET /api/egress/home（登录可见，只读）
 func (a *app) handleEgressHome(w http.ResponseWriter, r *http.Request) {
+	if a.egressPluginGate(w) {
+		return
+	}
 	// v0.31.53：这个视图只剩平台视角（路由挂 adminGuard，普通用户进不来）。
 	//
 	// 运维密钥（X-Admin-Key）通道没有会话 → userFrom 为 nil，UserID 保持 0；

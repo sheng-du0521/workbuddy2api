@@ -418,6 +418,10 @@ func (p egressAgentConfigPayload) JSON() ([]byte, error) {
 //
 // 返回一个可双击运行的 .bat。**响应是附件下载**（不是页面），浏览器会直接存盘。
 func (a *app) handleEgressInstall(w http.ResponseWriter, r *http.Request) {
+	// v0.31.57：插件停用时不再签发安装包 —— 否则等于"关了门还发钥匙"。
+	if a.egressPluginGate(w) {
+		return
+	}
 	// v0.31.53：安装包只面向平台机器（路由挂 adminGuard）。
 	// 不再按登录用户生成 —— 用户端代理下线后，用户手里不该再有"带令牌的安装包"。
 	scope := egressScope{Platform: true}

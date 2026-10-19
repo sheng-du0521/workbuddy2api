@@ -2820,10 +2820,17 @@ function pluginCard(p) {
   const card = el('div', 'card');
   card.style.marginBottom = '14px';
 
-  const isAdminScope = pluginScope() === 'admin';
+  // 页面视角 ≠ 插件归属（v0.31.57）：
+  //   · pageIsAdmin   管理后台「插件」页（这里每一条都是平台级）
+  //   · platformScope 这条插件的启停走**平台级**开关
+  // 控制台里也可能出现平台级插件（管理员登录时才会下发），所以不能再用
+  // 「页面是不是管理端」去决定开关语义 —— 那会让管理员在控制台点开关时
+  // 走用户级接口，服务端写的是平台键，前端却以为只影响自己。
+  const pageIsAdmin = pluginScope() === 'admin';
+  const platformScope = pageIsAdmin || p.scope === 'platform';
   // 生效口径由服务端算好（`active = 平台启用 && 用户启用`），前端只渲染 ——
   // 两边各拼一遍 `a && b` 迟早有一边漏。
-  const active = isAdminScope ? !!p.enabled : !!p.active;
+  const active = pageIsAdmin ? !!p.enabled : !!p.active;
 
   const head = el('div', 'section-head');
   head.appendChild(el('h2', null, p.name));
@@ -2838,6 +2845,15 @@ function pluginCard(p) {
   kindTag.style.marginLeft = '6px';
   if (kl.title) kindTag.title = kl.title;
   head.appendChild(kindTag);
+  if (!pageIsAdmin && platformScope) {
+    // 管理员在控制台里看到平台插件时，必须一眼看出"这不是我的个人插件"：
+    // 否则他会以为关掉只影响自己，实际关了所有人。
+    const scopeTag = el('span', 'tag warn', '平台能力');
+    scopeTag.style.fontSize = '12px';
+    scopeTag.style.marginLeft = '6px';
+    scopeTag.title = '平台级插件：这里的开关影响所有管理员与运维脚本，不是个人偏好';
+    head.appendChild(scopeTag);
+  }
   card.appendChild(head);
 
   card.appendChild(el('div', 'sub', p.desc || ''));
@@ -2849,10 +2865,12 @@ function pluginCard(p) {
   row.style.alignItems = 'center';
   row.style.gap = '8px';
 
-  if (isAdminScope) {
-    // 平台级开关：动的是"要不要把这项能力提供给用户"，影响所有人。
-    row.appendChild(pluginToggleSwitch(p, !!p.enabled, false, '全局启用',
-      '平台级开关：影响所有用户。用户各自的启用偏好不受它影响（但平台停用时一律不可用）'));
+  if (platformScope) {
+    // 平台级开关：动的是"要不要把这项能力提供出去"，影响所有人。
+    // 控制台里的平台插件也走这条（服务端对管理员开放平台级写入）。
+    row.appendChild(pluginToggleSwitch(p, !!p.enabled, false,
+      pageIsAdmin ? '全局启用' : '全局启用（平台级）',
+      '平台级开关：影响所有用户与运维脚本。停用后该能力的所有端点都会拒绝执行，不只是隐藏入口'));
   } else {
     // 用户级开关（v0.31.22）：只影响"我自己"，动不了平台开关。
     const globallyOff = p.enabled === false;
@@ -2871,7 +2889,9 @@ function pluginCard(p) {
   btnOpen.disabled = !active;
   btnOpen.title = active
     ? '进入独立界面（占满内容区，带返回栏）'
-    : '插件已停用：先启用再打开';
+    : (platformScope
+      ? '插件已被平台停用：先在上面的开关启用（会影响所有人）'
+      : '插件已停用：先启用再打开');
   btnOpen.addEventListener('click', () => openPluginView(p));
   row.appendChild(btnOpen);
 
@@ -3377,9 +3397,60 @@ async function loadEgressHome() {
     const v = await api('/api/egress/home');
     renderEgressHome(box, v);
   } catch (e) {
-    box.textContent = '';
-    box.appendChild(el('div', 'sub', '读取出口状态失败：' + (e && e.message ? e.message : e)));
+    renderEgressHomeError(box, e);
   }
+}
+
+// renderEgressHomeError 把"读不到状态"的几种原因分开说（v0.31.57）。
+//
+// 以前所有失败都是同一句"读取出口状态失败：<原文>"。三种原因的**下一步动作
+// 完全不同**，混在一起时用户只会做错的那件事：
+//   · plugin_disabled → 去插件页把开关打开（不是网络问题，重试一百次都一样）
+//   · platform_only   → 这个账号不是管理员（换账号，不是修配置）
+//   · 其它            → 网络/服务异常，值得重试
+function renderEgressHomeError(box, e) {
+  box.textContent = '';
+  const code = (e && e.data && e.data.code) || '';
+  const msg = String((e && e.message) || e || '未知错误');
+
+  const card = el('div', 'card');
+  const head = el('div', 'section-head');
+  head.appendChild(el('h2', null, '出口状态'));
+  card.appendChild(head);
+
+  const notice = (text) => {
+    const w = el('div', null, text);
+    w.style.cssText = 'margin:8px 0;padding:8px 10px;border-left:3px solid #c0392b;' +
+      'background:rgba(192,57,43,.08);font-size:12px;';
+    return w;
+  };
+
+  const row = el('div', 'row');
+  row.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;';
+
+  if (code === 'plugin_disabled') {
+    card.appendChild(notice('「平台直属出口」插件当前是停用状态，所以这里不能拉起或应用代理。'));
+    card.appendChild(el('div', 'sub', msg));
+    const go = el('button', null, '去插件页启用');
+    go.onclick = () => { if (typeof window.navGo === 'function') window.navGo('plugins'); };
+    row.appendChild(go);
+    const retry = el('button', 'ghost', '启用后重试');
+    retry.onclick = () => loadEgressHome();
+    row.appendChild(retry);
+  } else if (code === 'platform_only' || /需要管理员|仅管理员|平台能力/.test(msg)) {
+    card.appendChild(notice('出口代理是平台能力，只有管理员账号能操作。'));
+    card.appendChild(el('div', 'sub', msg));
+    card.appendChild(el('div', 'sub',
+      '如果你只是想调整自己账号的出口，请联系平台管理员在「管理后台 → 代理」里分配。'));
+  } else {
+    card.appendChild(notice('读取出口状态失败。'));
+    card.appendChild(el('div', 'sub', msg));
+    const retry = el('button', 'ghost', '重试');
+    retry.onclick = () => loadEgressHome();
+    row.appendChild(retry);
+  }
+  card.appendChild(row);
+  box.appendChild(card);
 }
 
 // ======================================================================
@@ -3742,7 +3813,11 @@ function renderEgressHome(box, v) {
 
   // ---- 操作区 ----
   if (!v.can_manage) {
-    const tip = el('div', 'sub', '当前账号没有执行出口操作的权限；上面是只读状态。');
+    // v0.31.57：把"谁能用"写清。控制台里只有管理员会看到这个插件，
+    // 但仍可能因为会话被降权/账号被停用而拿到只读视图 —— 这时必须说明是权限问题，
+    // 而不是让用户以为"页面坏了"。
+    const tip = el('div', 'sub',
+      '当前账号没有执行出口操作的权限（出口代理是平台能力，仅活跃管理员可用）；上面是只读状态。');
     tip.style.marginTop = '10px';
     card.appendChild(tip);
     box.appendChild(card);
@@ -3971,10 +4046,23 @@ function egressWatchInstall() {
 
 // egressPull 一键拉起：向**选中的那台机器**下发指令 → 轮询状态 → 就绪后自动应用配置。
 async function egressPull(v) {
-  if (egressTimer) return;
+  // 重复拉起（v0.31.57）：以前这里是静默 return —— 用户看到按钮没反应，
+  // 会以为"炸了"，于是狂点。现在明确说"上一次还在跑"，并给出最坏等待时间。
+  if (egressTimer) {
+    toast('正在拉起中：上一台机器还没完成（最长 90 秒），请等它结束再试', 'warn');
+    return;
+  }
   const machine = egressSelMachine;
   if (!machine) {
     toast('还没有已接入的机器：请先在目标电脑上运行 agent（本页下方有命令）', 'bad');
+    return;
+  }
+  // 目标机器明显离线时**前端先拦一道**（服务端也会回 409）：省掉 90 秒干等。
+  const target = ((v && v.machines) || []).find((m) => m.id === machine);
+  if (target && target.online === false && Number(target.offline_sec) > 120) {
+    const label0 = egressLabels[machine] || machine;
+    toast('「' + label0 + '」已经 ' + egressAgo(target.offline_sec) +
+      '没有任何心跳：请先在那台电脑上启动 agent（或改选在线的机器）', 'bad');
     return;
   }
   // 提示里用**主机名**而不是机器 id：用户视角的 id 是 `u12:abc…` 这种内部键，
