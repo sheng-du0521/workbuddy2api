@@ -400,6 +400,122 @@ func (p *Proxy) SyncAccounts() error {
 //
 // Added/Removed 需要与「上一次」比较，故首次调用（lastSyncedUIDs 为空）不计新增，
 // 只建立基线——否则第一次点会显示「新增 5」，看着像刚导入，其实是既有账号。
+// lineState 线路在池里的**运行态**（v0.31.47）。
+//
+// 与 egress.Validate 的分工：那是"这个 URL 格式对不对"，这是"这条线现在能不能用"。
+// 二者缺一不可 —— 只校验格式，就会出现"线路已被探活停用、账号仍被选中"的
+// 持续失败（2026-10-19 现场：用户拉起代理后全部请求失败，而页面上线路已停用）。
+type lineState struct {
+	Name       string
+	Enabled    bool
+	FailStreak int64
+}
+
+// unusableReason 这条线路当前是否不可用；可用返回空串。
+func (ls lineState) unusableReason() string {
+	if !ls.Enabled {
+		return "出口线路已停用"
+	}
+	if ls.FailStreak >= egressFailThreshold {
+		return fmt.Sprintf("出口线路连续 %d 次探活失败", ls.FailStreak)
+	}
+	return ""
+}
+
+// loadLineStates 读线路池，按**规范化 URL** 建索引（与账号侧写入口径一致）。
+func (p *Proxy) loadLineStates() map[string]lineState {
+	out := map[string]lineState{}
+	list, err := p.store.ListEgressProxies()
+	if err != nil {
+		return out
+	}
+	for _, lp := range list {
+		key := strings.TrimSpace(lp.URL)
+		if norm, err := egress.Validate(lp.URL); err == nil && norm != "" {
+			key = norm
+		}
+		out[key] = lineState{Name: lp.Name, Enabled: lp.Enabled, FailStreak: lp.FailStreak}
+	}
+	return out
+}
+
+// computeEgressBad 计算 uid → 出口不可用原因（纯函数，便于单测）。
+//
+// 判据分两层（v0.31.47 补齐第二层）：
+//  1. **配置层**：URL 格式非法 → 出口异常；
+//  2. **运行层**：线路在池里，但已停用 / 连续探活失败 → 出口异常。
+//
+// 第二层此前**完全缺失**，而 egress_ops.go 的注释却写着"账号留在坏线路上 →
+// 判 egressBad → 排除出选号"。注释与实现不一致的代价在 2026-10-19 兑现了：
+// 线路被自动停用后，绑在它上面的账号仍被正常选中，于是每次请求都连不上 ——
+// 用户看到的就是"刚拉起代理，本地和号池的反代请求全部失败"。
+//
+// 语义边界：**不在池里的 URL 不判坏**。手填的线路本来就可以不在池里，
+// 我们没有任何依据说它不能用（探活只覆盖池内线路）。
+func computeEgressBad(all []*Account, defEgress string, lines map[string]lineState) map[string]string {
+	bad := make(map[string]string, len(all))
+	// 默认出口自身的问题（格式错 / 运行态不可用）会波及所有"未指定出口"的账号，
+	// 影响面比单个账号大得多，必须一并标出。
+	defBad := ""
+	if defEgress != "" {
+		if _, err := egress.Validate(defEgress); err != nil {
+			defBad = "全局默认出口代理配置有误：" + err.Error()
+		} else if st, ok := lines[strings.TrimSpace(defEgress)]; ok {
+			if reason := st.unusableReason(); reason != "" {
+				defBad = "全局默认" + reason + "（" + st.Name + "）"
+			}
+		}
+	}
+	for _, acc := range all {
+		// 显式直连：无需校验，且**不**继承全局默认代理（这正是 direct 的语义）。
+		if egress.IsDirect(acc.EgressProxy) {
+			continue
+		}
+		cur := strings.TrimSpace(acc.EgressProxy)
+		if cur != "" {
+			norm, err := egress.Validate(cur)
+			if err != nil {
+				bad[acc.UID] = err.Error()
+				continue
+			}
+			if st, ok := lines[norm]; ok {
+				if reason := st.unusableReason(); reason != "" {
+					bad[acc.UID] = reason + "（" + st.Name + "）：请重新拉起本机代理，或把该号改绑到可用线路"
+				}
+			}
+			continue
+		}
+		// 留空 = 未指定 → 继承默认（默认有问题则全部继承者不可用）。
+		if defBad != "" {
+			bad[acc.UID] = defBad
+		}
+	}
+	return bad
+}
+
+// RefreshEgressBad 只重算「出口异常」映射，不重载池（v0.31.47）。
+//
+// 为什么不能直接调 SyncAccounts：那是重载整个池（SyncToDir），
+// 而线路启停是每 5 分钟一次的探活结果 —— 为了一次健康判定去重载号池，
+// 会把在途请求与冷却状态都搅一遍。这里只需要替换一个 map。
+func (p *Proxy) RefreshEgressBad() {
+	all, err := p.store.ListAccounts()
+	if err != nil {
+		return
+	}
+	p.selMu.RLock()
+	def := p.defaultEgress
+	p.selMu.RUnlock()
+	bad := computeEgressBad(all, def, p.loadLineStates())
+	p.selMu.Lock()
+	prev := len(p.egressBad)
+	p.egressBad = bad
+	p.selMu.Unlock()
+	if len(bad) != prev {
+		log.Printf("INFO: [egress] 出口异常账号数 %d → %d（线路启停后重算）", prev, len(bad))
+	}
+}
+
 func (p *Proxy) SyncAccountsReport() (SyncReport, error) {
 	all, err := p.store.ListAccounts()
 	if err != nil {
@@ -453,37 +569,14 @@ func (p *Proxy) SyncAccountsReport() (SyncReport, error) {
 		// 生效消耗分组：显式设置优先，否则按来源推断（v0.13.0）。
 		cgm[acc.UID] = effectiveConsumeGroup(acc)
 	}
-	// 出口代理校验：格式不合法的账号记为「出口异常」，平台选号会跳过它们。
+	// 出口异常判定（v0.31.47）：**配置层 + 运行层**，见 computeEgressBad。
 	//
-	// 两类都要查：账号自己的 egress_proxy，以及**全局默认代理**——后者影响面更大，
-	// 一个默认代理填错会让所有未单独配置的账号同时失去出口隔离。
+	// 此前这里只做格式校验，于是「线路已被探活停用」不会被反映到选号上 ——
+	// 那条线路上的账号照常被选中、每次请求都失败。
 	p.selMu.RLock()
 	defEgress := p.defaultEgress
 	p.selMu.RUnlock()
-	bad := make(map[string]string, len(all))
-	defBad := ""
-	if defEgress != "" {
-		if _, err := egress.Validate(defEgress); err != nil {
-			defBad = err.Error()
-		}
-	}
-	for _, acc := range all {
-		// 显式直连：无需校验，且**不**继承全局默认代理（这正是 direct 的语义）。
-		if egress.IsDirect(acc.EgressProxy) {
-			continue
-		}
-		if acc.EgressProxy != "" {
-			if _, err := egress.Validate(acc.EgressProxy); err != nil {
-				bad[acc.UID] = err.Error()
-			}
-			continue
-		}
-		// 留空 = 未指定 → 若全局默认代理本身有问题，则所有继承者都不可用。
-		// 影响面比单个账号大得多，必须一并标出（否则会看到「配了默认代理却全池失效」）。
-		if defBad != "" {
-			bad[acc.UID] = "全局默认出口代理配置有误：" + defBad
-		}
-	}
+	bad := computeEgressBad(all, defEgress, p.loadLineStates())
 	// 进池集合（用于计数）：以真正进池的凭证为准。
 	now := make(map[string]bool, len(auths))
 	for _, au := range auths {

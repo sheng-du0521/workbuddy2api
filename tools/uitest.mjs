@@ -2690,6 +2690,73 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.47：**代理链路必须"要么可用、要么明确不可用"，不能沉默地绑到坏线路上**。
+  //
+  // 现场：用户拉起代理后全部请求失败。查下来是四个缺口叠加：
+  //   ① apply 只验证"隧道端口可连"，不验证"线路真能出网" → 绑号到坏线路；
+  //   ② 线路被探活自动停用后**不会自动恢复** → 用户重拉代理也没用；
+  //   ③ egressBad 只校验 URL 格式，**不看线路停用** → 死线路上的号仍被选中；
+  //   ④ 迁移到默认出口时把 URL 写死，抹掉"跟随默认"，重拉代理后号绑不回来。
+  const emBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+
+    const pool = read('cmd/webapp/egress_pool.go');
+    if (!pool.includes('ADD COLUMN auto_disabled') && !pool.includes('"auto_disabled"')) {
+      emBad.push('egress_proxies 缺 auto_disabled（无法区分自动停用与人工停用）');
+    }
+    if (!pool.includes('func egressEnableDecision(')) emBad.push('缺少启停决策纯函数');
+    // 自动停用的标记在决策函数里（return false, true, "disable"），
+    // 不在调用点 —— 断言要跟着实现走，否则改了结构守卫就误报。
+    if (!/return false, true, "disable"/.test(pool)) emBad.push('自动停用没有打标记');
+    if (!pool.includes('case "enable"')) emBad.push('探活恢复后没有自动重新启用');
+    // 人工停用不许被拉活：决策函数里必须有 autoDisabled 判定。
+    if (!/probeOK && !enabled && autoDisabled/.test(pool)) {
+      emBad.push('自动恢复没有限制在「自动停用」的线路上（会拉活人工停用的线路）');
+    }
+
+    const agent = read('cmd/webapp/egress_agent.go');
+    if (!agent.includes('func (a *app) verifyLineUsable(')) {
+      emBad.push('缺少线路准入验证（apply 只验证隧道端口，绑号会绑到出不去的线路上）');
+    }
+    if (!agent.includes('egress.Probe(url)')) emBad.push('准入门槛没有用真实出网探测');
+    // 验证必须在"注册线路/绑账号"之前 return。
+    // 验证可能经钩子调用（生产 verifyLineUsable / 测试用桩），断言要认两处。
+    const verifyIdx = agent.indexOf('a.verifyLineUsable');
+    const bindIdx = agent.indexOf('SetAccountEgress(');
+    if (verifyIdx < 0 || bindIdx < 0 || verifyIdx > bindIdx) {
+      emBad.push('线路验证必须在绑号之前（否则坏线路已经被绑上了）');
+    }
+    if (!agent.includes('errEgressNotUsable')) emBad.push('缺哨兵错误（状态码会跟着文案漂）');
+
+    const proxy = read('cmd/webapp/proxy.go');
+    if (!proxy.includes('func computeEgressBad(')) emBad.push('缺少 computeEgressBad');
+    if (!proxy.includes('unusableReason()')) {
+      emBad.push('egressBad 没有纳入线路运行态（停用线路上的号仍会被选中）');
+    }
+    if (!proxy.includes('func (p *Proxy) RefreshEgressBad(')) emBad.push('缺少 RefreshEgressBad');
+    if (!pool.includes('a.proxy.RefreshEgressBad()')) {
+      emBad.push('探活后没有重算出口异常（停用/恢复要等下次 SyncAccounts 才生效）');
+    }
+
+    const ops = read('cmd/webapp/egress_ops.go');
+    if (!ops.includes('func rehomeWriteValue(')) emBad.push('缺 rehomeWriteValue');
+    if (ops.includes('a.store.SetAccountEgress(acc.UID, target)')) {
+      emBad.push('迁移仍把默认出口 URL 写死（会抹掉「跟随默认」，重拉代理后号绑不回来）');
+    }
+
+    const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!adminHtml.includes('自动停用 · 恢复后自动启用')) emBad.push('管理端没区分自动停用/人工停用');
+    if (!adminHtml.includes('已停用（人工）')) emBad.push('管理端没标人工停用');
+    const appJs = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+    if (!appJs.includes('本机代理')) emBad.push('用户端没有显示本机代理进程状态（隧道通≠能用）');
+  }
+  emBad.forEach((m) => console.log('  [FAIL] egress-mech: ' + m));
+  if (!emBad.length) {
+    console.log('  [ok] egress-mech: 绑号前真出网验证 + 自动停用可恢复 + 死线路排除选号 + 迁移保留跟随默认');
+  }
+
   // v0.31.46：**扫码/导入默认不入池**（入池必须经"申请 + 批准"）。
   //
   // 这是产品闸门而不是偏好：入池 = 该号开始接平台反代流量、消耗号主积分。

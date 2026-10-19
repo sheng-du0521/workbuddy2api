@@ -33,7 +33,10 @@ func newTestApp(t *testing.T, accounts ...*Account) (*Store, *Proxy, *app) {
 	if err != nil {
 		t.Fatalf("LoadOrCreateSecret: %v", err)
 	}
-	return store, px, &app{store: store, proxy: px, secret: sec, key: "v012-admin-key"}
+	// 线路准入验证用桩（v0.31.47）：这些用例测的是"绑谁、绑不绑"，
+	// 不是"这条线路能不能出网" —— 用真探测会让用例依赖外网。
+	return store, px, &app{store: store, proxy: px, secret: sec, key: "v012-admin-key",
+		egressVerify: func(string) (string, error) { return "203.0.113.9", nil }}
 }
 
 // TestUserMatchesQuery 需求 1：用户名子串（不区分大小写）/ ID 精确匹配。

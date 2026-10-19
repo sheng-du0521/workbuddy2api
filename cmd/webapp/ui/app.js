@@ -3881,7 +3881,10 @@ function renderEgressHome(box, v) {
   const online = cur ? cur.online : v.agent_online;
   const tunnel = cur ? cur.tunnel_reachable : v.tunnel_reachable;
   const applied = cur ? cur.applied : v.applied;
-  const ready = cur ? cur.ready : v.ready;
+  // 就绪必须以「隧道通 + 本机代理在跑」为准（v0.31.47 起服务端 apply 还会
+  // 真发一次请求验证出口）。这里只做提示，真正的闸门在服务端 ——
+  // 前端放宽不会导致号被绑到坏线路上，最多是白点一次并看到原因。
+  const ready = cur ? (cur.ready && cur.proxy_ok !== false) : (v.ready && v.proxy_ok !== false);
   const ports = cur ? { proxy_port: cur.proxy_port, tunnel_port: cur.tunnel_port } : (v.ports || {});
   const bound = cur ? cur.host_bound : v.host_bound;
   const total = cur ? cur.host_total : v.host_total;
@@ -3960,9 +3963,13 @@ function renderEgressHome(box, v) {
       const line = el('div');
       line.style.padding = '2px 0';
       line.appendChild(el('b', null, egressMachineLabel(m) + ' '));
+      // 「隧道通」不等于「能用」（v0.31.47）：隧道只是云端到本机的一条管子，
+      // 管子那头没有代理在跑，请求照样出不去。两个状态分开显示，
+      // 用户才能自己判断该看哪一头（隧道不通看网络/防火墙，代理没跑看本机进程）。
       line.appendChild(el('span', null,
         (m.online ? '● 在线' : '○ 离线')
         + ' · 隧道' + (m.tunnel_reachable ? '通' : '不通')
+        + ' · 本机代理' + (m.proxy_ok ? '运行中' : '未运行')
         + ' · 端口 ' + m.tunnel_port
         + (m.exit_ip ? ' · 出口 ' + m.exit_ip : '')
         + (m.applied ? ' · 已应用' : '')));

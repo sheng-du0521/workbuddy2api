@@ -1,16 +1,16 @@
 {
-  "version": "0.31.46",
+  "version": "0.31.47",
   "min_supported": "0.24.0",
-  "notes": "v0.31.46：扫码/导入默认**不入池**（回归审批闸门）+ 修一处我自己引入的日志刷屏 bug。① 产品规则回归：v0.31.37 把「扫码后自动入池」做成了默认开（kv qr_auto_pool 缺省视为开），而原本的设计是——扫码与导入都只**入库**（pool_state=\"\"），号主在「账号代挂」页申请、管理员批准后才进消耗池。入池等于该号开始接平台反代流量、消耗号主积分，这个决定权应在平台侧。现在 qrAutoPoolOn 缺省返回 false，只有显式 1/true/on/yes 才算开；垃圾值一律按关（失败方向必须是\"不入池\"）。真机证据：10-19 10:08/10:10/10:11 三条 `[qr] ... 扫码后自动入池（kv 开启）` 日志，那正是本版要消除的行为。② 修 pruneStaleMachines 无限循环（v0.31.43 引入）：poll 也会经 egressRegister 创建记录但**不写 StateAt**，于是 StateAt=0 被 `now-0` 判成\"老于一天\"→ 每 5 秒 poll 建一次、prune 删一次，日志里 16 小时刷了上万条「清理陈旧机器记录 default」，把排查要看的扫码日志整段淹掉（这次排查就被它挡住绕了一圈）。现在用 machineLastSeen（StateAt 优先、退 CreatedAt，两者都为 0 时**保留**）。③ 前端提示改准：扫码完成不再说\"已自动入池\"，改为\"已入库（未入池 —— 请在「账号代挂」页申请，管理员批准后才会接单）\"；显式开启自动入池的部署会显示\"本部署开启了扫码自动入池\"。测试：qr_pool_default_test.go 六例（默认不入池/显式才入/垃圾值一律关/新建 poll 记录不被误删/无时间戳保留/真老记录仍清）；uitest 新增 qr-pool-default 守卫。",
+  "notes": "v0.31.47：修「用户拉起代理后本地与号池全部失败」——代理链路四个结构性缺口。① 绑号前不再只看隧道端口：apply 现在经该线路真发一次请求（egress.Probe）验证能出网，不通过就返回 409 且一个账号都不动。旧行为只测 TCP 可连，而端口可连只证明 sshd 在 listen，不证明隧道那头的 wbproxy 能把请求转出去 —— 于是「拉起后自动应用」会把一批健康号绑到出不去的线上。② 线路自动停用可自动恢复：新增 egress_proxies.auto_disabled 区分「探活停用」与「人工停用」；探活通过时只恢复前者，人工停用一律不碰（v0.31.34 的教训）。存量按 enabled=0 且 fail_streak>=3 回填，否则老线路永远停在停用态、永远等不到自动恢复。③ egressBad 补齐运行层：此前只校验 URL 格式，线路被停用后账号仍被选中、每次请求都失败（egress_ops.go 的注释写着「判 egressBad 排除」，实现里没有这段）。现在 computeEgressBad 同时看 enabled / fail_streak，探活后调 RefreshEgressBad 立刻生效（不必等下次 SyncAccounts）。④ 迁移保留「跟随默认」：坏线路迁移到全局默认出口时写空串而不是写死 URL —— 否则那个号看起来「已被显式指定」，用户重拉代理后 apply 会跳过它，号再也绑不回来。另：线路准入验证做成可注入钩子（生产走真实探测，测试用桩）；管理端线路卡区分「自动停用·恢复后自动启用」与「已停用（人工）」；用户端机器状态新增「本机代理运行中/未运行」（隧道通不等于能用）。测试：egress_mech_test.go（启动决策六例含人工停用反例 / 迁移写值 / 运行态判坏 / 默认出口挂掉 / 验证失败零改动 / 验证通过写入出口 IP）；uitest 新增 egress-mech 守卫。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.46/webapp.exe",
-      "sha256": "d189b2d0a3a04ec2864fc9864869b37eab68c0412946b3010edfb315ad2c0372",
-      "size": 15525376
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.47/webapp.exe",
+      "sha256": "1331dccc860bf2a83471775697dc294380018eda9709192839660e8dc6ac4c94",
+      "size": 15536640
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

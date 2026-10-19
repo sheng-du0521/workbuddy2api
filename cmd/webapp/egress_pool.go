@@ -81,11 +81,21 @@ type EgressProxy struct {
 	// rehomeAccountsFromDeadProxies 的排除逻辑）—— 它是不受我们控制的第三方出口，
 	// 把别人的 access_token 从它送出去是明确的错误。
 	OwnerUserID int64 `json:"owner_user_id"`
+	// AutoDisabled 这条线路是**被探活自动停用**的（v0.31.47）。
+	//
+	// 为什么必须与"人工停用"分开：自动停用是**暂时性**判断（本机断开、代理没起），
+	// 人工停用是**决定**（这条线我不要了）。此前两者共用一个 Enabled 位，后果是
+	// 「探活失败 → 自动停用 → 用户重新拉起代理 → 端口通了但线路仍是停用」
+	// —— 恢复这件事没有任何代码负责，用户看到的是"拉起来了但全部失败"。
+	//
+	// 有了这一位，探活成功就能**只恢复自己停掉的**，绝不碰人工停用的线路
+	// （v0.31.34 已经踩过"无条件 Enabled=true 把别人停用线路拉活"的坑）。
+	AutoDisabled bool `json:"auto_disabled"`
 }
 
 // egressProxyCols 列清单（与 scanEgressProxy 顺序严格对应）。
 const egressProxyCols = `id, name, url, region, note, enabled, last_ok, last_ip,
-	last_check, fail_streak, created_at, updated_at, owner_user_id`
+	last_check, fail_streak, created_at, updated_at, owner_user_id, auto_disabled`
 
 func (s *Store) migrateEgressProxy() error {
 	stmts := []string{
@@ -102,7 +112,8 @@ func (s *Store) migrateEgressProxy() error {
 			fail_streak INTEGER NOT NULL DEFAULT 0,
 			created_at  INTEGER NOT NULL DEFAULT 0,
 			updated_at  INTEGER NOT NULL DEFAULT 0,
-			owner_user_id INTEGER NOT NULL DEFAULT 0
+			owner_user_id INTEGER NOT NULL DEFAULT 0,
+			auto_disabled INTEGER NOT NULL DEFAULT 0
 		)`,
 		// URL 唯一：同一条线路重复录入只会让分配结果出现「分配了但其实是同一个出口」。
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_proxy_url ON egress_proxies(url)`,
@@ -123,19 +134,36 @@ func (s *Store) migrateEgressProxy() error {
 		"owner_user_id INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate egress_proxies(owner): %w", err)
 	}
+	// 增量列（v0.31.47）：区分"探活自动停用"与"人工停用"。
+	// 老库一律 0 = 人工/未知 —— 保守方向：宁可让运维点一下启用，
+	// 也不要凭"没这个字段"就自动拉活一条可能是人工停掉的线路。
+	if err := s.ensureColumn("egress_proxies", "auto_disabled",
+		"auto_disabled INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate egress_proxies(auto_disabled): %w", err)
+	}
+	// 存量标注（v0.31.47，幂等）：加列前就已经"停用 + 连续失败达阈值"的线路，
+	// 几乎只可能来自自动停用（人工停用不会恰好连续失败 3 次）。
+	// 不标的话它们会永远停在停用态 —— 用户重新拉起代理也不会自动恢复，
+	// 而新加的这个能力对存量线路等于没有。
+	if _, err := s.db.Exec(`UPDATE egress_proxies SET auto_disabled = 1
+		WHERE enabled = 0 AND fail_streak >= ?`, egressFailThreshold); err != nil {
+		return fmt.Errorf("migrate egress_proxies(auto_disabled backfill): %w", err)
+	}
 	return nil
 }
 
 func (s *Store) scanEgressProxy(row interface{ Scan(dest ...any) error }) (*EgressProxy, error) {
 	var p EgressProxy
-	var enabled, lastOK int
+	var enabled, lastOK, autoDisabled int
 	err := row.Scan(&p.ID, &p.Name, &p.URL, &p.Region, &p.Note, &enabled, &lastOK,
-		&p.LastIP, &p.LastCheck, &p.FailStreak, &p.CreatedAt, &p.UpdatedAt, &p.OwnerUserID)
+		&p.LastIP, &p.LastCheck, &p.FailStreak, &p.CreatedAt, &p.UpdatedAt, &p.OwnerUserID,
+		&autoDisabled)
 	if err != nil {
 		return nil, err
 	}
 	p.Enabled = enabled != 0
 	p.LastOK = lastOK != 0
+	p.AutoDisabled = autoDisabled != 0
 	return &p, nil
 }
 
@@ -181,10 +209,11 @@ func (s *Store) UpsertEgressProxy(p *EgressProxy) error {
 	}
 	p.UpdatedAt = now
 	_, err := s.db.Exec(`INSERT INTO egress_proxies (`+egressProxyCols+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, url=excluded.url, region=excluded.region, note=excluded.note,
-			enabled=excluded.enabled, updated_at=excluded.updated_at,
+			enabled=excluded.enabled, auto_disabled=excluded.auto_disabled,
+			updated_at=excluded.updated_at,
 			-- ⚠️ 归属**粘性**：一旦有人认领过就不再被后续写入覆盖（v0.31.23）。
 			-- 否则「管理员手工登记同一条 URL」或「另一个用户恰好用同一个出口」
 			-- 会把原来的归属抹掉 —— 而归属恰恰是事后追责时唯一能查的东西。
@@ -192,7 +221,8 @@ func (s *Store) UpsertEgressProxy(p *EgressProxy) error {
 			owner_user_id=CASE WHEN egress_proxies.owner_user_id = 0
 				THEN excluded.owner_user_id ELSE egress_proxies.owner_user_id END`,
 		p.ID, p.Name, p.URL, p.Region, p.Note, boolToInt(p.Enabled), boolToInt(p.LastOK),
-		p.LastIP, p.LastCheck, p.FailStreak, p.CreatedAt, p.UpdatedAt, p.OwnerUserID)
+		p.LastIP, p.LastCheck, p.FailStreak, p.CreatedAt, p.UpdatedAt, p.OwnerUserID,
+		boolToInt(p.AutoDisabled))
 	return err
 }
 
@@ -609,8 +639,12 @@ type egressOverviewProxy struct {
 	URL    string `json:"url"`
 	Region string `json:"region"`
 	Note   string `json:"note"`
-	// Enabled 是否启用（停用的线路不参与分配，但已分配的账号仍照原样路由）。
+	// Enabled 是否启用（停用的线路不参与分配；已分配的账号会被判出口异常而
+	// 排除出选号，见 computeEgressBad）。
 	Enabled bool `json:"enabled"`
+	// AutoDisabled 是否为**探活自动停用**（v0.31.47）。
+	// 前端据此区分"等它自己好"与"要人处理"，两者处置完全不同。
+	AutoDisabled bool `json:"auto_disabled"`
 	// LastOK/LastIP/LastCheck/FailStreak 最近一次探活结果。
 	LastOK     bool   `json:"last_ok"`
 	LastIP     string `json:"last_ip"`
@@ -718,7 +752,8 @@ func (a *app) egressOverview() (egressOverviewView, error) {
 	for _, p := range proxies {
 		v := add(p.URL, p.Name)
 		v.ID, v.Region, v.Note = p.ID, p.Region, p.Note
-		v.Enabled, v.LastOK, v.LastIP = p.Enabled, p.LastOK, p.LastIP
+		v.Enabled, v.AutoDisabled = p.Enabled, p.AutoDisabled
+		v.LastOK, v.LastIP = p.LastOK, p.LastIP
 		v.LastCheck, v.FailStreak = p.LastCheck, p.FailStreak
 	}
 
@@ -939,6 +974,10 @@ func (a *app) handleEgressProxies(w http.ResponseWriter, r *http.Request) {
 			}
 			p.CreatedAt = old.CreatedAt
 			p.LastCheck, p.LastIP, p.FailStreak, p.LastOK = old.LastCheck, old.LastIP, old.FailStreak, old.LastOK
+			// 管理员显式设 enabled 就是"人的决定"（v0.31.47）：
+			// 清掉自动停用标记，否则下一次探活成功会把它自动拉活 ——
+			// 而管理员刚刚明明手动停用了它（v0.31.34 踩过的同类坑）。
+			p.AutoDisabled = false
 		}
 		if p.Name == "" {
 			p.Name = norm
@@ -1062,15 +1101,44 @@ func (a *app) checkEgressProxy(p *EgressProxy) egress.ProbeResult {
 		return res
 	}
 	_ = a.store.RecordEgressCheck(p.ID, res.OK, res.IP, res.Error)
-	if fresh, err := a.store.GetEgressProxy(p.ID); err == nil && fresh != nil {
-		p.FailStreak = fresh.FailStreak
-		if !res.OK && fresh.FailStreak >= egressFailThreshold && p.Enabled {
-			p.Enabled = false
-			_ = a.store.UpsertEgressProxy(p)
-			log.Printf("[egress] 出口代理连续 %d 次探活失败，已自动停用：%s（%s）", fresh.FailStreak, p.Name, p.URL)
+	fresh, err := a.store.GetEgressProxy(p.ID)
+	if err != nil || fresh == nil {
+		return res
+	}
+	p.FailStreak = fresh.FailStreak
+	enabled, auto, action := egressEnableDecision(res.OK, fresh.Enabled, fresh.AutoDisabled, fresh.FailStreak)
+	if action != "" {
+		p.Enabled, p.AutoDisabled = enabled, auto
+		_ = a.store.UpsertEgressProxy(p)
+		switch action {
+		case "disable":
+			log.Printf("[egress] 线路连续 %d 次探活失败，已自动停用（恢复后会自动启用）：%s（%s）",
+				fresh.FailStreak, fresh.Name, fresh.URL)
+		case "enable":
+			log.Printf("INFO: [egress] 线路探活恢复，已自动重新启用：%s（%s）", fresh.Name, fresh.URL)
 		}
 	}
 	return res
+}
+
+// egressEnableDecision 根据一次探活结果决定线路的启停怎么变（纯函数，v0.31.47）。
+//
+// 返回 (enabled, autoDisabled, action)，action ∈ {"", "disable", "enable"}。
+// 抽成纯函数是因为这是本版最关键的判定，必须能被单测钉住：
+//   - 连续失败达阈值且当前启用 → 自动停用并**打标记**；
+//   - 探活通过且**打了标记的停用** → 自动恢复；
+//   - 人工停用（标记为 false）→ 无论探活成功与否都不动它。
+//
+// 第三条是 v0.31.34 的教训：能无条件 `Enabled=true` 的地方，迟早会把
+// 管理员刚停用的线路拉活。
+func egressEnableDecision(probeOK, enabled, autoDisabled bool, failStreak int64) (bool, bool, string) {
+	if !probeOK && failStreak >= egressFailThreshold && enabled {
+		return false, true, "disable"
+	}
+	if probeOK && !enabled && autoDisabled {
+		return true, false, "enable"
+	}
+	return enabled, autoDisabled, ""
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1185,11 @@ func (a *app) probeAllEgress() {
 	}
 	a.probeProxiesConcurrently(list)
 	a.rehomeAccountsFromDeadProxies()
+	// 探活可能刚刚**停用或恢复**了线路（v0.31.47），而选号依赖的 egressBad
+	// 是 SyncAccounts 时算的 —— 不在这里重算，"线路已停用"要等到下次
+	// SyncAccounts 才会反映到选号上，中间这段时间账号会被派到一个死出口。
+	// 反过来，"线路已恢复"也要立刻放回候选，否则用户拉起代理后仍要等一轮。
+	a.proxy.RefreshEgressBad()
 }
 
 // egressJitterMsNow 返回当前抖动上限（毫秒），供设置页展示。

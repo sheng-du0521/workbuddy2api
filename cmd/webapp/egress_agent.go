@@ -58,6 +58,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -67,6 +68,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/egress"
 )
 
 const (
@@ -1796,6 +1799,17 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scop
 	}
 	res, err := a.applyHomeEgress(mm.Ports.TunnelPort, scope, req.RebindAll)
 	if err != nil {
+		// 线路不通 → 409 而不是 500：这是"当前状态不允许"，不是服务故障。
+		// 文案直接给出下一步（用户要的是"为什么刚拉起就全挂"，不是 HTTP 语义）。
+		if errors.Is(err, errEgressNotUsable) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": err.Error() + "。未改动任何账号的出口。" +
+					"请检查本机 agent 窗口：代理进程是否在跑、是否被系统代理劫持（VPN/Clash），" +
+					"然后重新点「一键拉起」",
+				"unusable": true,
+			})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -1830,6 +1844,57 @@ type egressHomeApplyResult struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
+// errEgressNotUsable 隧道端口可连、但线路实际出不了网。
+//
+// 用哨兵错误而不是匹配错误文案：本仓踩过「状态码跟着文案改」的坑
+// （改一句话，403 变 400）。调用方用 errors.Is 判，文案随便改。
+var errEgressNotUsable = errors.New("egress line not usable")
+
+// notUsableError 带**用户可读文案**的「线路不可用」错误。
+//
+// 为什么不直接 fmt.Errorf("%w：...", errEgressNotUsable)：`%w` 会把哨兵的
+// Error() 原文拼在最前面，于是用户在前端看到的是
+// "egress line not usable：隧道端口可连……" —— 一句英文技术话混在中文提示里。
+// 这个类型对 errors.Is(errEgressNotUsable) 回答"是"，但自己的文案只有中文。
+type notUsableError struct{ msg string }
+
+func (e *notUsableError) Error() string { return e.msg }
+
+// Is 让 errors.Is(err, errEgressNotUsable) 成立，同时不影响 Error() 的文案。
+func (e *notUsableError) Is(target error) bool { return target == errEgressNotUsable }
+
+// verifyLineUsable 经这条线路做一次**真实出网**验证，并把结果落库。
+//
+// 为什么必须有这一步（v0.31.47，2026-10-19 现场）：
+//
+//	「一键拉起」的就绪判据是 `agent 在线 + 隧道端口可连`。但端口可连只证明
+//	**sshd 在 listen**，不证明隧道那头的 wbproxy 真能把请求转出去 ——
+//	代理进程可能还没 listen、可能走了系统代理、也可能上游根本不通。
+//	于是"拉起 → 立刻自动应用 → 把该用户所有号绑到这条线"会把一批**健康账号**
+//	绑到一条**出不去的线路**上：用户看到的就是"刚拉起，全部失败"。
+//
+// 判据用真实请求而不是 TCP 探测：这正是 `egress.Probe` 的口径（走代理抓出口 IP）。
+func (a *app) verifyLineUsable(url string) (string, error) {
+	pr := egress.Probe(url)
+	if pr.EndpointUnreachable {
+		return "", &notUsableError{msg: "服务端自身出网受限，无法验证这条线路的出口（" + pr.Error + "）"}
+	}
+	// 落库：页面立刻能看到出口 IP / 状态，不必等下一轮 5 分钟定时探活。
+	// 这里只用 RecordEgressCheck（不改 enabled），启停仍由探活那一套统一负责。
+	if list, err := a.store.ListEgressProxies(); err == nil {
+		for _, p := range list {
+			if strings.EqualFold(strings.TrimSpace(p.URL), strings.TrimSpace(url)) {
+				_ = a.store.RecordEgressCheck(p.ID, pr.OK, pr.IP, pr.Error)
+				break
+			}
+		}
+	}
+	if !pr.OK {
+		return "", &notUsableError{msg: "隧道端口可连，但经它出不了网（" + strings.TrimSpace(pr.Error) + "）"}
+	}
+	return pr.IP, nil
+}
+
 // applyHomeEgress 把某台机器的本地出口线路**应用到位**（幂等，可反复调用）。
 //
 // 三件事，缺一不可：
@@ -1852,6 +1917,20 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 	url := egressHomeURL(tunnelPort)
 	var res egressHomeApplyResult
 	res.ProxyURL = url
+
+	// 0) **先验证这条线路真能出网，再谈绑定**（v0.31.47）。
+	//
+	// 放在这里而不是只放调用方：这是"绑号"这件事唯一的入口，
+	// 验证写在入口里才是结构性的（以后新增调用点不会忘）。失败时**一个账号都不动**。
+	verify := a.verifyLineUsable
+	if a.egressVerify != nil {
+		verify = a.egressVerify
+	}
+	ip, err := verify(url)
+	if err != nil {
+		return res, err
+	}
+	res.Probed, res.ExitIP = true, ip
 
 	// 1) 注册（或复用）线路。
 	existing, err := a.store.ListEgressProxies()
@@ -1892,6 +1971,11 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 	}
 	hit.UpdatedAt = now
 	hit.Enabled = true // 拉起即启用（否则"通了但被停用"仍是个坑）
+	// 刚做过真实出网验证，结果直接写进线路记录（v0.31.47）：
+	// 否则页面会显示"未探活"，而运维刚点完"拉起"最想看到的就是出口 IP。
+	// 同时清掉 AutoDisabled —— 这条线刚刚被证明能用，没有理由还留着自动停用标记。
+	hit.LastOK, hit.LastIP, hit.FailStreak = true, ip, 0
+	hit.AutoDisabled = false
 	if err := a.store.UpsertEgressProxy(hit); err != nil {
 		return res, err
 	}

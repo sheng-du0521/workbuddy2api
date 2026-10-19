@@ -8201,7 +8201,19 @@ function egrCard(p) {
   who.appendChild(el('div', 'name', p.name || p.url));
   who.appendChild(el('div', 'ident mono', p.url));
   head.appendChild(who);
-  head.appendChild(el('span', 'tag ' + (p.enabled ? 'ok' : 'err'), p.enabled ? '启用' : '已停用'));
+  // 停用分两种（v0.31.47）：自动停用（探活连续失败，恢复后自动启用）
+  // 与人工停用（人的决定，绝不自动拉活）。共用一个 tag 会让运维无法判断
+  // "要不要去看一眼" —— 前者等它自己好，后者必须人处理。
+  if (p.enabled) {
+    head.appendChild(el('span', 'tag ok', '启用'));
+  } else if (p.auto_disabled) {
+    head.appendChild(chipWithTitle('自动停用 · 恢复后自动启用', 'warn',
+      '连续 ' + (p.fail_streak || 3) + ' 次探活失败后自动停用。这不是人工决定：'
+      + '本机代理重新上线、探活通过时会自动重新启用。'
+      + '若确认不再使用这条线路，请手动停用它（手动停用不会被自动拉活）。'));
+  } else {
+    head.appendChild(el('span', 'tag err', '已停用（人工）'));
+  }
   card.appendChild(head);
 
   const chips = el('div', 'chips');

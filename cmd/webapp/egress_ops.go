@@ -88,6 +88,21 @@ type rehomeReport struct {
 //     运维的决定，程序只保证"不吊死在那条已知坏掉的上"；
 //   - **不**删账号的任何状态位 —— 迁移只改 egress_proxy 一个字段，其余（冷却 /
 //     停用 / 分组）一概不动，避免"修出口"顺手改了别的东西。
+//
+// rehomeWriteValue 决定迁移时**写到账号上的值**（v0.31.47，纯函数）。
+//
+// 目标就是全局默认出口时写空串（= 跟随默认），而不是把默认出口的 URL 写死。
+// 二者的区别在"下次重新应用本机出口"时才显形：
+//   - 写空 → 仍算"没做过决定"，用户重新拉起自己的代理时会被正常接管；
+//   - 写 URL → 看起来像"显式指定到这条线"，重新应用时被当成已决定而跳过，
+//     于是用户重拉代理后号再也绑不回来（现场真实发生）。
+func rehomeWriteValue(target, defEgress string) string {
+	if strings.EqualFold(strings.TrimSpace(target), strings.TrimSpace(defEgress)) {
+		return ""
+	}
+	return target
+}
+
 func (a *app) rehomeAccountsFromDeadProxies() rehomeReport {
 	rep := rehomeReport{Mode: a.egressOnLineDownMode()}
 	proxies, err := a.store.ListEgressProxies()
@@ -197,7 +212,17 @@ func (a *app) rehomeAccountsFromDeadProxies() rehomeReport {
 			rep.Kept++
 			continue
 		}
-		if err := a.store.SetAccountEgress(acc.UID, target); err != nil {
+		// 写到账号上的值（v0.31.47）：目标若就是**全局默认出口**，写空串而不是 URL。
+		//
+		// 为什么：写 URL 会把"这个号跟随默认"变成"这个号被显式指定到默认线路"，
+		// 而后者在「重新应用本机出口」时会被当成"用户已做过决定"跳过 ——
+		// 于是用户重新拉起自己的代理后，这些号**再也绑不回来**。
+		// 现场：用户换了一条线路，旧线路挂过一次把号迁到默认，之后重拉代理，
+		// 页面显示"已应用"，号却仍然从平台出口出去。
+		//
+		// 写空串保持"跟随默认"语义：默认变它就跟着变，重新应用时也能被正常接管。
+		writeTo := rehomeWriteValue(target, a.defaultEgress())
+		if err := a.store.SetAccountEgress(acc.UID, writeTo); err != nil {
 			rep.Warnings = append(rep.Warnings, "迁移 "+acc.UID+" 失败："+err.Error())
 			continue
 		}

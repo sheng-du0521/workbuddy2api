@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.46"
+const version = "0.31.47"
 
 type app struct {
 	store  *Store
@@ -98,6 +98,12 @@ type app struct {
 	// dataDir 数据目录（webapp.db / secret.key / admin.key 所在）。
 	// 导入白名单**永远**不允许覆盖到这里（v0.24.2，P3-8，见 resolveImportPath）。
 	dataDir string
+	// egressVerify 线路准入验证的可替换实现（**仅测试**，v0.31.47）。
+	//
+	// 生产为 nil → 用 verifyLineUsable（真实发一次请求经该代理出去）。
+	// 测试里替换成桩，是因为"绑号前必须验证线路"这条纪律本身要保留，
+	// 而单测环境没有可用代理 —— 用桩保留结构、绕开网络。
+	egressVerify func(url string) (string, error)
 	// agentDir agent 产物目录（-agent-dir，v0.31.42）。空 = 可执行文件同级 egress-agent/。
 	// 服务端从这里读 agent-version.json 与二进制，供 agent 自更新下载（见 agent_dist.go）。
 	agentDir string
