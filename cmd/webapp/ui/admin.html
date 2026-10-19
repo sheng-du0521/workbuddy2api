@@ -28,6 +28,8 @@
       <button class="nav-item" data-nav="growth" data-on="loadGrowthAdmin" data-title="成长任务" data-sub="手动选号执行 + 完成进度（不自动排程）"><span class="ico">🌱</span>成长任务</button>
       <button class="nav-item" data-nav="egress" data-on="loadEgress" data-title="代理" data-sub="出口代理（线路池）+ 账号代理（逐号出口），防同 IP 关联"><span class="ico">🛡</span>代理<span class="badge hidden" id="egressBadge">0</span></button>
       <div class="nav-group">扩展</div>
+      <!-- v0.31.52（需求一）：官方倍率/免费标识与实测计费口径的对照面板。 -->
+      <button class="nav-item" data-nav="ratios" data-on="loadModelRatios" data-title="模型倍率" data-sub="官方 credits / 免费标识 vs 本站实测积分；变化台账与手动同步"><span class="ico">⚖</span>模型倍率</button>
       <button class="nav-item" data-nav="plugins" data-on="loadPlugins" data-title="插件" data-sub="可独立启停的功能扩展；停用只影响入口与执行，不改动任何数据"><span class="ico">🧩</span>插件</button>
       <div class="nav-group">经营</div>
       <button class="nav-item" data-nav="users" data-on="loadUsers" data-title="用户" data-sub="余额、限额与封禁"><span class="ico">👤</span>用户</button>
@@ -537,6 +539,20 @@
           <!-- v0.31.50（R11）：越界存量必须可见。规则收紧之后，历史数据里
                一定有"已入池的号绑在个人线路上"这类记录 —— 没人看见就没人修。 -->
           <div id="egrCompliance" class="sub" style="margin:8px 0 0;"></div>
+        </div>
+
+        <!-- 强制越界审计（v0.31.52）：把用户线路分给不该用的号时必须能回溯。
+             这条链路会把 access_token 送进别人的家庭网络，日志会被轮转，表不会。 -->
+        <div class="card" id="egrAuditCard" style="margin-top:16px;">
+          <div class="section-head">
+            <h2>强制越界审计</h2>
+            <span class="slot-refresh" data-refresh="loadEgressAudits" data-refresh-label="刷新"></span>
+          </div>
+          <div class="sub" style="margin:0 0 8px;">
+            管理员强制把用户线路分配给「非本人」或「已入池」的账号时，会在这里留一条记录：
+            谁、对哪几个号、理由、结果。<b>停用的线路不可强制</b>（失败的尝试也会记 <code>failed</code>）。
+          </div>
+          <div id="egrAuditList" class="sub">加载中…</div>
         </div>
 
         <!-- 出站口径（v0.31.35）：一句话决定"还用不用代理"。
@@ -1634,6 +1650,37 @@
 
     <!-- ==================== 调试对话 ==================== -->
     <!-- ==================== 插件（v0.31.16） ==================== -->
+    <!-- v0.31.52（需求一）：模型倍率面板。
+         两个口径**并列**：官方 credits 只作对照、不参与计费；扣点以实测积分为准。 -->
+    <section class="pane" data-pane="ratios">
+      <div class="card">
+        <div class="section-head">
+          <h2>模型倍率与官方口径</h2>
+          <span class="slot-refresh" data-refresh="loadModelRatios" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          两套口径并列展示，别混：<b>官方倍率</b>是上游模型目录里的 <code>credits</code> 原文（如 <code>x0.05</code>），
+          <b>只作对照、不参与计费</b>；<b>实测</b>是本站在该模型上实际扣的积分/1k（<code>model_cost_1k</code>）。
+          两者矛盾时会标「口径待核对」，由人工决定是否调价 —— 自动同步只改展示与台账，不改计费。
+        </div>
+        <div id="mrSummary" class="sub" style="margin:0 0 10px;">加载中…</div>
+        <div class="row" style="gap:8px;align-items:center;margin:0 0 10px;">
+          <button id="btnMrSync" title="从上游模型目录重新读取 credits 与免费标识；不产生额外计费，也不会改任何账号配置">立即同步官方口径</button>
+          <span id="mrSyncHint" class="muted" style="font-size:12px;"></span>
+        </div>
+        <div id="mrDrift"></div>
+        <div id="mrTable"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="section-head">
+          <h3 style="font-size:13px;">变化台账</h3>
+          <span class="muted" style="font-size:12px;">新增模型 / 免费状态翻转 / 倍率变更</span>
+        </div>
+        <div id="mrDiffs" class="sub">加载中…</div>
+      </div>
+    </section>
+
     <section class="pane" data-pane="plugins" data-plugin-scope="admin">
       <div class="section-head">
         <h2>插件</h2>
@@ -7623,6 +7670,7 @@ async function loadEgress(silent) {
     mountEgrTabs();
     renderEgressAlert();
     loadEgressCompliance();
+    loadEgressAudits();
     renderEgressCards();
     renderAuthCandidates();
     renderEgrAssignHint();
@@ -7636,6 +7684,123 @@ async function loadEgress(silent) {
 // 前端只用来分组文案，**不做判定** —— 判定永远在服务端。
 const EGR_CODE_POOLED = 'account_pooled';
 const EGR_CODE_FOREIGN = 'foreign_account';
+
+// loadModelRatios 模型倍率面板（v0.31.52，需求一）。
+//
+// 两套口径并列：官方 credits 只作对照、不参与计费；扣点看 measured_cost_1k。
+// 面板本身**没有写入口**（除了"立即同步"），因为调价是运营决定，不该藏在展示页里。
+let mrLastSync = 0;
+async function loadModelRatios() {
+  const sum = $('mrSummary'), box = $('mrTable');
+  if (!box) return;
+  let d = null;
+  try { d = await api('/api/admin/model-ratios'); }
+  catch (e) { if (sum) sum.textContent = '加载失败：' + e.message; return; }
+  const models = (d && d.models) || [];
+  const drift = (d && d.drift) || [];
+  const diffs = (d && d.diffs) || [];
+  mrLastSync = Number(d && d.last_sync_at) || 0;
+  if (sum) {
+    sum.textContent = '';
+    const free = models.filter((m) => m.official_free).length;
+    const withCredits = models.filter((m) => m.official_credits).length;
+    const withCost = models.filter((m) => Number(m.measured_cost_1k) > 0).length;
+    sum.appendChild(el('b', '', '共 ' + models.length + ' 个模型'));
+    sum.appendChild(document.createTextNode(
+      ' · 带官方倍率 ' + withCredits + ' · 标免费 ' + free + ' · 有实测成本 ' + withCost +
+      (mrLastSync ? ' · 上次同步 ' + new Date(mrLastSync * 1000).toLocaleString() : ' · 尚未同步')));
+  }
+
+  // 口径矛盾（免费却扣点 / 付费却 0 点）：只提示，不自动改价。
+  const dr = $('mrDrift');
+  if (dr) {
+    dr.textContent = '';
+    if (drift.length) {
+      dr.appendChild(el('div', 'notice warn',
+        '有 ' + drift.length + ' 个模型的官方口径与实收不一致（计费仍按实测执行）：'));
+      const list = el('div', 'cfg-list');
+      for (const m of drift) list.appendChild(cfgRow(m.model, m.drift, ''));
+      dr.appendChild(list);
+    }
+  }
+
+  box.textContent = '';
+  if (!models.length) {
+    box.appendChild(el('div', 'hintbar', '还没有同步数据：点上方「立即同步官方口径」（不产生额外计费）。'));
+    return;
+  }
+  const head = el('div', 'code-gen-row');
+  for (const t of ['模型', '官方倍率', '标签', '免费', '实测积分/1k', '状态']) {
+    const c = el('span', 'muted', t);
+    c.style.fontWeight = '600';
+    head.appendChild(c);
+  }
+  box.appendChild(head);
+  for (const m of models) {
+    const r = el('div', 'code-gen-row');
+    r.appendChild(el('span', 'mono', m.model));
+    r.appendChild(el('span', 'mono', m.official_credits || '—'));
+    r.appendChild(el('span', 'mono muted', m.official_badge || '—'));
+    r.appendChild(el('span', m.official_free ? 'tag ok' : 'muted', m.official_free ? '免费' : '—'));
+    r.appendChild(el('span', 'mono', Number(m.measured_cost_1k) > 0 ? String(m.measured_cost_1k) : '未实测'));
+    r.appendChild(el('span', m.drift ? 'tag warn' : 'muted', m.drift ? '口径待核对' : '—'));
+    box.appendChild(r);
+  }
+
+  const df = $('mrDiffs');
+  if (df) {
+    df.textContent = '';
+    if (!diffs.length) df.appendChild(el('div', 'muted', '（暂无变化记录）'));
+    else for (const x of diffs.slice(0, 50)) {
+      const kind = x.kind === 'free_switch' ? '免费状态' : (x.kind === 'credits_change' ? '倍率' : '新增模型');
+      df.appendChild(cfgRow(x.model, kind + '：' + (x.old || '—') + ' → ' + (x.new || '—'),
+        new Date(Number(x.created_at) * 1000).toLocaleString()));
+    }
+  }
+}
+
+if ($('btnMrSync')) {
+  $('btnMrSync').onclick = async () => {
+    const btn = $('btnMrSync'), hint = $('mrSyncHint');
+    btn.disabled = true;
+    if (hint) hint.textContent = '正在读取上游模型目录…';
+    try {
+      const d = await post('/api/admin/model-ratios/sync');
+      if (hint) {
+        hint.textContent = '完成：' + (d.total || 0) + ' 个模型，新增 ' + (d.added || 0) +
+          '，倍率变更 ' + (d.changed || 0) + '，免费状态变化 ' + (d.free_flip || 0) +
+          (d.announced ? '（已发公告）' : '') + (d.skipped ? '；' + d.skipped : '');
+      }
+      loadModelRatios();
+    } catch (e) {
+      if (hint) hint.textContent = '同步失败：' + e.message;
+    } finally { btn.disabled = false; }
+  };
+}
+
+// loadEgressAudits 强制越界审计（v0.31.52）。
+//
+// 只读。没有"删除记录"入口 —— 追责台账不该提供擦除按钮。
+async function loadEgressAudits() {
+  const box = $('egrAuditList');
+  if (!box) return;
+  let d = null;
+  try { d = await api('/api/admin/egress/force-audits?limit=20'); }
+  catch (e) { box.textContent = '加载失败：' + e.message; return; }
+  const list = (d && d.audits) || [];
+  box.textContent = '';
+  if (!list.length) { box.appendChild(el('div', 'muted', '（还没有强制越界的记录）')); return; }
+  for (const a of list) {
+    const uids = (a.uids || []).length;
+    const line = el('div', 'code-gen-row');
+    line.appendChild(el('span', 'mono', (a.admin_name || ('#' + a.admin_id)) + ' → ' + (a.proxy_url || a.proxy_id || '?')));
+    line.appendChild(el('span', 'mono', uids + ' 个号 · ' + (a.reason || '（无理由）')));
+    line.appendChild(el('span', a.result === 'failed' ? 'tag warn' : 'tag ok',
+      a.result === 'failed' ? '未生效' : '已生效'));
+    line.appendChild(el('span', 'mono muted', new Date(Number(a.created_at) * 1000).toLocaleString()));
+    box.appendChild(line);
+  }
+}
 
 // loadEgressCompliance 出口范围越界存量（v0.31.50，R11）。
 //

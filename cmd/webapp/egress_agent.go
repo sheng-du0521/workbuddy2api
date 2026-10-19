@@ -1456,6 +1456,24 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 	// proxyLastIP = 该线路**最近一次探活（从云端经隧道发出）**看到的出口 IP。
 	// 这个值不采信 agent 自报，因此可以用来校验"隧道到底通到哪台机器"。
 	proxyLastIP := map[string]string{}
+	// boundByURL 每个 URL 上挂了几个号（v0.31.52，R6）：用户开两台电脑时，
+	// 只有"真的有号挂上去的那台"在承重，另一台只是连着 —— 页面必须说清是哪台，
+	// 否则用户会以为两台都在工作，而实际出口始终只有一台。
+	boundByURL := map[string]int{}
+	if accs, err := a.store.ListAccounts(); err == nil {
+		for _, acc := range accs {
+			if acc == nil {
+				continue
+			}
+			raw := strings.TrimSpace(acc.EgressProxy)
+			if raw == "" || egress.IsDirect(raw) {
+				continue
+			}
+			if c, cerr := egress.Normalize(raw); cerr == nil {
+				boundByURL[c]++
+			}
+		}
+	}
 	if proxies, err := a.store.ListEgressProxies(); err == nil {
 		for _, p := range proxies {
 			u := egressURLKey(p.URL)
@@ -1774,6 +1792,22 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 			}
 		}
 	}
+	// 承重机判定（v0.31.52，R6）：每个出口 URL 上挂了几个号。
+	boundByURL := map[string]int{}
+	if accs, err := a.store.ListAccounts(); err == nil {
+		for _, acc := range accs {
+			if acc == nil {
+				continue
+			}
+			raw := strings.TrimSpace(acc.EgressProxy)
+			if raw == "" || egress.IsDirect(raw) {
+				continue
+			}
+			if c, cerr := egress.Normalize(raw); cerr == nil {
+				boundByURL[c]++
+			}
+		}
+	}
 
 	byFP := map[string][]string{}
 	byExit := map[string][]string{}
@@ -1848,6 +1882,10 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 			// alt_ids 同一台机器上另外几份 agent 自报的 id（一台电脑装了多份）。
 			"alt_ids": append([]string(nil), mm.AltIDs...),
 			"port":    mm.Ports.TunnelPort,
+			// 承重机判定（v0.31.52）：这条线路当前挂着几个号。
+			// carrying=true 才是"真正在承重"的那台；另一台即便在线也只是待命。
+			"bound_accounts": boundByURL[egressURLKey(url)],
+			"carrying":       boundByURL[egressURLKey(url)] > 0,
 		}
 	}
 	return out
@@ -2240,6 +2278,19 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 		}
 	}
 	now := time.Now().Unix()
+	// 每用户线路条数配额（v0.31.52，R7）：同一用户反复"拉起不同机器"会占满端口段、
+	// 让线路池膨胀，而每条线路都绑定着他家的一台设备（不可信边界）。
+	// 只拦**新建**：已有线路的重复应用不受影响（否则升级后老用户会被锁死）。
+	if hit == nil && !scope.Platform {
+		if n := a.egressUserLineCount(scope.UserID); n >= a.egressUserLineQuota() {
+			log.Printf("WARN: [egress] 用户 #%d 线路数已达上限 %d（当前 %d），拒绝新建 %s",
+				scope.UserID, a.egressUserLineQuota(), n, url)
+			return res, &notUsableError{msg: fmt.Sprintf(
+				"你的出口线路已达上限（%d 条，当前已有 %d 条）：多出来的机器不会带来新出口，"+
+					"只会占用端口段。请先在「我的出口」停用/删除不用的机器，或联系管理员扩容",
+				a.egressUserLineQuota(), n)}
+		}
+	}
 	if hit == nil {
 		// 名称按视角区分：平台叫"本地住宅出口"，用户叫"<用户名> 的出口" ——
 		// 管理后台的线路池一眼就能看出这条线是谁接进来的（归属由 owner_user_id
@@ -2446,4 +2497,37 @@ func newEgressProxyID(url string) string {
 		sum = sum*31 + int(url[i])
 	}
 	return fmt.Sprintf("home%08x", uint32(sum))
+}
+
+// egressUserLineQuota 每个用户最多能接几条出口线路（v0.31.52，R7）。
+//
+// 默认 2（一台主力 + 一台备用）。可在 kv `egress_max_lines_per_user` 覆盖。
+// 为什么要有上限：每条用户线路都占一个端口、一条隧道、以及"某个人的家庭网络"
+// 这个不可信边界；没有上限时，反复拉起会把端口段吃光，而端口段是按 uid 模 1000
+// 分配的 —— 吃光的后果会牵连到**别的用户**。
+func (a *app) egressUserLineQuota() int {
+	if v, err := a.store.GetKV("egress_max_lines_per_user"); err == nil {
+		if n := egressAtoi(v, 0); n > 0 {
+			return n
+		}
+	}
+	return 2
+}
+
+// egressUserLineCount 某个用户当前占了几条线路（只数 owner 是他的）。
+func (a *app) egressUserLineCount(uid int64) int {
+	if uid <= 0 {
+		return 0
+	}
+	list, err := a.store.ListEgressProxies()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, p := range list {
+		if p != nil && p.OwnerUserID == uid {
+			n++
+		}
+	}
+	return n
 }

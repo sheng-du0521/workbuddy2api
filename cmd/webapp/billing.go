@@ -458,6 +458,20 @@ func (a *app) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Kind) == KeyKindHost {
 		kind = KeyKindHost
 	}
+	// v0.31.52：传了 account_uids 却没指定 kind=host → **明确拒绝**。
+	//
+	// 现场（2026-10-19 端到端验证）：按 API 直接建 Key 时传了 account_uids 但没带
+	// kind，结果绑定被**静默丢弃**，Key 变成"平台计费 Key"——请求走平台号池、
+	// 从余额扣点，而调用方以为自己建的是"只用自己代挂号"的自用 Key。
+	// 这类"参数看着生效、其实没生效"的静默降级，比直接报错贵得多。
+	if len(req.AccountUIDs) > 0 && kind != KeyKindHost {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "account_uids 只对代挂自用 Key 生效：请同时传 kind=host，" +
+				"否则这是一把会走平台号池、从余额扣点的普通 Key",
+			"code": "account_uids_requires_host",
+		})
+		return
+	}
 	// 绑定账号集合：仅代挂自用 Key 有意义；只接受本人代挂账号（防越权绑定他人账号）。
 	accountUIDs := ""
 	if kind == KeyKindHost && len(req.AccountUIDs) > 0 {

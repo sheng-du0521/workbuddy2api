@@ -1,16 +1,16 @@
 {
-  "version": "0.31.51",
+  "version": "0.31.52",
   "min_supported": "0.24.0",
-  "notes": "v0.31.51：① 排查「控制台调用模型请求 Internal error 404」——服务端此前**没有任何日志**（404 在路由层产生、不进 handler），所以先加 `routeDiagnostics` 中间件：尾部斜杠归一（`/v1/chat/completions/` 视为同一路由）+ 未匹配路径打 WARN（方法/路径/UA/IP），下次再报 404 能直接说出是哪个客户端请求了哪条路径。② 落地需求一的后端与用户端展示：新表 `model_ratios` / `model_ratio_diffs`，每日（20 小时间隔）从上游模型目录同步 `credits` 与 `tags` 里的免费 badge，与本地 `model_cost_1k:<model>` 并列落库；免费↔付费、倍率变更各记一条差异，并写一条站内公告（每轮最多一条）。新增 `GET /api/models/ratios`（用户只读）、`GET /api/admin/model-ratios`、`POST /api/admin/model-ratios/sync`。用户控制台「可用模型」弹窗改为并列展示官方倍率/免费标/实测积分，并明说**计费仍以实测为准**（credits 语义未实证，不拿它算钱）。",
-  "released_at": 1792412542,
+  "notes": "v0.31.52：① 端到端真机验证（注册→导入→自挂→建 key→调用）过程中发现并修掉一个**静默降级**：建 Key 时传了 account_uids 却没带 kind=host，绑定被静默丢弃、Key 变成平台计费 Key（走平台号池、扣余额），调用方却以为建的是自用 Key → 现在直接 400 `account_uids_requires_host`。② 管理端「模型倍率」独立面板（导航新增）：模型/官方倍率/标签/免费/实测积分/口径状态 + 变化台账 + 「立即同步」，与用户端同一套口径（倍率只对照、计费看实测）。③ 「强制越界审计」面板：谁、对哪几个号、理由、结果（failed 也留痕）；并补上「强制打到停用线路」时的 failed 审计（此前只在候选阶段被过滤、什么都不留）。④ 每用户出口线路配额（默认 2 条，kv `egress_max_lines_per_user` 可调）：只拦新建，已有线路重复应用不受影响。⑤ 机器视图新增 `carrying` / `bound_accounts`：用户端会标明「承重中 N 个号 / 待命（无号绑定）」。⑥ 顺带把 v0.31.50 的 force 失败审计缺口补齐（见 ③）。",
+  "released_at": 1792413627,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.51/webapp.exe",
-      "sha256": "008d2b742b50dafc9ba5cfc006310c0ca431826f7e8d265e175be7eb4e27a82d",
-      "size": 15635968
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.52/webapp.exe",
+      "sha256": "045b739a0e82b84ee3c6937de165b95b403091ce48266817ec9185af9948edc6",
+      "size": 15652352
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

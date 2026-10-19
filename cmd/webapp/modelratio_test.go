@@ -32,16 +32,19 @@ func TestModelBadgeOf(t *testing.T) {
 
 // TestModelRatioDrift 口径不一致的判定：只在证据明确时提示。
 func TestModelRatioDrift(t *testing.T) {
-	if s := modelRatioDrift(true, 0); s != "" {
+	if s := modelRatioDrift(true, 0, false); s != "" {
+		t.Fatalf("未实测不该报 drift（未知≠异常），得 %q", s)
+	}
+	if s := modelRatioDrift(true, 0, true); s != "" {
 		t.Fatalf("免费且实测 0 不该报 drift，得 %q", s)
 	}
-	if s := modelRatioDrift(true, 0.5); s == "" {
+	if s := modelRatioDrift(true, 0.5, true); s == "" {
 		t.Fatal("免费但实测在扣点必须提示")
 	}
-	if s := modelRatioDrift(false, 0); s == "" {
+	if s := modelRatioDrift(false, 0, true); s == "" {
 		t.Fatal("付费但实测为 0 必须提示")
 	}
-	if s := modelRatioDrift(false, 0.5); s != "" {
+	if s := modelRatioDrift(false, 0.5, true); s != "" {
 		t.Fatalf("一致的口径不该报 drift，得 %q", s)
 	}
 }

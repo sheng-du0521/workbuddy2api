@@ -56,8 +56,13 @@ type modelRatio struct {
 	OfficialBadge string `json:"official_badge"`
 	// OfficialFree 上游是否标了免费（badge 含"免费"）。
 	OfficialFree bool `json:"official_free"`
-	// MeasuredCost1k 实测积分/1k（本地 kv；0 = 尚未实测）。
+	// MeasuredCost1k 实测积分/1k（本地 kv；0 且 MeasuredKnown=false = 尚未实测）。
 	MeasuredCost1k float64 `json:"measured_cost_1k"`
+	// MeasuredKnown 本地**有没有**这个模型的实测记录（v0.31.52）。
+	//
+	// 必须与"实测为 0"分开：没有记录 ≠ 测得 0。混为一谈时，
+	// 每一个还没被实测过的模型都会被标成"口径待核对"（现场实测 44/51 条误报）。
+	MeasuredKnown bool `json:"measured_known"`
 	// Drift 两个口径"看起来不一致"（免费但实测在扣费 / 付费但实测为 0）。
 	// 只做提示，不改计费。
 	Drift     string `json:"drift,omitempty"`
@@ -83,6 +88,7 @@ func (s *Store) migrateModelRatio() error {
 			official_badge    TEXT NOT NULL DEFAULT '',
 			official_free     INTEGER NOT NULL DEFAULT 0,
 			measured_cost_1k  REAL NOT NULL DEFAULT 0,
+			measured_known    INTEGER NOT NULL DEFAULT 0,
 			updated_at        INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS model_ratio_diffs (
@@ -100,13 +106,22 @@ func (s *Store) migrateModelRatio() error {
 			return fmt.Errorf("migrate model_ratios: %w", err)
 		}
 	}
+	if err := s.ensureColumn("model_ratios", "measured_known",
+		"measured_known INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate model_ratios(measured_known): %w", err)
+	}
+	// 存量回填：值非 0 的一定有记录。
+	if _, err := s.db.Exec(`UPDATE model_ratios SET measured_known = 1
+		WHERE measured_cost_1k > 0 AND measured_known = 0`); err != nil {
+		return fmt.Errorf("migrate model_ratios(backfill): %w", err)
+	}
 	return nil
 }
 
 // ListModelRatios 全量倍率（按 model 排序，保证界面稳定）。
 func (s *Store) ListModelRatios() ([]*modelRatio, error) {
 	rows, err := s.db.Query(`SELECT model, name, official_credits, official_badge,
-		official_free, measured_cost_1k, updated_at FROM model_ratios ORDER BY model`)
+		official_free, measured_cost_1k, measured_known, updated_at FROM model_ratios ORDER BY model`)
 	if err != nil {
 		return nil, err
 	}
@@ -114,13 +129,14 @@ func (s *Store) ListModelRatios() ([]*modelRatio, error) {
 	var out []*modelRatio
 	for rows.Next() {
 		var r modelRatio
-		var free int
+		var free, known int
 		if err := rows.Scan(&r.Model, &r.Name, &r.OfficialCredits, &r.OfficialBadge,
-			&free, &r.MeasuredCost1k, &r.UpdatedAt); err != nil {
+			&free, &r.MeasuredCost1k, &known, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.OfficialFree = free != 0
-		r.Drift = modelRatioDrift(r.OfficialFree, r.MeasuredCost1k)
+		r.MeasuredKnown = known != 0
+		r.Drift = modelRatioDrift(r.OfficialFree, r.MeasuredCost1k, r.MeasuredKnown)
 		out = append(out, &r)
 	}
 	return out, rows.Err()
@@ -130,7 +146,10 @@ func (s *Store) ListModelRatios() ([]*modelRatio, error) {
 //
 // 刻意保守：只有在**证据明确**时才提示 —— 免费但实测在扣点、或付费但实测为 0。
 // 上游 credits 为空、或本地还没实测（0）时一律不提示（未知不等于异常）。
-func modelRatioDrift(free bool, measured float64) string {
+func modelRatioDrift(free bool, measured float64, known bool) string {
+	if !known {
+		return "" // 还没实测过：未知不等于异常（这一条曾把 44/51 个模型误报成"口径待核对"）
+	}
 	switch {
 	case free && measured > 0:
 		return "官方标免费，但实测在扣点 —— 计费暂按实测执行，请人工核对"
@@ -143,25 +162,27 @@ func modelRatioDrift(free bool, measured float64) string {
 // PutModelRatio upsert 一条（内部用）。
 func (s *Store) PutModelRatio(r *modelRatio) error {
 	_, err := s.db.Exec(`INSERT INTO model_ratios
-		(model, name, official_credits, official_badge, official_free, measured_cost_1k, updated_at)
-		VALUES (?,?,?,?,?,?,?)
+		(model, name, official_credits, official_badge, official_free, measured_cost_1k,
+		 measured_known, updated_at)
+		VALUES (?,?,?,?,?,?,?,?)
 		ON CONFLICT(model) DO UPDATE SET
 			name=excluded.name, official_credits=excluded.official_credits,
 			official_badge=excluded.official_badge, official_free=excluded.official_free,
-			measured_cost_1k=excluded.measured_cost_1k, updated_at=excluded.updated_at`,
+			measured_cost_1k=excluded.measured_cost_1k, measured_known=excluded.measured_known,
+			updated_at=excluded.updated_at`,
 		r.Model, r.Name, r.OfficialCredits, r.OfficialBadge, b2i(r.OfficialFree),
-		r.MeasuredCost1k, r.UpdatedAt)
+		r.MeasuredCost1k, b2i(r.MeasuredKnown), r.UpdatedAt)
 	return err
 }
 
 // GetModelRatio 单条（找不到返回 nil）。
 func (s *Store) GetModelRatio(model string) (*modelRatio, error) {
 	row := s.db.QueryRow(`SELECT model, name, official_credits, official_badge,
-		official_free, measured_cost_1k, updated_at FROM model_ratios WHERE model = ?`, model)
+		official_free, measured_cost_1k, measured_known, updated_at FROM model_ratios WHERE model = ?`, model)
 	var r modelRatio
-	var free int
+	var free, known int
 	err := row.Scan(&r.Model, &r.Name, &r.OfficialCredits, &r.OfficialBadge, &free,
-		&r.MeasuredCost1k, &r.UpdatedAt)
+		&r.MeasuredCost1k, &known, &r.UpdatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return nil, nil
@@ -169,7 +190,8 @@ func (s *Store) GetModelRatio(model string) (*modelRatio, error) {
 		return nil, err
 	}
 	r.OfficialFree = free != 0
-	r.Drift = modelRatioDrift(r.OfficialFree, r.MeasuredCost1k)
+	r.MeasuredKnown = known != 0
+	r.Drift = modelRatioDrift(r.OfficialFree, r.MeasuredCost1k, r.MeasuredKnown)
 	return &r, nil
 }
 
@@ -217,14 +239,17 @@ func modelBadgeOf(tags []string) string {
 }
 
 // measuredCost1k 读本地实测成本（kv `model_cost_1k:<model>`）。
-func (a *app) measuredCost1k(model string) float64 {
+// 第二个返回值表示"有没有这条记录"—— 与"测得 0"是两件事。
+func (a *app) measuredCost1k(model string) (float64, bool) {
 	v, err := a.store.GetKV("model_cost_1k:" + strings.ToLower(strings.TrimSpace(model)))
 	if err != nil || strings.TrimSpace(v) == "" {
-		return 0
+		return 0, false
 	}
 	var f float64
-	_, _ = fmt.Sscanf(strings.TrimSpace(v), "%f", &f)
-	return f
+	if _, perr := fmt.Sscanf(strings.TrimSpace(v), "%f", &f); perr != nil {
+		return 0, false
+	}
+	return f, true
 }
 
 // modelRatioSyncResult 一次同步的结果（接口回显 + 日志）。
@@ -272,12 +297,13 @@ func (a *app) syncModelRatios() (modelRatioSyncResult, error) {
 		}
 		badge := modelBadgeOf(mi.Tags)
 		free := strings.Contains(badge, "免费")
+		cost, known := a.measuredCost1k(id)
 		next := &modelRatio{
 			Model: id, Name: mi.Name,
 			OfficialCredits: strings.TrimSpace(mi.Credits),
 			OfficialBadge:   badge, OfficialFree: free,
-			MeasuredCost1k: a.measuredCost1k(id),
-			UpdatedAt:      now,
+			MeasuredCost1k: cost, MeasuredKnown: known,
+			UpdatedAt: now,
 		}
 		prev, gerr := a.store.GetModelRatio(id)
 		if gerr != nil {

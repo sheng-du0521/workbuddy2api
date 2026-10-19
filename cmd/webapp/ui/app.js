@@ -3997,6 +3997,9 @@ function renderEgressHome(box, v) {
         + ' · 隧道' + (m.tunnel_reachable ? '通' : '不通')
         + ' · 本机代理' + (m.proxy_ok ? '运行中' : '未运行')
         + ' · 端口 ' + m.tunnel_port
+        // 承重机（v0.31.52）：只有挂了号的机器在真正承重，另一台只是连着 ——
+        // 不说清的话，用户会以为两台电脑都在出流量。
+        + (m.carrying ? ' · 承重中 ' + (m.bound_accounts || 0) + ' 个号' : ' · 待命（无号绑定）')
         + (m.local_ip ? ' · 内网 ' + m.local_ip : '')
         + (m.exit_ip ? ' · 出口 ' + m.exit_ip : '')
         + (m.applied ? ' · 已应用' : '')));

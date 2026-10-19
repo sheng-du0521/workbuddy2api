@@ -258,6 +258,9 @@ func (s *Store) ListEgressForceAudits(limit int, proxyID string) ([]*egressForce
 func (a *app) handleEgressForceAudits(w http.ResponseWriter, r *http.Request) {
 	list, err := a.store.ListEgressForceAudits(egressAtoi(r.URL.Query().Get("limit"), 20),
 		r.URL.Query().Get("proxy_id"))
+	if list == nil {
+		list = []*egressForceAudit{} // 空列表要是 []，前端才不用为 null 写分支
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return

@@ -2559,6 +2559,13 @@ function run(pageFile, meOverride, plan) {
       rlBad.push('admin.html 未渲染 blocked（被拦下的号会“消失”）');
     }
     // v0.31.51：模型倍率必须与计费口径并列展示，并说明“倍率不参与计费”。
+    // v0.31.52：管理端必须能看见「官方口径 vs 实测」和「强制越界审计」。
+    if (!adminHtml.includes('data-pane="ratios"') || !adminHtml.includes('loadModelRatios')) {
+      rlBad.push('admin.html 缺模型倍率面板（官方口径无法核对）');
+    }
+    if (!adminHtml.includes('egrAuditList') || !adminHtml.includes('loadEgressAudits')) {
+      rlBad.push('admin.html 缺强制越界审计面板（越权分发无法回溯）');
+    }
     if (!dash.includes('/api/models/ratios')) {
       rlBad.push('dashboard.html 未展示模型倍率（用户看不到官方口径）');
     }

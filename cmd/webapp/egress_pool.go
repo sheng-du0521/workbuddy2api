@@ -478,6 +478,25 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(usable) == 0 {
 		if wantURL != "" {
+			// 强制越界打到一条**被停用**的线路上：必须留一条 failed 审计（v0.31.52）。
+			// 否则"我明明强制了"与"一条都没改"之间没有任何可查的东西 ——
+			// 而这次操作恰恰是"越权分发凭证"的尝试，失败也要留痕。
+			if req.ForceScope {
+				target := egressLineByURL(proxies, wantURL)
+				if target != nil {
+					audit := &egressForceAudit{
+						ProxyID: target.ID, ProxyURL: target.URL, UIDs: targets2UIDs(targets),
+						Violations: map[string]string{}, Reason: strings.TrimSpace(req.ForceReason),
+						Result: "failed",
+					}
+					if u := userFrom(r); u != nil {
+						audit.AdminID, audit.AdminName = u.ID, u.Username
+					}
+					if err := a.store.InsertEgressForceAudit(audit); err != nil {
+						log.Printf("WARN: [egress] 写失败审计出错：%v", err)
+					}
+				}
+			}
 			// 指定线路时把话说清：是"这条不在池里/被停用"，不是"池子空了"
 			// —— 两者的下一步动作完全不同（去线路池找它 vs 去加线路）。
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -1442,4 +1461,16 @@ func (a *app) handleEgressLineManualDisable(w http.ResponseWriter, r *http.Reque
 	_ = a.proxy.SyncAccounts()
 	log.Printf("INFO: [egress] 管理员把线路 %s（%s）人工停用=%v", p.ID, p.URL, p.ManualDisabled)
 	writeJSON(w, http.StatusOK, map[string]any{"proxy": p})
+}
+
+// targets2UIDs 把目标账号转成 uid 列表（审计用，保持稳定顺序）。
+func targets2UIDs(targets []*Account) []string {
+	out := make([]string, 0, len(targets))
+	for _, acc := range targets {
+		if acc != nil && strings.TrimSpace(acc.UID) != "" {
+			out = append(out, acc.UID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
