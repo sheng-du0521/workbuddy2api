@@ -91,6 +91,12 @@ const (
 	// （否则升级瞬间页面会显示"一台机器都没有"，而它的隧道其实还好着）。
 	kvEgressLegacyState = "egress_agent_state"
 	kvEgressLegacyCmd   = "egress_agent_cmd"
+	// kvEgressLegacyMigrated 旧单机 kv **已迁移**的标记（v0.31.49）。
+	//
+	// 有它才能保证"旧 kv 只读一次"：否则 default 桶被清掉后，下一次 load 又把它
+	// 从旧 kv 重建出来，而 prune 又会按"无指纹 + 很老"清掉 —— 删建循环每 5 秒
+	// 刷两行日志，把真正要查的扫码/代理日志整段淹掉（现场 16 小时上万条）。
+	kvEgressLegacyMigrated = "egress_legacy_migrated"
 	// kvEgressAgentPorts 端口**默认值**（用户机可覆盖；正常情况永远不用动）。
 	kvEgressAgentPorts = "egress_agent_ports"
 
@@ -173,6 +179,12 @@ type egressAgentState struct {
 	// agent 自己生成、随参数上行的（用户把整个目录拷到另一台电脑就会重复），
 	// 而指纹取的是这台机器的物理特征 —— 两台机器同一个指纹，基本只能是同一台机器。
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// FingerprintPrev 指纹算法**上一版**的取值（v0.31.49，升级过渡期用）。
+	//
+	// 旧算法把内网 IP 算进哈希 → 同一台笔记本换个网络就换了身份。新算法只用
+	// hostname + 主网卡 MAC。升级时 agent 同时报两个值，服务端才能把老记录
+	// 认回来（否则每台机器升级后都会多出一条幽灵线路 + 一个新端口）。
+	FingerprintPrev string `json:"fingerprint_prev,omitempty"`
 	// LocalIP 本机首选内网地址（人眼核对"这是哪台机器"用，不参与判定）。
 	LocalIP string `json:"local_ip,omitempty"`
 	// Message 最近一条人话状态（错误原文也放这里）。
@@ -238,11 +250,34 @@ type egressMachine struct {
 	// Cmd / CmdAt 待执行（或最近一条）指令。空串 = none。
 	Cmd   string `json:"cmd,omitempty"`
 	CmdAt int64  `json:"cmd_at,omitempty"`
+	// LegacyFingerprint 指纹算法上一版的取值（v0.31.49）。
+	//
+	// 旧算法把**内网 IP** 也算进哈希里，于是同一台笔记本换个网络（DHCP 变了 IP、
+	// 换 Wi-Fi、开热点）就会被判成"另一台机器"，凭空多出一条线路 + 一个端口。
+	// 升级时 agent 会同时上报新旧两个指纹，服务端据此把老记录认回来，
+	// 并把旧值留在这里，供再下次核对（老 agent 也可能只报旧值）。
+	LegacyFingerprint string `json:"legacy_fingerprint,omitempty"`
 	// State / StateAt 最近一次上报。
 	State   egressAgentState `json:"state,omitempty"`
 	StateAt int64            `json:"state_at,omitempty"`
+	// LastPollAt 最近一次 poll 的时刻（v0.31.49）。
+	//
+	// poll 与 report 是两条独立心跳：agent 刚装好、代理还没起来时只会 poll，
+	// 此时 StateAt 一直是 0 —— 页面把一台**活着**的机器显示成"离线"，
+	// 用户就去点另一台早已关机的卡片，"拉起"永远等不到响应。
+	LastPollAt int64 `json:"last_poll_at,omitempty"`
 	// CreatedAt 首次出现时刻（用于列表稳定排序 + "这台什么时候接入的"）。
 	CreatedAt int64 `json:"created_at,omitempty"`
+}
+
+// sameHostname 两个主机名是否指向同一台机器（大小写无关，空值一律不成立）。
+//
+// 刻意不做模糊匹配：主机名相同只是**辅证**，真正决定身份的是指纹；
+// 这里只在"同一个 machine id + 同一个主机名 + 原记录已离线"这种组合下
+// 才用来判断"是同一台机器换了网络"，而不是"另一台电脑"。
+func sameHostname(a, b string) bool {
+	x, y := strings.ToLower(strings.TrimSpace(a)), strings.ToLower(strings.TrimSpace(b))
+	return x != "" && x == y
 }
 
 // egressMachineKey 机器表的键：owner + agent 自报的 machine id。
@@ -265,9 +300,31 @@ func egressMachineKey(owner int64, id string) string {
 	return id
 }
 
-// online 该机器最近是否上报过。
+// online 该机器最近是否上报过（或至少还在 poll）。
+//
+// v0.31.49：判据从"只看 StateAt"改成 max(StateAt, LastPollAt)。
+// 只看上报时刻会把"agent 活着、代理还没起来"的机器显示成离线 —— 而拉起代理
+// 恰恰发生在这个阶段，用户据此去点另一台真离线的机器，就永远等不到结果。
 func (m *egressMachine) online(now int64) bool {
-	return m != nil && m.StateAt > 0 && now-m.StateAt < egressAgentOnlineSec
+	if m == nil {
+		return false
+	}
+	seen := m.StateAt
+	if m.LastPollAt > seen {
+		seen = m.LastPollAt
+	}
+	return seen > 0 && now-seen < egressAgentOnlineSec
+}
+
+// lastSeenAt 这台机器最后一次"说过话"的时刻（上报或 poll，取较大者）。
+func (m *egressMachine) lastSeenAt() int64 {
+	if m == nil {
+		return 0
+	}
+	if m.LastPollAt > m.StateAt {
+		return m.LastPollAt
+	}
+	return m.StateAt
 }
 
 // machinesLoad 读取机器表（含 v0.31.17 单机 kv 的只读迁移）。
@@ -279,8 +336,13 @@ func (a *app) machinesLoad() map[string]*egressMachine {
 			out = raw
 		}
 	}
-	// 旧单机格式迁移（只在 default 桶缺失时做一次）。
-	if _, ok := out[egressDefaultMachine]; !ok {
+	// 旧单机格式迁移（只做**一次**，v0.31.49 加标记）。
+	//
+	// 旧写法只判"default 桶缺失就迁移"，而迁移结果会被 pruneStaleMachines 当作
+	// 幽灵清掉（default 桶 StateAt>0 + 无指纹 + 同机已有新记录）—— 下一次 load
+	// 又把它从旧 kv 里重建出来，于是每 5 秒删一次、建一次，日志被刷满上万行。
+	// 迁移过一次就写标记：**这份 kv 只值得读一次**。
+	if _, ok := out[egressDefaultMachine]; !ok && len(out) == 0 && a.egressLegacyMigrateNeeded() {
 		if v, err := a.store.GetKV(kvEgressLegacyState); err == nil && strings.TrimSpace(v) != "" {
 			var st egressAgentState
 			if json.Unmarshal([]byte(v), &st) == nil && st.At > 0 {
@@ -295,10 +357,24 @@ func (a *app) machinesLoad() map[string]*egressMachine {
 					}
 				}
 				out[egressDefaultMachine] = mm
+				a.markEgressLegacyMigrated()
 			}
 		}
 	}
 	return out
+}
+
+// egressLegacyMigrateNeeded 旧单机 kv 是否还需要迁移一次。
+func (a *app) egressLegacyMigrateNeeded() bool {
+	v, err := a.store.GetKV(kvEgressLegacyMigrated)
+	return err != nil || strings.TrimSpace(v) == ""
+}
+
+// markEgressLegacyMigrated 记下"旧 kv 已经读过了"，保证它只读一次。
+func (a *app) markEgressLegacyMigrated() {
+	if err := a.store.SetKV(kvEgressLegacyMigrated, "1"); err != nil {
+		log.Printf("WARN: [egress] 写迁移标记失败（下次启动会再读一次旧 kv）：%v", err)
+	}
 }
 
 // machinesSave 落盘机器表。
@@ -437,6 +513,43 @@ func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []s
 	return pruned
 }
 
+// pruneDriftedSiblings 清掉同一台机器"换网络"留下的旧记录（v0.31.49）。
+//
+// 判据（三条全中才删）：
+//  1. 同 owner + 同 machine id + 同主机名 —— 只是键不同（分叉键带指纹后缀）；
+//  2. **当前这台在线**（否则可能是两台交替开机的机器，删错就没了一条线路）；
+//  3. 旧记录超过 staleMachineAge 没有任何心跳。
+//
+// 为什么需要它：v0.3.6 及以前的指纹含内网 IP，同一台笔记本换一次网络就分叉出一条
+// 新记录。修好指纹之后，这些**历史**记录不会自己消失 —— 它们永远不会再上报，
+// 只会让页面一直显示"两台同名电脑"。
+func pruneDriftedSiblings(m map[string]*egressMachine, owner int64, cur *egressMachine, now int64) []string {
+	if cur == nil || !cur.online(now) || strings.TrimSpace(cur.Hostname) == "" {
+		return nil
+	}
+	var out []string
+	for k, v := range m {
+		if v == nil || v == cur || v.OwnerUserID != owner {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(v.ID), strings.TrimSpace(cur.ID)) {
+			continue
+		}
+		if !sameHostname(v.Hostname, cur.Hostname) {
+			continue
+		}
+		if seen := v.lastSeenAt(); seen > 0 && now-seen <= staleMachineAge {
+			continue
+		}
+		log.Printf("INFO: [egress] 清理同机旧记录 %s（machine=%s 主机名 %s 相同，"+
+			"已 %d 小时无心跳 —— 指纹修复前换网络留下的）",
+			k, cur.ID, cur.Hostname, (now-v.lastSeenAt())/3600)
+		delete(m, k)
+		out = append(out, k)
+	}
+	return out
+}
+
 // machineEnsure 取一台机器；不存在则登记并**分配端口**。返回值 created 表示本次新建。
 //
 // owner 来自 agent 令牌（见 egressAgentAuth）：0 = 平台，>0 = 该用户。
@@ -450,7 +563,7 @@ func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []s
 //	  这个 id（最常见：把整份安装目录连同 machine.id 一起拷到第二台电脑）。
 //	  此时不能共用端口（共用 = 两条线路指向同一台机器 = 同一个出口 IP），
 //	  必须分出一个新键 + 新端口。
-func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, owner int64, fp string) (mm *egressMachine, created bool) {
+func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, owner int64, fp, fpPrev string) (mm *egressMachine, created bool) {
 	rawID := strings.TrimSpace(id)
 	if rawID == "" {
 		rawID = egressDefaultMachine
@@ -464,13 +577,34 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 	}
 	key := egressMachineKey(owner, rawID)
 	fp = strings.TrimSpace(fp)
+	fpPrev = strings.TrimSpace(fpPrev)
+	// 本次上报自报的身份集合：新算法指纹 + 旧算法指纹（升级过渡期两者并存）。
+	incomingFP := map[string]bool{}
+	if fp != "" {
+		incomingFP[fp] = true
+	}
+	if fpPrev != "" {
+		incomingFP[fpPrev] = true
+	}
 
 	// ---- 指纹优先（v0.31.31）----
-	if fp != "" {
-		// (a) 同 owner + 同指纹 = 同一台机器：认回既有记录，不新建、不占新端口。
+	if len(incomingFP) > 0 {
+		// (a) 同 owner + 指纹命中（新/旧算法任一）= 同一台机器：认回既有记录。
 		for k, v := range m {
-			if v == nil || v.OwnerUserID != owner || strings.TrimSpace(v.Fingerprint) != fp {
+			if v == nil || v.OwnerUserID != owner {
 				continue
+			}
+			recFP := strings.TrimSpace(v.Fingerprint)
+			if recFP == "" || !incomingFP[recFP] {
+				continue
+			}
+			// 指纹算法升级（v0.31.49）：旧算法把内网 IP 算进哈希，换网络就会变。
+			// agent 会同时上报新旧两个值，这里把记录刷成新值，旧值留痕。
+			if fp != "" && recFP != fp {
+				v.LegacyFingerprint = recFP
+				v.Fingerprint = fp
+				log.Printf("INFO: [egress] 机器 %s 指纹算法升级（%s → %s），线路与端口保持不变",
+					k, recFP, fp)
 			}
 			if k != key {
 				// 同一个 agent 换了 id（重装/清目录），或历史升级路径留下的重复记录：
@@ -482,7 +616,7 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 				// 只删"指纹为空或相同"的记录；指纹不同的说明是另一台机器占着这个 id，
 				// 那种情形下面 (b) 会单独处理，不能动。
 				if dup, ok := m[key]; ok && dup != nil &&
-					(strings.TrimSpace(dup.Fingerprint) == "" || strings.TrimSpace(dup.Fingerprint) == fp) {
+					(strings.TrimSpace(dup.Fingerprint) == "" || incomingFP[strings.TrimSpace(dup.Fingerprint)]) {
 					delete(m, key)
 					log.Printf("INFO: [egress] 指纹 %s 已登记为 %s，本次上报 id=%q 归并到既有记录（清理冗余记录 %s）",
 						fp, k, rawID, key)
@@ -511,24 +645,48 @@ func (a *app) machineEnsure(m map[string]*egressMachine, id, hostname string, ow
 			}
 			return v, false
 		}
-		// (b) 该键已被另一台机器占用（指纹不同）→ 复制安装目录的经典症状。
-		if exist, ok := m[key]; ok && strings.TrimSpace(exist.Fingerprint) != "" &&
-			strings.TrimSpace(exist.Fingerprint) != fp {
-			base := key + "~" + fp
-			if len(fp) > 6 {
-				base = key + "~" + fp[:6]
-			}
-			alt := base
-			for i := 2; ; i++ {
-				if _, taken := m[alt]; !taken {
-					break
+		// (b) 身份漂移（v0.31.49）：同一个 machine id、同一个主机名，指纹却变了，
+		// 而老记录**已经不在线** —— 这不是"另一台电脑"，而是同一台电脑换了网络。
+		//
+		// 现场就是这个坑：笔记本白天在公司（10.168.1.110）、晚上在家（192.168.1.19），
+		// 旧指纹把内网 IP 算进去 → 服务端当成第二台机器，多出一条线路 + 一个新端口。
+		// 用户在页面上看到两张一模一样的卡片，点了**旧那张**的「一键拉起」，
+		// 指令写进一台早已下线的记录里，等 90 秒超时 —— 报告的就是"无法拉起代理"。
+		//
+		// 只在"老记录不在线"时认回：两台机器**同时**跑才需要各占一条线路，
+		// 这时保持分叉（指纹不同 + 都在线 ⇒ 真的是两台）。
+		if exist, ok := m[key]; ok && exist != nil && fp != "" {
+			existFP := strings.TrimSpace(exist.Fingerprint)
+			if existFP != "" && !incomingFP[existFP] &&
+				sameHostname(exist.Hostname, hostname) && !exist.online(time.Now().Unix()) {
+				if fpPrev != "" {
+					exist.LegacyFingerprint = fpPrev
+				} else {
+					exist.LegacyFingerprint = existFP
 				}
-				alt = fmt.Sprintf("%s#%d", base, i)
+				exist.Fingerprint = fp
+				log.Printf("INFO: [egress] machine=%s 指纹变化（%s → %s）且原记录已离线，"+
+					"按「同一台机器换了网络」就地认回（线路与端口保持 %d）",
+					key, existFP, fp, exist.Ports.TunnelPort)
+				// 落到下面的公共分支：更新 hostname 后返回既有记录。
+			} else if existFP != "" && !incomingFP[existFP] {
+				// 该键已被**在线**的另一台机器占用（指纹不同）→ 复制安装目录的经典症状。
+				base := key + "~" + fp
+				if len(fp) > 6 {
+					base = key + "~" + fp[:6]
+				}
+				alt := base
+				for i := 2; ; i++ {
+					if _, taken := m[alt]; !taken {
+						break
+					}
+					alt = fmt.Sprintf("%s#%d", base, i)
+				}
+				log.Printf("WARN: [egress] machine id %q 被两台在线机器复用（指纹 %s ≠ %s）—— "+
+					"第二台已改用独立键 %s 与独立端口；请确认是否复制了安装目录",
+					rawID, fp, existFP, alt)
+				key = alt
 			}
-			log.Printf("WARN: [egress] machine id %q 被两台机器复用（指纹 %s ≠ %s）—— "+
-				"第二台已改用独立键 %s 与独立端口；请确认是否复制了安装目录",
-				rawID, fp, exist.Fingerprint, alt)
-			key = alt
 		}
 	}
 
@@ -803,18 +961,22 @@ func (a *app) egressAgentAuth(r *http.Request) (int64, bool) {
 // owner 来自 agent 令牌；st != nil 表示这次带状态上报（report），否则只是取指令（poll）。
 // dupAgent = 这次上报的 machine id 与**该指纹名下已登记的那台**不一致 ——
 // 即同一台机器上跑了多份 agent。
-func (a *app) egressRegister(id, hostname, fp string, owner int64, st *egressAgentState) (mm *egressMachine, created, dupAgent bool, err error) {
+func (a *app) egressRegister(id, hostname, fp, fpPrev string, owner int64, st *egressAgentState) (mm *egressMachine, created, dupAgent bool, err error) {
 	egressMachMu.Lock()
 	defer egressMachMu.Unlock()
 
 	m := a.machinesLoad()
-	mm, created = a.machineEnsure(m, id, hostname, owner, fp)
+	mm, created = a.machineEnsure(m, id, hostname, owner, fp, fpPrev)
 	// 老机器端口可能不在本账号段内（v0.31.24 全局分配 → v0.31.25 分段），迁回来。
 	moved := a.egressMigratePortsToSeg(m, owner)
 	// 顺手清掉同一台机器升级后留下的无指纹老记录（v0.31.43）。
 	// 放在这里而不是单独定时任务：机器表只在 agent 上报时才有新事实，
 	// 清理跟着上报走，就不需要再引入一个后台循环去猜"什么时候该清"。
 	pruned := pruneStaleMachines(m, time.Now().Unix(), owner)
+	// 连带清掉"换网络留下的同机旧记录"（v0.31.49）：同 owner + 同 machine id +
+	// 同主机名，且离线超过一天。指纹漂移修复之前，同一台笔记本每换一次网络
+	// 就会多出一条这样的记录，页面上就是两个同名卡片 —— 用户分不清该点哪个。
+	pruned = append(pruned, pruneDriftedSiblings(m, owner, mm, time.Now().Unix())...)
 	for _, k := range pruned {
 		log.Printf("INFO: [egress] 清理陈旧机器记录 %s（无指纹且已有同机新记录）", k)
 	}
@@ -827,6 +989,15 @@ func (a *app) egressRegister(id, hostname, fp string, owner int64, st *egressAge
 		if s := strings.TrimSpace(st.Fingerprint); s != "" {
 			mm.Fingerprint = s
 		}
+		if s := strings.TrimSpace(st.FingerprintPrev); s != "" && s != mm.Fingerprint {
+			mm.LegacyFingerprint = s
+		}
+	}
+	// 每次 poll / report 都记一次心跳（v0.31.49）：只看 StateAt 时，"agent 活着、
+	// 代理还没起来"的机器会被判离线 —— 而那正是用户点「拉起」的时刻。
+	now := time.Now().Unix()
+	if now-mm.LastPollAt >= 1 {
+		mm.LastPollAt = now
 	}
 
 	rawID := strings.TrimSpace(id)
@@ -837,7 +1008,9 @@ func (a *app) egressRegister(id, hostname, fp string, owner int64, st *egressAge
 	// 它与普通记录本来就不同键，不能算"多装了一份"。
 	dupAgent = strings.TrimSpace(id) != "" && mm.ID != "" && !strings.EqualFold(rawID, mm.ID)
 
-	if created || moved > 0 || len(pruned) > 0 || st != nil {
+	// LastPollAt 也要落盘：只在 poll 时它才变，而 poll 的其余字段都不变，
+	// 若沿用"created/moved/pruned/st"这套条件，心跳会永远写不进去。
+	if created || moved > 0 || len(pruned) > 0 || st != nil || mm.LastPollAt == now {
 		if e := a.machinesSave(m); e != nil {
 			return mm, created, dupAgent, e
 		}
@@ -861,7 +1034,8 @@ func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.URL.Query().Get("machine"))
 	host := strings.TrimSpace(r.URL.Query().Get("hostname"))
 	fp := strings.TrimSpace(r.URL.Query().Get("fingerprint"))
-	mm, created, dupAgent, err := a.egressRegister(id, host, fp, owner, nil)
+	fpPrev := strings.TrimSpace(r.URL.Query().Get("fingerprint_prev"))
+	mm, created, dupAgent, err := a.egressRegister(id, host, fp, fpPrev, owner, nil)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -912,7 +1086,8 @@ func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.At = time.Now().Unix()
-	mm, _, _, err := a.egressRegister(r.URL.Query().Get("machine"), st.Hostname, st.Fingerprint, owner, &st)
+	mm, _, _, err := a.egressRegister(r.URL.Query().Get("machine"), st.Hostname,
+		st.Fingerprint, st.FingerprintPrev, owner, &st)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -1653,8 +1828,19 @@ func (a *app) egressMachinesByURL() map[string]map[string]any {
 			// duplicate_fingerprint 与 self 同指纹的**其它**机器 key。
 			"duplicate_fingerprint": others(byFP[fp], key),
 			// same_exit 出口 IP 相同、但指纹不同的机器 key（两台机器同一个出口）。
-			"same_exit":  others(byExit[ip], key),
-			"last_at":    mm.StateAt,
+			"same_exit": others(byExit[ip], key),
+			"last_at":   mm.StateAt,
+			// last_poll_at / last_seen_at / offline_sec（v0.31.49）：页面据此说清
+			// "它到底是关机了，还是只是还没上报"。同主机名的两条记录摆在一起时，
+			// 这一列是用户唯一能分辨"该点哪张卡"的依据。
+			"last_poll_at": mm.LastPollAt,
+			"last_seen_at": mm.lastSeenAt(),
+			"offline_sec": func() int64 {
+				if seen := mm.lastSeenAt(); seen > 0 && now > seen {
+					return now - seen
+				}
+				return 0
+			}(),
 			"is_default": mm.ID == egressDefaultMachine,
 			// tunnel_exit_ip 云端经隧道实测的出口；exit_mismatch 两者不一致。
 			"tunnel_exit_ip": tunnelIP,
@@ -1693,6 +1879,56 @@ func (a *app) egressPickMachine(r *http.Request, m map[string]*egressMachine, sc
 	return best
 }
 
+// egressOfflineGraceSec 下发 start 前容忍的"沉默"时长（v0.31.49）。
+//
+// 2 分钟 ≈ 24 个心跳：足够过滤网络抖动、系统休眠唤醒，又能挡住"这台其实早就关了"。
+const egressOfflineGraceSec = 120
+
+// egressOfflineHint 目标机器是否已经不在了；在则返回空串。
+//
+// 为什么要在下发前判（而不是让前端等超时）：agent 是**拉取式**的，指令只是写进
+// 一张表，机器不在就永远没人取。用户看到的"转 90 秒然后超时"和"拉起坏了"没有区别，
+// 而真实原因往往是"你选中的是另一台已离线的机器"（同一台电脑换网络会留下两条记录）。
+func egressOfflineHint(mm *egressMachine, now int64) (string, int64) {
+	if mm == nil {
+		return "", 0
+	}
+	seen := mm.lastSeenAt()
+	if seen <= 0 {
+		// 从未上报也未 poll 过 —— 没有证据说它离线，放行（宁可让前端等）。
+		return "", 0
+	}
+	off := now - seen
+	if off <= egressOfflineGraceSec {
+		return "", 0
+	}
+	h := strings.TrimSpace(mm.Hostname)
+	if h == "" {
+		h = mm.ID
+	}
+	return fmt.Sprintf("「%s」已经 %s 没有任何心跳（agent 未运行，或那台电脑没联网）——"+
+		"请在**那台**电脑上启动 agent 后再点「一键拉起」", h, egressAgoText(off)), off
+}
+
+// egressAgoText 把秒数说成人话（只到"分/小时/天"，不追求精确）。
+func egressAgoText(sec int64) string {
+	if sec < 60 {
+		return fmt.Sprintf("%d 秒", sec)
+	}
+	mins := sec / 60
+	if mins < 60 {
+		return fmt.Sprintf("%d 分钟", mins)
+	}
+	h, m := mins/60, mins%60
+	if h < 24 {
+		if m == 0 {
+			return fmt.Sprintf("%d 小时", h)
+		}
+		return fmt.Sprintf("%d 小时 %d 分", h, m)
+	}
+	return fmt.Sprintf("%d 天", h/24)
+}
+
 // handleEgressHomePull POST /api/egress/home/pull body {"machine":"<key>"}
 //
 // 下发 start 指令。**不等结果就返回**：真正的进度由前端轮询 GET 得到
@@ -1714,6 +1950,23 @@ func (a *app) handleEgressHomePull(w http.ResponseWriter, r *http.Request, scope
 	mm, ok := a.egressMachineFor(m, id, scope)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "该机器尚未登记，或不属于你"})
+		return
+	}
+	// 目标机器明显已经不在线 → 立刻说清楚，不要让前端干等 90 秒（v0.31.49）。
+	//
+	// 现场：用户在同一台笔记本上换了网络，服务端因此多出一条"同主机名"的旧记录；
+	// 他在下拉框里选中旧那条点「一键拉起」，指令写进一台早已下线的记录，
+	// 页面转 90 秒后只给一句"等待超时" —— 看起来就是"拉起功能坏了"。
+	// 判定用 120 秒的宽限（约 24 个心跳），只为挡住"真的关机/agent 没跑"，
+	// 网络抖动（几秒）仍然照常下发。
+	if msg, off := egressOfflineHint(mm, time.Now().Unix()); msg != "" {
+		log.Printf("INFO: [egress] 拒绝向离线机器 machine=%s 下发 start（离线 %ds）", mm.ID, off)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":       msg,
+			"offline_sec": off,
+			"machine":     mm.ID,
+			"hint":        "如果这台就是你正在用的电脑，说明它换了网络、被登记成了两条线路；请选“最近在线”的那条，或直接在目标电脑上重新运行 agent",
+		})
 		return
 	}
 	// 去抖（v0.31.25）：连点不该让 agent 把隧道拆了又建。

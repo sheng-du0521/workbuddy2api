@@ -3832,12 +3832,31 @@ function egressMachineLabel(m) {
 const egressLabels = {};
 
 // egressCurMachine 从状态里取当前选中的机器（并保证选中项有效）。
+//
+// v0.31.49：默认选中项从"列表第一个"改成"最近说过话的那台"。
+// 同一台笔记本换网络会在机器表里留下两条**同名**记录（一条早已离线），
+// 按列表顺序选中的往往正是那条死的 —— 用户点「一键拉起」后转 90 秒超时，
+// 看起来就是"代理拉不起来"。
 function egressCurMachine(v) {
   const machines = (v && v.machines) || [];
   if (!egressSelMachine || !machines.some((m) => m.id === egressSelMachine)) {
-    egressSelMachine = (v && v.active_machine) || (machines.length ? machines[0].id : '');
+    const byTime = (a, b) => (b.last_seen_at || 0) - (a.last_seen_at || 0);
+    const online = machines.filter((m) => m.online).sort(byTime);
+    const picked = online[0] || machines.slice().sort(byTime)[0];
+    egressSelMachine = (picked && picked.id) || (v && v.active_machine) || '';
   }
   return { machines, cur: machines.find((m) => m.id === egressSelMachine) || null };
+}
+
+// egressAgo 秒数转人话（与后端 egressAgoText 同口径，只用于页面展示）。
+function egressAgo(sec) {
+  const s = Number(sec) || 0;
+  if (s < 60) return s + ' 秒';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + ' 分钟';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + ' 小时' + (m % 60 ? ' ' + (m % 60) + ' 分' : '');
+  return Math.floor(h / 24) + ' 天';
 }
 
 function renderEgressHome(box, v) {
@@ -3866,8 +3885,15 @@ function renderEgressHome(box, v) {
     sel.id = 'egressMachineSel';
     sel.style.minWidth = '260px';
     for (const m of machines) {
-      const o = el('option', null, egressMachineLabel(m) + (m.online ? ' · 在线' : ' · 离线')
-        + ' · 隧道:' + m.tunnel_port + (m.id === v.active_machine ? ' · 最近上报' : ''));
+      // 同名机器必须能分辨（v0.31.49）：同一台笔记本换了网络会留下两条 hostname
+      // 相同的记录；下拉框里只写主机名时，用户根本不知道自己选的是哪一条。
+      // 内网 IP 是人眼最快的区分依据，其次是在线状态与"已经离线多久"。
+      const bits = [egressMachineLabel(m)];
+      if (m.local_ip) bits.push(m.local_ip);
+      bits.push('隧道:' + m.tunnel_port);
+      bits.push(m.online ? '在线' : ('离线' + (m.offline_sec ? ' ' + egressAgo(m.offline_sec) : '')));
+      if (m.id === v.active_machine) bits.push('最近上报');
+      const o = el('option', null, bits.join(' · '));
       o.value = m.id;
       sel.appendChild(o);
     }
@@ -3967,10 +3993,11 @@ function renderEgressHome(box, v) {
       // 管子那头没有代理在跑，请求照样出不去。两个状态分开显示，
       // 用户才能自己判断该看哪一头（隧道不通看网络/防火墙，代理没跑看本机进程）。
       line.appendChild(el('span', null,
-        (m.online ? '● 在线' : '○ 离线')
+        (m.online ? '● 在线' : ('○ 离线' + (m.offline_sec ? '（' + egressAgo(m.offline_sec) + '没心跳）' : '')))
         + ' · 隧道' + (m.tunnel_reachable ? '通' : '不通')
         + ' · 本机代理' + (m.proxy_ok ? '运行中' : '未运行')
         + ' · 端口 ' + m.tunnel_port
+        + (m.local_ip ? ' · 内网 ' + m.local_ip : '')
         + (m.exit_ip ? ' · 出口 ' + m.exit_ip : '')
         + (m.applied ? ' · 已应用' : '')));
       mt.appendChild(line);

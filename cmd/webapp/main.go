@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.48"
+const version = "0.31.49"
 
 type app struct {
 	store  *Store
@@ -627,6 +627,37 @@ func recoverer(next http.Handler) http.Handler {
 	})
 }
 
+// rootHandler 根路径与"未匹配路径"的统一落点（v0.31.49）。
+//
+// 为什么不再直接 `mux.Handle("GET /", ui)`：Go 1.22 的 ServeMux 在**方法不匹配**时
+// 回 405，而 `GET /` 会吃掉所有未注册路径 —— 于是"POST 到 /chat/completions"
+// （客户端把 base_url 填成裸域名，SDK 自动补 /chat/completions）得到的是
+// `405 Method Not Allowed`，看的人只会以为网关不支持这个接口，实际是**路径少了 /v1**。
+// 现在：GET/HEAD 仍走静态页；其它方法一律回 404 + 明确的接入提示。
+// 405 只该出现在"路径对、方法错"的地方，不该替 404 背锅。
+func (a *app) rootHandler() http.Handler {
+	ui := a.uiHandler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			ui.ServeHTTP(w, r)
+			return
+		case http.MethodOptions:
+			// 预检：不放置任何跨域头（本应用同源使用），但仍要给出可读的答复。
+			w.Header().Set("Allow", "GET, HEAD, POST, OPTIONS")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": "no such endpoint: " + r.Method + " " + r.URL.Path,
+			"hint": "OpenAI 兼容接口是 POST /v1/chat/completions 与 GET /v1/models" +
+				"（也接受不带 /v1 的 /chat/completions 与 /models）；" +
+				"客户端 base_url 建议填 http://<host>:<port>/v1",
+		})
+	})
+}
+
+// uiHandler 静态前端资源。
 func (a *app) uiHandler() http.Handler {
 	sub, err := fs.Sub(uiFS, "ui")
 	if err != nil {
@@ -1436,7 +1467,7 @@ func (a *app) routes() *http.ServeMux {
 	// Prometheus 抓取端点：仅指标，不含凭证/uid/会话键 —— 但**含**用户数、用量与
 	// 号池规模聚合，且默认需要管理员权限（v0.24.2，P3-11；-metrics-public 可放开）。
 	mux.HandleFunc("GET /metrics", a.metricsGuard(a.handleMetrics))
-	mux.Handle("GET /", a.uiHandler())
+	mux.Handle("/", a.rootHandler())
 
 	// 认证
 	mux.HandleFunc("POST /api/auth/register", a.handleRegister)
@@ -1769,6 +1800,13 @@ func (a *app) routes() *http.ServeMux {
 	// /v1/models 是客户端接入时的第一个探测请求，且不产生消费 —— 故豁免余额校验，
 	// 否则余额为 0 的用户在客户端里只会看到「连接失败」（详见 apiKeyGuardNoBalance）。
 	mux.HandleFunc("GET /v1/models", a.apiKeyGuardNoBalance(a.handleModels))
+	// 不带 /v1 的别名（v0.31.49）：不少客户端把 base_url 填成裸域名
+	// （`http://host:8780`），SDK 会自己补 /chat/completions 与 /models。
+	// 此前这两条路径没有注册，落到 `GET /` 兜底上 → 用户看到的是
+	// `405 Method Not Allowed (target: http://host:8780)`，一句都指不到真正原因。
+	// 同一个处理器、同一套鉴权，只是多认一个入口。
+	mux.HandleFunc("POST /chat/completions", a.liveCapture(a.apiKeyGuard(a.proxy.ServeChat)))
+	mux.HandleFunc("GET /models", a.apiKeyGuardNoBalance(a.handleModels))
 
 	return mux
 }

@@ -59,7 +59,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.6"
+const agentVersion = "0.3.7"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -99,10 +99,14 @@ type agentState struct {
 	ExitIP string `json:"exit_ip,omitempty"`
 	// ExitIPNote 归属地/运营商（原复合串括号里的部分），只给人看。
 	ExitIPNote string `json:"exit_ip_note,omitempty"`
-	// Fingerprint 机器指纹（v0.3.1）：hostname + 主网卡 MAC + 首选内网 IP 的哈希。
+	// Fingerprint 机器指纹（v0.3.1）：hostname + 主网卡 MAC 的哈希（v0.3.7 起**不再含内网 IP**）。
 	// 用来识破「同一台机器跑了两份 agent」，以及「拷贝安装目录到另一台电脑导致
 	// machine.id 重复」这两种会让后台误以为有两条独立线路的情况。
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// FingerprintPrev 上一版指纹（v0.3.7）：旧算法把内网 IP 也算进去，同一台笔记本
+	// 换个网络就会变。升级过渡期两个值一起报，云端才能把"老记录"认回来，
+	// 而不是给每台机器多开一条线路 + 一个新端口。
+	FingerprintPrev string `json:"fingerprint_prev,omitempty"`
 	// LocalIP 本机首选内网地址（人眼核对"这是哪台电脑"）。
 	LocalIP string `json:"local_ip,omitempty"`
 	Message string `json:"message,omitempty"`
@@ -132,7 +136,9 @@ type agent struct {
 	exitNote   string
 	// fp / localIP 启动时算一次即可：MAC 与内网地址不会在运行期变化，
 	// 每 5 秒重算一遍只是白白遍历网卡。
-	fp      string
+	fp string
+	// fpPrev 旧算法指纹（含内网 IP），只在升级过渡期上报（v0.3.7）。
+	fpPrev  string
 	localIP string
 	// noUpdate 关闭自动更新（--no-update）。
 	noUpdate bool
@@ -204,10 +210,11 @@ func (a *agent) poll() (cmdSpec, error) {
 	// 带上指纹（v0.3.2）：云端在**第一次** poll 就能分清"这是哪台机器"。
 	// 不带的话，复制安装目录的第二台电脑会先用同一个 machine.id 登记一次，
 	// 直到下一次 report 才被指纹纠正 —— 那一小段时间里它拿的是别人的端口。
-	err := a.get("/api/agent/poll?machine="+url.QueryEscape(a.machine)+
+	bErr := a.get("/api/agent/poll?machine="+url.QueryEscape(a.machine)+
 		"&hostname="+url.QueryEscape(hostname())+
-		"&fingerprint="+url.QueryEscape(a.fp), &spec)
-	return spec, err
+		"&fingerprint="+url.QueryEscape(a.fp)+
+		"&fingerprint_prev="+url.QueryEscape(a.fpPrev), &spec)
+	return spec, bErr
 }
 
 func (a *agent) report() {
@@ -220,6 +227,7 @@ func (a *agent) report() {
 	st.Message = a.msg
 	a.mu.Unlock()
 	st.Fingerprint = a.fp
+	st.FingerprintPrev = a.fpPrev
 	st.LocalIP = a.localIP
 	a.mu.Lock()
 	st.AuthCandidates = a.authCand
@@ -653,10 +661,11 @@ func main() {
 
 	a := &agent{
 		server: base, token: *token, proxy: *proxy, key: *key, user: *user, machine: mid,
-		fp: machineFingerprint(), localIP: localIPv4(), noUpdate: *noUpdate,
+		fp: machineFingerprint(), fpPrev: machineFingerprintLegacy(),
+		localIP: localIPv4(), noUpdate: *noUpdate,
 	}
-	log.Printf("wb2api-egress-agent %s 启动 | 云端=%s | 机器=%s(%s) | 指纹=%s | 内网=%s | 代理=%s | 私钥=%s",
-		agentVersion, base, mid, hostname(), a.fp, a.localIP, *proxy, *key)
+	log.Printf("wb2api-egress-agent %s 启动 | 云端=%s | 机器=%s(%s) | 指纹=%s（旧算法 %s）| 内网=%s | 代理=%s | 私钥=%s",
+		agentVersion, base, mid, hostname(), a.fp, a.fpPrev, a.localIP, *proxy, *key)
 
 	// 自检模式：只验一次令牌与网络，然后退出。
 	if *once {
@@ -794,17 +803,34 @@ func main() {
 	}
 }
 
-// machineFingerprint 这台机器的物理指纹（v0.3.1）。
+// machineFingerprint 这台机器的物理指纹（v0.3.7）。
 //
 // 为什么不能只用 machine.id：那个 id 是 agent 自己生成、存在同目录 machine.id 里的。
 // 用户把整个安装目录拷到另一台电脑（很常见：家里两台机都想接进来）→ 两份 agent
 // 报同一个 id，云端按 owner+id 分桶就会把两台并成一台，第二台永远抢不到端口。
-// 指纹取的是 hostname + 主网卡 MAC + 首选内网 IP，跨目录、跨版本都稳定，
-// 且不是 agent 随便填的 —— 后台据此能直接说"这两条线路是同一台机器"。
+// 指纹取的是 hostname + 主网卡 MAC，跨目录、跨版本都稳定，且不是 agent 随便填的。
 //
-// 取不到 MAC（容器/权限受限）时退化为 hostname+内网 IP：仍然是"同一台机器会相同"，
+// ⚠️ **不能把内网 IP 算进去**（v0.3.7 修，现场踩到）：笔记本白天在公司
+// （10.168.1.110）、晚上在家（192.168.1.19），IP 一变指纹就变 —— 云端把同一台
+// 电脑当成"第二台机器"，多开一条线路 + 一个新端口。用户在页面上看到两张同名卡片，
+// 点了旧那张的「一键拉起」，指令写进早已下线的记录，等 90 秒超时，
+// 报上来就是一句"用户无法拉起代理"。
+// 内网 IP 只作为 `local_ip` 单独上报，供人眼核对，**不参与身份判定**。
+//
+// 取不到 MAC（容器/权限受限）时退化为 hostname：仍然"同一台机器相同"，
 // 只是区分度低一些，并在日志里说明，不假装自己拿到了。
 func machineFingerprint() string {
+	parts := []string{strings.ToLower(strings.TrimSpace(hostname())), primaryMAC()}
+	seed := strings.Join(parts, "|")
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:8])
+}
+
+// machineFingerprintLegacy 旧算法（hostname + MAC + 内网 IP，v0.3.1~v0.3.6）。
+//
+// 只用于升级过渡：随 poll/report 上报，让云端把"旧指纹那条记录"认回来并刷成新值。
+// 一两个版本之后可以删掉 —— 留着不会有害，但别让它再参与任何判定。
+func machineFingerprintLegacy() string {
 	parts := []string{strings.ToLower(strings.TrimSpace(hostname())), primaryMAC(), localIPv4()}
 	seed := strings.Join(parts, "|")
 	sum := sha256.Sum256([]byte(seed))

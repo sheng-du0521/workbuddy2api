@@ -1829,6 +1829,25 @@ function run(pageFile, meOverride, plan) {
   for (const def of dupDefs) if (!APP_JS.includes(def)) dupBad.push(`app.js 缺少共享定义：${def}`);
   dupBad.forEach((m) => console.log('  [FAIL] dedup: ' + m));
   if (!dupBad.length) console.log('  [ok] dedup: 三个共享 helper 只在 app.js 定义一次');
+  // v0.31.49：机器列表必须能区分**同名机器**，且默认选中"还活着的那台"。
+  //
+  // 现场：同一台笔记本换网络后在机器表里留下两条 hostname 相同的记录（一条早已离线）。
+  // 旧实现把下拉框默认值设成 `machines[0]`，用户点「一键拉起」时指令写进死那条，
+  // 页面转 90 秒只说"等待超时" —— 报上来就是"用户无法拉起代理"。
+  // 这类退化在渲染层面看起来完全正常（页面有卡片、按钮能点），只能源码级守住。
+  const egrPickBad = [];
+  if (!APP_JS.includes('m.local_ip')) {
+    egrPickBad.push('机器下拉框没显示内网 IP —— 同名机器无法区分');
+  }
+  if (!APP_JS.includes('egressAgo(')) {
+    egrPickBad.push('离线机器没显示"多久没心跳" —— 用户看不出哪台是死的');
+  }
+  if (APP_JS.includes("(v && v.active_machine) || (machines.length ? machines[0].id : '')")) {
+    egrPickBad.push('默认选中项又回到了 machines[0] —— 会选中已离线的那台');
+  }
+  egrPickBad.forEach((m) => console.log('  [FAIL] egress-pick: ' + m));
+  if (!egrPickBad.length) console.log('  [ok] egress-pick: 同名机器可区分，默认选中在线那台');
+
 
   // v0.24.3（2026-10-13 封号事故）：账号卡片**不得**再「渲染即出站」。
   //

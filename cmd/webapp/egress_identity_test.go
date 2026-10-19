@@ -28,11 +28,11 @@ func TestEgressMachineIdentityByFingerprint(t *testing.T) {
 	const owner int64 = 7
 
 	// 1) 两台不同机器各自登记 → 端口必须不同（否则隧道互相顶掉）。
-	m1, created1, dup1, err := a.egressRegister("m-aaa", "pc-a", "fpaaaa", owner, nil)
+	m1, created1, dup1, err := a.egressRegister("m-aaa", "pc-a", "fpaaaa", "", owner, nil)
 	if err != nil || !created1 || dup1 {
 		t.Fatalf("首台登记应 created=true dup=false，得 created=%v dup=%v err=%v", created1, dup1, err)
 	}
-	m2, created2, _, err := a.egressRegister("m-bbb", "pc-b", "fpbbbb", owner, nil)
+	m2, created2, _, err := a.egressRegister("m-bbb", "pc-b", "fpbbbb", "", owner, nil)
 	if err != nil || !created2 {
 		t.Fatalf("第二台应 created=true，得 %v err=%v", created2, err)
 	}
@@ -43,14 +43,14 @@ func TestEgressMachineIdentityByFingerprint(t *testing.T) {
 
 	// 2) 复制安装目录：同一个 machine id、不同指纹 → 必须是**新的一台 + 新端口**，
 	//    而且不能把原来那台顶掉（顶掉 = 第一台电脑的线路静默消失）。
-	m3, created3, _, err := a.egressRegister("m-aaa", "pc-c", "fpcccc", owner, nil)
+	m3, created3, _, err := a.egressRegister("m-aaa", "pc-c", "fpcccc", "", owner, nil)
 	if err != nil || !created3 {
 		t.Fatalf("复制目录应登记为新机器，得 created=%v err=%v", created3, err)
 	}
 	if m3.Ports.TunnelPort == m1.Ports.TunnelPort {
 		t.Fatalf("复制目录的第二台拿到了与第一台相同的端口 %d", m3.Ports.TunnelPort)
 	}
-	orig, _, _, err := a.egressRegister("m-aaa", "pc-a", "fpaaaa", owner, nil)
+	orig, _, _, err := a.egressRegister("m-aaa", "pc-a", "fpaaaa", "", owner, nil)
 	if err != nil {
 		t.Fatalf("回查第一台失败：%v", err)
 	}
@@ -64,7 +64,7 @@ func TestEgressMachineIdentityByFingerprint(t *testing.T) {
 
 	// 3) 重装 / 删掉 machine.id → 新 id、同指纹：必须**认回同一台**，
 	//    不能多出一台幽灵机器（否则列表里"9 台电脑"、端口一路往后涨）。
-	m4, created4, dup4, err := a.egressRegister("m-zzz", "pc-b", "fpbbbb", owner, nil)
+	m4, created4, dup4, err := a.egressRegister("m-zzz", "pc-b", "fpbbbb", "", owner, nil)
 	if err != nil {
 		t.Fatalf("同指纹不同 id 登记失败：%v", err)
 	}
@@ -108,7 +108,7 @@ func TestEgressRegisterConcurrentPorts(t *testing.T) {
 			_, _, _, err := a.egressRegister(
 				fmt.Sprintf("m-conc-%d", i),
 				fmt.Sprintf("pc-%d", i),
-				fmt.Sprintf("fpconc%d", i),
+				fmt.Sprintf("fpconc%d", i), "",
 				owner, nil)
 			errs[i] = err
 		}(i)

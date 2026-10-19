@@ -1,16 +1,16 @@
 {
-  "version": "0.31.48",
+  "version": "0.31.49",
   "min_supported": "0.24.0",
-  "notes": "v0.31.48：代理机制核对后的两处收尾（承接 v0.31.47）。① 平台视角 apply 绑号不再写死默认出口 URL：若这条线路刚被设为全局默认，写空串（= 跟随默认）。写死 URL 会让「非破坏式绑定」把那些号当成「已做过决定」，之后用户拉起自己的线路再点应用时被跳过 —— 现场表现是「拉起了、点了应用，号还在平台出口」。rehome 侧 v0.31.47 已改，这是同一条纪律的另一个入口（applyHomeEgress）。同时把「本次要写的值」提到比较之前，避免「已经是跟随默认」的号每轮都被算一次绑定。② apply 结果把「显式直连」单列（skipped_direct）并在前端明说：直连的号根本不走任何代理，用户拉起代理后会以为已生效、其实号还在裸奔；而 direct 很可能是系统批量设置的，不是号主的决定。文案给出下一步「点全部改绑」。③ default 机器记录分两种：StateAt==0（只 poll 不上报）永不清（否则每 5 秒删建一次，v0.31.46 的坑）；StateAt>0 且同机已有带指纹活跃记录的，按幽灵清掉 —— 否则页面一直显示「两台机器」。④ 真机验证：平台 apply 走通真实出网探测（probed=true / exit_ip=39.91.80.16 / default_ok=true / bound 5 / skipped 4），并核对那 5 个号 updated_at 未变 —— 确认零写库副作用。",
-  "released_at": 1792277932,
+  "notes": "v0.31.49：修「用户控制台调用 API 报 405」与「用户无法拉起代理」两件事，都是可复现的结构性问题。① 405 是兜底路由替 404 背锅：`mux.Handle(\"GET /\")` 会吃掉所有未注册路径，而 Go 1.22 的 mux 在方法不匹配时回 405 —— 客户端把 base_url 填成裸域名、SDK 自动补 /chat/completions 时，看到的就是 `405 Method Not Allowed (target: http://host:8780)`，一句都指不到真正原因。改为方法感知的根处理器（GET/HEAD 走静态页，其它回 404 + 明确接入提示），并补上不带 /v1 的别名 POST /chat/completions、GET /models（同一套鉴权）。② 「拉不起代理」的真因是机器身份漂移：旧指纹把内网 IP 算进哈希，同一台笔记本换网络（10.168.1.110 → 192.168.1.19）就被判成第二台机器，多出一条线路 + 一个新端口；页面出现两张同名卡片，用户点了早已离线的那张，指令写进死记录里，转 90 秒只报「等待超时」。agent 0.3.7 的指纹改为 hostname+主网卡 MAC，并同时上报旧指纹供云端认回老记录（换网络端口不变、已绑定账号不受影响）；服务端只在「同 id + 同主机名 + 原记录已离线」时认回，两台同时在线仍然分叉（保住 v0.31.31 那条不变量）。③ 向明显离线（>120 秒无心跳）的机器下发 start 现在直接回 409 并说清离线多久，不再让前端干等 90 秒。④ online 判据纳入 poll 心跳（新增 last_poll_at）：「agent 活着、代理还没起」不再显示离线。⑤ 顺手修旧单机 kv 被反复重建导致的删建循环日志（加迁移标记，只读一次）。⑥ 前端：机器下拉框显示内网 IP 与「离线多久」，默认选中最近在线的那台。",
+  "released_at": 1792408957,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.48/webapp.exe",
-      "sha256": "64116623c885440550abb297024593fb058a93249a37af0030f979b10b327b71",
-      "size": 15537664
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.49/webapp.exe",
+      "sha256": "af8b77d35f78a103815d047ed250615fa0e7bdbb6524a614ab0a6be9eb23c027",
+      "size": 15553024
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
