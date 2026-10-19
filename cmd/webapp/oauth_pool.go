@@ -19,9 +19,11 @@
 //     导出即所见。
 //  2. **不登记来源**。运营判断"扫码登录更容易掉线"，但库里没有任何列能区分来源，
 //     这条判断既不能证实也不能证伪。现在写 `accounts.source='qr'`。
-//  3. **代挂号不入池**。扫码后停在 `pool_state=”`（未申请），要人工点"申请入池" →
-//     管理员审批。用户要求的语义是"扫完就在池里"，故按 kv `qr_auto_pool`（默认开）
-//     自动置 `in`，并写清备注。
+//  3. **代挂号默认不入池**（v0.31.46 回归）。扫码后停在 `pool_state=""`（未申请），
+//     要号主在「账号代挂」页点"申请入池"，管理员审批通过才进消耗池。
+//     v0.31.37 曾把这里改成"扫码即在池"（kv `qr_auto_pool` 默认开），那是误读需求：
+//     审批闸门的意义是**平台决定哪些号参与反代**，自动入池等于把这个决定权交回给号主。
+//     现在默认关；确需自动入池的部署可以显式设 kv `qr_auto_pool=1`。
 //
 // ## 边界（必须写清楚，否则下一个人会以为扫码号"什么都自动"）
 //
@@ -36,21 +38,30 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/upstream"
 )
 
-// qrAutoPoolKey 扫码自动入池开关（kv）。缺省/非法值按"开"处理。
+// qrAutoPoolKey 扫码自动入池开关（kv）。
+//
+// **缺省 = 关**（v0.31.46）。默认值就是产品语义：导入/扫码进来的代挂号一律
+// `pool_state=""`（未申请），要号主申请、管理员审批才进池。
+// 想开就显式设 `qr_auto_pool=1` —— 这是个"要主动决定"的开关，不该有默认开。
 const qrAutoPoolKey = "qr_auto_pool"
 
-// qrAutoPoolOn 读开关。默认开：用户明确要求"扫码后自动进号池"。
+// qrAutoPoolOn 读开关。缺省关；只有显式的 1/true/on 才算开。
 func (a *app) qrAutoPoolOn() bool {
 	v, err := a.store.GetKV(qrAutoPoolKey)
-	if err != nil || v == "" {
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
 		return true
 	}
-	return v != "0" && v != "false"
+	return false
 }
 
 // materializeQRLogin 把一次成功的扫码登录**规范成与导入同构的账号行**。
@@ -95,7 +106,8 @@ func (a *app) materializeQRLogin(acc *Account) (string, error) {
 			} else {
 				acc.PoolState = "in"
 				acc.HostNote = note
-				log.Printf("INFO: [qr] %s 扫码后自动入池（kv %s 开启）", acc.UID, qrAutoPoolKey)
+				log.Printf("WARN: [qr] %s 扫码后自动入池（kv %s 被显式开启；默认行为是不入池、需申请审批）",
+					acc.UID, qrAutoPoolKey)
 			}
 		}
 	}

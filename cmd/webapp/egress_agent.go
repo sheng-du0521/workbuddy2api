@@ -343,6 +343,26 @@ const staleMachineAge = 24 * 3600
 //
 // 为什么限制在"同 owner"：跨 owner 的 hostname 相同是正常的（同一台电脑上
 // 平台 agent 与用户 agent 并存），删掉别人的记录不是我们该做的清理。
+// machineLastSeen 这条记录最近一次已知活动的时刻。
+//
+// **不能直接用 StateAt**（v0.31.46 修，现场踩到）：poll 也会经 egressRegister
+// 创建记录，而 poll 不带 state → StateAt 恒为 0。用 0 去算 `now-StateAt` 会得出
+// "老于 1 天"，于是刚建出来的记录立刻被判为陈旧：每 5 秒 poll 建一次、prune 删一次，
+// 无限循环，并且每轮打两行日志。生产实测 16 小时刷了上万条，
+// 把真正要查的扫码日志整段淹掉（那次排查就是被它挡住才绕了一圈）。
+//
+// 语义：StateAt（上报时刻）优先，没有则用 CreatedAt（登记时刻）；两者都为 0
+// 表示"无法判断年龄"，由调用方按**保留**处理。
+func machineLastSeen(v *egressMachine) int64 {
+	if v == nil {
+		return 0
+	}
+	if v.StateAt > 0 {
+		return v.StateAt
+	}
+	return v.CreatedAt
+}
+
 func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []string {
 	fresh := map[string]bool{}
 	for _, v := range m {
@@ -352,7 +372,7 @@ func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []s
 		if strings.TrimSpace(v.Fingerprint) == "" {
 			continue
 		}
-		if now-v.StateAt > staleMachineAge {
+		if seen := machineLastSeen(v); seen > 0 && now-seen > staleMachineAge {
 			continue
 		}
 		if h := strings.ToLower(strings.TrimSpace(v.Hostname)); h != "" {
@@ -367,6 +387,20 @@ func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []s
 		if v == nil || v.OwnerUserID != owner {
 			continue
 		}
+		// **default 桶一律不碰**（v0.31.46 修，现场踩到）。
+		//
+		// default = "没报自己是谁的那台"，它是**老 agent 的合法落点**：这类 agent
+		// 只 poll、不带 machine id，而 poll **不写任何时间戳** —— 于是它的记录永远
+		// 看起来是"很久没活动"，被这里删掉后下一次 poll 立刻重建：
+		// 每 5 秒删一次建一次，16 小时刷了上万条日志（还把这轮排查要看的日志淹了）。
+		//
+		// 而"升级后留下的幽灵 default"**不需要这里处理** —— machineEnsure 里
+		// 已有一段专门的逻辑：新 agent 带 machine id 登记时，若 hostname 与 default
+		// 相同，会把 default 改名接管（v0.31.18 幽灵机器防护）。两处都做，等于
+		// 一边删一边建。
+		if k == egressDefaultMachine {
+			continue
+		}
 		if strings.TrimSpace(v.Fingerprint) != "" {
 			continue
 		}
@@ -374,9 +408,17 @@ func pruneStaleMachines(m map[string]*egressMachine, now int64, owner int64) []s
 		if h == "" || !fresh[h] {
 			continue
 		}
-		if now-v.StateAt <= staleMachineAge {
+		seen := machineLastSeen(v)
+		if seen == 0 {
+			// 连登记时间都没有 —— 无法判断它是不是"升级留下的老记录"，
+			// 宁可留着（多一条幽灵机器比删掉一台真机器便宜）。
 			continue
 		}
+		if now-seen <= staleMachineAge {
+			continue
+		}
+		log.Printf("DEBUG: [egress] 清理陈旧机器 %s（last_seen=%d now=%d host=%s）",
+			k, seen, now, v.Hostname)
 		delete(m, k)
 		pruned = append(pruned, k)
 	}

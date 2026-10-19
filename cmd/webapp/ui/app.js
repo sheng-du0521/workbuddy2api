@@ -1173,11 +1173,14 @@ function oauthLoginDialog(opts) {
     const name = account && (account.nickname || account.uid);
     ok.appendChild(el('b', '', '已采集账号：' + (name || '（匿名）')));
     if (account && account.realm) ok.appendChild(el('span', 'muted', ' · ' + (account.realm === 'global' ? '国际版' : '国内版')));
-    // 入池结果要**明说**：自动入池是服务端按开关做的决策，用户没有点过任何"申请"，
-    // 不告知就会在下一次看到"已入池"时以为是自己记错了（或以为系统乱动了状态）。
+    // 入池状态要**明说**（v0.31.46 文案调整）：
+    // 默认行为是"只入库、不入池"，用户需要自己去「账号代挂」页申请、等管理员批准 ——
+    // 不写清就会以为"扫完就该在池里"，然后去问"为什么我的号不出量"。
+    // 极少数部署显式开了扫码自动入池（kv qr_auto_pool=1），那种情况也要说清"是自动的"。
     if (account && account.owner_id > 0) {
       ok.appendChild(el('span', 'muted', account.pool_state === 'in'
-        ? ' · 已自动入池' : ' · 已入库（未入池，可在号池页申请）'));
+        ? ' · 已入池（本部署开启了扫码自动入池）'
+        : ' · 已入库（未入池 —— 请在「账号代挂」页申请，管理员批准后才会接单）'));
     }
     authBox.appendChild(ok);
     // 来源说明：扫码进来的号与"导入 JSON"落库同构，区别只在来源标记。

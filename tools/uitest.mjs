@@ -2690,6 +2690,50 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.46：**扫码/导入默认不入池**（入池必须经"申请 + 批准"）。
+  //
+  // 这是产品闸门而不是偏好：入池 = 该号开始接平台反代流量、消耗号主积分。
+  // v0.31.37 曾把它改成"扫码即在池"（默认开），v0.31.46 回归默认关。
+  const qpBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const pool = read('cmd/webapp/oauth_pool.go');
+    // 默认值必须是关：qrAutoPoolOn 的缺省分支不能 return true。
+    const fnStart = pool.indexOf('func (a *app) qrAutoPoolOn() bool {');
+    if (fnStart < 0) {
+      qpBad.push('缺少 qrAutoPoolOn');
+    } else {
+      const fn = pool.slice(fnStart, fnStart + 420);
+      if (/if err != nil \{\s*return true/.test(fn)) {
+        qpBad.push('qrAutoPoolOn 缺省返回 true（扫码会直接入池）');
+      }
+      if (!fn.includes('case "1", "true", "on", "yes":')) {
+        qpBad.push('qrAutoPoolOn 不再是"显式白名单才开"');
+      }
+    }
+    // 导入路径必须与扫码一致：默认未申请。
+    if (!read('cmd/webapp/host_import.go').includes('acc.PoolState = ""')) {
+      qpBad.push('用户端导入没有默认未入池');
+    }
+    if (!read('cmd/webapp/import_desktop.go').includes('PoolState:   ""')) {
+      qpBad.push('桌面导入没有默认未入池');
+    }
+    // 申请/审批链路必须在（默认不入池的前提是"有地方申请"）。
+    const mainGo = read('cmd/webapp/main.go');
+    if (!mainGo.includes('/api/host/accounts/{uid}/pool')) qpBad.push('缺少用户申请入池接口');
+    const host = read('cmd/webapp/host.go');
+    for (const act of ['apply', 'cancel', 'leave']) {
+      if (!host.includes('"' + act + '"')) qpBad.push('入池动作缺少 ' + act);
+    }
+    const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+    if (!app.includes('请在「账号代挂」页申请')) qpBad.push('扫码完成提示没有告诉用户要申请');
+  }
+  qpBad.forEach((m) => console.log('  [FAIL] qr-pool-default: ' + m));
+  if (!qpBad.length) {
+    console.log('  [ok] qr-pool-default: 扫码/导入默认不入池 + 申请审批链路在 + 提示明确');
+  }
+
   // v0.31.45：**被拒的请求必须留痕**（日志 + 页面两路）。
   //
   // 起因：用户报「反代 403」，服务端近 6 小时零条 401/403、usage_logs 停在

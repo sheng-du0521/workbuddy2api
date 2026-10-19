@@ -11,23 +11,28 @@ import (
 
 // TestPruneStaleMachinesRemovesFingerprintlessDup 同一台机器升级后留下的无指纹老记录必须清掉。
 //
-// 场景（2026-10-18 实测）：0.1.0 的 agent 不带 machine id / 指纹，登记成 `default`；
-// 升到 0.3.x 后带指纹，又登记成 `m-xxxx`。两条 hostname 相同、端口不同 —— 页面上
-// 就是"多了一台机器"，而老那条永远不会再上报（v0.31.31 修掉的错觉又回来了）。
+// 场景（2026-10-18 实测）：老 agent 登记时没有指纹/固定 id，升到 0.3.x 后带指纹，
+// 又登记成 `m-xxxx`。两条 hostname 相同、端口不同 —— 页面上就是"多了一台机器"，
+// 而老那条永远不会再上报（v0.31.31 修掉的错觉又回来了）。
+//
+// ⚠️ v0.31.46 起 **default 桶不在此列**：那是"没报自己是谁"的老 agent 的合法落点，
+// 它只 poll 不写时间戳，按时间判一定"很老" —— 删了就被下一次 poll 重建，
+// 形成每 5 秒一次的无限循环。幽灵 default 由 machineEnsure 的改名逻辑收拾。
+// 所以本用例用 `m-legacy` 这种"明确带 id 但没指纹"的键。
 func TestPruneStaleMachinesRemovesFingerprintlessDup(t *testing.T) {
 	now := time.Now().Unix()
 	m := map[string]*egressMachine{
 		// 老记录：无指纹、一天多没上报、同 hostname
-		"default": {ID: "default", Hostname: "PC-A", StateAt: now - 2*staleMachineAge},
+		"m-legacy": {ID: "m-legacy", Hostname: "PC-A", StateAt: now - 2*staleMachineAge},
 		// 新记录：有指纹、刚上报
 		"m-aaaa": {ID: "m-aaaa", Hostname: "PC-A", Fingerprint: "fp1", StateAt: now},
 	}
 	got := pruneStaleMachines(m, now, 0)
-	if len(got) != 1 || got[0] != "default" {
-		t.Fatalf("应只清掉 default，实得 %v", got)
+	if len(got) != 1 || got[0] != "m-legacy" {
+		t.Fatalf("应只清掉 m-legacy，实得 %v", got)
 	}
-	if _, ok := m["default"]; ok {
-		t.Fatal("default 未被删除")
+	if _, ok := m["m-legacy"]; ok {
+		t.Fatal("m-legacy 未被删除")
 	}
 	if _, ok := m["m-aaaa"]; !ok {
 		t.Fatal("新记录不能被动")
