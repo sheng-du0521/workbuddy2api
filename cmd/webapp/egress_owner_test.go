@@ -42,7 +42,7 @@ func ownerApp(t *testing.T) (store *Store, a *app, mux *http.ServeMux, adminCook
 	if err := store.UpsertAccount(&Account{
 		UID: "ow-acct", Nickname: "甲", Realm: "cn",
 		AccessToken: "tok", RefreshToken: "rtok",
-		ConsumeGroup: "apply", PoolState: "in", OwnerUserID: memberID,
+		ConsumeGroup: "apply", PoolState: "", OwnerUserID: memberID,
 	}); err != nil {
 		t.Fatalf("UpsertAccount: %v", err)
 	}

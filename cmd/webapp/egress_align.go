@@ -143,8 +143,15 @@ func (a *app) setAccountEgress(uid, raw string) (string, error) {
 		if acc != nil {
 			owner = acc.OwnerUserID
 		}
-		if _, _, err := a.ensureEgressLineRegistered(norm, owner); err != nil {
+		line, _, err := a.ensureEgressLineRegistered(norm, owner)
+		if err != nil {
 			return "", err
+		}
+		// 唯一闸门（v0.31.50，需求二 / 拦截点 3）：单账号改出口也要过同一套规则。
+		// 这条路径以前只校验 URL 格式，于是"把已入池的号改到某人的个人线路上"
+		// 一路畅通 —— 写入口少一处，规则就整体失效。
+		if ok, code, reason := egressLineAllows(line, acc, egressAllowOpts{}); !ok {
+			return "", &egressScopeError{Code: code, Msg: reason}
 		}
 	}
 	if err := a.store.SetAccountEgress(uid, norm); err != nil {

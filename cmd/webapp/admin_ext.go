@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -118,6 +119,14 @@ func (a *app) handleAccountEgress(w http.ResponseWriter, r *http.Request) {
 	// 对不上"的来源。现在走统一入口，账号上出现的 URL 一定能在池里找到。
 	p, err := a.setAccountEgress(uid, req.Proxy)
 	if err != nil {
+		// 范围规则拒绝 → 403 + code（v0.31.50）：这不是"参数错了"，而是"不允许"。
+		var se *egressScopeError
+		if errors.As(err, &se) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": se.Error(), "code": se.Code, "uid": uid,
+			})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

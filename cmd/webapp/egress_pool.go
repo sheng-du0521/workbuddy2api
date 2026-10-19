@@ -91,11 +91,27 @@ type EgressProxy struct {
 	// 有了这一位，探活成功就能**只恢复自己停掉的**，绝不碰人工停用的线路
 	// （v0.31.34 已经踩过"无条件 Enabled=true 把别人停用线路拉活"的坑）。
 	AutoDisabled bool `json:"auto_disabled"`
+	// Scope 这条线路「能承载哪些账号」（v0.31.50，需求二）。
+	//
+	//	platform      平台线路：不限制入池状态（放行所有账号，行为与历史一致）
+	//	self_unpooled 用户线路：**只给线路主人的、且尚未入池的账号**用
+	//
+	// 为什么要落库而不是每次靠 owner+pool_state 现算：范围会随规则演进
+	// （将来可能有"仅本人全部号"或"平台共享池"），把它显式写出来，
+	// 判定、展示、审计读的是同一个字段，不用改三处判断。
+	Scope string `json:"scope"`
+	// ManualDisabled 管理员**人工停用**（v0.31.50）。
+	//
+	// 与 Enabled 分开的理由：Enabled=false 可能是探活自动停的（可自动恢复），
+	// 而 manual_disabled 是**人的决定** —— 用户重新拉起代理不得把它拉活，
+	// 管理员可以强制的范围也**不包含**它（见 egressLineAllows 第 1 条）。
+	ManualDisabled bool `json:"manual_disabled"`
 }
 
 // egressProxyCols 列清单（与 scanEgressProxy 顺序严格对应）。
 const egressProxyCols = `id, name, url, region, note, enabled, last_ok, last_ip,
-	last_check, fail_streak, created_at, updated_at, owner_user_id, auto_disabled`
+	last_check, fail_streak, created_at, updated_at, owner_user_id, auto_disabled,
+	scope, manual_disabled`
 
 func (s *Store) migrateEgressProxy() error {
 	stmts := []string{
@@ -113,7 +129,9 @@ func (s *Store) migrateEgressProxy() error {
 			created_at  INTEGER NOT NULL DEFAULT 0,
 			updated_at  INTEGER NOT NULL DEFAULT 0,
 			owner_user_id INTEGER NOT NULL DEFAULT 0,
-			auto_disabled INTEGER NOT NULL DEFAULT 0
+			auto_disabled INTEGER NOT NULL DEFAULT 0,
+			scope TEXT NOT NULL DEFAULT '',
+			manual_disabled INTEGER NOT NULL DEFAULT 0
 		)`,
 		// URL 唯一：同一条线路重复录入只会让分配结果出现「分配了但其实是同一个出口」。
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_proxy_url ON egress_proxies(url)`,
@@ -149,21 +167,42 @@ func (s *Store) migrateEgressProxy() error {
 		WHERE enabled = 0 AND fail_streak >= ?`, egressFailThreshold); err != nil {
 		return fmt.Errorf("migrate egress_proxies(auto_disabled backfill): %w", err)
 	}
+	// 增量列（v0.31.50，需求二）：显式表达「这条线路能承载哪些账号」。
+	if err := s.ensureColumn("egress_proxies", "scope",
+		"scope TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate egress_proxies(scope): %w", err)
+	}
+	// 人工停用位（与 Enabled/AutoDisabled 三者分离，见 EgressProxy.ManualDisabled）。
+	if err := s.ensureColumn("egress_proxies", "manual_disabled",
+		"manual_disabled INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate egress_proxies(manual_disabled): %w", err)
+	}
+	// 存量回填（幂等）：用户线路 → self_unpooled，其余 → platform。
+	// 不回填的话，老线路的 scope 是空串，闸门会把它当"未知范围"拒绝 ——
+	// 那等于一次升级把全平台的出口都停了。
+	if _, err := s.db.Exec(`UPDATE egress_proxies SET scope = CASE
+			WHEN owner_user_id > 0 THEN 'self_unpooled' ELSE 'platform' END
+		WHERE scope IS NULL OR scope = ''`); err != nil {
+		return fmt.Errorf("migrate egress_proxies(scope backfill): %w", err)
+	}
 	return nil
 }
 
 func (s *Store) scanEgressProxy(row interface{ Scan(dest ...any) error }) (*EgressProxy, error) {
 	var p EgressProxy
-	var enabled, lastOK, autoDisabled int
+	var enabled, lastOK, autoDisabled, manualDisabled int
+	var scope string
 	err := row.Scan(&p.ID, &p.Name, &p.URL, &p.Region, &p.Note, &enabled, &lastOK,
 		&p.LastIP, &p.LastCheck, &p.FailStreak, &p.CreatedAt, &p.UpdatedAt, &p.OwnerUserID,
-		&autoDisabled)
+		&autoDisabled, &scope, &manualDisabled)
 	if err != nil {
 		return nil, err
 	}
 	p.Enabled = enabled != 0
 	p.LastOK = lastOK != 0
 	p.AutoDisabled = autoDisabled != 0
+	p.ManualDisabled = manualDisabled != 0
+	p.Scope = normEgressScope(scope, p.OwnerUserID)
 	return &p, nil
 }
 
@@ -208,11 +247,21 @@ func (s *Store) UpsertEgressProxy(p *EgressProxy) error {
 		p.CreatedAt = now
 	}
 	p.UpdatedAt = now
+	if p.Scope == "" {
+		p.Scope = normEgressScope("", p.OwnerUserID)
+	}
 	_, err := s.db.Exec(`INSERT INTO egress_proxies (`+egressProxyCols+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, url=excluded.url, region=excluded.region, note=excluded.note,
 			enabled=excluded.enabled, auto_disabled=excluded.auto_disabled,
+			-- 人工停用位必须能落库（否则手动停用接口写完等于没写）；
+			-- 但**编辑接口**会在进入这里之前先把旧值拷回来，见 handleEgressProxies。
+			manual_disabled=excluded.manual_disabled,
+			-- scope 粘性同 owner：线路一旦被登记为「平台」或「用户受限」，
+			-- 后续写入不得把它改宽/改窄（改范围要显式走管理员接口）。
+			scope=CASE WHEN egress_proxies.scope = '' THEN excluded.scope
+				ELSE egress_proxies.scope END,
 			updated_at=excluded.updated_at,
 			-- ⚠️ 归属**粘性**：一旦有人认领过就不再被后续写入覆盖（v0.31.23）。
 			-- 否则「管理员手工登记同一条 URL」或「另一个用户恰好用同一个出口」
@@ -222,7 +271,7 @@ func (s *Store) UpsertEgressProxy(p *EgressProxy) error {
 				THEN excluded.owner_user_id ELSE egress_proxies.owner_user_id END`,
 		p.ID, p.Name, p.URL, p.Region, p.Note, boolToInt(p.Enabled), boolToInt(p.LastOK),
 		p.LastIP, p.LastCheck, p.FailStreak, p.CreatedAt, p.UpdatedAt, p.OwnerUserID,
-		boolToInt(p.AutoDisabled))
+		boolToInt(p.AutoDisabled), p.Scope, boolToInt(p.ManualDisabled))
 	return err
 }
 
@@ -295,15 +344,23 @@ type assignRequest struct {
 	ProxyURL string `json:"proxy_url"`
 	// DryRun 只算不写，用于预览分配方案。
 	DryRun bool `json:"dry_run"`
-	// IncludeUserLines 自动分配时**把用户接进来的线路也纳入候选**（v0.31.32）。
-	//
-	// 默认 false（保持原纪律）。但产品需求明确："管理后台可以借用用户的住宅 IP，
-	// 自由分配给任意账号" —— 所以要有这个显式开关，而不是逼管理员挨条线路点「分配」。
-	//
-	// 为什么默认关：用户线路是**别人的机器**，自动挑"最闲的一条"会把平台账号的
-	// access_token 随机送到某个用户家里。管理员点这个勾 = 明确表示知情。
+	// IncludeUserLines **已废弃**（v0.31.50）：它做的事（把用户线路纳入自动候选、
+	// 且能承载任意账号）正是需求二要禁的「跨用户分发且无痕」。
+	// 保留字段只为让老客户端收到一条**明确**的 400（而不是静默忽略后行为变了）。
+	// 新写法：`force_scope: true` + `force_reason`（≥10 字）。
 	IncludeUserLines bool `json:"include_user_lines"`
+	// ForceScope 允许**强制越界**：把用户线路分给"不属于该主人"或"已入池"的账号
+	// （v0.31.50，宽松版）。
+	//
+	// 必须同时给 ForceReason；写入前落 `egress_force_audits`。
+	// ⚠️ 强制**不覆盖**线路的 enabled=false / manual_disabled —— 那是停用决定。
+	ForceScope bool `json:"force_scope"`
+	// ForceReason 强制越界的理由（≥10 个字，不能为空或套话）。
+	ForceReason string `json:"force_reason"`
 }
+
+// egressForceReasonMin 强制越界的理由最短字数（按 rune 计）。
+const egressForceReasonMin = 10
 
 // assignPlanItem 单个账号的分配结果。
 type assignPlanItem struct {
@@ -330,6 +387,26 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
 		return
+	}
+	// 废弃字段必须先拒（v0.31.50）：静默忽略等于"行为悄悄变了"，
+	// 而管理员可能正是靠它分发了几十个号。
+	if req.IncludeUserLines {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "include_user_lines 已废弃：它会不经审计地把用户线路分给任意账号。" +
+				"请改用 force_scope=true + force_reason（≥10 字），系统会写强制越界审计",
+			"code": "include_user_lines_deprecated",
+		})
+		return
+	}
+	if req.ForceScope {
+		if n := len([]rune(strings.TrimSpace(req.ForceReason))); n < egressForceReasonMin {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": fmt.Sprintf("强制越界必须填写理由（至少 %d 个字，当前 %d 个）——"+
+					"这条记录是事后追责的唯一依据", egressForceReasonMin, n),
+				"code": "force_reason_required",
+			})
+			return
+		}
 	}
 	targets, err := a.assignTargets(req)
 	if err != nil {
@@ -394,7 +471,7 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		// 「自动挑一条最闲的」会把**平台账号的 access_token** 从它送出去 ——
 		// 而 access_token 是 bearer 凭证，谁看到谁就能冒充那个号。
 		// 显式指名（卡片点「分配」）或显式勾选，才代表管理员知情。
-		if wantURL == "" && p.OwnerUserID > 0 && !req.IncludeUserLines {
+		if wantURL == "" && p.OwnerUserID > 0 && !req.ForceScope {
 			continue
 		}
 		usable = append(usable, p)
@@ -441,11 +518,77 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	plan, warnings := planEgressAssignment(targets, usable, maxPer, isolate)
 	warnings = append(dedupeWarn, warnings...)
 
+	// 唯一闸门（v0.31.50，需求二 / R1）：**写入前**逐个账号复核，不合格的进 blocked。
+	//
+	// 为什么放在计划之后而不是之前：planner 只按"负载均衡 + 号主隔离"挑线路，
+	// 不知道业务范围；而范围取决于每条线路的 scope/owner 与每个账号的归属/入池状态，
+	// 是 (账号, 线路) 的二元判断 —— 事后过滤是最不容易漂移的写法。
+	byUID := make(map[string]*Account, len(targets))
+	for _, acc := range targets {
+		byUID[acc.UID] = acc
+	}
+	byURL := make(map[string]*EgressProxy, len(usable))
+	for _, p := range usable {
+		byURL[p.URL] = p
+	}
+	blocked := make([]map[string]any, 0)
+	violations := map[string]string{}
+	keep := plan[:0]
+	for _, it := range plan {
+		line := egressLineByURL(usable, it.Proxy)
+		ok, code, reason := egressLineAllows(line, byUID[it.UID],
+			egressAllowOpts{Force: req.ForceScope})
+		if !ok {
+			blocked = append(blocked, map[string]any{
+				"uid": it.UID, "nickname": it.Nickname, "code": code, "reason": reason,
+				"proxy": it.Proxy,
+			})
+			continue
+		}
+		if strings.HasPrefix(code, "forced_") {
+			violations[it.UID] = code
+		}
+		keep = append(keep, it)
+	}
+	plan = keep
+	_ = byURL
+	if len(blocked) > 0 {
+		warnings = append(warnings, fmt.Sprintf("有 %d 个账号因出口范围规则被拦下（见 blocked）；"+
+			"确需越界请用 force_scope + force_reason", len(blocked)))
+	}
+
 	if !req.DryRun {
 		for _, it := range plan {
 			if err := a.store.SetAccountEgress(it.UID, it.Proxy); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
+			}
+		}
+		// 强制越界必须落审计（v0.31.50）：谁、对哪些号、什么理由、结果如何。
+		// 这条链路会**把凭证送进别人的家庭网络**，日志会被轮转，表不会。
+		if len(violations) > 0 || req.ForceScope {
+			audit := &egressForceAudit{
+				ProxyID: "", ProxyURL: req.ProxyURL, UIDs: []string{},
+				Violations: violations, Reason: strings.TrimSpace(req.ForceReason),
+				Result: "applied",
+			}
+			if u := userFrom(r); u != nil {
+				audit.AdminID, audit.AdminName = u.ID, u.Username
+			}
+			if len(plan) > 0 {
+				if line := egressLineByURL(usable, plan[0].Proxy); line != nil {
+					audit.ProxyID, audit.ProxyURL = line.ID, line.URL
+				}
+			}
+			for uid := range violations {
+				audit.UIDs = append(audit.UIDs, uid)
+			}
+			sort.Strings(audit.UIDs)
+			if len(blocked) > 0 && len(plan) == 0 {
+				audit.Result = "failed"
+			}
+			if err := a.store.InsertEgressForceAudit(audit); err != nil {
+				log.Printf("WARN: [egress] 写强制越界审计失败（分配已生效，请人工登记）：%v", err)
 			}
 		}
 		// 分配后必须重同步：egressBad 与 egressByUID 都在这条路径上重建。
@@ -483,6 +626,7 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		"dry_run":        req.DryRun,
 		"plan":           plan,
 		"per_proxy":      perProxy,
+		"blocked":        blocked,
 		"warnings":       warnings,
 		// merged_exits 被折叠的线路 → 代表线路。前端据此解释"为什么只用了 1 条"，
 		// 而不是让人怀疑分配少派了线路。
@@ -974,6 +1118,11 @@ func (a *app) handleEgressProxies(w http.ResponseWriter, r *http.Request) {
 			}
 			p.CreatedAt = old.CreatedAt
 			p.LastCheck, p.LastIP, p.FailStreak, p.LastOK = old.LastCheck, old.LastIP, old.FailStreak, old.LastOK
+			// 人工停用位与范围**只能通过专门接口改**（v0.31.50）：
+			// 编辑名字/备注/备注顺手把 manual_disabled 清掉，等于"改个名字就把
+			// 管理员的停用决定撤销了" —— 这类副作用必须在接口层挡死。
+			p.ManualDisabled = old.ManualDisabled
+			p.Scope = old.Scope
 			// 管理员显式设 enabled 就是"人的决定"（v0.31.47）：
 			// 清掉自动停用标记，否则下一次探活成功会把它自动拉活 ——
 			// 而管理员刚刚明明手动停用了它（v0.31.34 踩过的同类坑）。
@@ -1240,4 +1389,57 @@ func deterministicJitter(uid string, jitterMs int) time.Duration {
 		h *= 16777619
 	}
 	return time.Duration(h%uint32(jitterMs)) * time.Millisecond
+}
+
+// handleEgressLineManualDisable POST /api/admin/egress/proxies/manual-disable
+//
+// body {"id":"<proxy id>","disabled":true,"note":"可选：为什么停"}
+//
+// 为什么单独一个接口（v0.31.50，R3/R10）：`enabled` 有三个来源（管理员开关、
+// 探活自动停用、用户拉起时"通了就启用"）。把"人工停用"混进 enabled 里，
+// 用户重新拉起代理就会把管理员的决定覆盖掉 —— v0.31.34 已经踩过一次。
+// 所以停用要走这个**只改 manual_disabled** 的入口，且必须同时落 enabled=false。
+func (a *app) handleEgressLineManualDisable(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       string `json:"id"`
+		Disabled *bool  `json:"disabled"`
+		Note     string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	if strings.TrimSpace(req.ID) == "" || req.Disabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "需要 id 与 disabled"})
+		return
+	}
+	p, err := a.store.GetEgressProxy(req.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if p == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "代理不存在"})
+		return
+	}
+	p.ManualDisabled = *req.Disabled
+	if p.ManualDisabled {
+		p.Enabled = false
+		// 人工停用与"自动停用"要分开记：前者不该被探活成功自动恢复。
+		p.AutoDisabled = false
+	} else {
+		// 解锁时必须显式启用 —— 否则"解锁了但还是停用"，用户拉起也救不回来。
+		p.Enabled, p.AutoDisabled, p.FailStreak = true, false, 0
+	}
+	if note := strings.TrimSpace(req.Note); note != "" {
+		p.Note = note
+	}
+	if err := a.store.UpsertEgressProxy(p); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	// 线路状态是选号输入（computeEgressBad）→ 必须重建。
+	_ = a.proxy.SyncAccounts()
+	log.Printf("INFO: [egress] 管理员把线路 %s（%s）人工停用=%v", p.ID, p.URL, p.ManualDisabled)
+	writeJSON(w, http.StatusOK, map[string]any{"proxy": p})
 }

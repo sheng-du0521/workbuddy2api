@@ -534,6 +534,9 @@
             <span class="muted" style="font-size:12px;">结论只列「可操作项」</span>
           </div>
           <div id="egressAlert" class="sub" style="margin:0;"></div>
+          <!-- v0.31.50（R11）：越界存量必须可见。规则收紧之后，历史数据里
+               一定有"已入池的号绑在个人线路上"这类记录 —— 没人看见就没人修。 -->
+          <div id="egrCompliance" class="sub" style="margin:8px 0 0;"></div>
         </div>
 
         <!-- 出站口径（v0.31.35）：一句话决定"还用不用代理"。
@@ -672,12 +675,15 @@
             <label class="inline" style="font-size:12px;">
               <input type="checkbox" id="egrIsolate" checked> 同号主不共用出口
             </label>
-            <!-- v0.31.32：借用用户住宅 IP。默认不勾 —— 勾了就等于"平台账号的
-                 access_token 可以从某个用户的家里出去"，这是知情决定。 -->
+            <!-- v0.31.50：用户线路只能给「线路主人 + 未入池」的号用。
+                 要越界必须勾「强制越界」并写理由 —— 系统会落 egress_force_audits。
+                 停用的线路**不可强制**（那是管理员自己的决定）。 -->
             <label class="inline" style="font-size:12px;"
-              title="把用户控制台接进来的线路也纳入自动候选。用户线路是别人的机器：勾选后平台账号的请求（含 access_token）会经过对方设备。不勾也能用：在线路卡上点「分配」显式指定即可。">
-              <input type="checkbox" id="egrIncludeUser"> 纳入用户线路（借用住宅 IP）
+              title="把用户线路也纳入自动候选，并允许分配给不符合范围的账号（跨用户 / 已入池）。必须填写理由，系统会写审计表。停用的线路不可强制。">
+              <input type="checkbox" id="egrForceScope"> 强制越界（需理由）
             </label>
+            <input type="text" id="egrForceReason" placeholder="越界理由（≥10 字，必填）"
+              style="min-width:240px;font-size:12px;" title="为什么必须把别人的/已入池的号放到这条个人线路上？这句话是事后追责的唯一依据。">
             <button class="ghost" id="btnEgrDry">预览方案</button>
             <button id="btnEgrApply">执行分配</button>
             <button class="ghost" id="btnEgrDirect" title="把所选范围内的账号一键设为显式直连（不继承全局默认代理）。用于回退代理。">设为直连</button>
@@ -7616,6 +7622,7 @@ async function loadEgress(silent) {
     }
     mountEgrTabs();
     renderEgressAlert();
+    loadEgressCompliance();
     renderEgressCards();
     renderAuthCandidates();
     renderEgrAssignHint();
@@ -7623,6 +7630,64 @@ async function loadEgress(silent) {
     renderEgrAccCards();
 
   } catch (e) { if (!silent) toast(e.message, 'err'); }
+}
+
+// 出口范围判定的 code（与 cmd/webapp/egress_scope.go 的常量一一对应）。
+// 前端只用来分组文案，**不做判定** —— 判定永远在服务端。
+const EGR_CODE_POOLED = 'account_pooled';
+const EGR_CODE_FOREIGN = 'foreign_account';
+
+// loadEgressCompliance 出口范围越界存量（v0.31.50，R11）。
+//
+// 只读、不出站：扫的是本地库 + 线路池。有越界才渲染红条 —— 一条常驻的
+// "0 个违规"提示只会让人习惯性忽略这个区域。
+async function loadEgressCompliance() {
+  const box = $('egrCompliance');
+  if (!box) return;
+  let d = null;
+  try { d = await api('/api/admin/egress/compliance'); } catch (e) { return; }
+  box.textContent = '';
+  const total = Number(d && d.total) || 0;
+  if (!total) return;
+  const row = el('div', 'notice warn');
+  row.appendChild(el('b', '', '发现 ' + total + ' 个账号违反出口范围规则：'));
+  const by = (d && d.by_code) || {};
+  const parts = [];
+  if (by[EGR_CODE_POOLED]) parts.push('已入池却绑在个人出口 ' + by[EGR_CODE_POOLED] + ' 个');
+  if (by[EGR_CODE_FOREIGN]) parts.push('跨用户使用 ' + by[EGR_CODE_FOREIGN] + ' 个');
+  row.appendChild(document.createTextNode(parts.join('；') || '（详见清单）'));
+  box.appendChild(row);
+
+  const actions = el('div', 'row');
+  actions.style.cssText = 'gap:8px;margin-top:6px;flex-wrap:wrap;';
+  const view = el('button', 'ghost sm', '查看清单');
+  view.onclick = () => {
+    const list = (d && d.violations) || [];
+    let text = '';
+    for (const v of list.slice(0, 30)) {
+      text += '· ' + (v.nickname || v.uid) + '（' + v.code + '）→ ' + v.proxy_url + '\n';
+    }
+    if (list.length > 30) text += '…… 其余 ' + (list.length - 30) + ' 条省略\n';
+    alert(text || '（空）');
+  };
+  actions.appendChild(view);
+
+  // 一键改回默认：**先 dry_run 预览**，再执行 —— 这是"会断流量"的操作，
+  // 不能在用户看不见的情况下直接改（一批号突然换出口，上游可能立刻风控）。
+  const fix = el('button', 'ghost sm', '一键改回默认（先预览）');
+  fix.onclick = async () => {
+    const uids = ((d && d.violations) || []).map((v) => v.uid);
+    if (!uids.length) return;
+    try {
+      const pre = await post('/api/admin/egress/assign', { uids: uids, clear: true, dry_run: true });
+      if (!(await confirmAsk('将把 ' + pre.assigned + ' 个越界账号改回「跟随默认出口」并立即重同步号池。继续？'))) return;
+      await post('/api/admin/egress/assign', { uids: uids, clear: true, dry_run: false });
+      toast('已改回默认出口：' + uids.length + ' 个', 'ok');
+      loadEgress();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  actions.appendChild(fix);
+  box.appendChild(actions);
 }
 
 // startEgressPoll / stopEgressPoll 代理页轮询（v0.31.23）。
@@ -8518,9 +8583,18 @@ async function egrAssignBody(dry) {
     isolate_owner: $('egrIsolate').checked,
     dry_run: !!dry,
   };
-  // 借用用户住宅 IP（v0.31.32）：显式勾选才把 owner>0 的线路放进自动候选。
-  const inc = $('egrIncludeUser');
-  if (inc && inc.checked) body.include_user_lines = true;
+  // 强制越界（v0.31.50）：勾了就必须写理由（≥10 字），由服务端校验并落审计。
+  // 旧字段 include_user_lines 已被服务端拒收（400），前端不得再发。
+  const fs2 = $('egrForceScope');
+  if (fs2 && fs2.checked) {
+    const reason = String(($('egrForceReason') || {}).value || '').trim();
+    if (Array.from(reason).length < 10) {
+      toast('强制越界必须填写理由（至少 10 个字）', 'err');
+      return null;
+    }
+    body.force_scope = true;
+    body.force_reason = reason;
+  }
   // 指定了线路（从线路卡点「分配」进来）→ 只在这一条上分配。
   if (egrAssignUrl) body.proxy_url = egrAssignUrl;
   if (v === 'all') {
@@ -8655,6 +8729,26 @@ function renderEgressPlan(d, dry) {
 
   if ((d.warnings || []).length) {
     for (const w of d.warnings) box.appendChild(el('div', 'notice warn', w));
+  }
+
+  // blocked（v0.31.50）：被出口范围规则拦下的账号必须逐条列出原因 ——
+  // 否则管理员只看到"分配了 1 个"，剩下的号去哪了完全无从得知。
+  const blocked = d.blocked || [];
+  if (blocked.length) {
+    const t = el('div', 'notice warn',
+      '有 ' + blocked.length + ' 个账号不符合这条线路的可用范围（默认拦截）：');
+    box.appendChild(t);
+    const bl = el('div', 'code-gen-list');
+    for (const b of blocked.slice(0, 20)) {
+      const r = el('div', 'code-gen-row');
+      r.appendChild(el('span', 'mono', (b.nickname || b.uid) + ' · ' + b.code));
+      r.appendChild(el('span', 'mono muted', b.reason || ''));
+      bl.appendChild(r);
+    }
+    box.appendChild(bl);
+    if (blocked.length > 20) box.appendChild(el('div', 'muted', '…… 其余 ' + (blocked.length - 20) + ' 条省略'));
+    box.appendChild(el('div', 'sub',
+      '确需越界：勾选「强制越界」并填写理由（≥10 字），系统会写强制越界审计。'));
   }
 
   const rows = d.plan || [];

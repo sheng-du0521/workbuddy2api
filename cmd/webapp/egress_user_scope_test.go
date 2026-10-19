@@ -51,7 +51,7 @@ func usApp(t *testing.T) usFixture {
 			UID: spec.uid, Nickname: spec.uid, Realm: "cn",
 			AccessToken: "t", RefreshToken: "r",
 			ExpiresAt:   time.Now().Add(time.Hour).Unix(),
-			OwnerUserID: spec.owner.ID, ConsumeGroup: "us", PoolState: "in",
+			OwnerUserID: spec.owner.ID, ConsumeGroup: "us", PoolState: "",
 		}
 		if err := store.UpsertAccount(acc); err != nil {
 			t.Fatalf("UpsertAccount %s: %v", spec.uid, err)

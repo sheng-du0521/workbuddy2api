@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.49"
+const version = "0.31.50"
 
 type app struct {
 	store  *Store
@@ -1729,6 +1729,11 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/egress/recover", a.adminGuard(a.handleEgressRecover))
 	mux.HandleFunc("POST /api/admin/egress/candidates", a.adminGuard(a.handleEgressCandidates))
 	mux.HandleFunc("POST /api/admin/egress/assign", a.adminGuard(a.handleEgressAssign))
+	// 出口范围（v0.31.50，需求二）：人工停用 / 越界存量 / 强制越界审计。
+	// 三个都是**只读或单点写**，不加额外权限层：adminGuard 已是最高权威。
+	mux.HandleFunc("POST /api/admin/egress/proxies/manual-disable", a.adminGuard(a.handleEgressLineManualDisable))
+	mux.HandleFunc("GET /api/admin/egress/compliance", a.adminGuard(a.handleEgressCompliance))
+	mux.HandleFunc("GET /api/admin/egress/force-audits", a.adminGuard(a.handleEgressForceAudits))
 	// 全局默认出口修复（v0.31.26）：护栏管不了历史配置，历史配置需要一键改回。
 	mux.HandleFunc("POST /api/admin/egress/default/repair", a.adminGuard(a.handleEgressDefaultRepair))
 	// 账号出口 ↔ 线路池对齐（v0.31.33）：补登记池外的账号出口、合并同 URL 不同写法。

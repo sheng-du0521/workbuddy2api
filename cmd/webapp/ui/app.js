@@ -4333,6 +4333,11 @@ async function egressPull(v) {
         const d = await post('/api/egress/home/apply', { machine });
         const ap = (d && d.applied) || {};
         let msg = '已就绪并自动应用：自挂号绑定 ' + (ap.host_bound || 0) + ' 个';
+        if (ap.skipped_pooled) {
+          // v0.31.50：已入池的号**按规则**不走个人出口（平台反代承重），
+          // 这不是失败，但必须说清 —— 否则用户会反复点「全部改绑」以为没生效。
+          msg += '；跳过 ' + ap.skipped_pooled + ' 个已入池号（由平台统一调度，不能使用个人出口）';
+        }
         if (ap.skipped_direct) {
           msg += '；但 ' + ap.skipped_direct + ' 个号是「直连」（不走代理），需点「全部改绑」才会走本机出口';
         }

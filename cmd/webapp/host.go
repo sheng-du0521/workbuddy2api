@@ -475,11 +475,18 @@ func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	changed := 0
+	// blocked 记录"被出口范围规则拒绝"的号（v0.31.50）：静默跳过会让用户
+	// 以为"设置成功"，而他的号其实还挂在原出口上。
+	blocked := make([]map[string]any, 0)
 	for _, uid := range targets {
 		// 统一入口（v0.31.33）：规范化 + 确保池里存在这条线路。用户在"我的出口"
 		// 里手填的地址从此会被自动登记进线路池，管理后台能看到、能探活、能分配 ——
 		// 而不是只躺在 accounts.egress_proxy 里当一条"看不见的出口"。
 		if _, err := a.setAccountEgress(uid, norm); err != nil {
+			var se *egressScopeError
+			if errors.As(err, &se) {
+				blocked = append(blocked, map[string]any{"uid": uid, "code": se.Code, "reason": se.Error()})
+			}
 			log.Printf("WARN: [host] 设置代挂出口失败 acct=%s: %v", uid, err)
 			continue
 		}
@@ -494,6 +501,7 @@ func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
 		u.Username, changed, norm, proxyID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"updated": changed, "proxy": norm, "total": len(targets), "proxy_id": proxyID,
+		"blocked": blocked,
 	})
 }
 

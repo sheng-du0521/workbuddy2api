@@ -158,7 +158,8 @@ func TestComputeEgressBadDefaultDown(t *testing.T) {
 // 所以判据不能是"端口可连"（那只证明 sshd 在 listen），必须是**真实出网探测**。
 func TestApplyRefusesWhenLineUnusable(t *testing.T) {
 	store, _, a := newTestApp(t,
-		&Account{UID: "u-own", Nickname: "甲", OwnerUserID: 5, PoolState: "in"},
+		// v0.31.50：必须是未入池号——已入池的号按规则不走个人出口。
+		&Account{UID: "u-own", Nickname: "甲", OwnerUserID: 5, PoolState: ""},
 		&Account{UID: "u-other", Nickname: "乙", OwnerUserID: 9, PoolState: "in"},
 	)
 	defer store.Close()
@@ -189,7 +190,8 @@ func TestApplyRefusesWhenLineUnusable(t *testing.T) {
 // 把验证结果直接落库，页面不用等。
 func TestApplyWritesVerifiedExitIP(t *testing.T) {
 	store, _, a := newTestApp(t,
-		&Account{UID: "u-own", Nickname: "甲", OwnerUserID: 5, PoolState: "in"},
+		// v0.31.50：必须是未入池号 —— 已入池的号按规则不走个人出口（需求二）。
+		&Account{UID: "u-own", Nickname: "甲", OwnerUserID: 5, PoolState: ""},
 	)
 	defer store.Close()
 

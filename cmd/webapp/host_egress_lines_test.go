@@ -145,7 +145,8 @@ func TestHostEgressRebalanceByExitIP(t *testing.T) {
 			UID: "us-a-x" + itoa(i), Nickname: "x" + itoa(i), Realm: "cn",
 			AccessToken: "t", RefreshToken: "r",
 			ExpiresAt:   time.Now().Add(time.Hour).Unix(),
-			OwnerUserID: f.userA.ID, ConsumeGroup: "us", PoolState: "in",
+			// v0.31.50：夹具必须是**未入池**——已入池的号不许绑个人出口（需求二）。
+			OwnerUserID: f.userA.ID, ConsumeGroup: "us", PoolState: "",
 		}
 		if err := f.store.UpsertAccount(acc); err != nil {
 			t.Fatalf("UpsertAccount: %v", err)
@@ -217,7 +218,7 @@ func TestApplyHomeEgressNonDestructive(t *testing.T) {
 		UID: "us-a-new", Nickname: "新号", Realm: "cn",
 		AccessToken: "t", RefreshToken: "r",
 		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
-		OwnerUserID: f.userA.ID, ConsumeGroup: "us", PoolState: "in",
+		OwnerUserID: f.userA.ID, ConsumeGroup: "us", PoolState: "",
 	}
 	if err := f.store.UpsertAccount(acc2); err != nil {
 		t.Fatalf("UpsertAccount: %v", err)

@@ -186,6 +186,11 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// 强制越界审计（v0.31.50，需求二）：独立建表，随线路池一起迁移。
+	if err := s.migrateEgressForceAudit(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// 站内公告（v0.17.8）：同样独立建表，便于单测构造。
 	if err := s.migrateAnnouncements(); err != nil {
 		db.Close()

@@ -2545,8 +2545,21 @@ function run(pageFile, meOverride, plan) {
       rlBad.push('用户端不得调用管理端导入接口（会 403，且语义是"替平台收号"）');
     }
     const adminHtml = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
-    if (!adminHtml.includes('egrIncludeUser')) {
-      rlBad.push('admin.html 缺少「纳入用户线路」开关 —— 借用住宅 IP 必须显式知情');
+    // v0.31.50：越界必须“勾选 + 理由”，且不再发废字段。
+    if (!adminHtml.includes('egrForceScope') || !adminHtml.includes('egrForceReason')) {
+      rlBad.push('admin.html 缺少「强制越界 + 理由」入口（越界必须有据可查）');
+    }
+    if (adminHtml.includes('body.include_user_lines')) {
+      rlBad.push('admin.html 仍在发 include_user_lines（服务端已拒收）');
+    }
+    if (!adminHtml.includes('body.force_scope')) {
+      rlBad.push('admin.html 未传 force_scope（强制越界就不会生效）');
+    }
+    if (!adminHtml.includes('d.blocked')) {
+      rlBad.push('admin.html 未渲染 blocked（被拦下的号会“消失”）');
+    }
+    if (!APP_JS.includes('skipped_pooled')) {
+      rlBad.push('app.js 未说明 skipped_pooled（用户会以为“没生效”）');
     }
     const pluginSrc = fs.readFileSync(path.join(ROOT, 'cmd/webapp/host_import.go'), 'utf8');
     if (!pluginSrc.includes('OwnerUserID != u.ID')) {

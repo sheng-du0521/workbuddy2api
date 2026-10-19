@@ -27,7 +27,7 @@ func eaAccount(t *testing.T, s *Store, uid string, owner int64) {
 		UID: uid, Nickname: uid, Realm: "cn",
 		AccessToken: "t", RefreshToken: "r",
 		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
-		OwnerUserID: owner, PoolState: "in",
+		OwnerUserID: owner, PoolState: "",
 	}
 	if err := s.UpsertAccount(acc); err != nil {
 		t.Fatalf("UpsertAccount %s: %v", uid, err)

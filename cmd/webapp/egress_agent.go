@@ -2063,6 +2063,14 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scop
 	if err != nil {
 		// 线路不通 → 409 而不是 500：这是"当前状态不允许"，不是服务故障。
 		// 文案直接给出下一步（用户要的是"为什么刚拉起就全挂"，不是 HTTP 语义）。
+		if errors.Is(err, errEgressLineManuallyDisabled) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": "这条出口已被管理员停用：可以确认它能出网，但不会启用、也不会绑定任何账号。" +
+					"如需恢复，请让管理员在「代理」页解锁后再点「一键拉起」",
+				"line_manually_disabled": true,
+			})
+			return
+		}
 		if errors.Is(err, errEgressNotUsable) {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": err.Error() + "。未改动任何账号的出口。" +
@@ -2103,6 +2111,16 @@ type egressHomeApplyResult struct {
 	//     不是号主的决定。
 	// 不分开说，用户只会看到"跳过 4 个"，然后以为代理没生效。
 	SkippedDirect int `json:"skipped_direct,omitempty"`
+	// SkippedPooled 因「已入池」而跳过的号数（v0.31.50，需求二）。
+	//
+	// 与 Skipped / SkippedDirect 都不同：这不是"已经做过决定"，而是**规则不允许** ——
+	// 已入池的号参与平台反代，把它绑到个人出口等于把平台流量转到个人宽带。
+	SkippedPooled int `json:"skipped_pooled,omitempty"`
+	// SkippedForeign 因「不属于这条线路的主人」而跳过的号数（理论上恒 0）。
+	SkippedForeign int `json:"skipped_foreign,omitempty"`
+	// EligibleTotal / IneligibleTotal 本次评估的号里"能用/不能用"这条线路的数量。
+	EligibleTotal   int `json:"eligible_total,omitempty"`
+	IneligibleTotal int `json:"ineligible_total,omitempty"`
 	// RebindAll 本次是否强制改绑（用户显式要求）。
 	RebindAll bool   `json:"rebind_all,omitempty"`
 	Probed    bool   `json:"probed"`
@@ -2120,6 +2138,12 @@ type egressHomeApplyResult struct {
 // 用哨兵错误而不是匹配错误文案：本仓踩过「状态码跟着文案改」的坑
 // （改一句话，403 变 400）。调用方用 errors.Is 判，文案随便改。
 var errEgressNotUsable = errors.New("egress line not usable")
+
+// errEgressLineManuallyDisabled 线路被管理员**人工停用**（v0.31.50）。
+//
+// 语义是"这个决定属于管理员"，不是"线路坏了"：用户重新拉起代理不得把它拉活，
+// 管理员的强制越界也不放开这一条（见 egressLineAllows 第 1 条）。
+var errEgressLineManuallyDisabled = errors.New("egress line manually disabled")
 
 // notUsableError 带**用户可读文案**的「线路不可用」错误。
 //
@@ -2241,6 +2265,19 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 		}
 	}
 	hit.UpdatedAt = now
+	// 拉起即启用 —— **但不许把管理员的"人工停用"拉活**（v0.31.50，R3）。
+	// 这个坑 v0.31.34 踩过一次（无条件 Enabled=true 覆盖别人停用），当时只修了
+	// 用户线路的登记路径；这里是同一个决定的另一个入口。
+	if hit.ManualDisabled {
+		res.Warnings = append(res.Warnings, "这条出口已被管理员停用：已确认能出网，但不会启用、也不会绑定任何账号（需管理员先在后台解锁）")
+		log.Printf("WARN: [egress] 拒绝启用人工停用的线路 %s（owner=#%d scope=%s）",
+			url, hit.OwnerUserID, scope.label())
+		if err := a.store.UpsertEgressProxy(hit); err != nil {
+			return res, err
+		}
+		res.ProxyID = hit.ID
+		return res, errEgressLineManuallyDisabled
+	}
 	hit.Enabled = true // 拉起即启用（否则"通了但被停用"仍是个坑）
 	// 刚做过真实出网验证，结果直接写进线路记录（v0.31.47）：
 	// 否则页面会显示"未探活"，而运维刚点完"拉起"最想看到的就是出口 IP。
@@ -2312,6 +2349,25 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 			continue // 别人的号一个都不碰
 		}
 		res.HostTotal++
+		// 唯一闸门（v0.31.50，需求二 / R2）：已入池或不属于线路主人的号，
+		// **一个都不许绑到个人出口**。这条判断此前不存在 —— 用户拉起自己的代理后
+		// 点"应用"，会把他名下**已入池**的号也绑上，等于把平台反代流量转到他家宽带。
+		if ok, code, reason := egressLineAllows(hit, acc, egressAllowOpts{}); !ok {
+			res.IneligibleTotal++
+			switch code {
+			case egressCodePooled:
+				res.SkippedPooled++
+			case egressCodeForeign:
+				res.SkippedForeign++
+			default:
+				res.Skipped++
+			}
+			if code != egressCodeForeign {
+				log.Printf("INFO: [egress] 跳过账号 %s（%s：%s）", acc.UID, code, reason)
+			}
+			continue
+		}
+		res.EligibleTotal++
 		cur := strings.TrimSpace(acc.EgressProxy)
 		// 本次要写的值（见下方注释）：平台视角且这条线路成为全局默认时写空。
 		// 先算出来再比较，否则"已经是跟随默认"的号每轮都会被算作一次"本次绑定" ——

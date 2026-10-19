@@ -16,11 +16,16 @@ package main
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
 
-// TestAdminAssignUserLineOptIn 自动分配：默认跳过用户线路，勾选后纳入。
+// TestAdminAssignUserLineOptIn 自动分配：默认跳过用户线路；强制越界（带理由）才纳入并落审计。
+//
+// v0.31.50 起旧的 `include_user_lines` 被服务端**明确拒收**（它会不经审计地把
+// 用户线路分给任意账号）。这个用例同时守住三件事：默认排除、废弃字段 400、
+// 强制越界可成功且留下审计。
 func TestAdminAssignUserLineOptIn(t *testing.T) {
 	store, _, mux, adminCookie, _ := eaApp(t)
 	// 一个平台自持号（owner=0）+ 一条用户线路。
@@ -55,11 +60,22 @@ func TestAdminAssignUserLineOptIn(t *testing.T) {
 		t.Fatalf("dry_run 不该写库，得 %q", got.EgressProxy)
 	}
 
-	// 2) 显式勾选 → 纳入候选，平台号被分到用户线路上。
+	// 2) 旧字段必须被拒（而不是"悄悄忽略后行为变了"）。
 	code, raw = eaReq(t, mux, "POST", "/api/admin/egress/assign",
 		`{"uids":["asg-plat-1"],"include_user_lines":true}`, adminCookie, "")
+	if code != http.StatusBadRequest || !strings.Contains(raw, "include_user_lines_deprecated") {
+		t.Fatalf("include_user_lines 应 400，得 %d %s", code, raw)
+	}
+
+	// 3) 强制越界（带理由）→ 纳入候选，平台号被分到用户线路上，并落一条审计。
+	code, raw = eaReq(t, mux, "POST", "/api/admin/egress/assign",
+		`{"uids":["asg-plat-1"],"force_scope":true,"force_reason":"排障：临时借用测试出口，已获号主口头同意"}`,
+		adminCookie, "")
 	if code != http.StatusOK {
-		t.Fatalf("勾选后应能分配到用户线路，得 %d %s", code, raw)
+		t.Fatalf("强制越界后应能分配到用户线路，得 %d %s", code, raw)
+	}
+	if audits, _ := store.ListEgressForceAudits(5, ""); len(audits) != 1 {
+		t.Fatalf("强制越界必须落审计，得 %d 条", len(audits))
 	}
 	got, _ := store.GetAccount("asg-plat-1")
 	if got.EgressProxy != userLine {

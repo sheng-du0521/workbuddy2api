@@ -569,6 +569,17 @@ func (p *Proxy) SyncAccountsReport() (SyncReport, error) {
 		// 生效消耗分组：显式设置优先，否则按来源推断（v0.13.0）。
 		cgm[acc.UID] = effectiveConsumeGroup(acc)
 	}
+	// 出口范围兜底（R12，v0.31.50）：写入口已经统一收口，但数据会被迁移脚本、
+	// 手工 SQL、历史版本改。规则如果只在写入口生效，一次脏数据就绕过全部纪律 ——
+	// 而这里的后果是"某个人的 access_token 从别人的家庭宽带出去"。
+	// 违规映射**降级为跟随默认出口**并留 WARN 台账；不自动改库（避免批量断流）。
+	if p.store != nil {
+		if proxies, err := p.store.ListEgressProxies(); err == nil {
+			if _, dropped := egressScopeFilter(em, proxies, all); dropped > 0 {
+				log.Printf("WARN: [egress] 选号映射中发现 %d 个越界出口，已降级为跟随默认（详见上行 scope violation 日志）", dropped)
+			}
+		}
+	}
 	// 出口异常判定（v0.31.47）：**配置层 + 运行层**，见 computeEgressBad。
 	//
 	// 此前这里只做格式校验，于是「线路已被探活停用」不会被反映到选号上 ——
