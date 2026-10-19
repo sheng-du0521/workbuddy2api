@@ -2558,6 +2558,13 @@ function run(pageFile, meOverride, plan) {
     if (!adminHtml.includes('d.blocked')) {
       rlBad.push('admin.html 未渲染 blocked（被拦下的号会“消失”）');
     }
+    // v0.31.51：模型倍率必须与计费口径并列展示，并说明“倍率不参与计费”。
+    if (!dash.includes('/api/models/ratios')) {
+      rlBad.push('dashboard.html 未展示模型倍率（用户看不到官方口径）');
+    }
+    if (!dash.includes('计费以它为准')) {
+      rlBad.push('dashboard.html 未说明“倍率仅供对照、计费看实测”');
+    }
     if (!APP_JS.includes('skipped_pooled')) {
       rlBad.push('app.js 未说明 skipped_pooled（用户会以为“没生效”）');
     }

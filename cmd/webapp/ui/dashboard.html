@@ -1549,11 +1549,35 @@ async function openModelsModal(btn) {
   let ids = [];
   try { const m = await api('/api/models'); ids = m.models || []; }
   catch (e) { toast(e.message, 'err'); return; }
-  const m = openModal('可用模型 ID', '共 ' + ids.length + ' 个 · 点右侧按钮复制，粘贴到客户端即可');
+  // 倍率与免费标识（v0.31.51，需求一）：与模型列表分开拉 —— 它是本地表，
+  // 拉不到也不该让"复制模型 ID"这个主功能跟着失败。
+  let ratios = {};
+  let lastSync = '';
+  try {
+    const r = await api('/api/models/ratios');
+    for (const x of (r.models || [])) ratios[x.model] = x;
+    lastSync = r.last_sync_at || '';
+  } catch (e) { /* 忽略：没有倍率数据时只显示模型 ID */ }
+  const m = openModal('可用模型与倍率',
+    '共 ' + ids.length + ' 个 · 点右侧按钮复制，粘贴到客户端即可' +
+    (lastSync ? ' · 官方口径同步于 ' + new Date(Number(lastSync) * 1000).toLocaleString() : ''));
   if (!ids.length) { m.body.appendChild(el('div', 'hintbar', '暂未探测到模型列表（上游可能不可达）')); return; }
+  // 口径说明（v0.31.51）：官方 credits 原样展示、不参与计费；扣点看"实测"。
+  // 这两句必须写在界面上，否则用户会把 x0.05 当成"打 0.05 折"。
+  m.body.appendChild(el('div', 'hintbar',
+    '「官方倍率」是上游声明的 credits 原文，仅作对照；「实测」是本站实际扣的积分/1k，计费以它为准。'));
   const list = el('div', 'cfg-list');
   for (const id of ids) {
-    list.appendChild(cfgRow(id, '', copyBtn(() => id, '')));
+    const r = ratios[id] || {};
+    const bits = [];
+    if (r.official_free) bits.push('免费');
+    if (r.official_badge && !r.official_free) bits.push(r.official_badge);
+    if (r.official_credits) bits.push('官倍 ' + r.official_credits);
+    if (r.measured_cost_1k) bits.push('实测 ' + r.measured_cost_1k + ' 积分/1k');
+    if (r.drift) bits.push('⚠ 口径待核对');
+    const row = cfgRow(id, bits.join(' · '), copyBtn(() => id, ''));
+    if (r.official_free) row.classList.add('ok');
+    list.appendChild(row);
   }
   m.body.appendChild(list);
   const row = el('div', 'row');

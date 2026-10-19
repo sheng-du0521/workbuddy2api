@@ -186,6 +186,11 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// 模型倍率（v0.31.51，需求一）：官方口径与实测口径并列，独立建表。
+	if err := s.migrateModelRatio(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// 强制越界审计（v0.31.50，需求二）：独立建表，随线路池一起迁移。
 	if err := s.migrateEgressForceAudit(); err != nil {
 		db.Close()

@@ -1,16 +1,16 @@
 {
-  "version": "0.31.50",
+  "version": "0.31.51",
   "min_supported": "0.24.0",
-  "notes": "v0.31.50：落地《三项需求设计与实施方案》的 S1 批次（需求二 = 用户自拉出口只服务本人未入池号 + 四个 P0）。① **唯一闸门** `egressLineAllows`：线路范围（scope=platform/self_unpooled）、归属、入池三条一次判完，四个入口全部接入 —— 用户自助 apply（新增 skipped_pooled）、管理员批量 assign（新增 blocked[]）、单账号改出口（403 + code）、反代选号读路径（违规映射降级为跟随默认 + WARN 台账）。② **移除无痕后门**：`include_user_lines` 改为 `force_scope` + `force_reason`（≥10 字），旧字段直接 400；强制越界落新表 `egress_force_audits`（谁/对哪几个号/违反了哪条/理由/结果），新增 `GET /api/admin/egress/force-audits`。③ **拆出人工停用位** `egress_proxies.manual_disabled`：用户重新拉起不再能把管理员的停用拉活（apply 返回 409 `line_manually_disabled`），编辑线路也不会顺手清掉它；新增 `POST /api/admin/egress/proxies/manual-disable`。④ **越界存量可见** `GET /api/admin/egress/compliance` + 管理端红条 + 「一键改回默认（先预览）」；只报不改，避免批量断流。⑤ 迁移：新增 `scope` 列（存量回填：用户线路 self_unpooled / 其余 platform）+ `manual_disabled` 列，均幂等。⑥ 顺手修掉 v0.31.49 遗留的现场问题：清理用户 9915 换网络留下的幽灵机器记录与那条已停用的旧线路（0 账号引用）。",
-  "released_at": 1792411622,
+  "notes": "v0.31.51：① 排查「控制台调用模型请求 Internal error 404」——服务端此前**没有任何日志**（404 在路由层产生、不进 handler），所以先加 `routeDiagnostics` 中间件：尾部斜杠归一（`/v1/chat/completions/` 视为同一路由）+ 未匹配路径打 WARN（方法/路径/UA/IP），下次再报 404 能直接说出是哪个客户端请求了哪条路径。② 落地需求一的后端与用户端展示：新表 `model_ratios` / `model_ratio_diffs`，每日（20 小时间隔）从上游模型目录同步 `credits` 与 `tags` 里的免费 badge，与本地 `model_cost_1k:<model>` 并列落库；免费↔付费、倍率变更各记一条差异，并写一条站内公告（每轮最多一条）。新增 `GET /api/models/ratios`（用户只读）、`GET /api/admin/model-ratios`、`POST /api/admin/model-ratios/sync`。用户控制台「可用模型」弹窗改为并列展示官方倍率/免费标/实测积分，并明说**计费仍以实测为准**（credits 语义未实证，不拿它算钱）。",
+  "released_at": 1792412542,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.50/webapp.exe",
-      "sha256": "167163e8994dc49151bc5b735de8fd5594b20d8e6175995a1f98190ed661c57d",
-      "size": 15600128
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.51/webapp.exe",
+      "sha256": "008d2b742b50dafc9ba5cfc006310c0ca431826f7e8d265e175be7eb4e27a82d",
+      "size": 15635968
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

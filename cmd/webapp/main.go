@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.50"
+const version = "0.31.51"
 
 type app struct {
 	store  *Store
@@ -104,6 +104,8 @@ type app struct {
 	// 测试里替换成桩，是因为"绑号前必须验证线路"这条纪律本身要保留，
 	// 而单测环境没有可用代理 —— 用桩保留结构、绕开网络。
 	egressVerify func(url string) (string, error)
+	// modelRatioFetch 模型倍率同步的目录读取（**仅测试**，v0.31.51）。
+	modelRatioFetch func() ([]upstream.ModelInfo, error)
 	// agentDir agent 产物目录（-agent-dir，v0.31.42）。空 = 可执行文件同级 egress-agent/。
 	// 服务端从这里读 agent-version.json 与二进制，供 agent 自更新下载（见 agent_dist.go）。
 	agentDir string
@@ -446,6 +448,8 @@ func main() {
 	// 版本更新提醒（v0.26.0）：启动后延迟一次 + 之后每 12 小时一次。
 	// 失败静默、只读缓存，绝不碰账号与出站主链路（详见 updatecheck.go）。
 	go a.updateLoop(probeCtx)
+	// 模型倍率自动同步（v0.31.51，需求一）：启动后补跑 + 之后每小时检查是否满 20 小时。
+	go a.modelRatioLoop(probeCtx)
 
 	mux := a.routes()
 
@@ -453,7 +457,7 @@ func main() {
 		Addr: *addr,
 		// 中间件顺序：安全头最外（错误响应也要带）→ 请求体上限 → CSRF。
 		// CSRF 放在最内层：它需要读 Origin/Host，且拦截时希望已带上安全头。
-		Handler:           recoverer(securityHeaders(limitRequestBody(a.csrfGuard(mux), maxRequestBody))),
+		Handler:           recoverer(securityHeaders(limitRequestBody(a.csrfGuard(routeDiagnostics(mux)), maxRequestBody))),
 		ReadHeaderTimeout: 30 * time.Second,
 		// IdleTimeout / ReadTimeout 此前缺失（v0.24.0 补）：只有 ReadHeaderTimeout
 		// 挡不住「连上但不发完请求」的慢速连接占资源。写超时不给 —— 流式回答
@@ -625,6 +629,69 @@ func recoverer(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// routeDiagnostics 路径归一 + 404 留痕（v0.31.51）。
+//
+// 现场（2026-10-19 20:0x）：用户报"控制台调用模型请求 Internal error 404"，
+// 但服务端**没有任何日志** —— 因为 404 是在路由层产生的，压根没进任何 handler。
+// 结果是只能靠猜客户端到底请求了哪条路径，猜错的代价是改错地方。
+//
+// 这里做两件事：
+//  1. **尾部斜杠归一**：`/v1/chat/completions/` 与不带斜杠视为同一条路由。
+//     不少客户端（含手写 base_url + 自己拼路径）会多带一个斜杠，Go 的 ServeMux
+//     对它只回 404，而用户看到的就是一句"内部错误"。
+//  2. **未匹配路径留痕**：打一行 WARN（方法/路径/UA/IP），下次再报"404"时，
+//     我们能直接说出是哪个客户端、请求了哪条路径，而不是再猜一轮。
+func routeDiagnostics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p := r.URL.Path; len(p) > 1 && strings.HasSuffix(p, "/") {
+			r.URL.Path = strings.TrimRight(p, "/")
+		}
+		rec := &routeStatusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		if rec.status == http.StatusNotFound {
+			ua := r.Header.Get("User-Agent")
+			if len(ua) > 80 {
+				ua = ua[:80]
+			}
+			log.Printf("WARN: [route] 404 %s %s ua=%q ip=%s —— 客户端请求了未实现的路径；"+
+				"OpenAI 兼容接口是 POST /v1/chat/completions 与 GET /v1/models",
+				r.Method, r.URL.Path, ua, clientIPOf(r))
+		}
+	})
+}
+
+// routeStatusRecorder 只为读状态码而存在的包装。
+//
+// Unwrap 必须实现：流式回答依赖 http.ResponseController 拿到底层 Writer 做 Flush，
+// 少了它 SSE 会被缓冲住（表现为"回答很久才一次性出现"，比 404 更难查）。
+type routeStatusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *routeStatusRecorder) WriteHeader(code int) {
+	if !r.wroteHeader {
+		r.status, r.wroteHeader = code, true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *routeStatusRecorder) Write(b []byte) (int, error) {
+	if !r.wroteHeader {
+		r.status, r.wroteHeader = http.StatusOK, true
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func (r *routeStatusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+func (r *routeStatusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // rootHandler 根路径与"未匹配路径"的统一落点（v0.31.49）。
@@ -1539,6 +1606,10 @@ func (a *app) routes() *http.ServeMux {
 	// 消耗排行（v0.17.8）：控制台概览高频刷新榜单，故与 /api/usage 分开。
 	mux.HandleFunc("GET /api/usage/ranking", a.userGuard(a.handleUserUsageRanking))
 	mux.HandleFunc("GET /api/models", a.userGuard(a.handleUserModels))
+	// 模型倍率（v0.31.51，需求一）：用户侧只读，管理端含变化台账与手动同步。
+	mux.HandleFunc("GET /api/models/ratios", a.userGuard(a.handleModelRatios))
+	mux.HandleFunc("GET /api/admin/model-ratios", a.adminGuard(a.handleAdminModelRatios))
+	mux.HandleFunc("POST /api/admin/model-ratios/sync", a.adminGuard(a.handleAdminModelRatioSync))
 	mux.HandleFunc("GET /api/referral", a.userGuard(a.handleReferral))
 	// 站内公告（v0.17.8）：用户侧只读启用中的公告，用于弹窗与概览卡片。
 	mux.HandleFunc("GET /api/announcements", a.userGuard(a.handleUserAnnouncements))
