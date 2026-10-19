@@ -124,6 +124,23 @@
         <div class="feed" id="ovFeed"></div>
       </div>
 
+      <!-- ==================== 模型可用状态（模型冷却，v0.31.55） ====================
+           用户端此前**看不到**模型级冷却：某个模型被上游限流时，他只看到"一直失败"，
+           于是反复重试 —— 而重试可能让冷却续期。这张卡回答三件事：
+           能不能用、为什么、多久恢复。数据只到**模型维度**，不含账号数/uid。 -->
+      <div class="card" style="margin-top:16px;">
+        <div class="section-head">
+          <h2><span class="live-dot on" id="mcDot"></span>模型可用状态</h2>
+          <div class="row" style="align-items:center;gap:8px;">
+            <span class="muted" style="font-size:12px;" id="mcStamp"></span>
+            <button class="ghost sm" id="btnMcRefresh" title="立即刷新（页面每 30 秒也会自动刷）">刷新</button>
+          </div>
+        </div>
+        <div class="sub" id="mcSummary" style="margin:0 0 10px;">加载中…</div>
+        <div id="mcList"></div>
+        <div class="sub" id="mcHint" style="margin-top:8px;font-size:11px;"></div>
+      </div>
+
       <!-- ==================== 实时消耗排行（v0.17.8） ==================== -->
       <div class="card" style="margin-top:16px;">
         <div class="section-head">
@@ -791,6 +808,123 @@ function dailyTable(container, rows) {
 // 概览
 // ======================================================================
 
+// ======================================================================
+// 模型可用状态（模型冷却，v0.31.55）
+//
+// 用户端此前**看不到**模型级冷却：某个模型被上游限流时，他只看到"一直失败"，
+// 于是反复重试 —— 而重试可能让冷却续期，越试越久。
+// 这张卡只回答三件事：能不能用 / 为什么 / 多久恢复。
+//
+// 口径由服务端保证（full = 当前一个可用账号都选不出来，与转发选号同源），
+// 前端**不自己算**：前端拿到的数字若与真实选号不一致，会比不显示更糟。
+// ======================================================================
+let mcTimer = null;
+
+// mcLeft 秒数转人话（与后端剩余秒数同口径，只用于展示）。
+function mcLeft(sec) {
+  sec = Math.max(0, Math.floor(Number(sec) || 0));
+  if (sec < 60) return sec + ' 秒';
+  const m = Math.floor(sec / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return h + ' 小时' + (m % 60 ? ' ' + (m % 60) + ' 分' : '');
+  return m + ' 分钟' + (sec % 60 ? ' ' + (sec % 60) + ' 秒' : '');
+}
+
+function renderModelCooling(d) {
+  const list = $('mcList');
+  const sum = $('mcSummary');
+  const dot = $('mcDot');
+  const hint = $('mcHint');
+  if (!list) return;
+  list.textContent = '';
+  const models = (d && d.models) || [];
+  const s = (d && d.summary) || {};
+  const total = Number(s.total_models) || 0;
+  const cooling = Number(s.cooling_models) || 0;
+  const full = Number(s.full_models) || 0;
+
+  if (dot) {
+    dot.style.background = full ? '#e74c3c' : (cooling ? '#f39c12' : 'var(--accent)');
+    dot.title = full ? '有模型当前完全不可用' : (cooling ? '有模型部分降级' : '全部模型可用');
+  }
+  if (sum) {
+    sum.textContent = '';
+    if (!cooling) {
+      sum.appendChild(el('b', null, '全部模型可用'));
+      sum.appendChild(document.createTextNode('（共 ' + total + ' 个）'));
+    } else {
+      sum.appendChild(el('b', null, cooling + ' 个模型在冷却'));
+      sum.appendChild(document.createTextNode(
+        '（共 ' + total + ' 个' + (full
+          ? '，其中 ' + full + ' 个当前完全不可用'
+          : '，均仍可服务但更易失败') + '）'));
+    }
+  }
+
+  if (!models.length) {
+    list.appendChild(el('div', 'hintbar', '当前没有模型处于冷却：可以正常调用。'));
+  } else {
+    const head = el('div', 'code-gen-row');
+    for (const t of ['模型', '状态', '原因', '预计恢复']) {
+      const c = el('span', 'muted', t);
+      c.style.fontWeight = '600';
+      head.appendChild(c);
+    }
+    list.appendChild(head);
+    for (const m of models) {
+      const row = el('div', 'code-gen-row');
+      row.appendChild(el('span', 'mono', m.model));
+      row.appendChild(el('span', m.state === 'full' ? 'tag err' : 'tag warn',
+        m.state === 'full' ? '当前不可用' : '部分降级'));
+      row.appendChild(el('span', 'muted', m.reason_label || '—'));
+      const at = m.state === 'full'
+        ? (m.last_resume_at || m.first_resume_at)
+        : (m.first_resume_at || m.last_resume_at);
+      const left = Math.max(0, Number(m.retry_after_sec) || 0);
+      row.appendChild(el('span', 'mono',
+        '约 ' + mcLeft(left) + '后' + (at ? '（' + fmtClock(at) + '）' : '')));
+      list.appendChild(row);
+    }
+  }
+
+  if (hint) {
+    hint.textContent = cooling
+      ? ('冷却由上游限流触发，到期自动恢复。请不要反复重试 —— 重试可能让冷却续期。'
+        + '同一模型换一个也能用的模型通常是更快的路。')
+      : '';
+  }
+  if (d && d.generated_at) setTxt('mcStamp', '更新于 ' + fmtClock(d.generated_at));
+}
+
+async function loadModelCooling(silent) {
+  const list = $('mcList');
+  if (!list) return;
+  try {
+    const d = await api('/api/models/cooling');
+    renderModelCooling(d);
+  } catch (e) {
+    if (silent) return; // 轮询失败不打扰：下一轮再试
+    list.textContent = '';
+    list.appendChild(el('div', 'hintbar', '读取模型可用状态失败：' + e.message));
+  }
+}
+
+// mcEnsureTimer 30 秒轻轮询（只在概览页可见且页面在前台时跑）。
+//
+// 为什么不更密：冷却是分钟级状态，5 秒一次纯属浪费；而"用户盯着等恢复"
+// 这个场景 30 秒足够。单例 timer，重复调用不会叠加。
+function mcEnsureTimer() {
+  if (mcTimer) return;
+  mcTimer = setInterval(() => {
+    const pane = document.querySelector('.pane[data-pane="overview"]');
+    if (!pane || !pane.classList.contains('active')) return;
+    if (document.hidden) return;
+    loadModelCooling(true);
+  }, 30000);
+  const btn = $('btnMcRefresh');
+  if (btn) btn.onclick = () => loadModelCooling();
+}
+
 async function loadOverview() {
   const host = document.querySelector('.pane[data-pane="overview"]');
   try {
@@ -811,6 +945,8 @@ async function loadOverview() {
   });
   try {
     loadOvSplit(); // 消耗构成：不阻塞主流程（失败只影响这一块）
+    loadModelCooling(); // 模型冷却（同样不阻塞：拿不到只是少一张卡）
+    mcEnsureTimer();
     const [rep, bk] = await Promise.all([
       fetchReport(14),
       api('/api/usage/breakdown?days=14').catch(() => ({})),

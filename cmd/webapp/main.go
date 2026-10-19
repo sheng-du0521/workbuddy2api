@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.54"
+const version = "0.31.56"
 
 type app struct {
 	store  *Store
@@ -1604,6 +1604,9 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/models", a.userGuard(a.handleUserModels))
 	// 模型倍率（v0.31.51，需求一）：用户侧只读，管理端含变化台账与手动同步。
 	mux.HandleFunc("GET /api/models/ratios", a.userGuard(a.handleModelRatios))
+	// 模型冷却（v0.31.55）：用户端只给**模型级结论**（能不能用 / 为什么 / 多久恢复），
+	// 不含账号数也不含 uid —— 号池结构不出这个接口。
+	mux.HandleFunc("GET /api/models/cooling", a.userGuard(a.handleModelCooling))
 	mux.HandleFunc("GET /api/admin/model-ratios", a.adminGuard(a.handleAdminModelRatios))
 	mux.HandleFunc("POST /api/admin/model-ratios/sync", a.adminGuard(a.handleAdminModelRatioSync))
 	mux.HandleFunc("GET /api/referral", a.userGuard(a.handleReferral))

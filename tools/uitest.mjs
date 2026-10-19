@@ -2509,6 +2509,41 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-admin: 管理员仍可打开平台直属出口（立线路/看承重），且不提供逐号分配');
   }
 
+  // v0.31.55：用户端必须有「模型可用状态」（模型冷却）卡片。
+  //
+  // 这条需求此前只有管理端有（账号卡里的"模型级冷却"列表）。用户端缺它时，
+  // 用户看到的是"某个模型一直失败"，于是反复重试 —— 而重试可能让冷却续期。
+  // 所以守卫盯两件事：**卡片在**、**口径与选号同源**（不是前端自己算）。
+  const mcBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const dash = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8');
+    for (const [needle, why] of [
+      ['id="mcList"', '缺少「模型可用状态」卡片容器'],
+      ['/api/models/cooling', '没有请求冷却接口（卡片永远空着）'],
+      ['不要反复重试', '没有说明「重试会让冷却续期」（这是这张卡的主要价值）'],
+      ['部分降级', '没有区分 full / partial（用户分不清"能不能用"）'],
+    ]) {
+      if (!dash.includes(needle)) mcBad.push(why + '（' + needle + '）');
+    }
+    const src = fs.readFileSync(path.join(ROOT, 'cmd/webapp/modelcooling.go'), 'utf8');
+    if (!src.includes('AvailableUIDsForModel')) {
+      mcBad.push('full/partial 没有用生产选号判据（自己另算一套必然与转发不一致）');
+    }
+    // 用户端结构体里不许出现 uid / 账号数：号池结构不出这个接口。
+    // 只看**字段声明行**：注释里解释"不返回 uid"这句话本身不该被当成违规
+    // （v0.31.43 在 authscan 守卫上就这么误报过一次）。
+    const iface = src.slice(src.indexOf('type modelCoolingItem struct'), src.indexOf('type modelCoolingSummary'))
+      .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    for (const bad of ['UID', 'Accounts', 'accounts']) {
+      if (iface.includes(bad)) mcBad.push('用户端视图泄露出 ' + bad + '（号池结构不该给用户）');
+    }
+  }
+  mcBad.forEach((m) => console.log('  [FAIL] model-cooling: ' + m));
+  if (!mcBad.length) {
+    console.log('  [ok] model-cooling: 用户端有冷却卡片 + full/partial 与选号同源 + 不泄露号池结构');
+  }
+
   // v0.31.32：**重新登录必须能自助完成**（扫码 或 导入 auth JSON），
   // 而不是再给一句"去找管理员"。这条同时守住三处：
   //   · 卡片上的按钮真的调了弹窗（不是 alert 三步提示）；
@@ -3287,7 +3322,7 @@ function run(pageFile, meOverride, plan) {
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
     && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
-    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0;
+    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && mcBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

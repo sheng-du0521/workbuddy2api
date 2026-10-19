@@ -879,3 +879,52 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 // ---------------------------------------------------------------------------
 // 持久化
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 模型冷却的**横切视图**（v0.31.55）
+// ---------------------------------------------------------------------------
+
+// ModelCooldownRow 一条仍在有效期的「(账号, 模型) 冷却」。
+//
+// UID 供调用方自行决定是否暴露：管理端要按号追责，用户端只做**模型级聚合**
+// （把号池结构发给用户既无用又是信息泄露）。
+type ModelCooldownRow struct {
+	UID     string
+	Model   string
+	Until   time.Time
+	ResetAt time.Time
+	Reason  string
+}
+
+// ModelCooldowns 返回全池**此刻仍在冷却**的模型条目。
+//
+// 为什么需要它：`rateLimitedModelsLocked` 是**单账号**台账（账号卡用），
+// 而"这个模型现在还能不能用"是按模型聚合的问题。逐账号去拼装有两个问题：
+//
+//	① 调用方要自己判到期，谁忘了谁就把已恢复的模型继续标成冷却；
+//	② N 个账号 = N 次加锁遍历，在用户端每次刷新都跑一遍没有意义。
+//
+// 到期过滤只在这里做一次：调用方拿到的就是"此刻有效"的行。
+func (p *Pool) ModelCooldowns(now time.Time) []ModelCooldownRow {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]ModelCooldownRow, 0, 8)
+	for uid, e := range p.byUID {
+		for m, mc := range e.modelCooldowns {
+			if mc.Until.IsZero() || !now.Before(mc.Until) {
+				continue
+			}
+			out = append(out, ModelCooldownRow{
+				UID: uid, Model: m, Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason,
+			})
+		}
+	}
+	// 稳定排序：map 遍历无序，同一份状态两次刷新顺序不同会让人以为"变了"。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Model != out[j].Model {
+			return out[i].Model < out[j].Model
+		}
+		return out[i].UID < out[j].UID
+	})
+	return out
+}

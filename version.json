@@ -1,16 +1,16 @@
 {
-  "version": "0.31.54",
+  "version": "0.31.56",
   "min_supported": "0.24.0",
-  "notes": "v0.31.54：**移除用户端代理能力，代理收敛为平台能力**（产品决策；0.31.53 的部署只是中间态，未发布）。① 用户端四个接口（/api/host/egress、/lines、/assign、/rebalance）一律 410 `user_egress_removed` —— 用 410 而不是删路由：404 与「地址写错」无法区分，老客户端会反复重试。② /api/egress/home 与 pull/release/apply/repair/install 全部收紧为管理员（403 `platform_only`）；已安装的用户 agent 也不能再接入（poll/report/config → 410 + action=stop，私钥不再下发），且拒绝日志按 owner 5 分钟节流（一台没删的机器否则一天刷 1.7 万条）。③ 业务逻辑删除：handleHostEgress 系列、ensureUserEgressLine、每用户线路配额、按 owner 统计；**apply 不再绑定任何账号**（应用 = 验证 + 登记 + 设全局默认出口）。分配只剩管理端 assign 一个写入口。④ 用户端界面：插件列表不再出现出口插件（Audience 改 admin，改名「平台直属出口」）；删除「我的账号出口」卡片、逐号下拉、按出口 IP 均衡、批量改绑、设置页「我的出口」整卡；「仅剩 access」提示迁到账号卡徽标（它是账号健康信息，不该随代理消失）。⑤ 管理端：代理页新增权限边界说明（唯一分配入口）；插件列表保留「平台直属出口」供管理员操作平台机器。⑥ 视图口径修正：host_bound/host_total（只数自挂号，平台视角恒 0）→ bound_accounts/carrying（全部账号）。⑦ 生产数据：备份 webapp.db.bak-user-egress-202610192136，删除用户线路与用户机器记录；47 个账号全在平台出口，未改动。",
-  "released_at": 1792417724,
+  "notes": "v0.31.56：用户控制端新增「模型可用状态」卡片（模型冷却可视化）。此前模型级冷却只在管理端可见（账号卡的「模型级冷却」列表），用户端看不到 —— 于是某个模型被上游限流时，用户只看到「一直失败」并反复重试，而重试会让 6004 冷却续期（越试越久）。① 新增 GET /api/models/cooling：只返回**模型维度**结论（能不能用 / 为什么 / 多久恢复），不含账号数、uid、6004/11102 等内部码。② full/partial 判据与生产选号**同源**（AvailableUIDsForModel）：full = 此刻一个可用账号都选不出来，不使用「冷却条目数 ≥ 账号数」这种会给出假余量的自算口径。③ 原因归一为三类：上游限流 / 该模型在当前账号上不可用 / 上游暂时不可用（前两者处置完全不同：等 vs 换模型）。同时给出最早与最晚恢复时刻（partial 看最早、full 看最晚）。④ pool.ModelCooldowns(now) 提供全池横切视图，到期过滤只做一次；webapp 侧 5 秒缓存合并并发轮询。⑤ 前端：概览页「模型可用状态」卡（汇总 + 逐模型行 + 手动刷新 + 30 秒轻轮询，仅概览页可见且前台时），空态文案「全部模型可用」，并明确提示「不要反复重试 —— 重试可能让冷却续期」。⑥ 口径修正（上线后实测发现）：`total_models` 改取**用户可见的模型目录**（model_ratios，与「可用模型」弹窗同源）—— 原用 ObservedModels 只统计「产生过成本观测」的模型（生产实测仅 3 个），会出现「共 3 个模型」与另一个弹窗的 51 个直接矛盾。",
+  "released_at": 1792419722,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.54/webapp.exe",
-      "sha256": "329f94ebbc5e638db3ec09828d9ce08b06ed0b47f02233997f1e98d314c8ca18",
-      "size": 15582720
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.56/webapp.exe",
+      "sha256": "6ebd2f20288d5b612d2c926e8b54ca5605b3ca81a734d53f9ae5faaf3b19e35d",
+      "size": 15603712
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
