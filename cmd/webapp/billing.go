@@ -246,6 +246,9 @@ func (a *app) apiKeyGuardOpt(next http.HandlerFunc, requireBalance bool) http.Ha
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw := bearerToken(r)
 		if raw == "" {
+			// 留痕（v0.31.45）：见 authlog.go —— 这些分支以前不回任何日志，
+			// 用户报"403/401"时服务端一条都查不到。
+			logAuthReject(r, http.StatusUnauthorized, "missing api key", "", "")
 			writeOpenAIError(w, http.StatusUnauthorized, "missing api key")
 			return
 		}
@@ -260,15 +263,22 @@ func (a *app) apiKeyGuardOpt(next http.HandlerFunc, requireBalance bool) http.Ha
 		}
 		key, err := a.store.GetAPIKeyByHash(HashAPIKey(raw))
 		if err != nil {
+			// 最常见的原因：客户端里存的是**已删除**的旧 key（本仓支持重建 Key，
+			// 旧 Key 是物理删除）。日志里带上用户实际发来的指纹，能一眼看出来。
+			logAuthReject(r, http.StatusUnauthorized, "invalid api key", maskKeyForLog(raw), "库里无此 key")
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid api key")
 			return
 		}
 		if key.Status != StatusActive {
+			logAuthReject(r, http.StatusForbidden, "api key disabled", maskKeyForLog(raw),
+				"key id="+strconv.Itoa(int(key.ID))+" status="+key.Status)
 			writeOpenAIError(w, http.StatusForbidden, "api key disabled")
 			return
 		}
 		u, err := a.store.GetUserByID(key.UserID)
 		if err != nil {
+			logAuthReject(r, http.StatusUnauthorized, "api key owner not found", maskKeyForLog(raw),
+				"key id="+strconv.Itoa(int(key.ID)))
 			writeOpenAIError(w, http.StatusUnauthorized, "api key owner not found")
 			return
 		}
@@ -277,6 +287,8 @@ func (a *app) apiKeyGuardOpt(next http.HandlerFunc, requireBalance bool) http.Ha
 		// 最该看清的一件事。只影响面板展示，不改变鉴权语义。
 		setLiveUser(r, u.Username)
 		if u.Status != StatusActive {
+			logAuthReject(r, http.StatusForbidden, "account banned", maskKeyForLog(raw),
+				"user="+u.Username+" status="+u.Status)
 			writeOpenAIError(w, http.StatusForbidden, "account banned")
 			return
 		}

@@ -203,6 +203,23 @@
           <div class="kpis" id="poolRealmKpis" style="grid-template-columns:repeat(2,1fr);"></div>
         </div>
       </div>
+
+      <!-- 最近被拒的请求（v0.31.45）：这些拒绝**不写 usage_logs**（没有账号、没有计费），
+           以前服务端连日志都没有 —— 用户报"403"时我们连"请求来过没有"都答不上。
+           现在放在概览页最下方：出问题第一眼看这里，不用 SSH 上去 grep。 -->
+      <div class="card" style="margin-top:16px;">
+        <div class="section-head">
+          <h2>最近被拒的请求</h2>
+          <button class="ghost sm" id="btnAuthRejects">刷新</button>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          这里只列**被拒**的请求（401/403），它们不进用量流水也不计费。
+          <b>invalid api key</b> 最常见于客户端还配着<b>已删除的旧 Key</b>；
+          <b>account banned</b> 是用户被停用；<b>csrf origin mismatch</b> 多见于经反向代理访问时
+          Origin 与 Host 不一致。列表存在内存里，服务重启即清空。
+        </div>
+        <div id="authRejectRows"></div>
+      </div>
     </section>
 
     <!-- ==================== 账号池 ==================== -->
@@ -1670,6 +1687,10 @@ let selectedUIDs = new Set();
 // 导出账号 JSON（v0.31.29）。勾选优先；没有勾选就导全部 —— 与「批量设置」的
 // 兜底语义一致，但这里额外弹一次确认：导出是**读**操作（不会改账号），
 // 真正需要提醒的是"文件本身就等于账号钥匙"。
+if ($('btnAuthRejects')) {
+  $('btnAuthRejects').onclick = () => loadAuthRejects();
+}
+
 if ($('btnAuthCandRefresh')) {
   $('btnAuthCandRefresh').onclick = async () => {
     await loadEgress();
@@ -1839,12 +1860,68 @@ async function loadOvSplit() {
   if (!totalReq) box.appendChild(el('div', 'muted', '近 14 天还没有计费用量。'));
 }
 
+// loadAuthRejects 渲染「最近被拒的请求」（v0.31.45）。
+//
+// 失败静默：这是辅助诊断，不该因为一个统计接口把概览页弄成错误页。
+// 但**空态要说话** —— "没有拒绝"和"接口挂了"在界面上必须能区分。
+async function loadAuthRejects() {
+  const box = $('authRejectRows');
+  if (!box) return;
+  let rows = [];
+  try {
+    const d = await api('/api/admin/auth-rejects');
+    rows = d.rows || [];
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'muted', '读取失败：' + (e && e.message ? e.message : e)));
+    return;
+  }
+  box.textContent = '';
+  if (!rows.length) {
+    box.appendChild(el('div', 'muted', '目前没有 401/403 记录（服务重启后从零开始）。'));
+    return;
+  }
+  const tbl = el('table');
+  tbl.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;';
+  const head = el('tr');
+  for (const h of ['时间', '状态', '原因', '路径', 'Key 指纹', '来源 IP', 'UA / 细节']) {
+    const th = el('th', null, h);
+    th.style.cssText = 'text-align:left;padding:4px 8px;border-bottom:1px solid rgba(127,127,127,.25);';
+    head.appendChild(th);
+  }
+  tbl.appendChild(head);
+  for (const r of rows.slice(0, 20)) {
+    const tr = el('tr');
+    const t = r.at ? new Date(r.at * 1000).toLocaleTimeString() : '—';
+    const is4xx = r.status === 403;
+    const cells = [
+      t,
+      String(r.status || ''),
+      r.reason || '',
+      (r.method || '') + ' ' + (r.path || ''),
+      r.key_prefix || '—',
+      r.ip || '—',
+      [r.ua || '', r.detail || ''].filter(Boolean).join(' · '),
+    ];
+    for (let i = 0; i < cells.length; i++) {
+      const td = el('td', null, cells[i]);
+      td.style.cssText = 'padding:4px 8px;border-bottom:1px solid rgba(127,127,127,.12);word-break:break-all;'
+        + (i === 1 && is4xx ? 'color:#c0392b;font-weight:600;' : '')
+        + (i === 4 ? 'font-family:ui-monospace,Consolas,monospace;' : '');
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  }
+  box.appendChild(tbl);
+}
+
 async function loadLive() {
   // 实时接口失败**不能只 console.warn**（v0.26.6）：每 3 秒一个静默失败，页面上
   // 的数字会一直停在旧值，看起来"一切正常"，而实际上数据早就断了。
   // 改为常驻横幅：不刷屏、不自动消失，下一次成功自动清除。
   const host = $('ovKpis') ? $('ovKpis').parentNode : null;
   loadOvSplit(); // 消耗归属：独立拉，失败不影响实时主流程
+  loadAuthRejects(); // 最近被拒的请求：排障第一眼，独立拉不影响主流程
   try {
     const d = await api('/api/admin/live');
     renderLive(d);

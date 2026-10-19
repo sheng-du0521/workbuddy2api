@@ -449,6 +449,10 @@ func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleMe(w http.ResponseWriter, r *http.Request) {
 	u := a.currentUser(r)
 	if u == nil {
+		// 留痕（v0.31.45）：管理后台报 401 时，最需要分清的是
+		// "根本没带 cookie"（换地址访问/清过缓存）还是"cookie 在但会话无效"
+		// （过期/被别的会话注销）—— 处置完全不同。
+		logAuthReject(r, http.StatusUnauthorized, sessionRejectReason(r), "", "")
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
 		return
 	}
@@ -469,6 +473,7 @@ func (a *app) userGuard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := a.currentUser(r)
 		if u == nil {
+			logAuthReject(r, http.StatusUnauthorized, sessionRejectReason(r), "", "")
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
 			return
 		}
@@ -552,6 +557,18 @@ func (a *app) currentUser(r *http.Request) *User {
 		return nil
 	}
 	return u
+}
+
+// sessionRejectReason 区分 401 的两种成因（日志用）。
+//
+// "没带 cookie" 与 "cookie 无效" 在浏览器里表现一样（都跳登录页），
+// 但前者几乎总是**换了访问地址/端口**（cookie 按 host 隔离），
+// 后者是会话过期或被他处注销。没有这条区分，排查只能靠猜。
+func sessionRejectReason(r *http.Request) string {
+	if _, err := r.Cookie(sessionCookie); err != nil {
+		return "no session cookie"
+	}
+	return "session invalid or expired"
 }
 
 // userView 用户对外视图（绝不含密码哈希）。

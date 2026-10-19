@@ -2690,6 +2690,47 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-consistency: 账号出口写入即登记进线路池；页面有池外出口告警与一键对齐');
   }
 
+  // v0.31.45：**被拒的请求必须留痕**（日志 + 页面两路）。
+  //
+  // 起因：用户报「反代 403」，服务端近 6 小时零条 401/403、usage_logs 停在
+  // 14:08 —— 请求根本没穿过鉴权，而我们连"它来过、带的是哪个 key"都不知道。
+  // 这类拒绝不写 usage_logs（没账号没计费），必须单独留痕，否则排查只能靠猜。
+  const arBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const auth = read('cmd/webapp/authlog.go');
+    if (!auth.includes('func logAuthReject(')) arBad.push('缺少 logAuthReject');
+    if (!auth.includes('func maskKeyForLog(')) arBad.push('缺少密钥掩码（日志不能出现完整 key）');
+    if (!auth.includes('authLogWindow')) arBad.push('缺少日志节流（扫描器会刷满日志）');
+    if (!auth.includes('recordAuthReject')) arBad.push('缺少环表记录（页面看不到）');
+    const bill = read('cmd/webapp/billing.go');
+    for (const r of ['missing api key', 'invalid api key', 'api key disabled', 'account banned']) {
+      if (!bill.includes('"' + r + '"')) arBad.push('/v1 缺少拒绝原因 ' + r);
+    }
+    if ((bill.match(/logAuthReject\(/g) || []).length < 4) {
+      arBad.push('/v1 鉴权拒绝点没有全部接入留痕');
+    }
+    if (!read('cmd/webapp/users.go').includes('sessionRejectReason')) {
+      arBad.push('管理端 401 没有区分「没带 cookie」与「会话无效」');
+    }
+    if (!read('cmd/webapp/reqguard.go').includes('csrf origin mismatch')) {
+      arBad.push('CSRF 403 没留痕（经反代访问时最常见的 403）');
+    }
+    if (!read('cmd/webapp/main.go').includes('/api/admin/auth-rejects')) {
+      arBad.push('缺少 /api/admin/auth-rejects 端点');
+    }
+    const html = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8');
+    if (!html.includes('authRejectRows')) arBad.push('概览页没有「最近被拒的请求」面板');
+    if (!html.includes('loadAuthRejects')) arBad.push('面板没有加载逻辑');
+    // 面板里不能渲染完整 key —— 只允许 key_prefix。
+    if (/r\.key\b(?!_prefix)/.test(html)) arBad.push('前端出现了疑似完整 key 字段');
+  }
+  arBad.forEach((m) => console.log('  [FAIL] auth-trace: ' + m));
+  if (!arBad.length) {
+    console.log('  [ok] auth-trace: 鉴权拒绝留痕（日志+环表）+ 语义区分 + 页面可读 + 不含完整 key');
+  }
+
   // v0.31.44：**部署链路必须自解释**（小白能跑起来 + 发布包不缺件），
   // 以及**任务失败必须留下原因**（只记数量等于让运维去翻会轮转的日志）。
   const dpBad = [];

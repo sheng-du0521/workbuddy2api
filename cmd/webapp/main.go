@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.44"
+const version = "0.31.45"
 
 type app struct {
 	store  *Store
@@ -1718,6 +1718,8 @@ func (a *app) routes() *http.ServeMux {
 	// 批量端点默认 dry_run（只列候选、零出站），真正执行才逐号做对话探活。
 	// 路径注意：`/accounts/revive-dead` 是静态段，必须注册在 `/accounts/{uid}/...` 之前。
 	mux.HandleFunc("POST /api/admin/accounts/revive-dead", a.adminGuard(a.handleReviveDead))
+	// 最近被拒的请求（v0.31.45）：解决"用户报 403、服务端查不到"的最后一环。
+	mux.HandleFunc("GET /api/admin/auth-rejects", a.adminGuard(a.handleAuthRejects))
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/revive", a.adminGuard(a.handleReviveAccount))
 	// 刷新模式切换（v0.31.40）：冲突自动降级后的**反向开关**。
 	mux.HandleFunc("POST /api/admin/accounts/{uid}/refresh-mode", a.adminGuard(a.handleSetRefreshMode))

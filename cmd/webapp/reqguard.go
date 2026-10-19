@@ -256,6 +256,11 @@ func (a *app) csrfGuard(next http.Handler) http.Handler {
 			src = ref
 		}
 		if !sameHostAsRequest(src, r.Host) {
+			// 留痕（v0.31.45）：这条 403 发生在业务层之前，不写 usage_logs。
+			// 通过反向代理/端口转发访问时，Origin 与 Host 很容易不一致 ——
+			// 那是配置问题、不是攻击，但用户只会看到"403"，无法自查。
+			logAuthReject(r, http.StatusForbidden, "csrf origin mismatch", "",
+				"origin="+src+" host="+r.Host)
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error": "请求来源校验失败（可能的跨站请求）",
 			})

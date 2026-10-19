@@ -1,16 +1,16 @@
 {
-  "version": "0.31.44",
+  "version": "0.31.45",
   "min_supported": "0.24.0",
-  "notes": "v0.31.44：部署链路可用化（三个一键入口 + 双平台发布包）+ 生产检查发现的任务失败不可见。① 发布件长期残缺：README 写着「下载对应平台的压缩包（附 SHA256SUMS.txt 可核对）」，而 Release 里只有一个裸 webapp.exe —— 压缩包、校验和、Linux 版三样都不存在，用户拿到的是一个双击弹黑框、不知道密钥在哪、也不知道怎么停的可执行文件。新增 scripts/package.py：一次产出 windows zip（exe + start-webapp.bat + 快速开始 + 完整说明）、linux tar.gz（二进制 + install.sh + 文档）与 SHA256SUMS.txt；打包前有敏感文件黑名单与白名单断言，包内版本号由脚本从 version.json 注入（手写版本一定会漂，旧脚本里还写着 v0.31.25）。② 三个一键入口（都在仓库里，包内也自带）：deploy/quickstart-windows.bat（双击：查版本→下载→解压→启动，每步失败都给出下一步，含 GitHub 不通时的替代路径）、deploy/install-linux.sh（装 systemd、幂等、覆盖前备份旧二进制、端口占用预检、--no-systemd 供容器）、deploy/start-webapp.bat（精简启动脚本，默认监听 127.0.0.1 而不是 0.0.0.0 —— 管理后台与网关同端口，绑 0.0.0.0 等于把它摆到局域网）。③ README 快速开始重写：一键部署优先、Docker/源码在后、补「装完四步」与「出问题先看这里」表格、旧网关迁移降级为「只有老部署需要看」；并修掉指向已删除 config.example.json 的死链。④ 生产检查发现（真问题）：cat（夜猫子）任务 38 个号失败 12 个，全部是 upstream client (http 401): <html>，而台账只记「fail 12」—— 要查原因只能翻 journalctl（会轮转、页面看不到），于是这件事一整天没被注意到。新增 runTally.failWith(label, err) 与 taskledger.Run.FailSamples（最多 6 条 + 显式截断说明），7 处失败点全部接入；管理端任务卡新增「失败原因」折叠区。⑤ 修一处口径不一致：revive 复活后置了 refresh_lost 却把 refresh_mode 留在 auto，保活仍每小时拿废票刷一次（生产 10 个号全是这状态）。现在复活同时降为 passive，可一键切回。测试：ledger_failsample_test.go（样本保留/截断/空数组）+ revive_token_test.go 补 passive 断言；uitest 新增 deploy-path 守卫。",
+  "notes": "v0.31.45：鉴权拒绝留痕（用户报 403/401 却查不到的那个根因）。① 排查现场：用户报「自挂账号反代 API 403」+「管理后台 401」。查生产：服务 16 小时未重启、密钥未变、近 3 小时日志**零条 401/403**、usage_logs 停在 14:08 —— 说明这些请求**没穿过业务层**，而 /v1 的几个拒绝分支（missing/invalid api key、api key disabled、account banned）此前**只回 HTTP 错误、不写 usage_logs、也不打日志**。同类毛病昨天刚在任务侧修过（失败只记数量不记原因）。② 新增 authlog.go：logAuthReject 统一留痕 —— 路径/状态/原因/key 指纹（前 10+后 4，绝不打印完整 key）/IP/UA/细节；同 (IP+原因) 60 秒节流并在恢复时带\"已抑制 N 条\"，避免公网扫描器刷满日志；另有内存环表（最近 50 条，不节流 —— \"同一秒被拒 20 次\"本身就是线索）。接入点：/v1 五个鉴权拒绝分支、管理端 401（区分 no session cookie 与 session invalid）、CSRF 来源校验 403（经反向代理访问时最常见的 403）。③ 新增 GET /api/admin/auth-rejects + 概览页「最近被拒的请求」面板：出问题第一眼看页面，不必 SSH grep。④ 顺带排查到的两件事（不在代码里，记在说明）：9915 名下 4 个号现在是 auto/无 refresh_lost/无冷却（说明被重新导入过 —— 导入会把 refresh_mode 覆盖成 auto 并清 refresh_lost）；而 10022/10026/10027 三个 Key 已从库里**物理删除**，今天仍在使用 → 客户端若还配着旧 Key，就会得到 401 invalid api key。测试：authlog_test.go 四例（掩码绝不泄露完整 key / 日志含原因与指纹 / 节流与抑制计数 / 401 语义区分）；uitest 新增 auth-trace 守卫。",
   "released_at": 1792277932,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.44/webapp.exe",
-      "sha256": "32cb471f7da58c247124c45e0c70bdd4194bf4bccfa112bc27bdbb7107451e4d",
-      "size": 15502848
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.45/webapp.exe",
+      "sha256": "352545b79c7107070e9b17fd6c0ef2ae43e6e0a83289680d5914495cf4a7e1ba",
+      "size": 15523840
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
