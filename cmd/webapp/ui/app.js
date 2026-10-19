@@ -2675,7 +2675,7 @@ function pluginToggleSwitch(p, on, disabled, text, title) {
 //     必须占满内容区并带自己的返回栏，否则用户会不知道该页属于谁、怎么退出去。
 //
 // 结构：
-//   · 有专属 pane 的插件（egress 复用现有代理页 DOM）→ `.pane[data-plugin-view="<id>"]`；
+//   · 有专属 pane 的插件（egress 复用现有出口页 DOM）→ `.pane[data-plugin-view="<id>"]`；
 //   · 其余插件 → 动态建一个通用 pane（返回栏 + 标题 + 说明 + [data-plugin-body]）。
 //
 // ⚠️ 不写 location.hash：插件视图是"插件"这个导航项的子页，
@@ -2736,7 +2736,7 @@ function openPluginView(p) {
   try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch (e) { /* 忽略 */ }
 
   if (p.kind === 'egress') {
-    // 复用现有代理页加载链（含机器状态 + 我的账号出口两张卡）。
+    // 复用现有出口页加载链（只剩平台机器状态；逐号分配已在 v0.31.53 下线）。
     if (typeof window.loadEgressHome === 'function') window.loadEgressHome();
     return;
   }
@@ -2782,7 +2782,7 @@ if (typeof document !== 'undefined' && !window.__pluginBackBound) {
 function pluginKindLabel(kind) {
   switch (kind) {
     case 'health': return { text: '检测', title: '只读检查每个号的凭证/余额/对话/出口' };
-    case 'egress': return { text: '控制台', title: '持续运行的出口代理：拉起隧道、逐号分配出口' };
+    case 'egress': return { text: '控制台', title: '平台直属出口：拉起隧道、体检、设全局默认出口（不分配账号）' };
     case 'claim': return { text: '批量执行', title: '对选中的号逐个串行执行一次写操作' };
     default: return { text: '批量执行', title: '' };
   }
@@ -3371,9 +3371,8 @@ function egressDot(ok, text) {
 async function loadEgressHome() {
   const box = document.getElementById('egressHomeBox');
   if (!box) return;
-  // 两张卡一起刷：出口状态（机器/隧道）+ 我的账号出口（逐号线路）。
-  // 它们回答的是两个不同问题："隧道通不通" 与 "每个号到底从哪个 IP 出去"。
-  loadHostEgressLines();
+  // v0.31.53：只剩"平台机器状态"这一张卡。
+  // 「我的账号出口」（逐号分配）随用户端代理一起下线 —— 出口分配统一在管理后台。
   try {
     const v = await api('/api/egress/home');
     renderEgressHome(box, v);
@@ -3530,293 +3529,6 @@ function hostReloginDialog(acc) {
 // 于是两台机器最后只有一台在承重 —— 用户看到的就是"两个 IP 却是同一个出口"。
 // ======================================================================
 
-let heLines = [];       // 可用线路
-let heAccounts = [];    // 我的号 + 当前出口
-let hePicked = new Set();
-
-async function loadHostEgressLines() {
-  const box = document.getElementById('egrAccBox');
-  if (!box) return;
-  try {
-    const d = await api('/api/host/egress/lines');
-    heLines = d.lines || [];
-    heAccounts = d.accounts || [];
-    // 勾选集合随刷新收敛：只保留仍然存在的号，避免"删了号还勾着"。
-    const alive = new Set(heAccounts.map((a) => a.uid));
-    hePicked = new Set(Array.from(hePicked).filter((u) => alive.has(u)));
-    renderHostEgress(d);
-  } catch (e) {
-    box.textContent = '';
-    box.appendChild(el('div', 'sub', '读取账号出口失败：' + (e && e.message ? e.message : e)));
-  }
-}
-
-// heLineOptions 可选线路（跳过"不可选"的：停用的、别人的）。
-function heUsableLines() {
-  return heLines.filter((l) => !l.note);
-}
-
-function renderHostEgress(d) {
-  const box = document.getElementById('egrAccBox');
-  if (!box) return;
-  box.textContent = '';
-
-  const usable = heUsableLines();
-  const hint = document.getElementById('egrAccHint');
-  if (hint) {
-    // 口径（v0.31.34）：这里只统计**我能用的**线路（平台 + 我的）。
-    // 写「共 N 条」会让人以为全平台只有 N 条，而别人的线路对他是不可见的 ——
-    // 一个总数既不能用来判断"我够不够"，还会引出"为什么我看不到别的"这类疑问。
-    hint.textContent = heAccounts.length
-      ? ('可用 ' + usable.length + ' 条线路（平台 + 我的）· 实际 '
-        + (d.distinct_exit_ips || 0) + ' 个不同出口 IP')
-      : '';
-  }
-
-  if (!heAccounts.length) {
-    box.appendChild(el('div', 'hintbar', '还没有代挂账号。先到「账号代挂」页添加一个，再回来配出口。'));
-    return;
-  }
-
-  // ---- 顶部：口径说明 + 批量动作 ----
-  const bar = el('div', 'row');
-  bar.style.cssText = 'flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px;';
-
-  const rebal = el('button', null, '按出口 IP 均衡');
-  rebal.title = '把（勾选的）号轮流分到不同出口 IP 的线路上；同一 IP 的多条线路只算一个出口';
-  rebal.onclick = async () => {
-    const uids = Array.from(hePicked);
-    const scope = uids.length ? ('勾选的 ' + uids.length + ' 个号') : '全部代挂号';
-    if (!(await confirmAsk('把 ' + scope + '按出口 IP 均衡分配？\n\n'
-      + '· 我会按「不同出口 IP」分组，把号轮流分上去；\n'
-      + '· 同一个 IP 上的多条线路只算一个出口（不会假装更分散）；\n'
-      + '· 只会动你名下的号。'))) return;
-    rebal.disabled = true;
-    try {
-      const r = await post('/api/host/egress/rebalance', uids.length ? { uids } : {});
-      const desc = (r.exits || []).map((x) => (x.exit_ip || '未知') + ' × ' + x.count).join('、');
-      toast('已分配 ' + r.assigned + ' 个号到 ' + r.distinct_exit_ips + ' 个出口：' + desc, 'ok');
-      for (const w of (r.warnings || [])) toast(w, 'warn');
-      loadHostEgressLines();
-    } catch (e) { toast('均衡失败：' + e.message, 'err'); }
-    finally { rebal.disabled = false; }
-  };
-  bar.appendChild(rebal);
-
-  // 批量指定：把勾选的号统一指到某条线路（或直连 / 跟随默认）。
-  const sel = el('select');
-  sel.style.minWidth = '240px';
-  const opt = (v, t) => { const o = el('option', null, t); o.value = v; sel.appendChild(o); };
-  opt('', '— 批量设为… —');
-  opt('__direct', '直连（不走任何代理）');
-  opt('__clear', '跟随默认（清空本号出口配置）');
-  for (const l of usable) {
-    const who = l.mine ? '［我的］' : '［平台］';
-    opt(l.url, who + '线路：' + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : '（出口未知）'));
-  }
-  bar.appendChild(sel);
-  const apply = el('button', 'ghost', '应用到勾选');
-  apply.onclick = async () => {
-    const v = sel.value;
-    if (!v) { toast('先选一个目标', 'err'); return; }
-    const uids = Array.from(hePicked);
-    if (!uids.length) { toast('先勾选账号', 'err'); return; }
-    const proxy = v === '__direct' ? 'direct' : (v === '__clear' ? '' : v);
-    apply.disabled = true;
-    try {
-      const r = await post('/api/host/egress/assign', { uids, proxy });
-      toast('已设置 ' + r.updated + ' 个号' + (r.exit_ip ? '，该线路出口 ' + r.exit_ip : ''), 'ok');
-      if (r.note) toast(r.note, 'warn');
-      loadHostEgressLines();
-    } catch (e) { toast('设置失败：' + e.message, 'err'); }
-    finally { apply.disabled = false; }
-  };
-  bar.appendChild(apply);
-
-  const cnt = el('span', 'muted', '已选 ' + hePicked.size + ' / ' + heAccounts.length);
-  cnt.style.fontSize = '12px';
-  bar.appendChild(cnt);
-  box.appendChild(bar);
-
-  // ---- 线路一览（每条线路一个出口 IP；同 IP 的会合并提示）----
-  // 卡片内分区（v0.31.36）：一张卡里既有一览又有逐号表格时，加小节标题
-  // 才能一眼看出"这两段在回答不同问题"。
-  const secLines = el('div', 'section-head');
-  secLines.style.marginTop = '4px';
-  secLines.appendChild(el('h3', null, '线路一览'));
-  secLines.lastChild.style.fontSize = '13px';
-  box.appendChild(secLines);
-
-  const byIP = {};
-  for (const l of usable) (byIP[l.exit_ip || '未知'] = byIP[l.exit_ip || '未知'] || []).push(l);
-  const lineRow = el('div', 'sub');
-  lineRow.style.margin = '0 0 10px';
-  for (const ip of Object.keys(byIP)) {
-    const arr = byIP[ip];
-    const txt = el('div');
-    txt.style.padding = '2px 0';
-    txt.appendChild(el('b', null, ip + '  '));
-    // 归属只有两种（v0.31.34）：平台线路 / 我自己接的。
-    // 他人的线路后端已不再下发，这里也就不需要"借的是谁的机器"那套标注。
-    txt.appendChild(el('span', null, arr.map((l) => {
-      const who = l.mine ? '我的・' : '平台・';
-      return who + (l.name || l.url) + '（' + l.url + '）';
-    }).join('、')));
-    if (arr.length > 1) {
-      txt.appendChild(el('span', null, '  ⚠ 这几条线路共用同一个出口，只会算 1 个 IP'));
-      txt.lastChild.style.color = '#b9770e';
-    }
-    if (!arr[0].last_ok) {
-      txt.appendChild(el('span', null, '  · 最近探活未成功'));
-      txt.lastChild.style.color = '#b9770e';
-    }
-    lineRow.appendChild(txt);
-  }
-  if (!Object.keys(byIP).length) {
-    lineRow.appendChild(el('div', 'sub', '还没有可用线路：先在上面「一键拉起」，或等管理员加线路。'));
-  }
-  // 诊断结论（v0.31.31）：把"几条线路 / 几个 IP / 号怎么分布的"一句话说清。
-  // 用户问的"两台电脑两个 IP 却同一个出口"，答案就在这里。
-  if (usable.length) {
-    const distinct = d.distinct_exit_ips || 0;
-    const diag = el('div', 'sub');
-    diag.style.margin = '0 0 10px';
-    const perIP = {};
-    for (const a of heAccounts) {
-      const key = a.exit_ip || '未知';
-      perIP[key] = (perIP[key] || 0) + 1;
-    }
-    const dist = Object.keys(perIP).map((k) => k + ' × ' + perIP[k] + ' 个号').join('、');
-    diag.textContent = '账号分布：' + (dist || '（没有号）');
-    if (usable.length > 1 && distinct < usable.length) {
-      const w = el('div', null, '⚠ 你有 ' + usable.length + ' 条可用线路，但**只有 ' + distinct
-        + ' 个不同出口 IP**：同 IP 的线路再多也只算一个出口。'
-        + '要真正多出 IP，需要另一台电脑（另一条宽带）接入，或换一条不同出口的线路。');
-      w.style.cssText = 'margin-top:6px;color:#b9770e;font-size:12px;';
-      diag.appendChild(w);
-    } else if (usable.length && !usable.some((l) => l.mine)) {
-      const w = el('div', null, '你现在只用了平台线路。想要自己的住宅 IP，点上面的'
-        + '「① 下载本机代理安装包」在任意一台电脑上运行即可 —— 那条线路只承载你自己的号。');
-      w.style.cssText = 'margin-top:6px;color:#888;font-size:12px;';
-      diag.appendChild(w);
-    } else if (distinct === 1 && usable.length === 1) {
-      const w = el('div', null, '当前只有 1 条线路：所有号都从这一个 IP 出去。再接一台电脑（另一条宽带）就能分散。');
-      w.style.cssText = 'margin-top:6px;color:#888;font-size:12px;';
-      diag.appendChild(w);
-    }
-    lineRow.appendChild(diag);
-  }
-  box.appendChild(lineRow);
-
-  // ---- 逐号表格 ----
-  const secAcc = el('div', 'section-head');
-  secAcc.style.marginTop = '14px';
-  const h3 = el('h3', null, '逐号分配');
-  h3.style.fontSize = '13px';
-  secAcc.appendChild(h3);
-  box.appendChild(secAcc);
-
-  const tbl = el('div', 'cfg-list');
-  const head = el('div', 'gr-sub');
-  head.style.cssText = 'display:flex;gap:8px;align-items:center;padding:6px 0;font-size:12px;color:#888;';
-  const cbAll = document.createElement('input');
-  cbAll.type = 'checkbox';
-  cbAll.checked = hePicked.size === heAccounts.length && heAccounts.length > 0;
-  cbAll.onchange = () => {
-    hePicked = cbAll.checked ? new Set(heAccounts.map((a) => a.uid)) : new Set();
-    renderHostEgress(d);
-  };
-  head.appendChild(cbAll);
-  head.appendChild(el('span', null, '账号'));
-  head.appendChild(el('span', null, '当前出口'));
-  tbl.appendChild(head);
-
-  for (const a of heAccounts) {
-    const row = el('div');
-    row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:6px 0;border-top:1px solid rgba(127,127,127,.15);';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = hePicked.has(a.uid);
-    cb.onchange = () => {
-      if (cb.checked) hePicked.add(a.uid); else hePicked.delete(a.uid);
-      const c = document.getElementById('egrAccBox');
-      if (c) renderHostEgress(d);
-    };
-    row.appendChild(cb);
-
-    const who = el('div');
-    who.style.cssText = 'min-width:140px;flex:0 0 160px;';
-    who.appendChild(el('div', null, a.nickname || maskUID(a.uid)));
-    const sub = el('div', 'muted', a.configured ? ('已指定：' + (a.configured === 'direct' ? '直连' : a.configured)) : '未指定（跟随默认）');
-    sub.style.fontSize = '11px';
-    who.appendChild(sub);
-    row.appendChild(who);
-
-    const exitTxt = el('div');
-    exitTxt.style.cssText = 'flex:1;min-width:160px;';
-    const src = a.exit_source === 'direct'
-      ? '平台本机 IP 直连'
-      : (a.resolved_name || a.resolved || '（未知）');
-    exitTxt.appendChild(el('div', null, src));
-    const ipLine = el('div', 'muted', a.exit_ip ? ('出口 IP ' + a.exit_ip) : '出口 IP 未知（该线路还没探活）');
-    ipLine.style.fontSize = '11px';
-    if (!a.exit_ip) ipLine.style.color = '#b9770e';
-    exitTxt.appendChild(ipLine);
-    // 越界绑定（v0.31.34）：这个号当前走的是别人的线路。
-    // 规则收紧后用户选不到那条线路，所以他要靠这行字才知道"我现在在借谁的机器"。
-    if (a.foreign_bound) {
-      const fb = el('div', null, '⚠ 当前走的是「' + (a.foreign_owner_name || '其他用户')
-        + '」的线路：你的号经过对方的机器，对方一关机这个号就不可用。'
-        + '建议用右侧下拉改成自己的或平台线路。');
-      fb.style.fontSize = '11px';
-      fb.style.color = '#c0392b';
-      exitTxt.appendChild(fb);
-    }
-    if (a.token_dead) {
-      const dead = el('div', null, '⚠ 登录已失效，改出口无效 —— 请先重新登录');
-      dead.style.fontSize = '11px';
-      dead.style.color = '#c0392b';
-      exitTxt.appendChild(dead);
-    } else if (a.refresh_lost) {
-      // 仅剩 access（v0.31.37）：现在还能用，但**不会自动续期**了。
-      // 这条提示的目的就是让人在"还能用"的窗口里主动去重登，而不是等到某天突然掉线。
-      const lost = el('div', null, '⚠ 续期凭证已失效（还能用到 access 过期）—— 建议尽快重新登录一次');
-      lost.style.fontSize = '11px';
-      lost.style.color = '#b9770e';
-      exitTxt.appendChild(lost);
-    }
-    row.appendChild(exitTxt);
-
-    // 逐号改：选线路即生效（不必再点保存）。
-    const one = el('select');
-    one.style.minWidth = '180px';
-    const o0 = el('option', null, '— 改到… —'); o0.value = ''; one.appendChild(o0);
-    const od = el('option', null, '直连'); od.value = 'direct'; one.appendChild(od);
-    const oc = el('option', null, '跟随默认'); oc.value = '__clear'; one.appendChild(oc);
-    for (const l of usable) {
-      const who = l.mine ? '［我的］' : '［平台］';
-      const o = el('option', null, who + (l.name || l.url) + (l.exit_ip ? '（' + l.exit_ip + '）' : ''));
-      o.value = l.url;
-      one.appendChild(o);
-    }
-    one.onchange = async () => {
-      const v = one.value;
-      if (!v) return;
-      const proxy = v === '__clear' ? '' : v;
-      one.disabled = true;
-      try {
-        const r = await post('/api/host/egress/assign', { uids: [a.uid], proxy });
-        toast('已更新' + (r.exit_ip ? '，出口 ' + r.exit_ip : ''), 'ok');
-        loadHostEgressLines();
-      } catch (e) { toast('设置失败：' + e.message, 'err'); one.disabled = false; }
-    };
-    row.appendChild(one);
-
-    tbl.appendChild(row);
-  }
-  box.appendChild(tbl);
-}
-
 // egressMachineLabel 一台机器的显示名（hostname 优先；没有就用 id）。
 function egressMachineLabel(m) {
   const h = String((m && m.hostname) || '').trim();
@@ -3862,10 +3574,9 @@ function egressAgo(sec) {
 function renderEgressHome(box, v) {
   box.textContent = '';
   const { machines, cur } = egressCurMachine(v);
-  // manage_scope（v0.31.24）：平台视角 = 管理员/运维（能设全局默认出口、看全部机器）；
-  // 用户视角 = 普通用户（只有自己的机器，只绑自己名下的号）。**文案必须跟着切**：
-  // 对一个没有"全局默认出口"这个开关的人讲它，只会让他以为页面坏了。
-  const isPlatform = (v.manage_scope || 'platform') === 'platform';
+  // v0.31.53：只剩平台视角（普通用户进不来 —— 接口层 403、插件列表里也没有这一条）。
+  // 原来的 isPlatform 分支随用户端一起删掉；这里仍然只认 manage_scope 的取值，
+  // 若服务端哪天回了个非 platform 的值，页面会按"平台"渲染并由接口兜住越权。
   for (const m of machines) egressLabels[m.id] = egressMachineLabel(m);
 
   const card = el('div', 'card');
@@ -3912,8 +3623,9 @@ function renderEgressHome(box, v) {
   // 前端放宽不会导致号被绑到坏线路上，最多是白点一次并看到原因。
   const ready = cur ? (cur.ready && cur.proxy_ok !== false) : (v.ready && v.proxy_ok !== false);
   const ports = cur ? { proxy_port: cur.proxy_port, tunnel_port: cur.tunnel_port } : (v.ports || {});
-  const bound = cur ? cur.host_bound : v.host_bound;
-  const total = cur ? cur.host_total : v.host_total;
+  // v0.31.53：bound_accounts = 这条出口当前挂着几个号（含平台号）。
+  // 原来的 host_bound/host_total 只数自挂号 —— 平台视角下恒为 0，等于永远显示"没号"。
+  const bound = cur ? cur.bound_accounts : v.bound_accounts;
   const exitIP = (cur && cur.exit_ip) || (v.agent_state && v.agent_state.exit_ip) || '（未知 —— agent 尚未上报）';
   const curMsg = (cur && cur.message) || (v.agent_state && v.agent_state.message) || '';
 
@@ -3935,11 +3647,9 @@ function renderEgressHome(box, v) {
   if (cur) {
     rows.push(['隧道实测出口', cur.tunnel_exit_ip || '（还没探活）']);
   }
-  // 用户视角**不显示全局默认出口**：它不属于这个用户（那是平台级开关），
-  // 显示出来只会让他以为"我能不能改它"，而答案是不能。
-  if (isPlatform) rows.push(['全局默认出口', v.default_egress || '（空 = 直连）']);
-  rows.push([isPlatform ? '自挂号绑定' : '我的代挂号绑定',
-    (bound || 0) + ' / ' + (total || 0) + ' 个']);
+  rows.push(['全局默认出口', v.default_egress || '（空 = 直连）']);
+  rows.push(['承载账号', (bound || 0) + ' 个' +
+    (cur && cur.carrying ? '（承重中）' : '（待命）')]);
   rows.push(['隧道端口', '127.0.0.1:' + (ports.tunnel_port || '?')
     + '（本机代理端口 ' + (ports.proxy_port || '?') + '）']);
   if (curMsg) rows.push(['最近状态', curMsg]);
@@ -4081,34 +3791,24 @@ function renderEgressHome(box, v) {
     pull.addEventListener('click', () => egressPull(v));
     row.appendChild(pull);
 
-    // 应用（v0.31.31 改为**非破坏式**）：只接管"还没指定出口"的号。
+    // 应用（v0.31.53）：**只立线路，不改任何账号的出口**。
     //
-    // 旧行为是"把我名下所有号改绑到这条线路"，于是第二台电脑点一次拉起，
-    // 第一台的号全被静默搬过来 —— 两台机器只有一个在承重。
-    // 想整体改绑是另一个显式动作（下面的「全部改绑」），文案会说清代价。
-    const applyBtn = el('button', 'ghost', '应用（只绑未指定的号）');
+    // 以前这里有两个按钮：一个是"应用（只绑未指定的号）"，另一个是批量改绑；
+    // 两者都是"点一下就把一批账号的出口搬过来"，与"分配统一走管理后台"直接冲突。
+    // 现在应用 = 登记线路 + 设为全局默认出口：跟随默认的号自动生效，
+    // 要显式绑定某些号，请到管理后台「代理 → 分配到账号」。
+    const applyBtn = el('button', 'ghost', '应用（立线路）');
     applyBtn.disabled = busy || !tunnel || !hasMachine;
-    applyBtn.title = '把这条线路登记进线路池，并把**还没指定出口**的号绑上来；' +
-      '已绑到别的线路的号不动（避免在 B 机上点一下就把 A 机上的号搬走）';
+    applyBtn.title = '把这条线路登记进线路池，并设为**全局默认出口**。' +
+      '不会修改任何账号的出口绑定 —— 逐号分配请在管理后台「代理」页完成';
     applyBtn.addEventListener('click', async () => {
       applyBtn.disabled = true;
       try {
         const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
         const ap = (d && d.applied) || {};
-        let msg = '已应用：绑定 ' + (ap.host_bound || 0) + ' 个号';
-        if (ap.skipped) msg += '，跳过 ' + ap.skipped + ' 个（已显式绑在别的线路上）';
-        // 显式直连要**单独说**（v0.31.48）：这些号根本不会走任何代理，
-        // 用户拉起代理后会以为"已经生效"，其实号还在裸奔。而 direct 很可能是
-        // 系统批量设的（统一走服务器那次），不是号主的选择 —— 必须让他知道要改。
-        if (ap.skipped_direct) {
-          msg += '；其中 ' + ap.skipped_direct + ' 个被设为「直连」（不走代理），'
-            + '要让它们走这条线路请点「全部改绑」';
-        }
-        if (isPlatform) msg += '；默认出口 ' + (ap.default_ok ? '已设置' : '未设置');
-        toast(msg, 'ok');
-        if (ap.skipped) {
-          toast('跳过的号仍走原来的线路。要把它们全部搬到这条线路上，用「全部改绑」', 'warn');
-        }
+        toast('已应用：线路 ' + (ap.proxy_url || '') +
+          '，默认出口' + (ap.default_ok ? '已设置' : '未设置（该线路不在平台段）') +
+          '；未改动任何账号出口', 'ok');
         loadEgressHome();
       } catch (e) {
         toast(egressMsg('应用失败：' + (e && e.message ? e.message : e)), 'bad');
@@ -4116,27 +3816,6 @@ function renderEgressHome(box, v) {
       }
     });
     row.appendChild(applyBtn);
-
-    // 全部改绑：旧行为，显式二次确认（这一步会覆盖"每台机器各管一部分号"的分配）。
-    const rebind = el('button', 'ghost', '全部改绑');
-    rebind.disabled = busy || !tunnel || !hasMachine;
-    rebind.title = '把**我名下所有号**都改绑到这条线路（会覆盖你之前为不同机器做的分配）';
-    rebind.addEventListener('click', async () => {
-      if (!(await confirmAsk('把' + (isPlatform ? '所有自挂号' : '你名下所有代挂号') +
-        '都改绑到这条线路？\n\n⚠ 这会覆盖你之前「让 A 机管一部分、B 机管另一部分」的分配，' +
-        '所有号都会从这一条线路出去（同一个出口 IP）。'))) return;
-      rebind.disabled = true;
-      try {
-        const d = await post('/api/egress/home/apply', { machine: egressSelMachine, rebind_all: true });
-        const ap = (d && d.applied) || {};
-        toast('已全部改绑：' + (ap.host_bound || 0) + ' 个号', 'ok');
-        loadEgressHome();
-      } catch (e) {
-        toast(egressMsg('改绑失败：' + (e && e.message ? e.message : e)), 'bad');
-        rebind.disabled = false;
-      }
-    });
-    row.appendChild(rebind);
 
     // 修复出口（v0.31.31）：端口冲突 / 隧道没落到本机 → 换端口重建。
     // 只碰 ports 与 cmd，不动任何账号的出口配置。
@@ -4230,29 +3909,18 @@ function renderEgressHome(box, v) {
   const h2 = el('div', 'section-head');
   h2.appendChild(el('h2', null, '这条链路是什么'));
   help.appendChild(h2);
-  help.appendChild(el('div', 'sub', isPlatform
-    ? ('目标机器上的 agent 跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
-       '于是平台访问上游时，流量会从「你家的宽带」出去 —— 住宅 IP 比机房 IP 友好得多。' +
-       '拉起并应用后：全局默认出口指向这条线路（跟随默认的号自动生效），' +
-       '所有自挂号被显式绑定到它（不随默认出口漂移）。')
-    : ('你自己电脑上的 agent 跑一个本地代理，并用 SSH 反向隧道把它接到云端。' +
-       '于是**你自己的代挂账号**访问上游时，流量会从「你家的宽带」出去 —— ' +
-       '住宅 IP 比机房 IP 友好得多，也更像正常用户。' +
-       '拉起并应用后：**只把你名下的代挂号**绑到这条线路；' +
-       '平台的全局默认出口**不会**被改动（那不是你的号该决定的事）。')));
+  help.appendChild(el('div', 'sub',
+    '平台自己的机器上跑一个本地 agent（本地代理 + SSH 反向隧道），把它接进平台的出站链路。' +
+    '这一页是**平台直属出口控制台**：拉起、体检、释放、把线路设为全局默认出口。' +
+    '账号出口的分配**不在这里** —— 统一在管理后台「代理」页按账号分配（带审计）。'));
   const warn = el('div', 'sub');
   warn.style.marginTop = '8px';
   warn.appendChild(document.createTextNode('⚠️ 三点要知道：'));
   warn.appendChild(el('br'));
-  if (isPlatform) {
-    warn.appendChild(document.createTextNode(
-      '① **全局默认出口只有一个**：多台机器时，最后应用的那台决定它；要让部分号走另一台，用管理后台的「批量分配」显式绑定；'));
-    warn.appendChild(el('br'));
-  } else {
-    warn.appendChild(document.createTextNode(
-      '① 这条线路**只作用于你自己的代挂号**：不会改变平台默认出口，也不会影响任何其他用户的号；'));
-    warn.appendChild(el('br'));
-  }
+  warn.appendChild(document.createTextNode(
+    '① **全局默认出口只有一个**：多台机器时，最后应用的那台决定它；' +
+    '要让部分号走另一台，用管理后台的「代理 → 分配」显式绑定；'));
+  warn.appendChild(el('br'));
   warn.appendChild(document.createTextNode(
     '② 同一条线路只有一个出口 IP —— 绑它的账号共用这个 IP，会保留"同一 IP 出站"的特征；'));
   warn.appendChild(el('br'));
@@ -4335,16 +4003,10 @@ async function egressPull(v) {
       try {
         const d = await post('/api/egress/home/apply', { machine });
         const ap = (d && d.applied) || {};
-        let msg = '已就绪并自动应用：自挂号绑定 ' + (ap.host_bound || 0) + ' 个';
-        if (ap.skipped_pooled) {
-          // v0.31.50：已入池的号**按规则**不走个人出口（平台反代承重），
-          // 这不是失败，但必须说清 —— 否则用户会反复点「全部改绑」以为没生效。
-          msg += '；跳过 ' + ap.skipped_pooled + ' 个已入池号（由平台统一调度，不能使用个人出口）';
-        }
-        if (ap.skipped_direct) {
-          msg += '；但 ' + ap.skipped_direct + ' 个号是「直连」（不走代理），需点「全部改绑」才会走本机出口';
-        }
-        toast(msg, ap.skipped_direct ? 'warn' : 'ok');
+        // v0.31.53：自动应用只立线路（不改账号出口），所以文案也必须这么说 ——
+        // 否则运维会以为"拉起=号都搬过来了"，而实际分配要在管理后台做。
+        toast('已就绪并自动应用：默认出口' + (ap.default_ok ? '已设置' : '未设置') +
+          '（未改动任何账号出口）', 'ok');
       } catch (e) {
         toast(egressMsg('已就绪，但自动应用失败：' + (e && e.message ? e.message : e)), 'bad');
       }

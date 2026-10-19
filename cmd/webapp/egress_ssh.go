@@ -282,30 +282,15 @@ func (a *app) egressInstallScript(r *http.Request, scope egressScope) (string, e
 	if err != nil {
 		return "", err
 	}
-	// 先确保密钥可生成（早失败早报错，而不是让用户在目标电脑上才发现）。
-	if !scope.Platform {
-		if _, err := a.egressSSHKeyEnsure(scope.UserID); err != nil {
-			return "", err
-		}
-	} else {
-		// 平台视角（管理员本机）：沿用部署时那把密钥，不生成新的 ——
-		// 管理员本来就有服务器访问权，再发一把只会多一个要管的东西。
-		if _, err := a.egressAgentTokenGet(); err != nil {
-			return "", err
-		}
+	// v0.31.53：只剩平台视角，安装包沿用**部署时那把密钥**（同目录 ai.pem），
+	// 不再给用户生成专属隧道密钥 —— 那条路（用户自己接机器）已下线。
+	if _, err := a.egressAgentTokenGet(); err != nil {
+		return "", err
 	}
-	title := "WorkBuddy2API 本机出口代理"
-	extraArgs := ""
-	hint := ""
-	if scope.Platform {
-		// 平台视角（管理员本机）：**不生成用户密钥** —— 管理员本来就有服务器
-		// 访问权，再发一把只会多一个要管的东西。改用部署时那把私钥，放在同目录即可。
-		title += "(platform)"
-		extraArgs = " -key ai.pem"
-		hint = "echo NOTE: platform machine -- put the deployment key here as ai.pem\r\n"
-	} else {
-		title += "(" + a.userNameByID(scope.UserID) + ")"
-	}
+	title := "WorkBuddy2API 本机出口代理(platform)"
+	extraArgs := " -key ai.pem"
+	hint := "echo NOTE: platform machine -- put the deployment key here as ai.pem\r\n"
+	_ = scope // 保留参数：调用方仍传 scope，便于将来加"平台多机器"时区分
 
 	// ⚠️ 全部用 ASCII：cmd 的代码页对中文注释极不友好（之前踩过 "中文 rem 被拆行"
 	// 的坑）。窗口标题里的中文用 `title` 命令前先 chcp，且标题本身从简。
@@ -433,12 +418,12 @@ func (p egressAgentConfigPayload) JSON() ([]byte, error) {
 //
 // 返回一个可双击运行的 .bat。**响应是附件下载**（不是页面），浏览器会直接存盘。
 func (a *app) handleEgressInstall(w http.ResponseWriter, r *http.Request) {
-	u := userFrom(r)
-	if u == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
-		return
+	// v0.31.53：安装包只面向平台机器（路由挂 adminGuard）。
+	// 不再按登录用户生成 —— 用户端代理下线后，用户手里不该再有"带令牌的安装包"。
+	scope := egressScope{Platform: true}
+	if u := userFrom(r); u != nil {
+		scope.UserID = u.ID
 	}
-	scope := egressScope{UserID: u.ID, Platform: u.IsAdmin()}
 	script, err := a.egressInstallScript(r, scope)
 	if err != nil {
 		// 生成失败必须**说清原因**：最常见的是 webapp 不是 root（写不了
@@ -505,6 +490,12 @@ func (a *app) handleEgressAgentConfig(w http.ResponseWriter, r *http.Request) {
 	uid, ok := a.egressAgentAuth(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
+		return
+	}
+	// v0.31.53：这个端点会下发**受限私钥**。用户端代理下线后，用户身份的
+	// agent 不该再拿到任何凭证 —— 拒在这里比"下去之后再删"可靠得多。
+	if uid > 0 {
+		writeUserEgressGone(w)
 		return
 	}
 	cfg, err := a.egressAgentConfigFor(r, uid)

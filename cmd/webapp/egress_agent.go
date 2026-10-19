@@ -1031,6 +1031,17 @@ func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
 		return
 	}
+	// v0.31.53：用户端代理已下线 —— 用户身份的 agent 一律拒之门外。
+	// 否则这些机器会每 5 秒写一次机器表，页面上"看得见、没线路"，永远清不完。
+	if owner > 0 {
+		if shouldLogUserAgentGone(owner) {
+			log.Printf("WARN: [egress] 拒绝用户 agent 接入（owner=#%d machine=%q）：用户端代理已下线。"+
+				"请让该用户删除本机安装目录 %s（同类日志 5 分钟内只记一条）",
+				owner, r.URL.Query().Get("machine"), `%LOCALAPPDATA%\wb2api-egress`)
+		}
+		writeUserEgressGone(w)
+		return
+	}
 	id := strings.TrimSpace(r.URL.Query().Get("machine"))
 	host := strings.TrimSpace(r.URL.Query().Get("hostname"))
 	fp := strings.TrimSpace(r.URL.Query().Get("fingerprint"))
@@ -1078,6 +1089,10 @@ func (a *app) handleEgressAgentReport(w http.ResponseWriter, r *http.Request) {
 	owner, ok := a.egressAgentAuth(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
+		return
+	}
+	if owner > 0 {
+		writeUserEgressGone(w)
 		return
 	}
 	var st egressAgentState
@@ -1145,10 +1160,17 @@ type egressMachineView struct {
 	ProxyID string `json:"proxy_id,omitempty"`
 	// Applied 该线路是否已设为全局默认（= 配置已应用）。
 	Applied bool `json:"applied"`
-	// HostBound / HostTotal 自挂号里已绑定本线路的数量。报"已绑/总数"而不是一个布尔：
-	// **部分绑定**是最容易被忽略的中间状态（新挂了一个号、或换了线路）。
-	HostBound int `json:"host_bound"`
-	HostTotal int `json:"host_total"`
+	// BoundAccounts 这条线路当前**承载了几个账号**（含平台号与自挂号）。
+	//
+	// v0.31.53：它取代了原来的 host_bound/host_total —— 那两个只数自挂号，
+	// 而用户端代理下线后，平台视角下自挂号恒为 0，拿它判"承重"永远显示待命。
+	// 承重的定义应是"这条出口上真的挂着要出去的号"，不分号是谁的。
+	BoundAccounts int `json:"bound_accounts"`
+	// Carrying 是否正在承重（BoundAccounts > 0）。
+	//
+	// 两台机器都连着时，只有挂了号的那台在真正出流量；不标出来，
+	// 运维会以为两台都在工作（"两个 IP 却是同一个出口"的错觉来源）。
+	Carrying bool `json:"carrying"`
 	// AuthCandidates 这台机器上探测到的客户端登录态候选（v0.31.42）。
 	//
 	// 只有元信息（路径 / 修改时间 / uid 前 8 位）。用途是回答"这个号的本机
@@ -1195,10 +1217,11 @@ type egressHomeView struct {
 	Applied       bool             `json:"applied"`
 	ProxyID       string           `json:"proxy_id,omitempty"`
 	DefaultEgress string           `json:"default_egress"`
-	HostBound     int              `json:"host_bound"`
-	HostTotal     int              `json:"host_total"`
-	AppliedAt     int64            `json:"applied_at"`
-	Ready         bool             `json:"ready"`
+	// BoundAccounts / Carrying 汇总取"最近上报那台"（见下方 ActiveMachine）。
+	BoundAccounts int   `json:"bound_accounts"`
+	Carrying      bool  `json:"carrying"`
+	AppliedAt     int64 `json:"applied_at"`
+	Ready         bool  `json:"ready"`
 	// ActiveMachine 上面那批汇总字段属于哪台机器（无则空）。
 	ActiveMachine string `json:"active_machine,omitempty"`
 	// CanManage 当前视角能否执行操作。v0.31.24 起**两种视角都为 true** ——
@@ -1306,62 +1329,67 @@ func egressApplyBegin(key string) (release func(), busy bool) {
 	}, false
 }
 
-// egressScope 谁在执行这次出口动作 —— 决定"能看见哪些机器 / 能碰哪些账号"。
+// egressScope 谁在执行这次出口动作。
 //
-// 两类主体（v0.31.24）：
+// v0.31.53 之后**只有一个合法取值**：Platform=true（管理员会话 / X-Admin-Key）。
+// 用户端代理已整体下线，那个"UserID>0 → 只看自己机器、只绑自己的号"的视角
+// 连同它的实现一起删掉了。
 //
-//	平台视角 Platform=true（管理员会话 / X-Admin-Key 运维通道）
-//	    → 全部机器；apply 时设**全局默认出口** + 绑**全部**自挂号（升级前行为）。
-//	用户视角 UserID>0
-//	    → 只有 owner == 自己的机器；apply 只绑**自己名下**的号，
-//	      **不设全局默认出口**（那是平台级决定，会牵动所有人的出站链路）。
+// 字段保留而不是直接删掉理由：视图、日志、agent 令牌派生都以 egressScope 为参数，
+// 一次性拆掉会制造一大片与本次需求无关的改动面。但语义已经收紧到 **fail-closed**：
+// 非平台视角在 seesMachine 处看不到任何机器，而不是"按 owner 收窄"——
+// 万一将来有人误传 Platform=false，他拿到的是"什么都看不到"，不是一个
+// 半开的后门。
 type egressScope struct {
-	UserID   int64
+	// UserID 操作者（仅用于审计与日志，**不再参与范围收窄**）。
+	UserID int64
+	// Platform 是否平台视角。v0.31.53 起必须为 true。
 	Platform bool
 }
 
-// kind 前端判据（"platform" / "self"）。
+// kind 视角标识（v0.31.53 起只会是 "platform"；非平台返回 "invalid"）。
+//
+// 前端据此决定文案。返回 "invalid" 而不是硬编码 "platform"，
+// 是为了让误用**看得见**（页面上会显示出异常值，而不是悄悄按平台渲染）。
 func (s egressScope) kind() string {
 	if s.Platform {
 		return "platform"
 	}
-	return "self"
+	return "invalid"
 }
 
-// hostOwner 该视角下要统计 / 绑定的自挂号属于谁：平台 = 全部（0），用户 = 自己。
-func (s egressScope) hostOwner() int64 {
-	if s.Platform {
-		return 0
-	}
-	return s.UserID
-}
+// hostOwner 出口线路与自挂号的归属：平台恒为 0（不按人收窄）。
+func (s egressScope) hostOwner() int64 { return 0 }
 
 // seesMachine 该视角能否看见（并操作）这台机器。
+//
+// fail-closed：只有平台视角能看见机器。用户视角已下线，
+// 保留 "return false" 是为了让任何误用都表现为"看不到"而不是"全看得见"。
 func (s egressScope) seesMachine(mm *egressMachine) bool {
-	if mm == nil {
-		return false
-	}
-	if s.Platform {
-		return true
-	}
-	return mm.OwnerUserID == s.UserID
+	return mm != nil && s.Platform
 }
 
 func (s egressScope) label() string {
 	if s.Platform {
 		return "platform"
 	}
-	return fmt.Sprintf("user#%d", s.UserID)
+	return "invalid"
 }
 
-// egressActorGuard 出口执行端点的入口守卫（v0.31.24 取代 adminGuard）。
+// egressPlatformGuard 出口执行端点的入口守卫（v0.31.53 收紧）。
 //
-// 与 adminGuard 的区别只有一条，但它正是本版的目的：**普通用户也能过** ——
-// 只不过他能操作的只有自己名下的机器与账号（由 egressScope 一路带下去）。
+// v0.31.24 起这个位置叫 egressActorGuard，语义是"普通用户也能过，只是只能碰
+// 自己的机器"。v0.31.53 产品决定把出口收敛为平台能力 —— 用户端不再有代理入口
+// 与接口权限，于是这里**只放行平台身份**：
 //
-// 顺序仍是"运维密钥优先"：X-Admin-Key 通道没有会话，但它代表运维，
-// 语义上等同于平台视角（否则脚本化运维会突然失去这条通道）。
-func (a *app) egressActorGuard(next func(http.ResponseWriter, *http.Request, egressScope)) http.HandlerFunc {
+//   - 运维密钥（X-Admin-Key）：脚本化运维通道，语义上等同平台视角；
+//   - 管理员会话：平台视角（可设全局默认出口、操作任意平台机器）；
+//   - 普通用户：403 `platform_only`（不是 401 —— 他是登录着的，只是没这个权限）。
+//
+// 为什么不复用 adminGuard：后续 handler 需要拿到 **egressScope**（Platform 标志），
+// 而 adminGuard 只注入 *User。少了这个标志，下游会退回到"按 owner 收窄"的老路径，
+// 那正是这次要删掉的东西。
+func (a *app) egressPlatformGuard(next func(http.ResponseWriter, *http.Request, egressScope)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.authorized(r) { // X-Admin-Key 通道（运维 / 脚本）
 			next(w, r, egressScope{Platform: true})
@@ -1372,11 +1400,18 @@ func (a *app) egressActorGuard(next func(http.ResponseWriter, *http.Request, egr
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
 			return
 		}
+		if !u.IsAdmin() {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "出口代理是平台能力，仅管理员可用；用户端代理已下线",
+				"code":  "platform_only",
+			})
+			return
+		}
 		if u.Status != StatusActive {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "账号已被停用"})
 			return
 		}
-		next(w, withUser(r, u), egressScope{UserID: u.ID, Platform: u.IsAdmin()})
+		next(w, withUser(r, u), egressScope{UserID: u.ID, Platform: true})
 	}
 }
 
@@ -1398,42 +1433,6 @@ func (a *app) defaultEgress() string {
 		return strings.TrimSpace(kv)
 	}
 	return ""
-}
-
-// egressHostBinding 统计自挂号对若干线路 URL 的绑定数量。
-//
-// 一次遍历算出所有机器需要的计数（每台机器一条 URL），避免 N 台机器扫 N 遍账号表。
-//
-// owner（v0.31.24）：0 = 全部自挂号（平台视角）；>0 = 只统计该用户名下的。
-// 用户视角必须按 owner 收紧 —— 否则他会从"已绑/总数"里读出**全平台**的规模，
-// 而那既不是他的信息，也会让他误以为"这台机器在给平台供流量"。
-func (a *app) egressHostBinding(urls []string, owner int64) (bound map[string]int, total int) {
-	bound = map[string]int{}
-	for _, u := range urls {
-		// 键统一走规范化（v0.31.33）：账号上存的可能是旧写法，
-		// 原样比会让"已绑定"显示成 0（页面于是提示"还没应用"）。
-		bound[egressURLKey(u)] = 0
-	}
-	accs, err := a.store.ListAccounts()
-	if err != nil {
-		return bound, 0
-	}
-	for _, acc := range accs {
-		if acc.OwnerUserID <= 0 {
-			continue // 只统计自挂号（平台号跟随全局默认即可）
-		}
-		if owner > 0 && acc.OwnerUserID != owner {
-			continue // 用户视角：别人的号不进他的统计
-		}
-		total++
-		if u := strings.TrimSpace(acc.EgressProxy); u != "" {
-			k := egressURLKey(u)
-			if _, ok := bound[k]; ok {
-				bound[k]++
-			}
-		}
-	}
-	return bound, total
 }
 
 // buildEgressHomeView 组装状态（只读，不做任何写操作）。
@@ -1497,7 +1496,9 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 	for _, key := range keys {
 		urls = append(urls, egressHomeURL(m[key].Ports.TunnelPort))
 	}
-	bound, hostTotal := a.egressHostBinding(urls, scope.hostOwner())
+	// v0.31.53：承重统计改为**全部账号**。原来只数自挂号（scope.hostOwner()），
+	// 在平台视角下恒为 0 —— 那会让"承重机"永远显示待命，比不显示更误导。
+	boundAll := a.egressBoundByURL(urls)
 
 	// 同指纹 / 同出口分组（v0.31.26）：见 egressMachineView 两个字段的注释。
 	fpGroup := map[string][]string{}
@@ -1514,15 +1515,9 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 	for _, key := range keys {
 		mm := m[key]
 		url := egressHomeURL(mm.Ports.TunnelPort)
-		// Applied 的口径按视角分开：
-		//   平台 → "这条线路就是当前的全局默认出口"；
-		//   用户 → "我名下的号**全部**已绑到这条线路"（用户视角没有"全局默认"可判）。
-		// 用 bound == hostTotal 而不是 bound > 0：部分绑定（新挂了一个号、或换了线路）
-		// 是最容易被忽略的中间状态，报"已应用"会让人以为没事了。
+		// Applied 只有一个口径（v0.31.53）：这条线路就是当前的全局默认出口。
+		// 用户视角那个"我名下号是否全部绑上"的判据随用户端一起下线。
 		applied := def == url && url != ""
-		if !scope.Platform {
-			applied = hostTotal > 0 && bound[url] == hostTotal
-		}
 		mv := egressMachineView{
 			ID: key, Hostname: mm.Hostname,
 			Online:  mm.online(now),
@@ -1530,10 +1525,11 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 			AgentVersion: mm.State.Version, Message: mm.State.Message,
 			ExitIP:    mm.State.ExitIP,
 			ProxyPort: mm.Ports.ProxyPort, TunnelPort: mm.Ports.TunnelPort,
-			ProxyURL:  url,
-			ProxyID:   proxyIDByURL[url],
-			Applied:   applied,
-			HostBound: bound[url], HostTotal: hostTotal,
+			ProxyURL:       url,
+			ProxyID:        proxyIDByURL[url],
+			Applied:        applied,
+			BoundAccounts:  boundAll[url],
+			Carrying:       boundAll[url] > 0,
 			AuthCandidates: append([]agentAuthCandidate(nil), mm.State.AuthCandidates...),
 			CurrentCmd:     mm.Cmd,
 			LastAt:         mm.StateAt,
@@ -1614,7 +1610,7 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 		v.Tunnel = active.Tunnel
 		v.Applied = active.Applied
 		v.ProxyID = active.ProxyID
-		v.HostBound, v.HostTotal = active.HostBound, active.HostTotal
+		v.BoundAccounts, v.Carrying = active.BoundAccounts, active.Carrying
 		v.Ready = active.Ready
 	}
 	if scope.Platform {
@@ -1635,20 +1631,21 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 
 // handleEgressHome GET /api/egress/home（登录可见，只读）
 func (a *app) handleEgressHome(w http.ResponseWriter, r *http.Request) {
-	u := userFrom(r)
-	if u == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录"})
-		return
+	// v0.31.53：这个视图只剩平台视角（路由挂 adminGuard，普通用户进不来）。
+	//
+	// 运维密钥（X-Admin-Key）通道没有会话 → userFrom 为 nil，UserID 保持 0；
+	// Platform 恒为 true，`scope.hostOwner()` 因此恒返回 0（平台机器）。
+	scope := egressScope{Platform: true}
+	if u := userFrom(r); u != nil {
+		scope.UserID = u.ID
 	}
-	writeJSON(w, http.StatusOK, a.buildEgressHomeView(r, egressScope{
-		UserID: u.ID, Platform: u.IsAdmin(),
-	}))
+	writeJSON(w, http.StatusOK, a.buildEgressHomeView(r, scope))
 }
 
 // egressBoundByURL 每条线路 URL 被多少个账号绑定（**含平台号与自挂号**）。
 //
-// 与 egressHostBinding 的区别：那个只数自挂号（控制台要显示"我的号绑了几个"），
-// 这个数全部（管理后台要回答"这条线到底承载了多少号"）。
+// v0.31.53 起它是**唯一**的承重口径：出口代理只剩平台能力，
+// "我的号绑了几个"这个问题（以及为它服务的按 owner 统计）随用户端一起下线。
 func (a *app) egressBoundByURL(urls []string) map[string]int {
 	out := map[string]int{}
 	for _, u := range urls {
@@ -2089,15 +2086,10 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scop
 		})
 		return
 	}
-	// rebind_all（v0.31.31）：默认 **false** = 只接管未指定出口的号。
-	// 显式 true 才是旧行为（把我名下所有号都改到这条线路）。
-	var req struct {
-		RebindAll bool `json:"rebind_all"`
-	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
-	}
-	res, err := a.applyHomeEgress(mm.Ports.TunnelPort, scope, req.RebindAll)
+	// v0.31.53：不再接受 rebind_all —— "应用"不再改任何账号的出口。
+	// 老客户端仍可能带这个字段，JSON 解码会忽略未知字段（不报错），
+	// 但也不会产生任何绑定行为：分配统一走管理后台。
+	res, err := a.applyHomeEgress(mm.Ports.TunnelPort, scope)
 	if err != nil {
 		// 线路不通 → 409 而不是 500：这是"当前状态不允许"，不是服务故障。
 		// 文案直接给出下一步（用户要的是"为什么刚拉起就全挂"，不是 HTTP 语义）。
@@ -2127,44 +2119,18 @@ func (a *app) handleEgressHomeApply(w http.ResponseWriter, r *http.Request, scop
 }
 
 // egressHomeApplyResult 应用结果（逐项如实回报）。
+//
+// v0.31.53 起这里**不再有"绑定了几个号"的字段** —— 出口分配已收敛到管理后台，
+// 一键拉起只负责把平台线路立起来（注册 + 设默认）。保留一堆恒为 0 的字段会让
+// 前端/脚本以为"应用时会顺带绑号"，那正是这次要删掉的旧逻辑。
 type egressHomeApplyResult struct {
 	ProxyID   string `json:"proxy_id"`
 	ProxyURL  string `json:"proxy_url"`
 	DefaultOK bool   `json:"default_ok"`
-	HostBound int    `json:"host_bound"`
-	HostTotal int    `json:"host_total"`
-	// Skipped 已显式绑在**别的线路**上、本次刻意没动的账号数（v0.31.31）。
-	//
-	// 为什么这是必需的（用户现场："两台电脑两个 IP，拉起来却是同一个出口"）：
-	// 旧行为是"应用 = 把我名下所有号改绑到这条线路"。于是用户在第二台电脑上
-	// 拉一次，第一台电脑上那些号就被**静默搬走了** —— 两台机器最后都只有一台
-	// 在真正承重，看到的自然是同一个出口 IP。
-	Skipped int `json:"skipped,omitempty"`
-	// SkippedDirect 其中被**显式设为直连**（`direct` 哨兵）的号数（v0.31.48）。
-	//
-	// 单列出来是因为它和"绑在别的线路上"是**完全不同的两件事**：
-	//   · 绑在别的线路 → 那个人/那次操作已经做过选择，跳过是对的；
-	//   · 显式直连     → 这个号根本不会走任何代理，用户拉起代理后会发现
-	//     "号还在裸奔"。而直连很可能是**系统批量设置**的（比如统一走服务器那次），
-	//     不是号主的决定。
-	// 不分开说，用户只会看到"跳过 4 个"，然后以为代理没生效。
-	SkippedDirect int `json:"skipped_direct,omitempty"`
-	// SkippedPooled 因「已入池」而跳过的号数（v0.31.50，需求二）。
-	//
-	// 与 Skipped / SkippedDirect 都不同：这不是"已经做过决定"，而是**规则不允许** ——
-	// 已入池的号参与平台反代，把它绑到个人出口等于把平台流量转到个人宽带。
-	SkippedPooled int `json:"skipped_pooled,omitempty"`
-	// SkippedForeign 因「不属于这条线路的主人」而跳过的号数（理论上恒 0）。
-	SkippedForeign int `json:"skipped_foreign,omitempty"`
-	// EligibleTotal / IneligibleTotal 本次评估的号里"能用/不能用"这条线路的数量。
-	EligibleTotal   int `json:"eligible_total,omitempty"`
-	IneligibleTotal int `json:"ineligible_total,omitempty"`
-	// RebindAll 本次是否强制改绑（用户显式要求）。
-	RebindAll bool   `json:"rebind_all,omitempty"`
 	Probed    bool   `json:"probed"`
 	ExitIP    string `json:"exit_ip,omitempty"`
 	// Warnings 本次**刻意没做**的事（v0.31.35）。例如：这条 URL 已被某个用户认领，
-	// 平台视角就不再把它设成全局默认、也不把自挂号绑上去。
+	// 平台视角就不再把它设成全局默认。
 	//
 	// 为什么不用 error：线路注册本身是成功的（隧道确实通了），
 	// 只是"不能拿它当平台出口"—— 用错误会让调用方以为整件事失败。
@@ -2246,7 +2212,7 @@ func (a *app) verifyLineUsable(url string) (string, error) {
 // 理由：全局默认出口是平台级决定（它同时决定所有平台号与所有"跟随默认"的账号
 // 从哪出去），而用户提供的代理是不可信第三方 —— 它只应承载它主人的号。
 // 用户拉起的线路仍会进线路池（带 owner），管理员据此可显式分配给别人。
-func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool) (egressHomeApplyResult, error) {
+func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeApplyResult, error) {
 	url := egressHomeURL(tunnelPort)
 	var res egressHomeApplyResult
 	res.ProxyURL = url
@@ -2278,28 +2244,11 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 		}
 	}
 	now := time.Now().Unix()
-	// 每用户线路条数配额（v0.31.52，R7）：同一用户反复"拉起不同机器"会占满端口段、
-	// 让线路池膨胀，而每条线路都绑定着他家的一台设备（不可信边界）。
-	// 只拦**新建**：已有线路的重复应用不受影响（否则升级后老用户会被锁死）。
-	if hit == nil && !scope.Platform {
-		if n := a.egressUserLineCount(scope.UserID); n >= a.egressUserLineQuota() {
-			log.Printf("WARN: [egress] 用户 #%d 线路数已达上限 %d（当前 %d），拒绝新建 %s",
-				scope.UserID, a.egressUserLineQuota(), n, url)
-			return res, &notUsableError{msg: fmt.Sprintf(
-				"你的出口线路已达上限（%d 条，当前已有 %d 条）：多出来的机器不会带来新出口，"+
-					"只会占用端口段。请先在「我的出口」停用/删除不用的机器，或联系管理员扩容",
-				a.egressUserLineQuota(), n)}
-		}
-	}
+	// v0.31.53：每用户线路配额随用户端代理一起下线（唯一入口已是管理端）。
+	// 这里不再判配额 —— 平台机器数量由运维控制，用一条"按用户计数"的规则去管它
+	// 只会给出误导性的报错。
 	if hit == nil {
-		// 名称按视角区分：平台叫"本地住宅出口"，用户叫"<用户名> 的出口" ——
-		// 管理后台的线路池一眼就能看出这条线是谁接进来的（归属由 owner_user_id
-		// 承载，名字只是给人读的第一眼线索）。
 		name, region := "本地住宅出口", "本机所在网络"
-		if !scope.Platform {
-			name = a.userNameByID(scope.UserID) + " 的出口"
-			region = "用户自建（本机代理 + 反向隧道）"
-		}
 		hit = &EgressProxy{
 			ID:        newEgressProxyID(url),
 			Name:      name,
@@ -2308,11 +2257,6 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 			Note:      "由「一键拉起」自动注册（本机代理 + 反向隧道）",
 			Enabled:   true,
 			CreatedAt: now,
-		}
-		if !scope.Platform {
-			// 归属**只在新建时写**；已存在的线路由 UpsertEgressProxy 的粘性规则
-			// 处理（只允许 0 → 非 0 一次），不在这里覆盖别人已认领的线路。
-			hit.OwnerUserID = scope.UserID
 		}
 	}
 	hit.UpdatedAt = now
@@ -2339,138 +2283,43 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope, rebindAll bool)
 		return res, err
 	}
 	res.ProxyID = hit.ID
-	res.RebindAll = rebindAll
 
-	// 归属守卫（v0.31.35）：平台视角拉到一条**已被用户认领**的 URL 时，
-	// 绝不能再把它当平台出口用 —— 否则"全局默认 = 某用户家宽"、"自挂号全搬到他家"。
+	// 归属守卫（v0.31.35 / v0.31.53 收窄）：平台视角拉到一条**已被用户认领**的 URL 时，
+	// 绝不能再把它当平台出口用 —— 否则"全局默认 = 某个用户的家庭宽带"。
 	// 这种情形只可能来自端口/URL 撞车（用户段与平台段本该不同），
 	// 但代码不能依赖"本该"，否则一次端口迁移就会触发。
 	userOwnedLine := hit.OwnerUserID > 0
-	if scope.Platform && userOwnedLine {
+	if userOwnedLine {
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
-			"这条线路（%s）已由用户 #%d 认领：已登记，但**不会**设为全局默认出口，也不会改绑任何账号。"+
+			"这条线路（%s）已由用户 #%d 认领：已登记，但**不会**设为全局默认出口。"+
 				"平台出口请用平台自己的机器（端口 11080-11089）", url, hit.OwnerUserID))
-		log.Printf("WARN: [egress] 平台视角命中用户线路 %s（owner=#%d）：跳过默认出口与账号绑定",
+		log.Printf("WARN: [egress] 平台视角命中用户线路 %s（owner=#%d）：跳过默认出口",
 			url, hit.OwnerUserID)
 	}
-	// 用户视角同理（v0.31.35）：正常路径下这台机器的 URL 归属就是他自己
-	// （端口段隔离），但代码不依赖"本该" —— 一旦端口迁移/记录错位，
-	// 这里若不拦，用户的号会被绑到**另一个用户**的线路上。
-	if !scope.Platform && hit.OwnerUserID > 0 && hit.OwnerUserID != scope.UserID {
-		res.Warnings = append(res.Warnings, fmt.Sprintf(
-			"这条线路（%s）属于用户 #%d，不能用于你的账号：已登记但不会绑定任何号。"+
-				"请重新拉起你自己的代理（或联系管理员核对端口归属）", url, hit.OwnerUserID))
-		log.Printf("WARN: [egress] 用户 #%d 的机器命中他人线路 %s（owner=#%d）：跳过绑定",
-			scope.UserID, url, hit.OwnerUserID)
-		return res, nil
-	}
 
-	// 2) 全局默认出口 —— **仅平台视角**。用户视角下这一步不是"少做了"，
-	// 而是"本来就不该做"：他要的只是自己那几十个号从家里出去。
-	if scope.Platform && !userOwnedLine {
-		// 护栏（v0.31.26）：这条 URL 若已被某个用户认领（owner 粘性 >0），
-		// 把它设成全局默认等于让全平台从这个用户的家庭宽带走。
-		// 平台视角拉的机器正常是 owner=0；能走到这里的只有"URL 先被用户占过"这种情形。
-		if hit.OwnerUserID == 0 {
-			if err := a.store.SetKV(kvEgressDefault, url); err != nil {
-				return res, err
-			}
-			res.DefaultOK = true
-		} else {
-			log.Printf("WARN: [egress] 拒绝把用户线路 %s（用户 #%d）设为全局默认出口", url, hit.OwnerUserID)
+	// 2) 全局默认出口（只有平台自己的线路才配得上）
+	if !userOwnedLine {
+		if err := a.store.SetKV(kvEgressDefault, url); err != nil {
+			return res, err
 		}
+		res.DefaultOK = true
 	}
 
-	// 3) 显式绑定自挂号（只改 egress_proxy 一个字段）。按视角收窄到自己的号。
+	// 3) v0.31.53：**不再绑定任何账号**。
 	//
-	// 平台视角 + 命中用户线路 → 整体跳过（见上面 userOwnedLine 的说明）。
-	// 这一步用 return 而不是 if 包住整段，是为了让"为什么没绑"在代码里更显眼。
-	if scope.Platform && userOwnedLine {
-		return res, nil
-	}
-	accs, err := a.store.ListAccounts()
-	if err != nil {
-		return res, err
-	}
-	for _, acc := range accs {
-		if acc.OwnerUserID <= 0 {
-			continue
-		}
-		if !scope.Platform && acc.OwnerUserID != scope.UserID {
-			continue // 别人的号一个都不碰
-		}
-		res.HostTotal++
-		// 唯一闸门（v0.31.50，需求二 / R2）：已入池或不属于线路主人的号，
-		// **一个都不许绑到个人出口**。这条判断此前不存在 —— 用户拉起自己的代理后
-		// 点"应用"，会把他名下**已入池**的号也绑上，等于把平台反代流量转到他家宽带。
-		if ok, code, reason := egressLineAllows(hit, acc, egressAllowOpts{}); !ok {
-			res.IneligibleTotal++
-			switch code {
-			case egressCodePooled:
-				res.SkippedPooled++
-			case egressCodeForeign:
-				res.SkippedForeign++
-			default:
-				res.Skipped++
-			}
-			if code != egressCodeForeign {
-				log.Printf("INFO: [egress] 跳过账号 %s（%s：%s）", acc.UID, code, reason)
-			}
-			continue
-		}
-		res.EligibleTotal++
-		cur := strings.TrimSpace(acc.EgressProxy)
-		// 本次要写的值（见下方注释）：平台视角且这条线路成为全局默认时写空。
-		// 先算出来再比较，否则"已经是跟随默认"的号每轮都会被算作一次"本次绑定" ——
-		// 幂等的结果对，但计数会虚高，运维会以为每次点都在改动号。
-		writeTo := url
-		if scope.Platform && res.DefaultOK {
-			writeTo = ""
-		}
-		if cur == writeTo {
-			res.HostBound++
-			continue
-		}
-		// **非破坏式绑定**（v0.31.31）：只接管"还没指定出口"的号。
-		//
-		// 已显式绑到别的线路的号，说明用户/管理员已经为它做过决定（另一台机器的
-		// 线路、或某条商业代理）。一键拉起顺手把它们搬过来，等于"在 B 机上点一下，
-		// A 机上的号全跑了" —— 而页面上只显示"绑定成功 N 个"，没有任何提示。
-		// 需要整体改绑时由调用方显式传 rebind_all=true（按钮文案也会写明）。
-		if !rebindAll && cur != "" {
-			res.Skipped++
-			if egress.IsDirect(cur) {
-				res.SkippedDirect++
-			}
-			continue
-		}
-		// 写到账号上的值：**如果这条线路刚被设为全局默认出口，就写空串**（v0.31.48）。
-		//
-		// 写死 URL 看似等价（都走这条线），但语义完全不同：
-		//   · 空串 = 跟随默认 → 默认变它就跟着变，且算"没做过决定"；
-		//   · URL  = 显式指定 → 之后用户拉起自己的线路、再点应用时，
-		//     「非破坏式绑定」会把它当成"已做过决定"而**跳过** ——
-		//     现场表现就是"我拉起了代理，也点了应用，可这些号还是从平台出口出去"。
-		//
-		// 平台视角最容易踩这个：它会把所有"跟随默认"的代挂号写成平台出口的 URL，
-		// 等于一次性把一批号标成"已决定"。rehome 那边已经改成写空（v0.31.47），
-		// 这里是同一条纪律的另一个入口。
-		if err := a.store.SetAccountEgress(acc.UID, writeTo); err != nil {
-			// 单个号失败不回滚整体：出口是一个"尽量覆盖"的配置，
-			// 回滚会让已经生效的部分也退回去（更难诊断）。如实计数即可。
-			log.Printf("WARN: [egress] 绑定自挂号出口失败 acct=%s: %v", acc.UID, err)
-			continue
-		}
-		res.HostBound++
-	}
-	if scope.Platform {
-		_ = a.store.SetKV(kvEgressAppliedAt, fmt.Sprintf("%d", now))
-	}
-	// 池以库为准重建（否则选号仍按旧出口）。**两种视角都要重建** ——
-	// 用户视角改的是他自己名下账号的出口，同样是选号输入。
+	// 出口分配已统一收敛到管理后台（POST /api/admin/egress/assign，带唯一闸门与
+	// 强制越界审计）；"一键拉起 / 应用"只负责把**平台线路本身**立起来
+	// （注册线路 + 设全局默认出口）。
+	//
+	// 为什么删掉而不是留着：自动绑号是**隐式批量改出口** —— 点一下可能把几十个号
+	// 从一条线路搬到另一条，页面上只显示"绑定成功 N 个"，既没有理由也没有台账。
+	// 它也是唯一闸门（egressLineAllows）之外的额外写入点，规则同时存在于两处
+	// 就一定会漂移（v0.31.41 的血泪教训）。
+	_ = a.store.SetKV(kvEgressAppliedAt, fmt.Sprintf("%d", now))
+	// 池以库为准重建：全局默认出口刚可能变化，选号映射要跟着变。
 	_ = a.proxy.SyncAccounts()
-	log.Printf("INFO: [egress] 本地出口已应用 scope=%s proxy=%s url=%s host_bound=%d/%d",
-		scope.label(), hit.ID, url, res.HostBound, res.HostTotal)
+	log.Printf("INFO: [egress] 平台线路已应用 proxy=%s url=%s default=%v（不改任何账号出口）",
+		hit.ID, url, res.DefaultOK)
 	return res, nil
 }
 
@@ -2497,37 +2346,4 @@ func newEgressProxyID(url string) string {
 		sum = sum*31 + int(url[i])
 	}
 	return fmt.Sprintf("home%08x", uint32(sum))
-}
-
-// egressUserLineQuota 每个用户最多能接几条出口线路（v0.31.52，R7）。
-//
-// 默认 2（一台主力 + 一台备用）。可在 kv `egress_max_lines_per_user` 覆盖。
-// 为什么要有上限：每条用户线路都占一个端口、一条隧道、以及"某个人的家庭网络"
-// 这个不可信边界；没有上限时，反复拉起会把端口段吃光，而端口段是按 uid 模 1000
-// 分配的 —— 吃光的后果会牵连到**别的用户**。
-func (a *app) egressUserLineQuota() int {
-	if v, err := a.store.GetKV("egress_max_lines_per_user"); err == nil {
-		if n := egressAtoi(v, 0); n > 0 {
-			return n
-		}
-	}
-	return 2
-}
-
-// egressUserLineCount 某个用户当前占了几条线路（只数 owner 是他的）。
-func (a *app) egressUserLineCount(uid int64) int {
-	if uid <= 0 {
-		return 0
-	}
-	list, err := a.store.ListEgressProxies()
-	if err != nil {
-		return 0
-	}
-	n := 0
-	for _, p := range list {
-		if p != nil && p.OwnerUserID == uid {
-			n++
-		}
-	}
-	return n
 }

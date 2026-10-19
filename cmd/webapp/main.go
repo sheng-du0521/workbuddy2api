@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.52"
+const version = "0.31.54"
 
 type app struct {
 	store  *Store
@@ -1568,26 +1568,22 @@ func (a *app) routes() *http.ServeMux {
 	// 不让公网探测版本，也不让 agent 从第三方地址装可执行文件。
 	mux.HandleFunc("GET /api/agent/version", a.handleAgentVersion)
 	mux.HandleFunc("GET /api/agent/download", a.handleAgentDownload)
-	// 控制台「代理」页：状态对登录用户开放（**只列他自己的机器**）。
-	mux.HandleFunc("GET /api/egress/home", a.userGuard(a.handleEgressHome))
-	// 三个**执行**端点挂 egressActorGuard（v0.31.24 取代 adminGuard）：
-	// **普通用户也能过** —— 出口本该是"我的号从哪个 IP 出去"，由号主自己决定；
-	// 此前只能管理员代劳，等于把每个人的出站链路都挂在一个人手上。
-	// 守卫把"能碰谁"编码成 egressScope 一路带下去：
-	//   · 管理员会话 / 运维密钥（X-Admin-Key）→ 平台视角（全部机器 + 可设全局默认）
-	//   · 普通登录用户 → 自己视角（只有自己的机器、自己的号，不碰全局默认）
-	// 运维密钥这条通道保留，因为脚本化运维（部署时拉起、巡检时重应用）是真实场景，
-	// 不该只剩"必须开浏览器点一下"这一条路。
-	mux.HandleFunc("POST /api/egress/home/pull", a.egressActorGuard(a.handleEgressHomePull))
-	mux.HandleFunc("POST /api/egress/home/release", a.egressActorGuard(a.handleEgressHomeRelease))
-	mux.HandleFunc("POST /api/egress/home/apply", a.egressActorGuard(a.handleEgressHomeApply))
+	// 出口控制台（v0.31.53）：**仅平台直属**（管理员会话 / 运维密钥）。
+	//
+	// 用户端自助代理已整体下线：普通用户既没有入口，也没有接口权限 ——
+	// 五个端点全部在守卫层拒绝（403 platform_only），而不是靠前端藏按钮。
+	// 账号出口从此**统一由管理后台分配**（/api/admin/egress/*），
+	// 业务范围见 docs/用户端代理下线-20261019.md。
+	mux.HandleFunc("GET /api/egress/home", a.adminGuard(a.handleEgressHome))
+	mux.HandleFunc("POST /api/egress/home/pull", a.egressPlatformGuard(a.handleEgressHomePull))
+	mux.HandleFunc("POST /api/egress/home/release", a.egressPlatformGuard(a.handleEgressHomeRelease))
+	mux.HandleFunc("POST /api/egress/home/apply", a.egressPlatformGuard(a.handleEgressHomeApply))
 	// 出口体检与纠偏（v0.31.31）：端口冲突 / 隧道没落到本机 → 换端口重建。
 	// 只碰 ports 与 cmd 两个字段，不动账号、线路与全局默认。
-	mux.HandleFunc("POST /api/egress/home/repair", a.egressActorGuard(a.handleEgressRepair))
-	// 一键安装（v0.31.25）：下载一个可双击运行的 .bat —— 里面只有服务地址与
-	// **当前登录用户自己的**令牌。挂 userGuard（只认会话）：安装包是按"人"发的，
-	// 不该出现在共享的运维密钥通道里。
-	mux.HandleFunc("GET /api/egress/home/install", a.userGuard(a.handleEgressInstall))
+	mux.HandleFunc("POST /api/egress/home/repair", a.egressPlatformGuard(a.handleEgressRepair))
+	// 一键安装（v0.31.53）：安装包是**平台物料**（里面是平台 agent 令牌），
+	// 只在管理端生成，普通用户不再拥有这条链路。
+	mux.HandleFunc("GET /api/egress/home/install", a.adminGuard(a.handleEgressInstall))
 	// agent / wbproxy 可执行文件（令牌鉴权，避免变成公开的 15MB 下载位）。
 	mux.HandleFunc("GET /api/egress/agent/bundle", a.handleEgressAgentBundle)
 
@@ -1635,13 +1631,20 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/host/accounts/{uid}", a.userGuard(a.handleHostDeleteAccount))
 	mux.HandleFunc("GET /api/host/accounts/{uid}/resources", a.userGuard(a.handleHostResources))
 	mux.HandleFunc("GET /api/host/accounts/{uid}/task-status", a.userGuard(a.handleHostAccountTaskStatus))
-	mux.HandleFunc("POST /api/host/egress", a.userGuard(a.handleHostEgress))
-	// 账号出口（v0.31.31）：逐号分配 + 按出口 IP 均衡。
-	// 旧的 /api/host/egress 是"全量覆盖"语义（一个 URL 应用到所有号），
-	// 多机场景下它会静默把别的机器上的号搬走 —— 新页面不再用它。
-	mux.HandleFunc("GET /api/host/egress/lines", a.userGuard(a.handleHostEgressLines))
-	mux.HandleFunc("POST /api/host/egress/assign", a.userGuard(a.handleHostEgressAssign))
-	mux.HandleFunc("POST /api/host/egress/rebalance", a.userGuard(a.handleHostEgressRebalance))
+	// 用户端代理（v0.31.53 整体下线）：这四个端点保留注册，但**一律 410**。
+	//
+	// 为什么不直接删路由：直接删会回 404，而 404 与"路径写错"完全无法区分 ——
+	// 还在运行的老前端、用户自己的脚本会以为是地址问题，反复重试、报"接口不存在"。
+	// 410 附带 code 与明确出口，一眼就知道"这个能力没有了、该找谁"。
+	// 业务实现已经删干净（host_egress_lines.go 不再存在），这里只是**停止位**。
+	for _, p := range []string{
+		"POST /api/host/egress",
+		"GET /api/host/egress/lines",
+		"POST /api/host/egress/assign",
+		"POST /api/host/egress/rebalance",
+	} {
+		mux.HandleFunc(p, a.userGuard(a.handleUserEgressRetired))
+	}
 	mux.HandleFunc("GET /api/system/info", a.userGuard(a.handleSystemInfo))
 	mux.HandleFunc("GET /api/host/earnings", a.userGuard(a.handleHostEarnings))
 	mux.HandleFunc("POST /api/host/accounts/{uid}/task", a.userGuard(a.handleHostSetTask))

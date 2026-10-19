@@ -167,12 +167,9 @@ func TestApplyRefusesWhenLineUnusable(t *testing.T) {
 	a.egressVerify = func(string) (string, error) {
 		return "", fmt.Errorf("%w：隧道端口可连，但经它出不了网", errEgressNotUsable)
 	}
-	res, err := a.applyHomeEgress(21150, egressScope{UserID: 5}, false)
+	_, err := a.applyHomeEgress(21150, egressScope{Platform: true})
 	if !errors.Is(err, errEgressNotUsable) {
 		t.Fatalf("应返回 errEgressNotUsable（HTTP 层据此回 409），实得 %v", err)
-	}
-	if res.HostBound != 0 || res.HostTotal != 0 {
-		t.Fatalf("验证失败时不该统计/绑定任何号，得 bound=%d total=%d", res.HostBound, res.HostTotal)
 	}
 	acc, _ := store.GetAccount("u-own")
 	if strings.TrimSpace(acc.EgressProxy) != "" {
@@ -196,7 +193,7 @@ func TestApplyWritesVerifiedExitIP(t *testing.T) {
 	defer store.Close()
 
 	a.egressVerify = func(string) (string, error) { return "198.51.100.7", nil }
-	if _, err := a.applyHomeEgress(21150, egressScope{UserID: 5}, false); err != nil {
+	if _, err := a.applyHomeEgress(21150, egressScope{Platform: true}); err != nil {
 		t.Fatalf("apply 应成功：%v", err)
 	}
 	list, err := store.ListEgressProxies()
@@ -210,8 +207,10 @@ func TestApplyWritesVerifiedExitIP(t *testing.T) {
 	if p.AutoDisabled {
 		t.Fatal("刚验证通过的线路不该带自动停用标记")
 	}
+	// v0.31.53：验证通过只说明"这条线路能用"，**不等于**"要把谁的号搬上来"。
+	// 分配是管理端 assign 的事（带唯一闸门与审计），apply 碰账号就是越权。
 	acc, _ := store.GetAccount("u-own")
-	if strings.TrimSpace(acc.EgressProxy) == "" {
-		t.Fatal("验证通过应把自挂号绑到这条线路")
+	if strings.TrimSpace(acc.EgressProxy) != "" {
+		t.Fatalf("apply 不得改账号出口，得 %q", acc.EgressProxy)
 	}
 }

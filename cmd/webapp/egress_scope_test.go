@@ -62,38 +62,6 @@ func TestEgressLineAllowsRules(t *testing.T) {
 	}
 }
 
-// TestApplyHomeEgressSkipsPooled 用户自助应用：已入池的号一个都不许绑（R2）。
-func TestApplyHomeEgressSkipsPooled(t *testing.T) {
-	f := usApp(t)
-	// 造一个"已入池"的号：它正是平台反代的承重号，绑到个人出口等于把平台流量转走。
-	pooled := &Account{UID: "us-a-pooled", Nickname: "在池", Realm: "cn",
-		AccessToken: "t", RefreshToken: "r",
-		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
-		OwnerUserID: f.userA.ID, ConsumeGroup: "us", PoolState: "in"}
-	if err := f.store.UpsertAccount(pooled); err != nil {
-		t.Fatalf("UpsertAccount: %v", err)
-	}
-
-	const tunnelPort = 12075
-	res, err := f.app.applyHomeEgress(tunnelPort, egressScope{UserID: f.userA.ID}, true)
-	if err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-	if res.SkippedPooled != 1 {
-		t.Fatalf("应跳过 1 个已入池号，得 skipped_pooled=%d（bound=%d skipped=%d）",
-			res.SkippedPooled, res.HostBound, res.Skipped)
-	}
-	acc, _ := f.store.GetAccount("us-a-pooled")
-	if acc != nil && strings.TrimSpace(acc.EgressProxy) != "" {
-		t.Fatalf("已入池的号被绑到了个人出口：%q", acc.EgressProxy)
-	}
-	// rebind_all=true 也不能越过规则（它只放开"非破坏性"这一层，不放开范围）。
-	// A 名下只有 us-a-acct 一个未入池号（另一个是刚造的 pooled），故 bound=1。
-	if res.HostBound != 1 {
-		t.Fatalf("未入池号应绑定，得 bound=%d", res.HostBound)
-	}
-}
-
 // TestAssignBlocksThenForceWithAudit 管理端：默认拦下跨用户/已入池，force 必须带理由并落审计（R1）。
 func TestAssignBlocksThenForceWithAudit(t *testing.T) {
 	store, _, mux, adminCookie, _, memberID := ownerApp(t)
@@ -261,7 +229,10 @@ func TestEgressComplianceListsViolation(t *testing.T) {
 	_ = a
 }
 
-// TestManualDisableBlocksApplyAndSurvivesEdit 人工停用：用户拉不活、编辑也不丢（R3/R10）。
+// TestManualDisableBlocksApplyAndSurvivesEdit 人工停用：拉不活、编辑也不丢（R3/R10）。
+//
+// v0.31.53 起 apply 只剩平台视角（用户端能力已下线），但这条不变量仍然成立：
+// **人工停用是管理员的决定**，任何"拉起/应用"都不能把它翻过来。
 func TestManualDisableBlocksApplyAndSurvivesEdit(t *testing.T) {
 	store, a, mux, adminCookie, memberCookie, memberID := ownerApp(t)
 	// 必须用**该用户端口段内**的地址：applyHomeEgress 是按隧道端口拼 URL 的，
@@ -281,8 +252,9 @@ func TestManualDisableBlocksApplyAndSurvivesEdit(t *testing.T) {
 		t.Fatalf("人工停用应 200，得 %d %s", code, raw)
 	}
 
-	// 用户重新拉起（apply）→ 409 语义的错误，且线路仍停用。
-	_, err := a.applyHomeEgress(base, egressScope{UserID: memberID}, true)
+	// 重新拉起（apply）→ 409 语义的错误，且线路仍停用。
+	a.egressVerify = func(string) (string, error) { return "198.51.100.13", nil }
+	_, err := a.applyHomeEgress(base, egressScope{Platform: true})
 	if !errors.Is(err, errEgressLineManuallyDisabled) {
 		t.Fatalf("人工停用的线路应拒绝启用，得 %v", err)
 	}

@@ -189,9 +189,10 @@ func TestEgressRepairPortConflict(t *testing.T) {
 		t.Fatal("没冲突的那台不该被下发指令")
 	}
 	// 新端口必须落在该 owner 的段内，否则 sshd 的 permitlisten 会拒。
-	owner := egressScope{UserID: 7}
-	if !owner.seesMachine(px) {
-		t.Fatal("修复不应改变归属")
+	// v0.31.53：egressScope 只剩平台视角，不能再拿"用户视角看得见"当归属判据；
+	// 直接看字段（这才是归属本身）。
+	if px.OwnerUserID != 7 {
+		t.Fatalf("修复不应改变归属，得 owner=%d", px.OwnerUserID)
 	}
 	base, span := egressPortSegOf(7)
 	if px.Ports.TunnelPort < base || px.Ports.TunnelPort >= base+span {

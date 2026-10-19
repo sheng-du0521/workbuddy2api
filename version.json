@@ -1,16 +1,16 @@
 {
-  "version": "0.31.52",
+  "version": "0.31.54",
   "min_supported": "0.24.0",
-  "notes": "v0.31.52：① 端到端真机验证（注册→导入→自挂→建 key→调用）过程中发现并修掉一个**静默降级**：建 Key 时传了 account_uids 却没带 kind=host，绑定被静默丢弃、Key 变成平台计费 Key（走平台号池、扣余额），调用方却以为建的是自用 Key → 现在直接 400 `account_uids_requires_host`。② 管理端「模型倍率」独立面板（导航新增）：模型/官方倍率/标签/免费/实测积分/口径状态 + 变化台账 + 「立即同步」，与用户端同一套口径（倍率只对照、计费看实测）。③ 「强制越界审计」面板：谁、对哪几个号、理由、结果（failed 也留痕）；并补上「强制打到停用线路」时的 failed 审计（此前只在候选阶段被过滤、什么都不留）。④ 每用户出口线路配额（默认 2 条，kv `egress_max_lines_per_user` 可调）：只拦新建，已有线路重复应用不受影响。⑤ 机器视图新增 `carrying` / `bound_accounts`：用户端会标明「承重中 N 个号 / 待命（无号绑定）」。⑥ 顺带把 v0.31.50 的 force 失败审计缺口补齐（见 ③）。",
-  "released_at": 1792413627,
+  "notes": "v0.31.54：**移除用户端代理能力，代理收敛为平台能力**（产品决策；0.31.53 的部署只是中间态，未发布）。① 用户端四个接口（/api/host/egress、/lines、/assign、/rebalance）一律 410 `user_egress_removed` —— 用 410 而不是删路由：404 与「地址写错」无法区分，老客户端会反复重试。② /api/egress/home 与 pull/release/apply/repair/install 全部收紧为管理员（403 `platform_only`）；已安装的用户 agent 也不能再接入（poll/report/config → 410 + action=stop，私钥不再下发），且拒绝日志按 owner 5 分钟节流（一台没删的机器否则一天刷 1.7 万条）。③ 业务逻辑删除：handleHostEgress 系列、ensureUserEgressLine、每用户线路配额、按 owner 统计；**apply 不再绑定任何账号**（应用 = 验证 + 登记 + 设全局默认出口）。分配只剩管理端 assign 一个写入口。④ 用户端界面：插件列表不再出现出口插件（Audience 改 admin，改名「平台直属出口」）；删除「我的账号出口」卡片、逐号下拉、按出口 IP 均衡、批量改绑、设置页「我的出口」整卡；「仅剩 access」提示迁到账号卡徽标（它是账号健康信息，不该随代理消失）。⑤ 管理端：代理页新增权限边界说明（唯一分配入口）；插件列表保留「平台直属出口」供管理员操作平台机器。⑥ 视图口径修正：host_bound/host_total（只数自挂号，平台视角恒 0）→ bound_accounts/carrying（全部账号）。⑦ 生产数据：备份 webapp.db.bak-user-egress-202610192136，删除用户线路与用户机器记录；47 个账号全在平台出口，未改动。",
+  "released_at": 1792417724,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.52/webapp.exe",
-      "sha256": "045b739a0e82b84ee3c6937de165b95b403091ce48266817ec9185af9948edc6",
-      "size": 15652352
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.54/webapp.exe",
+      "sha256": "329f94ebbc5e638db3ec09828d9ce08b06ed0b47f02233997f1e98d314c8ca18",
+      "size": 15582720
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

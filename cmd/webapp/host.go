@@ -6,7 +6,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"workbuddy2api/internal/egress"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -399,178 +397,6 @@ func (a *app) handleHostPool(w http.ResponseWriter, r *http.Request) {
 	// 退出号池后立即重算选号范围，避免仍被平台反代选中。
 	_ = a.proxy.SyncAccounts()
 	writeJSON(w, http.StatusOK, map[string]any{"uid": uid, "pool_state": state})
-}
-
-// handleHostEgress 用户为自己名下的代挂号设置出口代理（v0.31.20）。
-//
-// 解决什么：「我的号从哪个 IP 出去」本该是我自己的事，此前只有管理员能在后台
-// 逐号设置。现在号主可以在控制台「设置 → 我的出口」自助完成，配好后
-// **该线路会自动出现在管理后台的代理页**（因为线路本就建在账号的 egress_proxy 上），
-// 管理员可收录进线路池、探活、再分配给别的号。
-//
-// ⚠️ 边界（很重要，别越）：
-//   - 只写 `accounts.egress_proxy`，**只动本人名下**的账号（逐个校验 owner）；
-//   - **不碰**平台全局默认出口（`egress_proxy_default`）—— 用户提供的代理是
-//     不可信第三方（我们无法担保其稳定性，且理论上能看到经过它的流量特征），
-//     它只能承载"号主自己的号"，绝不能成为平台号池的默认出口；
-//   - 不做任何账号状态改动（不禁用、不冷却）：出口配错只影响"能不能出去"，
-//     由既有的 `egressBad` / 线路失效策略去处理。
-func (a *app) handleHostEgress(w http.ResponseWriter, r *http.Request) {
-	u := userFrom(r)
-	var req struct {
-		UIDs  []string `json:"uids"`
-		Proxy string   `json:"proxy"`
-		All   bool     `json:"all"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
-		return
-	}
-	norm, err := egress.ValidateAccountEgress(req.Proxy)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	// 归属校验（v0.31.35 补漏）：这条路径此前**只校验格式**，于是用户在设置页手填
-	// 别人的线路 URL 就能把号绑上去 —— assign 拦得住，设置页拦不住，规则形同虚设。
-	// 现在与 assign 共用 `hostEgressLineFor`，规则只有一份实现。
-	if _, lerr := a.hostEgressLineFor(u, norm, true); lerr != nil {
-		status := http.StatusBadRequest
-		if errors.Is(lerr, errEgressForeignLine) {
-			status = http.StatusForbidden
-		}
-		writeJSON(w, status, map[string]any{"error": lerr.Error()})
-		return
-	}
-
-	owned, err := a.store.ListAccountsByOwner(u.ID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	alive := map[string]bool{}
-	for _, acc := range owned {
-		alive[acc.UID] = true
-	}
-	// 目标集：显式 uids（逐个校验归属）或全部本人代挂号。
-	var targets []string
-	if req.All {
-		for _, acc := range owned {
-			targets = append(targets, acc.UID)
-		}
-	} else {
-		for _, uid := range req.UIDs {
-			uid = strings.TrimSpace(uid)
-			if uid == "" {
-				continue
-			}
-			// 越权目标**静默剔除**（与插件同口径）：不报错、不泄露"这个 uid 存不存在"。
-			if alive[uid] {
-				targets = append(targets, uid)
-			}
-		}
-	}
-	if len(targets) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "没有可设置的账号（请确认勾选的账号属于你）"})
-		return
-	}
-	changed := 0
-	// blocked 记录"被出口范围规则拒绝"的号（v0.31.50）：静默跳过会让用户
-	// 以为"设置成功"，而他的号其实还挂在原出口上。
-	blocked := make([]map[string]any, 0)
-	for _, uid := range targets {
-		// 统一入口（v0.31.33）：规范化 + 确保池里存在这条线路。用户在"我的出口"
-		// 里手填的地址从此会被自动登记进线路池，管理后台能看到、能探活、能分配 ——
-		// 而不是只躺在 accounts.egress_proxy 里当一条"看不见的出口"。
-		if _, err := a.setAccountEgress(uid, norm); err != nil {
-			var se *egressScopeError
-			if errors.As(err, &se) {
-				blocked = append(blocked, map[string]any{"uid": uid, "code": se.Code, "reason": se.Error()})
-			}
-			log.Printf("WARN: [host] 设置代挂出口失败 acct=%s: %v", uid, err)
-			continue
-		}
-		changed++
-	}
-	_ = a.proxy.SyncAccounts() // 出口是选号输入，改完必须重同步
-	// 线路池同步（v0.31.23）：用户配的这条出口要**自动成为线路池里的一条线路**，
-	// 否则管理员在后台看不到它，也就没法"统一查看、选择、分配"。
-	// ⚠️ 只登记台账，**不碰全局默认出口**（见函数头注释的边界）。
-	proxyID := a.ensureUserEgressLine(u, norm)
-	log.Printf("INFO: [host] 用户 %s 把 %d 个代挂号的出口设为 %q（线路 %s）",
-		u.Username, changed, norm, proxyID)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"updated": changed, "proxy": norm, "total": len(targets), "proxy_id": proxyID,
-		"blocked": blocked,
-	})
-}
-
-// ensureUserEgressLine 把用户配置的出口登记为线路池里的一条线路（幂等）。
-//
-// 返回线路 id（空串 = 本次没有需要登记的线路，如"留空跟随默认"或"直连"）。
-//
-// 为什么必须做这一步：线路的**身份是 URL**，而在此之前只有"管理员手工录入"与
-// "agent 一键拉起"两条路径会写 `egress_proxies` —— 用户在控制台配的出口
-// 只落在 `accounts.egress_proxy`，管理后台的线路池里看不见它，
-// 于是「统一查看 / 选择 / 分配」全部无从谈起。
-//
-// 三条边界（都在这里写死，不靠调用方自觉）：
-//  1. 空串 / direct **不登记**（它们不是线路，是"不出代理"这一决定）；
-//  2. 名称与来源如实标注（`<用户名> 的出口`），管理员一眼知道这是谁的；
-//  3. 归属**只有从 0 变非 0 这一次**（UpsertEgressProxy 的 ON CONFLICT 里做），
-//     不让后写的把先认领的挤掉。
-func (a *app) ensureUserEgressLine(u *User, rawURL string) string {
-	url := strings.TrimSpace(rawURL)
-	if url == "" || egress.IsDirect(url) || u == nil {
-		return ""
-	}
-	if _, err := egress.Validate(url); err != nil {
-		// 走不到这里（调用方已校验过），但多一层防御：绝不把非法 URL 写进池。
-		return ""
-	}
-	now := time.Now().Unix()
-	note := fmt.Sprintf("由用户「%s」在控制台「设置 → 我的出口」配置", u.Username)
-	var hit *EgressProxy
-	if list, err := a.store.ListEgressProxies(); err == nil {
-		for _, p := range list {
-			if strings.TrimSpace(p.URL) == url {
-				hit = p
-				break
-			}
-		}
-	}
-	// ⚠️ 命中已存在的线路时先判归属（v0.31.35）：下面那句无条件 `hit.Enabled = true`
-	// 会把**别人停用的线路重新启用** —— 一个用户只要在设置页填上别人线路的 URL
-	// 就能把那条线拉活。这类"副作用跨过归属边界"的代码必须在这里截住。
-	if hit != nil && hit.OwnerUserID > 0 && hit.OwnerUserID != u.ID {
-		log.Printf("WARN: [host] 用户 %s 试图登记他人线路 %s（owner=#%d），已拒绝",
-			u.Username, url, hit.OwnerUserID)
-		return ""
-	}
-	if hit == nil {
-		hit = &EgressProxy{
-			ID:        newEgressProxyID(url),
-			Name:      u.Username + " 的出口",
-			URL:       url,
-			Region:    egressHostOf(url),
-			Note:      note,
-			Enabled:   true,
-			CreatedAt: now,
-		}
-	} else if strings.TrimSpace(hit.Note) == "" || hit.OwnerUserID == 0 {
-		// 已存在（可能是管理员手工录入过）：补上来源说明，但**不动**已有的名字/地区。
-		hit.Note = note
-	}
-	hit.Enabled = true
-	hit.UpdatedAt = now
-	if hit.OwnerUserID == 0 {
-		hit.OwnerUserID = u.ID
-	}
-	if err := a.store.UpsertEgressProxy(hit); err != nil {
-		log.Printf("WARN: [host] 登记用户出口线路失败 url=%s：%v", url, err)
-		return ""
-	}
-	return hit.ID
 }
 
 // egressHostOf 从代理 URL 里取 host:port，用于线路的「地区 / 出口」展示位。

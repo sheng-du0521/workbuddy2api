@@ -117,33 +117,6 @@ func TestEgressPortSeg(t *testing.T) {
 	}
 }
 
-// TestEgressPortSegMigration 老机器（端口在段外）会被迁回本段。
-//
-// v0.31.24 的端口是全局分配的 —— 用户机器可能拿到 11081，而 v0.31.25 给它加了
-// 只允许 12xxx 的 permitlisten 白名单。不迁的话那台机器**再也建不起隧道**。
-func TestEgressPortSegMigration(t *testing.T) {
-	f := usApp(t)
-	tokA, _ := f.app.egressAgentTokenFor(f.userA.ID)
-	usPoll(t, f, tokA, "pc-a", "host-a")
-	key := egressMachineKey(f.userA.ID, "pc-a")
-
-	// 人为把端口改成平台段（模拟 v0.31.24 遗留），再走一次 poll。
-	m := f.app.machinesLoad()
-	m[key].Ports.TunnelPort = egressBaseTunnelPort
-	if err := f.app.machinesSave(m); err != nil {
-		t.Fatalf("machinesSave: %v", err)
-	}
-	usPoll(t, f, tokA, "pc-a", "host-a")
-
-	mm := f.app.machinesLoad()[key]
-	if !egressMachinePortInSeg(mm) {
-		t.Fatalf("迁移后端口应在本账号段内，得 %d", mm.Ports.TunnelPort)
-	}
-	if mm.Cmd != "start" {
-		t.Fatal("迁移后应重新下发 start（否则 agent 还在用旧端口建隧道）")
-	}
-}
-
 // TestEgressAuthKeyRestrictions ⚠️ 本版最关键的安全断言。
 //
 // 用户拿到的 SSH 密钥必须是**受限**的：不能开 shell，且 `permitlisten` 只允许
@@ -225,11 +198,12 @@ func TestEgressInstallScriptHasNoSecretMaterial(t *testing.T) {
 	_ = adminCookie
 
 	req := httptest.NewRequest(http.MethodGet, "http://cloud.example:8780/api/egress/home/install", nil)
-	script, err := a.egressInstallScript(req, egressScope{UserID: u.ID})
+	// v0.31.53：安装包只面向平台机器（用户端自助代理已下线）。
+	script, err := a.egressInstallScript(req, egressScope{Platform: true})
 	if err != nil {
 		t.Fatalf("egressInstallScript: %v", err)
 	}
-	tok, _ := a.egressAgentTokenFor(u.ID)
+	tok, _ := a.egressAgentTokenFor(0)
 	for _, want := range []string{
 		"http://cloud.example:8780", // 服务地址自动带上
 		tok,                         // 他自己的令牌
@@ -240,6 +214,10 @@ func TestEgressInstallScriptHasNoSecretMaterial(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("安装脚本应包含 %q", want)
 		}
+	}
+	// 用户端下线后还多一条：脚本里**不该**出现任何"发给某个用户"的痕迹。
+	if userTok, _ := a.egressAgentTokenFor(u.ID); strings.Contains(script, userTok) {
+		t.Error("安装脚本不该携带用户令牌（用户端代理已下线）")
 	}
 	for _, bad := range []string{"PRIVATE KEY", "BEGIN OPENSSH", "permitlisten"} {
 		if strings.Contains(script, bad) {
@@ -334,18 +312,19 @@ func TestEgressAgentBundleMissingFile(t *testing.T) {
 // stopAll 再重建一次。连点三下的表现是"点了反而更慢、还一闪一闪"。
 func TestEgressPullDedup(t *testing.T) {
 	f := usApp(t)
-	tokA, _ := f.app.egressAgentTokenFor(f.userA.ID)
-	usPoll(t, f, tokA, "pc-a", "host-a")
-	key := egressMachineKey(f.userA.ID, "pc-a")
+	// v0.31.53：pull 只剩平台视角，用平台机器（default 桶）+ 管理员会话。
+	tokP, _ := f.app.egressAgentTokenGet()
+	usPoll(t, f, tokP, "", "host-plat")
+	key := egressDefaultMachine
 
 	if code, body := eaReq(t, f.mux, "POST", "/api/egress/home/pull",
-		`{"machine":"`+key+`"}`, f.cookieA, ""); code != http.StatusOK {
+		`{"machine":"`+key+`"}`, f.adminCookie, ""); code != http.StatusOK {
 		t.Fatalf("第一次 pull 应 200，得 %d %s", code, body)
 	}
 	at1 := f.app.machinesLoad()[key].CmdAt
 
 	code, raw := eaReq(t, f.mux, "POST", "/api/egress/home/pull",
-		`{"machine":"`+key+`"}`, f.cookieA, "")
+		`{"machine":"`+key+`"}`, f.adminCookie, "")
 	if code != http.StatusOK {
 		t.Fatalf("去抖期内重复 pull 应仍 200（幂等语义），得 %d %s", code, raw)
 	}
@@ -356,11 +335,10 @@ func TestEgressPullDedup(t *testing.T) {
 		t.Fatalf("去抖期内不该刷新指令 At（否则 agent 会重建隧道）：%d → %d", at1, at2)
 	}
 	// 另一台机器不受影响（去抖是按机器而不是全局）。
-	tokB, _ := f.app.egressAgentTokenFor(f.userB.ID)
-	usPoll(t, f, tokB, "pc-b", "host-b")
-	keyB := egressMachineKey(f.userB.ID, "pc-b")
+	// v0.31.53：出口只剩平台机器，第二台的键就是 agent 自报的 id（owner=0）。
+	usPoll(t, f, tokP, "plat-b", "host-plat2")
 	codeB, rawB := eaReq(t, f.mux, "POST", "/api/egress/home/pull",
-		`{"machine":"`+keyB+`"}`, f.cookieB, "")
+		`{"machine":"plat-b"}`, f.adminCookie, "")
 	if codeB != http.StatusOK || strings.Contains(rawB, `"deduped":true`) {
 		t.Fatalf("另一台机器不该被去抖，得 %d %s", codeB, rawB)
 	}
@@ -390,9 +368,9 @@ func TestEgressApplySingleFlight(t *testing.T) {
 // TestEgressApplyBusyReturns409 忙碌时接口要回 409 + 人话，而不是静默排队。
 func TestEgressApplyBusyReturns409(t *testing.T) {
 	f := usApp(t)
-	tokA, _ := f.app.egressAgentTokenFor(f.userA.ID)
-	usPoll(t, f, tokA, "pc-a", "host-a")
-	key := egressMachineKey(f.userA.ID, "pc-a")
+	tokP, _ := f.app.egressAgentTokenGet()
+	usPoll(t, f, tokP, "", "host-plat")
+	key := egressDefaultMachine
 	// 手动占住"正在应用"。
 	release, busy := egressApplyBegin(key)
 	if busy {
@@ -401,7 +379,7 @@ func TestEgressApplyBusyReturns409(t *testing.T) {
 	defer release()
 
 	code, raw := eaReq(t, f.mux, "POST", "/api/egress/home/apply",
-		`{"machine":"`+key+`"}`, f.cookieA, "")
+		`{"machine":"`+key+`"}`, f.adminCookie, "")
 	if code != http.StatusConflict {
 		t.Fatalf("忙碌时应 409，得 %d %s", code, raw)
 	}
@@ -413,16 +391,15 @@ func TestEgressApplyBusyReturns409(t *testing.T) {
 // TestEgressPollSegmentFullRejects 段满时 poll 明确报错（而不是给个 0 端口）。
 func TestEgressPollSegmentFullRejects(t *testing.T) {
 	f := usApp(t)
-	tokA, _ := f.app.egressAgentTokenFor(f.userA.ID)
-	key := egressMachineKey(f.userA.ID, "x")
-	_ = key
+	// v0.31.53：用户 agent 已不能接入，段满改用**平台段**验证（同一套分配逻辑）。
+	tokP, _ := f.app.egressAgentTokenGet()
 
-	// 先把该用户的段占满（10 台）。
+	// 先把平台段占满（10 台）。
 	m := f.app.machinesLoad()
-	base, span := egressPortSegOf(f.userA.ID)
+	base, span := egressPortSegOf(0)
 	for i := 0; i < span; i++ {
-		m[egressMachineKey(f.userA.ID, "fill"+strconv.Itoa(i))] = &egressMachine{
-			ID: "fill" + strconv.Itoa(i), OwnerUserID: f.userA.ID,
+		m[egressMachineKey(0, "fill"+strconv.Itoa(i))] = &egressMachine{
+			ID: "fill" + strconv.Itoa(i), OwnerUserID: 0,
 			Ports: egressAgentPorts{ProxyPort: 1080, TunnelPort: base + i},
 		}
 	}
@@ -430,7 +407,7 @@ func TestEgressPollSegmentFullRejects(t *testing.T) {
 		t.Fatalf("machinesSave: %v", err)
 	}
 	// 第 11 台（新 machine id）→ 409。
-	code, raw := eaReq(t, f.mux, "GET", "/api/agent/poll?machine=overflow&hostname=h", "", "", tokA)
+	code, raw := eaReq(t, f.mux, "GET", "/api/agent/poll?machine=overflow&hostname=h", "", "", tokP)
 	if code != http.StatusConflict {
 		t.Fatalf("段满应 409，得 %d %s", code, raw)
 	}

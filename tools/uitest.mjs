@@ -2306,36 +2306,50 @@ function run(pageFile, meOverride, plan) {
   egrBad.forEach((m) => console.log('  [FAIL] egr-cards: ' + m));
   if (!egrBad.length) console.log('  [ok] egr-cards: 代理页线路卡能渲染（键名与前端读取一致）');
 
-  // v0.31.24：**用户视角的代理页必须能操作，且文案不误导**。
+  // v0.31.53：**用户端不再具备任何代理使用能力**。
   //
-  // 这一版把出口的三个执行端点从 adminGuard 放开给登录用户
-  // （在此之前普通用户点「一键拉起」只会拿到 403）。前端是配套的一半：
-  // 服务端开好了权限，页面若仍按"只读"渲染，用户看到的还是那句
-  // "仅管理员可执行" —— 权限下沉就白做了。
+  // 这是一条"删功能"的守卫，写法与加法相反：绝大多数断言在证明某样东西
+  // **不存在**（入口、DOM、接口调用、文案）。只留一处正向 —— 平台面板的 DOM
+  // 必须还在，因为管理员还要用它操作平台机器。
   //
-  // 同时钉住**另一半**：用户视角**不能出现「全局默认出口」**。
-  // 对一个没有这个开关的人讲它，只会让他以为页面坏了，
-  // 更坏的是让他以为"我改了什么会影响全平台"。
+  // 为什么源码级断言不可省：删掉的功能不会自己报错，它只会"悄悄地又能用了"
+  // （某次合并、某次恢复旧分支）。CI 里唯一能发现这件事的地方就是这里。
   const egrSelfBad = [];
   {
-    const html = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8')
-      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const dashSrc = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8');
+    const html = dashSrc.replace('<script src="/app.js"></script>',
+      '<script>' + APP_JS + '</script>');
+
+    // ① 用户端不得再出现任何"账号出口配置"的痕迹。
+    const forbidden = [
+      ['egrAccBox', '「我的账号出口」卡片'],
+      ['egrAccHint', '逐号出口的计数提示'],
+      ['按出口 IP 均衡', '逐号均衡按钮'],
+      ['全部改绑', '批量改绑按钮'],
+      ['/api/host/egress', '用户端出口接口调用'],
+      ['setEgrUrl', '设置页手填出口的输入框'],
+      ['btnSetEgrAll', '设置页「应用到全部代挂号」按钮'],
+    ];
+    for (const [needle, what] of forbidden) {
+      if (APP_JS.indexOf(needle) >= 0) egrSelfBad.push('app.js 仍残留' + what + '（' + needle + '）');
+      if (dashSrc.indexOf(needle) >= 0) egrSelfBad.push('dashboard.html 仍残留' + what + '（' + needle + '）');
+    }
+    // ② 平台面板的 DOM 必须保留（管理员入口），且不得回到侧导航。
+    if (dashSrc.indexOf('data-plugin-view="host-egress"') < 0) {
+      egrSelfBad.push('平台直属出口面板的 DOM 丢了 —— 管理员将完全没有出口入口');
+    }
+    if (dashSrc.indexOf('data-nav="egress"') >= 0) {
+      egrSelfBad.push('侧导航仍有「代理」项 —— 出口只应通过插件进入');
+    }
+    if (dashSrc.indexOf('平台直属出口') < 0) {
+      egrSelfBad.push('出口面板标题应改为「平台直属出口」（原「本地出口代理」是用户语气）');
+    }
+
+    // ③ 行为：普通用户的插件列表里**没有**出口插件。
+    //    桩只回 2 个插件 —— 与服务端真实行为一致（audience=admin 不发给用户）。
     const vc = new VirtualConsole();
     vc.on('jsdomError', () => {});
     vc.on('error', () => {});
-    const SELF_VIEW = {
-      machines: [{
-        id: 'u2:pc-a', hostname: 'host-a', online: true, tunnel_reachable: true, ready: true,
-        proxy_ok: true, tunnel_ok: true, exit_ip: '1.2.3.4（山东）',
-        proxy_port: 1080, tunnel_port: 11081, proxy_url: 'http://127.0.0.1:11081',
-        applied: true, host_bound: 2, host_total: 2, last_at: now, is_default: false,
-      }],
-      agent_online: true, tunnel_reachable: true, applied: true, ready: true,
-      default_egress: '', host_bound: 2, host_total: 2,
-      can_manage: true, manage_scope: 'self', poll_sec: 5,
-      agent_command: 'wb2api-egress-agent.exe -server http://x -token ag2-stub',
-      active_machine: 'u2:pc-a',
-    };
     const dom = new JSDOM(html, {
       runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
       url: 'http://127.0.0.1:8780/dashboard.html',
@@ -2344,55 +2358,21 @@ function run(pageFile, meOverride, plan) {
         win.__autoPrompt = null;
         win.fetch = (url) => {
           const u = String(url);
-          if (u.indexOf('/api/egress/home') >= 0) {
-            const body = JSON.stringify(SELF_VIEW);
-            return Promise.resolve({ ok: true, status: 200,
-              text: () => Promise.resolve(body), json: () => Promise.resolve(SELF_VIEW) });
-          }
-          // 插件列表（v0.31.34）：三种 kind 各一个，用来验"打开 = 独立界面"。
           if (u.indexOf('/api/plugins') >= 0 && u.indexOf('/enabled') < 0) {
             const PLUG = { plugins: [
               { id: 'claim-compensation', name: '多账号领取积分补偿', desc: '桩',
                 audience: 'both', builtin: true, enabled: true, active: true, kind: 'claim' },
               { id: 'health-check', name: '账号健康检测', desc: '桩',
                 audience: 'both', builtin: true, enabled: true, active: true, kind: 'health' },
-              { id: 'host-egress', name: '本地出口代理', desc: '桩',
-                audience: 'user', builtin: true, enabled: true, active: true, kind: 'egress' },
             ] };
             return Promise.resolve({ ok: true, status: 200,
               text: () => Promise.resolve(JSON.stringify(PLUG)),
               json: () => Promise.resolve(PLUG) });
           }
-          // 我的账号出口（v0.31.31）：两条线路、两个不同出口 IP、两个号。
-          // 页面必须按 IP 报数，并且逐号给出"从哪出去"。
-          if (u.indexOf('/api/host/egress/lines') >= 0) {
-            const LINES = {
-              lines: [
-                { url: 'http://127.0.0.1:12070', name: '家里', owner_user_id: 2, mine: true,
-                  platform: false, enabled: true, last_ok: true, exit_ip: '1.1.1.1',
-                  bound_mine: 1, bound_total: 1, note: '' },
-                { url: 'http://127.0.0.1:12071', name: '公司', owner_user_id: 2, mine: true,
-                  platform: false, enabled: true, last_ok: true, exit_ip: '2.2.2.2',
-                  bound_mine: 1, bound_total: 1, note: '' },
-              ],
-              accounts: [
-                { uid: 'hx-1', nickname: '甲', configured: 'http://127.0.0.1:12070',
-                  resolved: 'http://127.0.0.1:12070', resolved_name: '家里', exit_ip: '1.1.1.1',
-                  exit_source: 'line' },
-                { uid: 'hx-2', nickname: '乙', configured: '',
-                  resolved: 'http://127.0.0.1:12071', resolved_name: '公司', exit_ip: '2.2.2.2',
-                  exit_source: 'line' },
-              ],
-              default_egress: '', distinct_exit_ips: 2,
-            };
-            return Promise.resolve({ ok: true, status: 200,
-              text: () => Promise.resolve(JSON.stringify(LINES)),
-              json: () => Promise.resolve(LINES) });
-          }
           if (u.indexOf('/api/auth/me') >= 0) {
             return Promise.resolve({ ok: true, status: 200,
-              text: () => Promise.resolve('{"user":{"id":2,"username":"u2","is_admin":false}}'),
-              json: () => Promise.resolve({ user: { id: 2, username: 'u2', is_admin: false } }) });
+              text: () => Promise.resolve('{"user":{"id":1,"username":"root","is_admin":true}}'),
+              json: () => Promise.resolve({ user: { id: 1, username: 'root', is_admin: true } }) });
           }
           return Promise.resolve({ ok: true, status: 200,
             text: () => Promise.resolve('{}'), json: () => Promise.resolve({}) });
@@ -2408,116 +2388,125 @@ function run(pageFile, meOverride, plan) {
     const w = dom.window;
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
-    // v0.31.34：代理页已并入插件，侧导航不再有 egress 项 ——
-    // 必须走 openPluginView 进入（这也顺带验证了「插件能打开独立界面」）。
-    if (typeof w.openPluginView === 'function') {
-      w.openPluginView({ id: 'host-egress', name: '本地出口代理', kind: 'egress', desc: '桩' });
-    }
-    await wait(700);
-    const box = w.document.getElementById('egressHomeBox');
-    const txt = box ? String(box.textContent) : '';
-    if (!box || !box.children.length) {
-      egrSelfBad.push('用户视角的代理页没渲染出任何内容（应能看到自己的机器与操作区）');
-    } else {
-      if (txt.indexOf('拉起') < 0) {
-        egrSelfBad.push('用户视角应出现「一键拉起」按钮（权限已下沉，前端不能仍按只读渲染）');
-      }
-      if (txt.indexOf('仅管理员') >= 0) {
-        egrSelfBad.push('用户视角不该再出现「仅管理员可执行」的旧文案');
-      }
-      // ⚠️ 断言的是**配置行**形态（`全局默认出口：…`），不是这个词本身：
-      // 用户视角的说明文案里**允许**出现"平台的全局默认出口不会被动" ——
-      // 那是一句安抚，不是给了一个开关。真正要禁的是把它**列成一行配置**，
-      // 那会让人以为"这是我的设置项"。
-      if (txt.indexOf('全局默认出口：') >= 0) {
-        egrSelfBad.push('用户视角不该把「全局默认出口」列成配置行（那不是他有的开关）');
-      }
-      if (txt.indexOf('我的代挂号绑定') < 0) {
-        egrSelfBad.push('用户视角的绑定计数应叫「我的代挂号绑定」（而不是「自挂号绑定」）');
-      }
-    }
-
-    // v0.31.31：**逐号出口分配**必须真的渲染出来（这是"两台电脑各出各的 IP"的落地动作）。
-    const accBox = w.document.getElementById('egrAccBox');
-    const accTxt = accBox ? String(accBox.textContent) : '';
-    if (!accBox || !accBox.children.length) {
-      egrSelfBad.push('#egrAccBox 没渲染 —— 用户端仍无法逐号指定出口');
-    } else {
-      // 条数口径写在卡片标题旁（#egrAccHint）：那里才是"共 N 条线路、实际 M 个 IP"。
-      const accHint = w.document.getElementById('egrAccHint');
-      const hintTxt = accHint ? String(accHint.textContent) : '';
-      if (hintTxt.indexOf('2 个不同出口 IP') < 0) {
-        egrSelfBad.push(`我的账号出口应按 IP 报数（期望含「2 个不同出口 IP」），实得「${hintTxt.slice(0, 120)}」`);
-      }
-      if (accTxt.indexOf('出口 IP 1.1.1.1') < 0 || accTxt.indexOf('出口 IP 2.2.2.2') < 0) {
-        egrSelfBad.push('逐号列表应显示每个号的实际出口 IP（两个 IP 都要出现）');
-      }
-      if (accTxt.indexOf('按出口 IP 均衡') < 0) {
-        egrSelfBad.push('缺少「按出口 IP 均衡」按钮 —— 用户没有办法一键把号分散到不同出口');
-      }
-    }
-    // v0.31.34：**代理并入插件**，且插件打开后是独立界面（不是卡片里的小面板）。
-    //
-    // 这一条同时守住三件事：
-    //   ① 侧导航不再有「代理」项（否则等于两个入口，状态会打架）；
-    //   ② 代理页 DOM 带 data-plugin-view，且带返回栏（用户必须能退出来）；
-    //   ③ 点插件卡的「打开」真的整页切过去，再点返回真的回到插件列表。
-    const dashSrc = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8');
-    if (dashSrc.indexOf('data-nav="egress"') >= 0) {
-      egrSelfBad.push('用户端侧导航仍有「代理」项 —— 它已并入插件，两个入口会各显示一套状态');
-    }
-    if (dashSrc.indexOf('data-plugin-view="host-egress"') < 0) {
-      egrSelfBad.push('代理页缺少 data-plugin-view 标记，openPluginView 找不到它');
-    }
-    if (dashSrc.indexOf('data-plugin-back') < 0) {
-      egrSelfBad.push('代理页缺少「← 插件」返回栏，用户进去就出不来');
-    }
-
-    // 行为：进插件列表 → 点「本地出口代理」的「打开」→ 断言整页切换 → 返回。
     if (typeof w.navGo === 'function') w.navGo('plugins');
-    await wait(500);
+    await wait(600);
     const cards = Array.from(w.document.querySelectorAll('#pluginCards .card'));
-    if (cards.length !== 3) {
-      egrSelfBad.push(`插件页应渲染 3 张卡，实得 ${cards.length}`);
+    if (cards.length !== 2) {
+      egrSelfBad.push(`普通用户插件页应只有 2 张卡（领取/体检），实得 ${cards.length}`);
     }
-    const egrCardEl = cards.find((c) => String(c.textContent).indexOf('本地出口代理') >= 0);
-    if (!egrCardEl) {
-      egrSelfBad.push('插件列表里没有「本地出口代理」—— 代理入口彻底丢了');
-    } else {
-      const openBtn = Array.from(egrCardEl.querySelectorAll('button'))
-        .find((b) => String(b.textContent).trim() === '打开');
-      if (!openBtn) {
-        egrSelfBad.push('「本地出口代理」卡上没有「打开」按钮');
-      } else {
-        openBtn.click();
-        await wait(400);
-        const egrPane = w.document.querySelector('.pane[data-pane="egress"]');
-        if (!egrPane || !egrPane.classList.contains('active')) {
-          egrSelfBad.push('点「打开」后代理页没有变成独立界面（pane 未激活）');
-        }
-        const title = w.document.getElementById('pageTitle');
-        if (!title || String(title.textContent).indexOf('本地出口代理') < 0) {
-          egrSelfBad.push('进入插件后标题应改成插件名（用户要知道自己在哪一页）');
-        }
-        const back = egrPane ? egrPane.querySelector('[data-plugin-back]') : null;
-        if (!back) {
-          egrSelfBad.push('独立界面缺少返回按钮');
-        } else {
-          back.click();
-          await wait(400);
-          const plugPane = w.document.querySelector('.pane[data-pane="plugins"]');
-          if (!plugPane || !plugPane.classList.contains('active')) {
-            egrSelfBad.push('点「← 插件」没有回到插件列表');
-          }
-        }
-      }
+    const allText = cards.map((c) => String(c.textContent)).join('|');
+    if (allText.indexOf('出口') >= 0 || allText.indexOf('代理') >= 0) {
+      egrSelfBad.push('普通用户插件列表里仍有「出口/代理」字样 —— 入口没有真正下线');
     }
-
     try { w.close(); } catch (e) {}
   }
   egrSelfBad.forEach((m) => console.log('  [FAIL] egress-self: ' + m));
   if (!egrSelfBad.length) {
-    console.log('  [ok] egress-self: 代理并入插件且能进独立界面；用户视角不出现「全局默认出口」');
+    console.log('  [ok] egress-self: 用户端零代理能力（无入口/无分配/无接口调用），平台面板 DOM 保留');
+  }
+
+  // v0.31.53：**管理员视角**仍要能用平台直属出口面板 —— 这是本次删功能时
+  // 唯一需要"保住"的东西。若只做删除而不验这一面，很可能把管理员也一起锁死。
+  const egrAdminBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const ADMIN_VIEW = {
+      machines: [{
+        id: 'default', hostname: 'plat-pc', online: true, tunnel_reachable: true, ready: true,
+        proxy_ok: true, tunnel_ok: true, exit_ip: '9.9.9.9',
+        proxy_port: 1080, tunnel_port: 11080, proxy_url: 'http://127.0.0.1:11080',
+        applied: true, bound_accounts: 47, carrying: true, last_at: now, is_default: true,
+      }],
+      agent_online: true, tunnel_reachable: true, applied: true, ready: true,
+      default_egress: 'http://127.0.0.1:11080', bound_accounts: 47, carrying: true,
+      can_manage: true, manage_scope: 'platform', poll_sec: 5,
+      agent_command: 'wb2api-egress-agent.exe -server http://x -token ag3-stub',
+      active_machine: 'default',
+    };
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/dashboard.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.fetch = (url) => {
+          const u = String(url);
+          if (u.indexOf('/api/egress/home') >= 0) {
+            const body = JSON.stringify(ADMIN_VIEW);
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(body), json: () => Promise.resolve(ADMIN_VIEW) });
+          }
+          if (u.indexOf('/api/plugins') >= 0 && u.indexOf('/enabled') < 0) {
+            const PLUG = { plugins: [
+              { id: 'claim-compensation', name: '多账号领取积分补偿', desc: '桩',
+                audience: 'both', builtin: true, enabled: true, active: true, kind: 'claim' },
+              { id: 'health-check', name: '账号健康检测', desc: '桩',
+                audience: 'both', builtin: true, enabled: true, active: true, kind: 'health' },
+              { id: 'host-egress', name: '平台直属出口', desc: '桩',
+                audience: 'admin', builtin: true, enabled: true, active: true, kind: 'egress' },
+            ] };
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve(JSON.stringify(PLUG)),
+              json: () => Promise.resolve(PLUG) });
+          }
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return Promise.resolve({ ok: true, status: 200,
+              text: () => Promise.resolve('{"user":{"id":1,"username":"root","is_admin":true}}'),
+              json: () => Promise.resolve({ user: { id: 1, username: 'root', is_admin: true } }) });
+          }
+          return Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve('{}'), json: () => Promise.resolve({}) });
+        };
+        win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+        win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+        win.navigator.clipboard = { writeText: () => Promise.resolve() };
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
+      },
+    });
+    const w = dom.window;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+    if (typeof w.navGo === 'function') w.navGo('plugins');
+    await wait(600);
+    const cards = Array.from(w.document.querySelectorAll('#pluginCards .card'));
+    const egrCard = cards.find((c) => String(c.textContent).indexOf('平台直属出口') >= 0);
+    if (!egrCard) {
+      egrAdminBad.push('管理员插件列表里没有「平台直属出口」—— 管理员将无法操作平台机器');
+    } else {
+      const openBtn = Array.from(egrCard.querySelectorAll('button'))
+        .find((b) => String(b.textContent).trim() === '打开');
+      if (!openBtn) egrAdminBad.push('「平台直属出口」卡上没有「打开」按钮');
+      else {
+        openBtn.click();
+        await wait(700);
+        const pane = w.document.querySelector('.pane[data-pane="egress"]');
+        if (!pane || !pane.classList.contains('active')) {
+          egrAdminBad.push('点「打开」后出口页没有激活');
+        }
+        const box = w.document.getElementById('egressHomeBox');
+        const txt = box ? String(box.textContent) : '';
+        if (!txt) egrAdminBad.push('平台出口面板渲染为空');
+        if (txt.indexOf('全局默认出口') < 0) egrAdminBad.push('平台面板应显示「全局默认出口」');
+        if (txt.indexOf('承载账号') < 0) egrAdminBad.push('平台面板应显示「承载账号」（承重口径）');
+        if (txt.indexOf('拉起') < 0) egrAdminBad.push('平台面板应有「一键拉起」');
+        // 反向：分配动作不得回到这个面板（它现在只做"立线路"）。
+        if (txt.indexOf('全部改绑') >= 0) egrAdminBad.push('平台面板仍有「全部改绑」—— 分配应只在管理后台');
+        if (pane && String(pane.textContent).indexOf('按出口 IP 均衡') >= 0) {
+          egrAdminBad.push('平台面板仍有「按出口 IP 均衡」—— 那是用户端能力');
+        }
+      }
+    }
+    try { w.close(); } catch (e) {}
+  }
+  egrAdminBad.forEach((m) => console.log('  [FAIL] egress-admin: ' + m));
+  if (!egrAdminBad.length) {
+    console.log('  [ok] egress-admin: 管理员仍可打开平台直属出口（立线路/看承重），且不提供逐号分配');
   }
 
   // v0.31.32：**重新登录必须能自助完成**（扫码 或 导入 auth JSON），
@@ -2572,9 +2561,6 @@ function run(pageFile, meOverride, plan) {
     if (!dash.includes('计费以它为准')) {
       rlBad.push('dashboard.html 未说明“倍率仅供对照、计费看实测”');
     }
-    if (!APP_JS.includes('skipped_pooled')) {
-      rlBad.push('app.js 未说明 skipped_pooled（用户会以为“没生效”）');
-    }
     const pluginSrc = fs.readFileSync(path.join(ROOT, 'cmd/webapp/host_import.go'), 'utf8');
     if (!pluginSrc.includes('OwnerUserID != u.ID')) {
       rlBad.push('host_import.go 缺少归属校验（会把别人的号导到自己名下）');
@@ -2597,7 +2583,7 @@ function run(pageFile, meOverride, plan) {
         builtin: true, enabled: true, active: true, kind: 'claim' },
       { id: 'health-check', name: '账号健康检测', desc: '桩', audience: 'both',
         builtin: true, enabled: true, active: true, kind: 'health' },
-      { id: 'host-egress', name: '本地出口代理', desc: '桩', audience: 'user',
+      { id: 'host-egress', name: '平台直属出口', desc: '桩', audience: 'admin',
         builtin: true, enabled: true, active: true, kind: 'egress' },
     ] };
     const HEALTH = {
@@ -2648,7 +2634,7 @@ function run(pageFile, meOverride, plan) {
     const wants = [
       { name: '多账号领取积分补偿', pane: 'plugin-claim-compensation', must: '开始领取' },
       { name: '账号健康检测', pane: 'plugin-health-check', must: '开始检测' },
-      { name: '本地出口代理', pane: 'egress', must: '本地出口代理' },
+      { name: '平台直属出口', pane: 'egress', must: '平台直属出口' },
     ];
     for (const want of wants) {
       const cards = Array.from(w.document.querySelectorAll('#pluginCards .card'));
@@ -2716,8 +2702,8 @@ function run(pageFile, meOverride, plan) {
       ecBad.push('admin_ext.go 绕过 setAccountEgress 直接写账号出口（不会登记进线路池）');
     }
     const hostSrc = read('cmd/webapp/host.go');
-    if (!hostSrc.includes('a.setAccountEgress(')) {
-      ecBad.push('host.go 的「我的出口」没有走统一入口（用户填的地址不会进线路池）');
+    if (hostSrc.includes('handleHostEgress')) {
+      ecBad.push('host.go 仍保留用户出口写入口（用户端代理应已整体下线）');
     }
     const align = read('cmd/webapp/egress_align.go');
     if (!align.includes('ensureEgressLineRegistered')) {
@@ -2769,10 +2755,20 @@ function run(pageFile, meOverride, plan) {
     if (!agent.includes('egress.Probe(url)')) emBad.push('准入门槛没有用真实出网探测');
     // 验证必须在"注册线路/绑账号"之前 return。
     // 验证可能经钩子调用（生产 verifyLineUsable / 测试用桩），断言要认两处。
-    const verifyIdx = agent.indexOf('a.verifyLineUsable');
-    const bindIdx = agent.indexOf('SetAccountEgress(');
-    if (verifyIdx < 0 || bindIdx < 0 || verifyIdx > bindIdx) {
-      emBad.push('线路验证必须在绑号之前（否则坏线路已经被绑上了）');
+    // v0.31.53：绑号已从 apply 里移走，这条不变量因此升级为更强的一条 ——
+    // apply 根本不绑号；分配只有一个写入口（管理端 assign）。
+    const applyStart = agent.indexOf('func (a *app) applyHomeEgress(');
+    const applyEnd = agent.indexOf('// userNameByID', applyStart);
+    const applyBody = applyStart >= 0 && applyEnd > applyStart ? agent.slice(applyStart, applyEnd) : '';
+    if (!applyBody) {
+      emBad.push('找不到 applyHomeEgress（守卫失去着力点）');
+    } else {
+      if (applyBody.indexOf('SetAccountEgress(') >= 0) {
+        emBad.push('apply 又开始改账号出口（分配必须只在管理后台）');
+      }
+      if (applyBody.indexOf('不再绑定任何账号') < 0) {
+        emBad.push('apply 缺少不绑号的说明（下一个人会以为它该绑）');
+      }
     }
     if (!agent.includes('errEgressNotUsable')) emBad.push('缺哨兵错误（状态码会跟着文案漂）');
 
@@ -3193,7 +3189,8 @@ function run(pageFile, meOverride, plan) {
     if (!adminHtml.includes("a.source === 'qr'")) srcBad.push('admin.html 账号卡没有来源标签');
     const appJs = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
     if (!appJs.includes('downloadText')) srcBad.push('app.js 缺少「扫码后下载 auth JSON」的实现');
-    if (!appJs.includes('refresh_lost')) srcBad.push('app.js 没有「仅剩 access」提示（用户端看不到预警）');
+    const dashHtml = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8');
+    if (!dashHtml.includes('refresh_lost')) srcBad.push('dashboard.html 没有「仅剩 access」提示（用户端看不到预警）');
   }
   srcBad.forEach((m) => console.log('  [FAIL] account-source: ' + m));
   if (!srcBad.length) {
@@ -3216,7 +3213,7 @@ function run(pageFile, meOverride, plan) {
     const EMPTY_VIEW = {
       machines: [], agent_online: false, tunnel_reachable: false, applied: false, ready: false,
       default_egress: '', host_bound: 0, host_total: 0,
-      can_manage: true, manage_scope: 'self', poll_sec: 5, agent_command: '',
+      can_manage: true, manage_scope: 'platform', poll_sec: 5, agent_command: '',
     };
     const dom = new JSDOM(html, {
       runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
@@ -3271,8 +3268,10 @@ function run(pageFile, meOverride, plan) {
       if (page.indexOf('双击') < 0) {
         egrSetupBad.push('应说明"在目标电脑上双击运行"（这是唯一的用户动作）');
       }
-      if (txt.indexOf('无需手动') < 0 && page.indexOf('不需要复制粘贴') < 0) {
-        egrSetupBad.push('应说明"无需复制粘贴任何参数"（这是本版要解决的问题）');
+      // v0.31.53：说明段改写为平台视角，旧的「不需要复制粘贴」文案已下线；
+      // 要保住的是安装引导本身（按钮 + 双击运行）。
+      if (page.indexOf('双击运行') < 0) {
+        egrSetupBad.push('应说明在目标电脑上双击运行（唯一的安装动作）');
       }
       // ⚠️ 刻意**不**断言"没有复制命令"：bat 只适用于 Windows，
       // macOS / Linux 用户仍需要那行命令作为 fallback（页面同时给两条路是对的）。

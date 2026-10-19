@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestCreateKeyAccountUIDsRequiresHost 传了 account_uids 却没传 kind=host → 400。
@@ -35,33 +34,6 @@ func TestCreateKeyAccountUIDsRequiresHost(t *testing.T) {
 	uids, _ := k["account_uids"].([]any)
 	if len(uids) != 1 || uids[0] != "us-a-acct" {
 		t.Fatalf("绑定应生效，得 %v", k["account_uids"])
-	}
-}
-
-// TestEgressUserLineQuota 每用户线路条数上限（默认 2）。
-//
-// 为什么需要：每条用户线路占一个端口 + 一条隧道 + 一份"别人家的网络"这个不可信边界；
-// 端口段按 uid 模 1000 分配，吃光会牵连到同一段的**别的用户**。
-func TestEgressUserLineQuota(t *testing.T) {
-	f := usApp(t)
-	// 先给他建满 2 条（走正常注册路径）。
-	for i := 0; i < 2; i++ {
-		url := egressHomeURL(12000 + int(f.userA.ID%1000)*10 + i)
-		if err := f.store.UpsertEgressProxy(scopeLine(f.userA.ID, url, true)); err != nil {
-			t.Fatalf("UpsertEgressProxy: %v", err)
-		}
-	}
-	// 第 3 条（新端口）必须被拒。
-	thirdPort := 12000 + int(f.userA.ID%1000)*10 + 5
-	_, err := f.app.applyHomeEgress(thirdPort, egressScope{UserID: f.userA.ID}, true)
-	if err == nil || !strings.Contains(err.Error(), "上限") {
-		t.Fatalf("第 3 条线路应被配额拒绝，得 %v", err)
-	}
-	// 已有线路的重复应用不受影响（否则老用户升级后会被锁死）。
-	firstURL := egressHomeURL(12000 + int(f.userA.ID%1000)*10)
-	firstPort := 12000 + int(f.userA.ID%1000)*10
-	if _, err := f.app.applyHomeEgress(firstPort, egressScope{UserID: f.userA.ID}, true); err != nil {
-		t.Fatalf("已有线路重复应用不该被配额拦：%v（%s）", err, firstURL)
 	}
 }
 
@@ -101,34 +73,63 @@ func TestForceOnDisabledLineWritesFailedAudit(t *testing.T) {
 }
 
 // TestEgressMachineCarryingFlag 视图要标出"哪台在承重"（挂了号的才算）。
+//
+// v0.31.53 起 apply 不再绑号，所以这里显式模拟**管理端的分配结果**：
+// 先把号绑到线路上，再看视图是否把该机器标成 carrying。
 func TestEgressMachineCarryingFlag(t *testing.T) {
 	f := usApp(t)
-	const port = 12075
-	res, err := f.app.applyHomeEgress(port, egressScope{UserID: f.userA.ID}, true)
-	if err != nil {
+	f.app.egressVerify = func(string) (string, error) { return "198.51.100.11", nil }
+	tokP, _ := f.app.egressAgentTokenGet()
+	usPoll(t, f, tokP, "", "host-plat")
+	mm := f.app.machinesLoad()[egressDefaultMachine]
+	if mm == nil {
+		t.Fatal("平台机器应落 default 桶")
+	}
+	port := mm.Ports.TunnelPort
+	if _, err := f.app.applyHomeEgress(port, egressScope{Platform: true}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if res.HostBound == 0 {
-		t.Skip("夹具里没有可绑的号，跳过（本用例只验标记逻辑）")
+	// 管理端分配（真实链路的简化）：把两个代挂号绑到这条线路上。
+	url := egressHomeURL(port)
+	for _, uid := range []string{"us-a-acct", "us-b-acct"} {
+		if err := f.store.SetAccountEgress(uid, url); err != nil {
+			t.Fatalf("SetAccountEgress %s: %v", uid, err)
+		}
 	}
-	code, raw := eaReq(t, f.mux, "GET", "/api/egress/home", "", f.cookieA, "")
+	_ = f.app.proxy.SyncAccounts()
+
+	code, raw := eaReq(t, f.mux, "GET", "/api/egress/home", "", f.adminCookie, "")
 	if code != http.StatusOK {
-		t.Fatalf("读出口状态应 200，得 %d", code)
+		t.Fatalf("管理员读出口状态应 200，得 %d %s", code, raw)
 	}
 	d := eaJSON(t, raw)
 	list, _ := d["machines"].([]any)
 	if len(list) == 0 {
-		return // 没有机器记录（apply 不创建机器），标记无从验证
+		t.Fatal("应至少有一台平台机器")
 	}
+	found := false
 	for _, it := range list {
-		if m, ok := it.(map[string]any); ok {
-			if _, has := m["carrying"]; !has {
-				t.Fatal("机器视图缺少 carrying 标记")
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, has := m["carrying"]; !has {
+			t.Fatal("机器视图缺少 carrying 标记")
+		}
+		if _, has := m["bound_accounts"]; !has {
+			t.Fatal("机器视图缺少 bound_accounts 计数")
+		}
+		if m["id"] == egressDefaultMachine {
+			found = true
+			if m["carrying"] != true {
+				t.Fatalf("挂了 2 个号应标 carrying=true，得 %+v", m)
 			}
-			if _, has := m["bound_accounts"]; !has {
-				t.Fatal("机器视图缺少 bound_accounts 计数")
+			if n, _ := m["bound_accounts"].(float64); int(n) < 2 {
+				t.Fatalf("bound_accounts 应 >= 2，得 %v", m["bound_accounts"])
 			}
 		}
 	}
-	_ = time.Now()
+	if !found {
+		t.Fatalf("视图里找不到 default 机器：%v", usKeysOf(f.app.machinesLoad()))
+	}
 }

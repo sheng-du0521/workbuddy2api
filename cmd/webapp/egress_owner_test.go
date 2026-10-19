@@ -95,69 +95,6 @@ func TestEgressOwnerStickyAndRoundTrip(t *testing.T) {
 	}
 }
 
-// TestUserEgressAutoRegistersLine 用户配置出口 → 自动成为线路池里的一条线路。
-func TestUserEgressAutoRegistersLine(t *testing.T) {
-	store, a, mux, adminCookie, memberCookie, memberID := ownerApp(t)
-
-	const url = "http://203.0.113.7:3128"
-	code, raw := eaReq(t, mux, "POST", "/api/host/egress",
-		`{"all":true,"proxy":"`+url+`"}`, memberCookie, "")
-	if code != http.StatusOK {
-		t.Fatalf("用户设置出口应 200，得 %d %s", code, raw)
-	}
-	var resp map[string]any
-	_ = json.Unmarshal([]byte(raw), &resp)
-	if pid, _ := resp["proxy_id"].(string); pid == "" {
-		t.Fatalf("应回线路 id（自动入池），得 %v", resp["proxy_id"])
-	}
-
-	line := findProxy(t, store, url)
-	if line == nil {
-		t.Fatal("用户配置的出口没有出现在线路池里 —— 管理后台就无从「统一查看/选择/分配」")
-	}
-	if line.OwnerUserID != memberID {
-		t.Fatalf("线路归属应为该用户 %d，得 %d", memberID, line.OwnerUserID)
-	}
-	if !strings.Contains(line.Name, "ea-member") {
-		t.Fatalf("线路名应带用户名（一眼看出是谁的），得 %q", line.Name)
-	}
-
-	// ⚠️ 边界：**不碰全局默认出口**（用户提供的是不可信第三方）。
-	if def := a.defaultEgress(); def != "" {
-		t.Fatalf("用户配置出口不得改动全局默认出口，得 %q", def)
-	}
-
-	// 管理接口要能把「声明者」与「在用归属」都下发（前端据此渲染）。
-	code, raw = eaReq(t, mux, "GET", "/api/admin/egress/proxies", "", adminCookie, "")
-	if code != http.StatusOK {
-		t.Fatalf("线路池接口应 200，得 %d", code)
-	}
-	var pl map[string]any
-	if err := json.Unmarshal([]byte(raw), &pl); err != nil {
-		t.Fatalf("线路池响应不是合法 JSON: %v", err)
-	}
-	owners, _ := pl["owners"].(map[string]any)
-	if owners[url] != "ea-member" {
-		t.Fatalf("owners[%s] 应为 ea-member，得 %v", url, owners[url])
-	}
-	bn, _ := pl["bound_names"].(map[string]any)
-	arr, _ := bn[url].([]any)
-	if len(arr) != 1 || arr[0] != "ea-member" {
-		t.Fatalf("bound_names[%s] 应为 [ea-member]，得 %v", url, bn[url])
-	}
-
-	// direct / 空串不是"线路"，不许登记。
-	for _, v := range []string{`{"all":true,"proxy":"direct"}`, `{"all":true,"proxy":""}`} {
-		if code, raw := eaReq(t, mux, "POST", "/api/host/egress", v, memberCookie, ""); code != http.StatusOK {
-			t.Fatalf("设置 %s 应 200，得 %d %s", v, code, raw)
-		}
-	}
-	list, _ := store.ListEgressProxies()
-	if len(list) != 1 {
-		t.Fatalf("direct/空值不该登记线路，池里应仍只有 1 条，得 %d", len(list))
-	}
-}
-
 // TestEgressAssignAutoPickSkipsUserLines ⚠️ 安全边界：自动选线不碰用户线路。
 //
 // 为什么用例要写成"**池里只有用户线路**"这种极端形态：如果同时摆一条平台线路，

@@ -164,46 +164,38 @@ func TestEgressAgentReportMakesOnline(t *testing.T) {
 	}
 }
 
-// TestEgressHomeAccessControl 状态查询要登录；执行动作对登录用户开放，
-// 但范围严格按"谁的机器 / 谁的号"切（v0.31.24）。
+// TestEgressHomeAccessControl 出口状态与控制台只对**平台**开放（v0.31.53）。
 //
-// 升级前这里是"普通用户一律 403"。现在**刻意不再断言 403** —— 那正是本版要改掉的
-// 行为；取而代之的是断言"权限放行了，但范围没跟着放开"（见 egress_user_scope_test.go
-// 的负向用例）。这里只钉住两端：认证边界（未登录 401）与两种视角的判据字段。
+// v0.31.24~v0.31.52 这里断言的是"普通用户 200、manage_scope=self"。
+// 产品决定把出口收敛为平台能力之后，这些断言全部反转 —— 反转本身是好事：
+// 它证明"用户端代理"不是一个藏起来的开关，而是真的从权限层消失了。
 func TestEgressHomeAccessControl(t *testing.T) {
 	_, a, mux, adminCookie, memberCookie := eaApp(t)
 
-	if code, _ := eaReq(t, mux, "GET", "/api/egress/home", "", "", ""); code != http.StatusUnauthorized {
-		t.Fatalf("未登录读状态应 401，得 %d", code)
+	// 未登录：被守卫拦下（adminGuard 不区分"没登录"与"不是管理员"，
+	// 对出口这个纯平台能力，这个区分没有产品意义）。
+	if code, _ := eaReq(t, mux, "GET", "/api/egress/home", "", "", ""); code != http.StatusForbidden {
+		t.Fatalf("未登录读状态应被拒，得 %d", code)
 	}
-	if code, _ := eaReq(t, mux, "GET", "/api/egress/home", "", memberCookie, ""); code != http.StatusOK {
-		t.Fatalf("普通用户读状态应 200，得 %d", code)
+	// 普通用户：403，且文案要说清"这是平台能力"，不能只说"需要管理员权限"
+	// （后者会让用户以为"申请一下就行"，而实际是能力已下线）。
+	code, raw := eaReq(t, mux, "GET", "/api/egress/home", "", memberCookie, "")
+	if code != http.StatusForbidden {
+		t.Fatalf("普通用户读状态应 403，得 %d %s", code, raw)
 	}
-	// 普通用户拿到的 agent 命令必须是**他自己的令牌**（用它启动的 agent 才归属他）。
-	// ⚠️ 这条是一个真实的越权面：命令若下发平台令牌，任何人都能拿它注册机器、
-	// 伪造在线状态 —— 而"给我一行命令"恰恰是最不设防的功能。
+	if !strings.Contains(raw, "平台能力") && !strings.Contains(raw, "管理员") {
+		t.Fatalf("拒绝文案要说清原因，得 %.200s", raw)
+	}
+
 	platformTok, err := a.egressAgentTokenGet()
 	if err != nil {
 		t.Fatalf("egressAgentTokenGet: %v", err)
 	}
-	_, raw := eaReq(t, mux, "GET", "/api/egress/home", "", memberCookie, "")
-	v := eaJSON(t, raw)
-	cmd, _ := v["agent_command"].(string)
-	if cmd == "" {
-		t.Fatal("普通用户应拿到 agent 命令（否则他无法把自己的机器接进来）")
+	// 管理员：200，平台视角，命令里是平台令牌（他接的就是平台机器）。
+	code, rawAdmin := eaReq(t, mux, "GET", "/api/egress/home", "", adminCookie, "")
+	if code != http.StatusOK {
+		t.Fatalf("管理员读状态应 200，得 %d %s", code, rawAdmin)
 	}
-	if strings.Contains(cmd, platformTok) {
-		t.Fatalf("普通用户的命令**不该**含平台令牌，得 %q", cmd)
-	}
-	if v["can_manage"] != true {
-		t.Fatal("普通用户应能管理自己的出口（can_manage=true）")
-	}
-	if v["manage_scope"] != "self" {
-		t.Fatalf("普通用户视角应为 self，得 %v", v["manage_scope"])
-	}
-
-	// 管理员：平台视角，且命令里必须仍是平台令牌（他管的是平台那台机器）。
-	_, rawAdmin := eaReq(t, mux, "GET", "/api/egress/home", "", adminCookie, "")
 	va := eaJSON(t, rawAdmin)
 	if va["manage_scope"] != "platform" {
 		t.Fatalf("管理员视角应为 platform，得 %v", va["manage_scope"])
@@ -212,20 +204,16 @@ func TestEgressHomeAccessControl(t *testing.T) {
 		t.Fatalf("管理员的命令应用平台令牌，得 %q", cmdA)
 	}
 
-	// 执行动作：未登录 → 401（先过认证）；普通用户 → 不再 403，
-	// 但"没有已接入的机器"是 400（引导他去跑 agent，而不是告诉他没权限）。
+	// 执行动作：未登录 401（认证先于授权）；普通用户 403 platform_only。
 	if code, _ := eaReq(t, mux, "POST", "/api/egress/home/pull", "", "", ""); code != http.StatusUnauthorized {
 		t.Fatalf("未登录执行应 401，得 %d", code)
 	}
 	code, body := eaReq(t, mux, "POST", "/api/egress/home/pull", "", memberCookie, "")
-	if code == http.StatusForbidden {
-		t.Fatalf("普通用户执行出口动作不该再 403，得 %d %s", code, body)
-	}
-	if code != http.StatusBadRequest {
-		t.Fatalf("没有已接入的机器时应 400，得 %d %s", code, body)
+	if code != http.StatusForbidden || !strings.Contains(body, "platform_only") {
+		t.Fatalf("普通用户执行应 403 platform_only，得 %d %s", code, body)
 	}
 
-	// 管理员：先让平台 agent 上线，再下发指令 → 200。
+	// 管理员：平台 agent 上线后下发指令 → 200。
 	if code, _ := eaReq(t, mux, "GET", "/api/agent/poll", "", "", platformTok); code != http.StatusOK {
 		t.Fatalf("平台 agent poll 应 200，得 %d", code)
 	}
@@ -245,6 +233,9 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	hostAcc := &Account{
 		UID: "ea-host", Nickname: "自挂号", Realm: "cn", AccessToken: "t1", RefreshToken: "r1",
 		ExpiresAt: time.Now().Add(time.Hour).Unix(), OwnerUserID: 7, ConsumeGroup: "apply", PoolState: "in",
+		// v0.31.53：刻意预置一个**非空**出口 —— apply 若偷偷绑号，就会把它覆盖掉。
+		// 预置空串的话，"没改"与"改成了空"无法区分，测试会失去判别力。
+		EgressProxy: "direct",
 	}
 	platAcc := &Account{
 		UID: "ea-plat", Nickname: "平台号", Realm: "cn", AccessToken: "t2", RefreshToken: "r2",
@@ -258,12 +249,8 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		res, err := a.applyHomeEgress(egressBaseTunnelPort, egressScope{Platform: true}, false)
-		if err != nil {
+		if _, err := a.applyHomeEgress(egressBaseTunnelPort, egressScope{Platform: true}); err != nil {
 			t.Fatalf("第 %d 次 apply: %v", i+1, err)
-		}
-		if res.HostBound != 1 || res.HostTotal != 1 {
-			t.Fatalf("第 %d 次：自挂号应 1/1，得 %d/%d", i+1, res.HostBound, res.HostTotal)
 		}
 	}
 
@@ -295,17 +282,16 @@ func TestApplyHomeEgressIdempotent(t *testing.T) {
 	for _, acc := range accs {
 		byUID[acc.UID] = acc.EgressProxy
 	}
-	// 平台视角 apply 的口径（v0.31.48）：这条线路**成为全局默认出口**时，
-	// 自挂号写**空串**（= 跟随默认）而不是写死 URL。
+	// v0.31.53：apply **一个账号都不碰**。
 	//
-	// 两者"现在都走这条线"，但语义不同：写空算"没做过决定"，
-	// 之后用户拉起自己的线路再点应用时会被正常接管；写死 URL 会被
-	// 「非破坏式绑定」当成"已决定"跳过 —— 现场就是"拉起了、点了应用，号还在平台出口"。
-	if byUID["ea-host"] != "" {
-		t.Fatalf("平台 apply 后自挂号应为「跟随默认」（空串），得 %q", byUID["ea-host"])
+	// 自挂号被预置成 direct，就是为了让这条断言有判别力：如果哪一天有人在
+	// apply 里重新加回"顺手绑号"，这里立刻变红。出口分配只有一个写入口
+	// （/api/admin/egress/assign），"拉起一条线路"与"决定谁的流量走它"是两件事。
+	if byUID["ea-host"] != "direct" {
+		t.Fatalf("apply 不得改自挂号出口，期望 direct，得 %q", byUID["ea-host"])
 	}
 	if byUID["ea-plat"] != "" {
-		t.Fatalf("平台号不该被写显式绑定（跟随全局默认即可），得 %q", byUID["ea-plat"])
+		t.Fatalf("apply 不得改平台号出口，得 %q", byUID["ea-plat"])
 	}
 }
 

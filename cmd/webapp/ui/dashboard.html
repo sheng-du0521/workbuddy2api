@@ -37,7 +37,7 @@
       <div class="nav-group">扩展</div>
       <button class="nav-item" data-nav="plugins" data-on="loadPlugins" data-title="插件" data-sub="可独立启停的功能扩展；停用只影响入口与执行，不改动任何数据"><span class="ico">🧩</span>插件</button>
       <div class="nav-group">设置</div>
-      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="账户、接入信息、我的出口、提醒与关于"><span class="ico">⚙</span>设置</button>
+      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="账户、接入信息、提醒与关于"><span class="ico">⚙</span>设置</button>
     </nav>
     <div class="sidebar-foot">
       <div class="whoami" id="whoami">…</div>
@@ -376,53 +376,30 @@
     </section>
 
     <!-- ==================== 账号代挂 ==================== -->
-    <!-- ==================== 本地出口代理（v0.31.17；v0.31.34 改为插件视图） ====================
-         这个 pane 不再挂在侧导航上，而是由「插件 → 本地出口代理」打开：
-         点插件卡的「打开」→ 整页切到这里（data-plugin-view 供 openPluginView 定位）。
-         为什么保留同一份 DOM：里面每一个 id 都被 loadEgressHome / loadHostEgressLines
-         使用，重写一份"插件专用版"等于把两条链路各自维护一遍，很快就有一边漏字段。 -->
+    <!-- ==================== 平台直属出口（v0.31.53） ====================
+         ⚠️ 这是**平台能力**，只对管理员可见（插件 Audience=admin）：
+           · 普通用户的插件列表里没有这一条，接口层也会 403；
+           · 账号出口的分配**不在这里** —— 统一在管理后台「代理」页按账号分配。
+         这个 pane 由「插件 → 平台直属出口」打开（data-plugin-view 供 openPluginView 定位）。 -->
     <section class="pane" data-pane="egress" data-plugin-view="host-egress">
-      <!-- 插件视图的返回栏：用户从插件进来，必须能一眼看出"这是插件里的一页"并能回去。 -->
       <div class="row" style="align-items:center;gap:10px;margin:0 0 10px;">
         <button class="ghost sm" data-plugin-back="1">← 插件</button>
-        <span class="muted" style="font-size:12px;">插件 · 本地出口代理</span>
+        <span class="muted" style="font-size:12px;">插件 · 平台直属出口</span>
       </div>
       <div class="section-head">
-        <h2>本地出口代理</h2>
+        <h2>平台直属出口</h2>
         <span class="slot-refresh" data-refresh="loadEgressHome" data-refresh-label="刷新状态"></span>
       </div>
       <div class="sub" style="margin:0 0 14px;">
-        把你自己的电脑做成<b>出口代理</b>：本机 agent 跑一个本地代理，
-        再用 SSH 反向隧道把它接到云端 —— 于是<b>你名下的代挂账号</b>访问上游时
-        是从<b>你家宽带</b>出去（住宅 IP 比机房 IP 友好得多）。
-        <br>用法：点下面的<b>「① 下载本机代理安装包」</b>，在目标电脑上<b>双击运行</b>它 ——
-        安装包已经带上了你的服务地址与令牌，<b>不需要复制粘贴任何东西</b>；
-        装好后本页会<b>自动检测到那台电脑并接着拉起代理</b>。
-        <br>🔒 <b>作用范围</b>：这条线路<b>只承载你自己的号</b>（账号代理与出口代理都是）。
-        其他用户的线路你既看不到也选不到；管理员可以在后台把你的线路显式分配给其他账号
-        —— 那属于管理动作，费用与责任由平台侧承担。
+        平台自己的机器接进出站链路：本机 agent 跑一个本地代理，再用 SSH 反向隧道接到云端，
+        于是平台流量从<b>这台机器的出口 IP</b> 出去。
+        <br>用法：点下面的<b>「① 下载本机代理安装包」</b>，在目标电脑上<b>双击运行</b>；
+        装好后本页会<b>自动检测到那台电脑并接着拉起</b>。
+        <br>🔒 <b>边界</b>：本页只做"把线路立起来 / 体检 / 释放 / 设全局默认出口"。
+        <b>逐号分配出口不在这里</b> —— 那是管理后台「代理」页的事（带唯一闸门与越界审计）。
+        用户端自助代理已下线，普通用户没有这个入口。
       </div>
       <div id="egressHomeBox"></div>
-
-      <!-- 我的账号出口（v0.31.31）：逐号把号分到不同出口 IP 上。
-           在此之前用户端只有"一个 URL 应用到全部"与"一键拉起=全部改绑"两种全量动作，
-           于是两台电脑接进来也只有一个出口在承重 —— 这正是"两个 IP 却是同一个出口"
-           的用户侧根因。 -->
-      <div class="card" style="margin-top:14px;">
-        <div class="section-head">
-          <h2>我的账号出口</h2>
-          <span class="muted" style="font-size:12px;" id="egrAccHint"></span>
-        </div>
-        <div class="sub" style="margin:0 0 10px;">
-          这里决定<b>每个代挂号从哪个 IP 出去</b>。有两条（或更多）线路时，
-          点<b>「按出口 IP 均衡」</b>即可把号均分到<b>不同出口</b>上 ——
-          同一个 IP 的多条线路只算一个出口，不会自欺。
-          <br>⚠️ <b>线路条数 ≠ 出口 IP 数</b>：下面会分别报出来。
-          <br>可选线路 = <b>平台线路 + 你自己接的线路</b>。别人接的线路不会出现在这里
-          （住宅 IP 属于他本人，把凭证发过去等于把号交给他）。
-        </div>
-        <div id="egrAccBox"></div>
-      </div>
     </section>
 
     <section class="pane" data-pane="host">
@@ -602,21 +579,6 @@ API Key : 在上方「API 密钥」页生成</pre>
       <div class="card">
         <div class="section-head"><h2>接入信息</h2></div>
         <div id="setAccess"></div>
-      </div>
-
-      <div class="card">
-        <div class="section-head"><h2>我的出口（代挂号）</h2></div>
-        <div class="sub" style="margin:0 0 10px;">
-          这里配的是<b>你自己代挂账号</b>从哪个 IP 出去。<b>留空 = 跟随平台默认出口</b>；
-          填一个代理地址 = 你这些号固定走它。
-          <br>它<b>只作用于你自己的号</b>：不会改变平台号池的默认出口，也不会替别的用户做决定。
-          配好后管理员会在后台「代理」页看到这条线路，可收录进线路池、探活、再分配给别的号。
-        </div>
-        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;">
-          <input type="text" id="setEgrUrl" placeholder="http://1.2.3.4:8080 或 socks5://user:pass@host:1080（留空 = 跟随默认）" style="min-width:300px;flex:1;">
-          <button id="btnSetEgrAll">应用到全部代挂号</button>
-        </div>
-        <div id="setEgrList" class="cfg-list" style="margin-top:10px;"></div>
       </div>
 
       <div class="card">
@@ -1747,6 +1709,15 @@ function hostCard(h) {
     dead.title = '这个号的登录凭证已被上游作废，平台无法再使用它。请在 WorkBuddy 桌面端重新登录该账号，'
       + '导出 auth 文件后交给管理员导入（导入后红标会自动消失）。';
     chips.appendChild(dead);
+  } else if (h.refresh_lost) {
+    // 仅剩 access（v0.31.37，v0.31.53 迁到这里）：还能用，但**不会自动续期**了。
+    // 这条提示原来挂在「我的账号出口」列表里，那张卡随用户端代理下线 ——
+    // 但它是**账号健康**信息，不该一起消失：让人在"还能用"的窗口里主动重登，
+    // 而不是等到某天突然掉线。
+    const lost = el('span', 'tag warn', '续期凭证失效 · 建议尽快重登');
+    lost.title = 'access 还没过期，所以现在仍然可用；但 refresh_token 已失效，'
+      + '平台无法再替你续期。请尽快在 WorkBuddy 桌面端重新登录该号并重新导入。';
+    chips.appendChild(lost);
   }
   chips.appendChild(el('span', 'tag', h.realm === 'global' ? '国际版' : '国内版'));
   if (h.host_group) chips.appendChild(el('span', 'tag accent', '代挂组：' + h.host_group));
@@ -2944,7 +2915,6 @@ async function loadSettings() {
     renderSettingsAppearance();
     renderSettingsAlerts();
     renderSettingsAbout(sys);
-    await loadSettingsEgress();
     clearLoadBanner(host, 'settings');
   } catch (e) {
     loadBanner(host, '设置加载失败（' + e.message + '）', loadSettings, 'settings');
@@ -3000,66 +2970,6 @@ function renderSettingsAccess(sys) {
   box.appendChild(row);
   box.appendChild(el('div', 'sub', '把上面的 Base URL 与一把密钥填进任意 OpenAI 兼容客户端即可接入。'));
 }
-
-// loadSettingsEgress 我的出口：列出我的代挂号与它们当前的出口。
-async function loadSettingsEgress() {
-  const box = $('setEgrList');
-  if (!box) return;
-  box.textContent = '';
-  let list = [];
-  try {
-    const d = await api('/api/host/accounts');
-    list = d.accounts || [];
-  } catch (e) {
-    box.appendChild(el('div', 'hintbar', '读取代挂账号失败：' + e.message));
-    return;
-  }
-  if (!list.length) {
-    box.appendChild(el('div', 'hintbar', '还没有代挂账号。先到「账号代挂」页添加一个，再回来配出口。'));
-    return;
-  }
-  const tip = el('div', 'sub');
-  tip.style.marginBottom = '6px';
-  tip.textContent = '共 ' + list.length + ' 个代挂号（只列出已单独设过出口的，可按需清除）：';
-  box.appendChild(tip);
-  let shown = 0;
-  for (const h of list) {
-    const cur = h.egress || '';
-    if (!cur) continue;
-    shown++;
-    const row = el('div', 'group-row');
-    const txt = el('div', 'gr-txt');
-    txt.appendChild(el('div', 'gr-name', h.nickname || h.uid));
-    txt.appendChild(el('div', 'gr-sub', 'UID ' + maskUID(h.uid) + ' · 出口：'
-      + (cur === 'direct' ? '直连（不走代理）' : cur)));
-    row.appendChild(txt);
-    const clr = el('button', 'ghost sm', '清除');
-    clr.onclick = async () => {
-      try {
-        await post('/api/host/egress', { uids: [h.uid], proxy: '' });
-        toast('已清除 （该号改为跟随平台默认出口）', 'ok');
-        loadSettingsEgress();
-      } catch (e) { toast(e.message, 'err'); }
-    };
-    row.appendChild(clr);
-    box.appendChild(row);
-  }
-  if (!shown) {
-    box.appendChild(el('div', 'hintbar', '当前所有代挂号都跟随平台默认出口（没有单独指定）。'));
-  }
-}
-
-$('btnSetEgrAll').onclick = async () => {
-  const v = ($('setEgrUrl').value || '').trim();
-  const btn = $('btnSetEgrAll');
-  btn.disabled = true;
-  try {
-    const d = await post('/api/host/egress', { all: true, proxy: v });
-    toast('已把 ' + d.updated + ' 个代挂号的出口设为：' + (v || '跟随平台默认'), 'ok');
-    await loadSettingsEgress();
-  } catch (e) { toast(e.message, 'err'); }
-  finally { btn.disabled = false; }
-};
 
 function renderSettingsAppearance() {
   const box = $('setAppearance');
