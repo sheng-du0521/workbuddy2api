@@ -226,6 +226,9 @@ func main() {
 	agentDir := flag.String("agent-dir", "",
 		"agent 产物目录（含 agent-version.json 与 wb2api-egress-agent.exe），供 agent 自更新下载。"+
 			"留空 = 可执行文件同级 egress-agent/；目录不存在时自动更新对 agent 呈 disabled")
+	tray := flag.Bool("tray", true,
+		"Windows：在右下角通知区域显示图标（左键打开控制台，右键菜单可退出）。\n"+
+			"服务化/无人值守部署用 -tray=false 关掉（非 Windows 平台本项无效）")
 	checkUpdate := flag.Bool("check-update", false,
 		"只做一次版本更新检查并打印结果，然后退出（不启动服务）。\n"+
 			"供运维脚本/定时巡检使用；退出码 0=已最新 1=有新版 2=检查失败")
@@ -509,6 +512,27 @@ func main() {
 			errCh <- err
 		}
 	}()
+
+	// 托盘图标：Windows 下本程序由启动脚本以隐藏窗口拉起，
+	// 之后桌面上一无所有 —— 既看不出它是否还活着，也关不掉它。
+	//
+	// 退路必须和信号同源：托盘的「退出」调的就是这里的 stop，
+	// 于是它走的是与 SIGTERM 完全一致的优雅停机（等在途请求收尾 → 逐个 defer 清理），
+	// 而不是另起一条 os.Exit 的捷径。
+	//
+	// diagnosticOnly 时不拉：诊断进程**不接流量**，给它一个图标等于告诉运维
+	// "有一个服务在跑"，而实际上它马上就退出了 —— 那是个误导性的信号。
+	if *tray && !diagnosticOnly {
+		startTray(trayOptions{
+			addr:    *addr,
+			version: version,
+			dataDir: filepath.Dir(*dbPath),
+			onExit:  stop,
+		})
+		// 停机时收掉图标：进程没了、图标还留在托盘里（要等鼠标划过才消失），
+		// 用户会以为"没关掉"。
+		defer stopTray()
+	}
 
 	select {
 	case err := <-errCh:
