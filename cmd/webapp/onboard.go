@@ -44,11 +44,15 @@ const (
 
 // onboardPlan 一次接入要写进客户端的东西（脚本与被测逻辑共用同一份结构）。
 type onboardPlan struct {
-	Target  string
-	BaseURL string // 形如 http://host:8780/v1
-	APIKey  string
-	Model   string
-	Name    string // 展示名（WorkBuddy 的 name 字段）
+	Target string
+	// BaseURL 带 /v1 的地址（**WorkBuddy 的 models.json 要这个形态**）。
+	BaseURL string
+	// Origin 不带 /v1 的地址（**Anthropic 客户端要这个**：它自己拼 /v1/messages，
+	// 写成 origin+/v1 会变成 /v1/v1/messages —— v0.31.69 就是这个错）。
+	Origin string
+	APIKey string
+	Model  string
+	Name   string // 展示名（WorkBuddy 的 name 字段）
 }
 
 // onboardMaxModelLen 模型名的长度上限。
@@ -110,7 +114,12 @@ func onboardWorkBuddyEntry(p onboardPlan) map[string]any {
 // 所以统一走 `[IO.File]::WriteAllText` + `UTF8Encoding($false)`。
 func buildOnboardScript(p onboardPlan, goos string) (filename, content string) {
 	if goos == "windows" {
+		// 两个目标写的是不同文件、不同结构（数组 vs 对象的 env 字段），
+		// 但壳（编码/备份/校验/自删）完全一致 —— 所以只有 payload 分支。
 		ps := buildPowerShellOnboard(p)
+		if p.Target == onboardTargetCCSwitch {
+			ps = buildPowerShellCCSwitch(p)
+		}
 		enc := encodePSCommand(ps)
 		bat := strings.Join([]string{
 			"@echo off",
@@ -200,6 +209,50 @@ func buildPowerShellOnboard(p onboardPlan) string {
 	}, "\n")
 }
 
+// buildPowerShellCCSwitch CC Switch / Claude Code 目标（v0.31.70）。
+//
+// 写的是 `~/.claude/settings.json` 的 `env` 两个键。**为什么不写 cc-switch.db**：
+// 那张表是 CC Switch 自己的 SSOT（第三方 schema，它自己也会写），直接改它
+// 既可能被覆盖、也可能破坏它的迁移；而 settings.json 是 Claude Code 认的格式，
+// CC Switch 在 direct 模式下本身就是写这份文件。
+//
+// 与 WorkBuddy 版的差别只有三处：路径、要合并的是**对象字段**而不是数组、
+// 以及必须保留 settings.json 里其它键（permissions / hooks …）——
+// 所以用 ConvertFrom-Json → 改 env → ConvertTo-Json 整体回写，而不是拼字符串。
+func buildPowerShellCCSwitch(p onboardPlan) string {
+	return strings.Join([]string{
+		"$ErrorActionPreference = 'Stop'",
+		"$path = Join-Path $env:USERPROFILE '.claude\\settings.json'",
+		"$dir = Split-Path -Parent $path",
+		"if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
+		"$cfg = $null",
+		"if (Test-Path $path) {",
+		"  $raw = [IO.File]::ReadAllText($path)",
+		"  if ($raw.Trim().Length -gt 0) { $cfg = $raw | ConvertFrom-Json }",
+		"  Copy-Item -LiteralPath $path -Destination ($path + '.wb2api.bak') -Force",
+		"  Write-Host ('已备份原配置 -> ' + $path + '.wb2api.bak')",
+		"}",
+		"if ($null -eq $cfg) { $cfg = New-Object psobject }",
+		// env 必须存在且是对象；若它被写成字符串（手改过），明确失败而不是覆盖。
+		"if (-not ($cfg.PSObject.Properties.Name -contains 'env')) {",
+		"  $cfg | Add-Member -NotePropertyName env -NotePropertyValue (New-Object psobject) -Force",
+		"} elseif ($cfg.env -is [string]) {",
+		"  throw '现有 settings.json 里的 env 是字符串而不是对象，为避免写坏已中止（请先手工改正）'",
+		"}",
+		"$cfg.env | Add-Member -NotePropertyName ANTHROPIC_BASE_URL -NotePropertyValue " + psQuote(p.Origin) + " -Force",
+		"$cfg.env | Add-Member -NotePropertyName ANTHROPIC_AUTH_TOKEN -NotePropertyValue " + psQuote(p.APIKey) + " -Force",
+		"$json = $cfg | ConvertTo-Json -Depth 20",
+		"[IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))",
+		// 读回校验：既要能解析，也要能读出新值（写没写进去必须当场知道）。
+		"$check = [IO.File]::ReadAllText($path) | ConvertFrom-Json",
+		"if ($check.env.ANTHROPIC_BASE_URL -ne " + psQuote(p.Origin) + ") { throw '写入后校验失败：base_url 不匹配' }",
+		"Write-Host ('已写入 ' + $path)",
+		"Write-Host ('  ANTHROPIC_BASE_URL = ' + $check.env.ANTHROPIC_BASE_URL)",
+		"Write-Host '接入完成：重启 Claude Code 生效。若 CC Switch 处于 routing 模式，请在它内部再选一次供应商。'",
+		"exit 0",
+	}, "\n")
+}
+
 // buildShellOnboard macOS / Linux 的等价实现（用 python3 处理 JSON，没有则明确报错）。
 //
 // 不用 sed/awk 改 JSON：JSON 不是行式格式，"看起来改对了"的 sed 在遇到
@@ -207,26 +260,61 @@ func buildPowerShellOnboard(p onboardPlan) string {
 func buildShellOnboard(p onboardPlan) string {
 	entry := onboardWorkBuddyEntry(p)
 	entryJSON, _ := json.Marshal(entry)
+	// 两个目标共用一个 python 主体（按 WB2API_TARGET 分支）：
+	// 差别只有"写数组元素"与"合并对象字段"，而备份/校验/UTF-8 语义完全一样。
 	py := `import json, os, shutil, sys
-path = os.path.join(os.path.expanduser("~"), ".workbuddy", "models.json")
+target = os.environ.get("WB2API_TARGET", "workbuddy")
+home = os.path.expanduser("~")
+if target == "ccswitch":
+    path = os.path.join(home, ".claude", "settings.json")
+else:
+    path = os.path.join(home, ".workbuddy", "models.json")
 os.makedirs(os.path.dirname(path), exist_ok=True)
-entry = json.loads(os.environ["WB2API_ENTRY"])
-lst = []
+data = None
 if os.path.exists(path):
     raw = open(path, encoding="utf-8").read().strip()
     if raw:
         data = json.loads(raw)
-        lst = data if isinstance(data, list) else [data]
     shutil.copy2(path, path + ".wb2api.bak")
     print("已备份原配置 -> " + path + ".wb2api.bak")
-lst = [x for x in lst if not (isinstance(x, dict) and x.get("id") == entry["id"])]
-lst.append(entry)
-with open(path, "w", encoding="utf-8", newline="\n") as f:
-    json.dump(lst, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-check = json.load(open(path, encoding="utf-8"))
-print("已写入 " + path + "（当前共 %d 个模型）" % len(check))
+if target == "ccswitch":
+    cfg = data if isinstance(data, dict) else {}
+    env = cfg.get("env")
+    if isinstance(env, str):
+        sys.exit("settings.json 里的 env 是字符串而不是对象，为避免写坏已中止")
+    if not isinstance(env, dict):
+        env = {}
+    env["ANTHROPIC_BASE_URL"] = os.environ["WB2API_BASE_URL"]
+    env["ANTHROPIC_AUTH_TOKEN"] = os.environ["WB2API_API_KEY"]
+    cfg["env"] = env
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    check = json.load(open(path, encoding="utf-8"))
+    got = (check.get("env") or {}).get("ANTHROPIC_BASE_URL")
+    if got != os.environ["WB2API_BASE_URL"]:
+        sys.exit("写入后校验失败：base_url 不匹配")
+    print("已写入 " + path)
+    print("  ANTHROPIC_BASE_URL = " + got)
+else:
+    entry = json.loads(os.environ["WB2API_ENTRY"])
+    lst = []
+    if isinstance(data, list):
+        lst = data
+    elif isinstance(data, dict):
+        lst = [data]
+    lst = [x for x in lst if not (isinstance(x, dict) and x.get("id") == entry["id"])]
+    lst.append(entry)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    check = json.load(open(path, encoding="utf-8"))
+    print("已写入 " + path + "（当前共 %d 个模型）" % len(check))
 `
+	baseURL := p.BaseURL
+	if p.Target == onboardTargetCCSwitch {
+		baseURL = p.Origin
+	}
 	return strings.Join([]string{
 		"#!/usr/bin/env bash",
 		"# WorkBuddy2API 一键接入脚本（" + p.Target + "）。本文件含明文 API Key，运行后请删除。",
@@ -236,10 +324,14 @@ print("已写入 " + path + "（当前共 %d 个模型）" % len(check))
 		"  echo 'macOS: xcode-select --install   /   Debian: apt install python3'",
 		"  exit 2",
 		"fi",
+		"export WB2API_TARGET=" + shellQuote(p.Target),
+		"export WB2API_BASE_URL=" + shellQuote(baseURL),
+		"export WB2API_API_KEY=" + shellQuote(p.APIKey),
 		"export WB2API_ENTRY=" + shellQuote(string(entryJSON)),
 		"python3 - <<'WB2API_PY'",
 		py + "WB2API_PY",
-		"echo '接入完成：打开 WorkBuddy 的模型选择即可看到「" + p.Name + "」。'",
+		"echo '接入完成：'",
+		"echo '  WorkBuddy：模型选择里应出现「" + p.Name + "」；Claude Code：/status 应显示新的 base_url。'",
 		"rm -- \"$0\" 2>/dev/null || true",
 	}, "\n") + "\n"
 }
@@ -310,9 +402,11 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	origin := requestOrigin(r)
 	plan := onboardPlan{
 		Target:  target,
-		BaseURL: requestOrigin(r) + "/v1",
+		BaseURL: origin + "/v1",
+		Origin:  origin,
 		APIKey:  plain,
 		Model:   model,
 		Name:    "WorkBuddy2API · " + model,
@@ -339,8 +433,14 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 // 与脚本走**同一份 plan**：两条路必须给出同样的值，否则会出现
 // "脚本能通、手动配不通"这种最难解释的支持问题。
 func onboardManual(p onboardPlan) map[string]any {
+	// base_url 按目标给**对应形态**：OpenAI 兼容要 /v1，Anthropic 要 origin。
+	// 给错的形态不会报错，只会 404 —— 那是用户最难自查的一类问题。
+	bu := p.BaseURL
+	if p.Target == onboardTargetCCSwitch {
+		bu = p.Origin
+	}
 	out := map[string]any{
-		"base_url": p.BaseURL,
+		"base_url": bu,
 		"api_key":  p.APIKey,
 		"model":    p.Model,
 	}
@@ -358,13 +458,14 @@ func onboardManual(p onboardPlan) map[string]any {
 		// 也就是 CC Switch 切到 direct 模式时用的那种配置。
 		blob, _ := json.MarshalIndent(map[string]any{
 			"env": map[string]any{
-				"ANTHROPIC_BASE_URL":   p.BaseURL,
+				"ANTHROPIC_BASE_URL":   p.Origin,
 				"ANTHROPIC_AUTH_TOKEN": p.APIKey,
 			},
 		}, "", "  ")
 		out["path"] = `%USERPROFILE%\.claude\settings.json（macOS/Linux: ~/.claude/settings.json）`
-		out["note"] = "把 env 里这三个键合并进现有 settings.json。若 CC Switch 处于 routing 模式，" +
-			"需在它内部再选一次供应商 —— 否则它会在下次切换时覆盖这里。"
+		out["note"] = "把 env 这两个键合并进现有 settings.json（ANTHROPIC_BASE_URL 填**不带 /v1** 的地址：" +
+			"客户端自己拼 /v1/messages）。若 CC Switch 处于 routing 模式，需在它内部再选一次供应商 —— " +
+			"否则它会在下次切换时覆盖这里。"
 		out["json"] = string(blob)
 	}
 	return out

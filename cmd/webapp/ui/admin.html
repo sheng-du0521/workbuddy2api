@@ -1712,6 +1712,27 @@
     <!-- v0.31.68（需求 P2）：第三方 / 中转站通道。
          分发规则是「号池优先」：只有号池模型目录里**没有**的模型才会走通道。 -->
     <section class="pane" data-pane="channels">
+      <!-- v0.31.70：Anthropic 兼容（/v1/messages）的兜底模型。
+           Claude Code 永远发 claude-*，号池里的名字不是这些 —— 不设这个，接进来也是 11102。 -->
+      <div class="card" style="margin-bottom:16px;">
+        <div class="section-head">
+          <h3 style="font-size:13px;">Anthropic 兼容（CC Switch / Claude Code）</h3>
+          <span class="slot-refresh" data-refresh="loadAnthropicCfg" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          本站已支持 <code>POST /v1/messages</code>（Anthropic 协议）。Claude Code 会固定发
+          <code>claude-sonnet-4-5</code> 这类模型名，而号池里没有这些名字 ——
+          所以必须在这里设一个<b>兜底模型</b>：不在号池目录里的名字会被映射成它。
+          <br>接入时 <code>ANTHROPIC_BASE_URL</code> 填<b>不带 /v1</b> 的地址（客户端自己拼 <code>/v1/messages</code>）。
+        </div>
+        <div class="row" style="gap:8px;align-items:center;">
+          <input id="anthDefaultModel" list="anthKnownModels" placeholder="兜底模型名，如 glm-5.3" style="width:240px;">
+          <datalist id="anthKnownModels"></datalist>
+          <button id="btnAnthSave">保存</button>
+          <span id="anthHint" class="muted" style="font-size:12px;"></span>
+        </div>
+      </div>
+
       <div class="card">
         <div class="section-head">
           <h2>第三方 / 中转站通道</h2>
@@ -5701,6 +5722,7 @@ function extLink(href, text) {
 if ($('btnCheckUpdate')) $('btnCheckUpdate').onclick = () => loadUpdateStatus(true);
 if ($('btnLedgerCheck')) $('btnLedgerCheck').onclick = () => loadLedgerCheck(true);
 if ($('btnChNew')) $('btnChNew').onclick = () => showChannelForm(null);
+if ($('btnAnthSave')) $('btnAnthSave').onclick = saveAnthropicCfg;
 if ($('btnDataUsage')) $('btnDataUsage').onclick = () => loadDataUsage(false);
 if ($('btnPruneLogs')) $('btnPruneLogs').onclick = () => {
   // 删数据不可逆：必须让人显式确认，且说明"按当前保留策略"而不是"全删"。
@@ -7835,6 +7857,48 @@ async function loadEgress(silent) {
 const EGR_CODE_POOLED = 'account_pooled';
 const EGR_CODE_FOREIGN = 'foreign_account';
 
+// loadAnthropicCfg Anthropic 入口的兜底模型（v0.31.70）。
+//
+// 为什么放在「第三方通道」页：它解决的是同一类问题（"客户端要的模型我们这边没有"），
+// 运维找配置时第一个会来这里。
+async function loadAnthropicCfg() {
+  const inp = $('anthDefaultModel');
+  const dl = $('anthKnownModels');
+  const hint = $('anthHint');
+  if (!inp) return;
+  try {
+    const d = await api('/api/admin/anthropic-config');
+    inp.value = d.default_model || '';
+    if (dl) {
+      dl.textContent = '';
+      for (const m of (d.known_models || [])) {
+        const o = el('option');
+        o.value = m;
+        dl.appendChild(o);
+      }
+    }
+    if (hint) hint.textContent = d.default_model ? '' : '未设置：claude-* 名字会照常 404';
+  } catch (e) {
+    if (hint) hint.textContent = '读取失败：' + e.message;
+  }
+}
+
+async function saveAnthropicCfg() {
+  const inp = $('anthDefaultModel');
+  const hint = $('anthHint');
+  if (!inp) return;
+  const v = inp.value.trim();
+  try {
+    await post('/api/admin/anthropic-config', { default_model: v });
+    if (hint) {
+      hint.textContent = v ? ('已保存，兜底到 ' + v) : '已清空（不再映射）';
+      hint.style.color = 'var(--ok)';
+    }
+  } catch (e) {
+    if (hint) { hint.textContent = '保存失败：' + e.message; hint.style.color = ''; }
+  }
+}
+
 // loadChannels 第三方 / 中转站通道（v0.31.68，需求 P2）。
 //
 // 这一页要回答三个问题，缺一个就会出事故：
@@ -7842,6 +7906,7 @@ const EGR_CODE_FOREIGN = 'foreign_account';
 //   2. 这个模型现在会走通道，还是会被号池抢走？（pool_models 命中就标「号池优先」）
 //   3. 改了之后什么时候生效？（停用/加模型会立刻作废模型缓存；计费倍率走快照，保存即生效）
 async function loadChannels() {
+  loadAnthropicCfg(); // 同一页的另一块，各自失败互不影响
   const box = $('chList');
   if (!box) return;
   let d;

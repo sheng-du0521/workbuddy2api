@@ -214,6 +214,25 @@ def main():
                 else:
                     print("真浏览器端到端通过")
 
+        # ③c Anthropic 兼容端点（v0.31.70）：CC Switch / Claude Code 请求 /v1/messages。
+        #
+        # 这里只断言"**端点存在且鉴权认 x-api-key**"，不断言 200：
+        # 冒烟进程里没有可用上游账号，正常结果就是 5xx。
+        # 但 404 是**确定性的缺陷**（协议层没接上）—— v0.31.69 就是这种情况，
+        # 而当时所有检查都是绿的（因为没人打过这个路径）。
+        # 注意 req() 内部会 json.dumps，所以这里传 dict，不要再自己 dumps（会双重编码）。
+        anon_body = {
+            "model": "claude-sonnet-4-5", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        code, _, _ = req("POST", base + "/v1/messages", anon_body,
+                         headers={"x-api-key": key})
+        if code == 404:
+            die("/v1/messages 返回 404 —— Anthropic 协议层没接上（CC Switch 会不可用）")
+        if code == 401:
+            die("/v1/messages 不认 x-api-key —— Anthropic 客户端会用这个头，必须支持")
+        print("Anthropic 端点：HTTP %d（非 404/401 即视为已挂载）" % code)
+
         # ④ 服务仍然活着（上面任何一步把进程搞挂了，这里会暴露）
         code, _, _ = req("GET", base + "/healthz")
         if code != 200:

@@ -330,3 +330,105 @@ func TestOnboardScriptActuallyWritesArray(t *testing.T) {
 		t.Fatalf("两条模型都应存在：%+v", ids)
 	}
 }
+
+// O5：CC Switch 目标的地址形态与真跑（v0.31.70）。
+//
+// 这条修的是 v0.31.69 的一个**实际不通**：当时把 `ANTHROPIC_BASE_URL` 写成
+// `origin + "/v1"`，而 Anthropic 客户端自己会拼 `/v1/messages` ——
+// 结果请求落到 `/v1/v1/messages`，404。配置写对了、端点不存在，面板不会报任何错。
+func TestOnboardCCSwitchUsesOrigin(t *testing.T) {
+	plan := onboardPlan{
+		Target:  onboardTargetCCSwitch,
+		BaseURL: "http://203.0.113.7:8780/v1",
+		Origin:  "http://203.0.113.7:8780",
+		APIKey:  "sk-wb-cc-test",
+		Model:   "claude-3-5-sonnet",
+		Name:    "WorkBuddy2API · claude-3-5-sonnet",
+	}
+	man := onboardManual(plan)
+	if man["base_url"] != plan.Origin {
+		t.Fatalf("CC Switch 的 base_url 必须是 origin（不带 /v1），得 %v", man["base_url"])
+	}
+	if !strings.Contains(man["json"].(string), plan.Origin) {
+		t.Fatalf("手动 JSON 里应是 origin：%v", man["json"])
+	}
+	if strings.Contains(man["json"].(string), "/v1\"") {
+		t.Fatalf("手动 JSON 里不该出现 /v1：%v", man["json"])
+	}
+	// WorkBuddy 那条路径反过来：**必须**带 /v1（它把 url 当 base 用）。
+	wb := onboardManual(onboardPlan{
+		Target: onboardTargetWorkBuddy, BaseURL: plan.BaseURL, Origin: plan.Origin,
+		APIKey: plan.APIKey, Model: "glm-5.3", Name: "n",
+	})
+	if wb["base_url"] != plan.BaseURL {
+		t.Fatalf("WorkBuddy 的 base_url 应带 /v1，得 %v", wb["base_url"])
+	}
+}
+
+// O6：真跑 CC Switch 脚本 —— env 写进去、**其它键必须保留**。
+//
+// 保留键这条最容易漏：settings.json 里还有 permissions / hooks / model 等，
+// 用一个"只写 env"的脚本会把用户的其它配置整个抹掉。
+func TestOnboardCCSwitchScriptPreservesOtherKeys(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("只在 Windows 上真跑 .bat")
+	}
+	home := t.TempDir()
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{"permissions":{"allow":["Bash(ls:*)"]},"model":"claude-3-5-sonnet"}`
+	cfgPath := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(cfgPath, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := onboardPlan{
+		Target:  onboardTargetCCSwitch,
+		BaseURL: "http://203.0.113.7:8780/v1",
+		Origin:  "http://203.0.113.7:8780",
+		APIKey:  "sk-wb-cc-run",
+		Model:   "claude-3-5-sonnet",
+		Name:    "n",
+	}
+	_, bat := buildOnboardScript(plan, "windows")
+	batPath := filepath.Join(home, "onboard.bat")
+	if err := os.WriteFile(batPath, []byte(bat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "cmd", "/c", batPath)
+	cmd.Env = append(os.Environ(), "USERPROFILE="+home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("脚本执行失败：%v\n%s", err, out)
+	}
+
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("读回配置失败：%v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("写出的不是合法 JSON：%v\n%s", err, raw)
+	}
+	env, _ := cfg["env"].(map[string]any)
+	if env["ANTHROPIC_BASE_URL"] != plan.Origin {
+		t.Fatalf("base_url 没写对：%+v", cfg)
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-wb-cc-run" {
+		t.Fatalf("token 没写对：%+v", env)
+	}
+	// 关键：原有键必须还在。
+	if _, ok := cfg["permissions"]; !ok {
+		t.Fatalf("原有 permissions 被抹掉了：%+v", cfg)
+	}
+	if cfg["model"] != "claude-3-5-sonnet" {
+		t.Fatalf("原有 model 丢了：%+v", cfg)
+	}
+	// 备份文件必须在（用户回滚路径）。
+	if _, err := os.Stat(cfgPath + ".wb2api.bak"); err != nil {
+		t.Fatalf("应生成备份：%v", err)
+	}
+}

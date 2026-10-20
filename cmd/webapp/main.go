@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.69"
+const version = "0.31.70"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1947,6 +1947,18 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /admin/accounts/{uid}/revive", a.compatGuard(a.handleCompatAccountRevive))
 	mux.HandleFunc("POST /admin/tasks/{name}/run", a.compatGuard(a.handleCompatTaskRun))
 	mux.HandleFunc("POST /v1/chat/completions", a.liveCapture(a.apiKeyGuard(a.proxy.ServeChat)))
+
+	// Anthropic Messages 兼容（v0.31.70）：CC Switch / Claude Code 请求 /v1/messages。
+	// 只做协议转换，转发/计费/风控全部复用 ServeChat（见 anthropic.go 的文件头）。
+	// 鉴权用同一个 apiKeyGuard —— 它的 bearerToken 已同时认 `Authorization: Bearer`
+	// 与 `x-api-key`（Anthropic SDK 用的是后者），不需要第二套。
+	mux.HandleFunc("POST /v1/messages", a.liveCapture(a.apiKeyGuard(a.handleAnthropicMessages)))
+	// count_tokens：Claude Code 用来估算上下文占用。不实现会让它退化成"按字符猜"；
+	// 这里给一个粗估（约 4 字符/token），并在响应里如实标注是估算。
+	mux.HandleFunc("POST /v1/messages/count_tokens", a.apiKeyGuardNoBalance(a.handleAnthropicCountTokens))
+	// Anthropic 入口的兜底模型（v0.31.70）：Claude Code 发 claude-*，号池不认。
+	mux.HandleFunc("GET /api/admin/anthropic-config", a.adminGuard(a.handleAdminAnthropicConfig))
+	mux.HandleFunc("POST /api/admin/anthropic-config", a.adminGuard(a.handleAdminAnthropicConfig))
 	// /v1/models 是客户端接入时的第一个探测请求，且不产生消费 —— 故豁免余额校验，
 	// 否则余额为 0 的用户在客户端里只会看到「连接失败」（详见 apiKeyGuardNoBalance）。
 	mux.HandleFunc("GET /v1/models", a.apiKeyGuardNoBalance(a.handleModels))

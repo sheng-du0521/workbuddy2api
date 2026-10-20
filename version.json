@@ -1,20 +1,20 @@
 {
-  "version": "0.31.69",
+  "version": "0.31.70",
   "min_supported": "0.24.0",
-  "notes": "v0.31.69：需求 P3 —— 一键接入（WorkBuddy / CC Switch）。\n\n① 控制台「API 密钥」每张卡新增「接入」：选目标 → 填模型 → 生成一次性脚本（Windows .bat / macOS+Linux .sh），双击即写入客户端配置。脚本会**先备份**（models.json.wb2api.bak）、**按 id 去重替换**（不是追加）、写完后读回校验，并自删（含明文 Key）。\n\n② 为什么不是\"服务端代写\"：浏览器不能写本地文件；用户端 agent 已于 v0.31.53 整体下线（`/api/agent/poll` 对 owner>0 回 410），普通用户没有可用 agent。一次性脚本不需要常驻进程、也不需要给它\"能写任意路径\"的权限。\n\n③ 三个真问题只有\"真跑\"才能发现（静态断言全绿而实际是坏的）：\n（a）.bat 本体含中文 → cmd 在 chcp 生效前按本地代码页解析，直接报 \"'ey，运行后请删除。' is not recognized\"；\n（b）Write-Host 'a' + 'b' 在 PS 里不是拼接，\"+\" 被当成第三个参数原样打印；\n（c）del \"%~f0\" 紧跟执行会报 \"The batch file cannot be found.\"（句柄未释放），需先 (goto) 2>nul 再删。\n这三条现在都有用例**真跑 .bat** 钉住（USERPROFILE 指向临时目录，不碰本机配置）。\n\n④ 注入防护：模型名拒绝引号/反斜杠/$/反引号/控制字符；.bat 用 -EncodedCommand（传输层只剩 base64，外部输入与命令行语法完全解耦）；写文件用 UTF-8 **无 BOM**（PS 5.1 的 Out-File 带 BOM，多数 JSON 解析器不认，表现为\"模型没出现\"）。\n\n⑤ 接口与 reveal 同一纪律：归属校验下推 SQL（跨用户 404）、停用 Key 409、不写日志、错误笼统；返回脚本含明文 Key，因此只对 active + 有密文的 Key 显示入口。\n\n⑥ 冒烟脚本改用真实 secret 文件（原来 -secret none）：禁用加密时 revealable 恒为 false，「查看/复制/接入」三颗按钮根本不会渲染 —— 真浏览器 E2E 点了「接入」却没有那颗按钮才暴露出来。\n\n验证：新增 4 条用例（脚本内容 / 模型名校验 / 接口权限 / 真跑 .bat 三种场景）；E2E 扩到\"注册→控制台→生成密钥→一键接入\"；go test ./... 全绿。\n\n边界：CC Switch 写的是 ~/.claude/settings.json 的 env（它自己的 providers 表是第三方 SSOT，不直接改）；macOS/Linux 脚本需要 python3 处理 JSON；未做\"接入后自动验证能连通\"。",
-  "released_at": 1792514019,
+  "notes": "v0.31.70：修 v0.31.69 留给「CC Switch 一键接入」的两个**实际不通**。\n\n① 服务端原本没有 `/v1/messages`：CC Switch / Claude Code 走 Anthropic 协议，配好之后一发请求就是 404 —— 面板不报错、脚本也成功，属于\"看起来接好了、实际不通\"。现在新增 `POST /v1/messages`（含 `count_tokens`）。\n\n② `ANTHROPIC_BASE_URL` 形态写错：Anthropic 客户端自己拼 `/v1/messages`，所以这个值应是 **origin（不带 /v1）**。v0.31.69 写成 `origin + \"/v1\"`，请求会落到 `/v1/v1/messages`。现在按目标区分形态：WorkBuddy 用带 `/v1` 的，CC Switch 用 origin。\n\n③ 模型名对不上：Claude Code 固定发 `claude-sonnet-4-5` 这类名字，号池里叫 `glm-5.3`。新增「Anthropic 兜底模型」设置（后台「第三方通道」页），不认识的模型名映射到它。判据**必须**是号池真实目录 + 严格相等 —— 用 knownModelIDs 会把内置清单 `claude-sonnet-4.5` 算进来（还带分隔符归一），于是被误判成\"认识\"，映射跳过、上游照拿 11102。\n\n实现方式：**复用而不是复制**。转发/选号/通道降级/预扣/结算/错误分类全在 `Proxy.ServeChat`，这里只做两件事：请求体 Anthropic→OpenAI；用一个 ResponseWriter 适配器把 ServeChat 写出的 OpenAI SSE/JSON 转回 Anthropic 格式。于是号池、第三方通道、计费、冷却在 Anthropic 入口上自动全部生效。\n\n协议覆盖：system（字符串/文本块）、messages（含 tool_use → tool_calls、tool_result → 独立 role:\"tool\" 消息）、tools/tool_choice、stop_sequences、流式事件序列（message_start → content_block_start/delta → content_block_stop → message_delta → message_stop，幂等收尾）、错误信封（OpenAI error → Anthropic `{\"type\":\"error\",...}`）。\n\n同时补 CC Switch 的接入脚本（原来只有 WorkBuddy 有脚本）：写 `~/.claude/settings.json` 的 env，用 ConvertFrom-Json→改 env→ConvertTo-Json 整体回写，**保留 permissions / hooks 等其它键**；env 若是字符串则明确中止而不是覆盖。\n\n验证：新增 9 条用例 —— 请求转换（含 tool_result 拆分）、响应转换（stop_reason/usage/tool_use）、SSE 事件序列与顺序、收尾幂等、错误信封、端到端真打 /v1/messages（x-api-key 鉴权 + 写用量流水 + 流式事件 + 400 信封）、兜底模型映射四种情形、CC Switch 地址形态、**真跑 .bat 写 settings.json 且保留其它键**。冒烟新增一步：/v1/messages 返 404/401 即判失败（v0.31.69 正是全部检查绿着、这个路径没人打过）。\n\n边界：tools 的流式参数用 input_json_delta 整段发送（协议允许，客户端会拼接）；`count_tokens` 是 ~3 字符/token 的粗估，不是真分词；thinking / computer_use 等 Anthropic 私有块不转换（忽略）；不做 prompt caching 相关的 cache_control 语义。",
+  "released_at": 1792515224,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.69/webapp.exe",
-      "sha256": "290aaf36a0700579342b370763fe6c286b554286256f0b4408ce6d0e7f34604b",
-      "size": 15824896
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.70/webapp.exe",
+      "sha256": "6ddc52be3fa708dd2b542d1a764bbcf9146f3e7926764e2daaa7dedf517758a3",
+      "size": 15894528
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "FYYu0wcJWDvS8ORSKJAnNVFsvQY/pTP0IXBBD9xmG51fCQykCYWFgCw0QDVb79NpgHesFiPQDKxake/z9WXuAA==",
+  "signature": "/rcT6ZCBvd7y3y8OJEe9tVByiIHgtTqShpsLDEFAsap1pAqAyeBgYl0EaLjIiWypNifYUXzcLZA5qtKbF6lBCA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
