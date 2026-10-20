@@ -38,8 +38,10 @@ import (
 	"strings"
 )
 
-// anthropicBodyMax Anthropic 请求体上限（与 OpenAI 入口同一量级）。
-const anthropicBodyMax = chatBodyMax
+// Anthropic 入口的请求体上限**直接引用 chatBodyMax**（不再有独立的 anthropicBodyMax）：
+// v0.31.73 起 chatBodyMax 是可被 WB_BODY_MAX_MB 覆盖的包级 var，
+// 另存一份副本（无论 const 还是 var 初始化）都会在环境变量生效后与它分叉，
+// 变成"改了 OpenAI 侧上限、Claude Code 那条路还卡在旧值"。
 
 // kvAnthropicDefaultModel Anthropic 入口的**兜底模型**（v0.31.70）。
 //
@@ -98,7 +100,7 @@ func (a *app) anthropicDefaultModelValid(v string) bool {
 //
 // 只做协议转换，不碰任何业务逻辑（见文件头）。
 func (a *app) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	raw, err := readCappedBody(w, r, anthropicBodyMax)
+	raw, err := readCappedBody(w, r, chatBodyMax)
 	if err != nil {
 		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
 			"request body too large")
@@ -762,7 +764,7 @@ func copyHeader(dst, src http.Header) {
 // 表现为对话在远未到真实上限时就被截断 —— 用户会以为是我们限制了长度。
 // 响应里 `note` 明确写出这是估算，避免被当成精确值用于计费核对。
 func (a *app) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Request) {
-	raw, err := readCappedBody(w, r, anthropicBodyMax)
+	raw, err := readCappedBody(w, r, chatBodyMax)
 	if err != nil {
 		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "body too large")
 		return

@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.72"
+const version = "0.31.73"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -471,7 +471,10 @@ func main() {
 		Addr: *addr,
 		// 中间件顺序：安全头最外（错误响应也要带）→ 请求体上限 → CSRF。
 		// CSRF 放在最内层：它需要读 Origin/Host，且拦截时希望已带上安全头。
-		Handler:           recoverer(securityHeaders(limitRequestBody(a.csrfGuard(routeDiagnostics(mux)), maxRequestBody))),
+		//
+		// 请求体上限**按路径取**（bodyLimitFor）：/v1 推理路径用 chatBodyMax，
+		// 其余路径用 maxRequestBody 兜底 —— 放宽推理不等于放宽未鉴权的注册接口。
+		Handler:           recoverer(securityHeaders(limitRequestBody(a.csrfGuard(routeDiagnostics(mux))))),
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 限制"把整个请求（含 body）读完"的总时长（v0.31.59，审查 F12）。
 		//
@@ -484,7 +487,11 @@ func main() {
 		ReadTimeout: 60 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
-	log.Printf("workbuddy2api webapp %s 启动于 http://%s", version, *addr)
+	// 请求体上限：先按环境变量覆盖（非法值退回默认并 WARN），再打启动日志 ——
+	// 顺序反了会让日志显示默认值、实际生效的是环境变量值，那是最误导人的一种"日志对不上"。
+	applyBodyLimitEnv()
+	log.Printf("workbuddy2api webapp %s 启动于 http://%s（推理请求体上限 %d MB，可用 %s 调整）",
+		version, *addr, chatBodyMax>>20, bodyLimitEnvKey)
 	// 提示语必须跟着 P3-12 一起改：还写「首个用户自动成为管理员」会直接把运维
 	// 引到一个已经不存在的功能上（他会以为注册完就是管理员，然后发现进不去后台）。
 	log.Printf("管理密钥 %s（首次部署：注册时填入该密钥即成为管理员；不再有「首个用户自动提权」）",
@@ -571,7 +578,7 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// maxRequestBody 单个请求体的上限（v0.24.0，P2-4）。
+// maxRequestBody 单个请求体的**通用**上限（v0.24.0，P2-4；v0.31.73 起只管非 /v1 路径）。
 //
 // 为什么必须有：本项目此前**一处都没用 http.MaxBytesReader**，约 40 处
 // json.NewDecoder(r.Body).Decode(...) 全是无上限读取 —— 其中还包括**未鉴权**的
@@ -579,18 +586,34 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 // 任何人发一个超大 body 就能持续吃内存。
 //
 // 取 16MB：导入接口要把整份账号 JSON 放在 body 里（上百个账号约 1-2MB），
-// 留一个数量级余量；正常 API 请求都远小于它。真正的细分限制（如 chat 的 8MB）
-// 仍由各 handler 自己加，这里只是**兜底**。
+// 留一个数量级余量；正常 API 请求都远小于它。
+//
+// ⚠️ **推理路径（/v1/*）不吃这个值**，它由 chatBodyMax（默认 32MB，可配）控制。
+// 两者刻意分开：把 16MB 一起抬到 32MB 等于顺带放宽了注册/登录接口的容错面，
+// 那不是这次要解决的问题。用户可见的错误文案里写的上限也必须与**实际生效**的那个一致。
 const maxRequestBody = 16 << 20
 
-// limitRequestBody 给请求体套一个硬上限。
+// bodyLimitFor 按路径取请求体上限（**唯一口径**）。
+//
+// 为什么必须只有一个入口：两层 MaxBytesReader 嵌套时，**内层先触发**，
+// 但报错里的 limit 取的是内层的值；若两层数字不同（曾经 8MB 内 / 16MB 外），
+// 外层会先拦下 9~16MB 的请求、错误却说 16MB，而 8MB 以内的错误说 8MB ——
+// 同一个 413 出现两个上限，排障时没人能判断到底是谁在拦。
+func bodyLimitFor(path string) int64 {
+	if strings.HasPrefix(path, "/v1/") {
+		return chatBodyMax
+	}
+	return maxRequestBody
+}
+
+// limitRequestBody 给请求体套一个硬上限（按路径，见 bodyLimitFor）。
 //
 // 超限时 MaxBytesReader 让后续 Read 返回错误，handler 的既有错误分支
 // 会把它转成 400/413 —— 不需要每个 handler 各写一遍。
-func limitRequestBody(next http.Handler, max int64) http.Handler {
+func limitRequestBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, max)
+			r.Body = http.MaxBytesReader(w, r.Body, bodyLimitFor(r.URL.Path))
 		}
 		next.ServeHTTP(w, r)
 	})

@@ -330,7 +330,7 @@ func TestCsrfGuard(t *testing.T) {
 	store, a, mux, tokens := newAuthzApp(t)
 	defer store.Close() // 不关会让 t.TempDir 清理报「文件被占用」
 	guard := a.csrfGuard(mux)
-	h := securityHeaders(limitRequestBody(guard, maxRequestBody))
+	h := securityHeaders(limitRequestBody(guard))
 
 	do := func(method, path, origin, referer, adminKey string) int {
 		req := httptest.NewRequest(method, path, nil)

@@ -1,20 +1,20 @@
 {
-  "version": "0.31.72",
+  "version": "0.31.73",
   "min_supported": "0.24.0",
-  "notes": "v0.31.72：通道看得见（接入 Sub2API 前的两个盲区）。\n\n① 后台通道页新增「近 7 天」统计：每个模型映射显示 总调用次数 / 0 费次数（占比），卡片底部给通道级汇总，0 费占比 >=20% 标红。口径来自 usage_logs 且只算 scope=relay —— 号池流水混进来会把「号池正常」读成「通道正常」。\n\n② 三个指标各自回答一个问题：total=0 说明配了却一次没走到（被号池同名抢走 / 没人用）；no_usage 高说明对面不支持 stream_options.include_usage；zero_fee 高说明这一单在白送。不再需要翻日志才能发现「通道在漏钱」。\n\n③ 探活顺带读 Sub2API 的 GET /v1/sub2api/billing，把 effective_rate_multiplier 拼进探活结论，用于核对毛利（我方售价 ≈ credit_per_1k × 倍率 要高于上游扣费）。两种 base_url 填法都试；**读不到不算失败** —— 私有端点，非 sub2 站点天生没有，判错会把所有正常通道标成故障。\n\n④ 统计失败不让列表挂掉（WARN + recent 留空 + 界面显示「—」）：把「看不见数字」升级成「看不见通道」只会更难排查。\n\n验证：TestRelayModelStats（只算 relay / 窗口外不计 / 0 费占比 2-3 精确 / 空窗口空 map）、TestProbeUpstreamBillingSub2API（三种 base 填法都读到 1.5）、TestProbeUpstreamBillingNonSub2（404 / 非 sub2 对象 / 非 JSON / 401 一律安静放弃）。\n\n边界：统计是「模型名」口径，同模型名配在两条通道上时数字合并；上游倍率是探活那一刻的快照，对方调价不自动同步；0 费仍不估算（通道没有估算基准，估出来就是假账），只能看见不能自动修正。",
-  "released_at": 1792522442,
+  "notes": "v0.31.73：推理请求体上限 8MB → 32MB（并可运行期调整）。\n\n① 现场：客户端 deepseek-harness 收到的 413 是**我们自己**发的 —— 生产日志显示 content_length 在 8.4MB ~ 23.4MB，全部卡在 8MB 闸门，一次都没触达上游（不耗账号、不产生流水）。8MB 当初是「够用就好」的估计，而 agent 类客户端的 body 与上下文长度成正比，估计必然被追上。\n\n② chatBodyMax 8MB → 32MB：覆盖实测最大值（23.4MB）的 1.37 倍。内存预算：body 在实现里同时存在三份（原始 buf → 字段 map → 重组 JSON），32MB × 3 ≈ 100MB/请求，生产 1.6GB / 3 并发约 300MB。再往上加必须同时改内存预算。\n\n③ 上限按路径分（bodyLimitFor 是唯一口径）：/v1/* 用 chatBodyMax，其余用 16MB 兜底 —— 放宽推理不等于放宽未鉴权的注册/登录/导入接口。此前是两层嵌套（外 16MB / 内 8MB），内层先触发但报错写内层数字，同一个 413 会看到两个上限。\n\n④ 可运行期调整：环境变量 WB_BODY_MAX_MB（4~128 MB），启动时读一次，非法/越界退回默认 + WARN，生效值打进启动日志 —— 「当前到底放行多大」必须能从日志回答。\n\n⑤ 413 的 gateway_hint 补可执行下一步：上限值、环境变量名与允许范围、以及「未使用任何上游账号、原样重发仍然失败」，避免客户端白重试。\n\n验证：TestBodyLimitForPath（/v1 三个入口走推理上限，注册/导入/healthz 走 16MB）、TestLimitRequestBodyByPath（真中间件真读体：9MB 在 /v1 放行、13MB 仍 413、9MB 非 /v1 放行、17MB 仍 413）、TestApplyBodyLimitEnv（64 生效；abc/-1/0/2/999/64.5 全退回默认）、TestTooLargeHintMentionsEnv。\n\n边界：32MB 是网关侧上限，与上游能接受多大无关（超上游限制时由上游返回 413/11115，我们只透传、不重试、不冷却账号）；ReadTimeout 仍 60 秒，慢网络上大 body 可能先超时（408 可重试）；1.6GB 小机器不要配 128MB。",
+  "released_at": 1792523142,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.72/webapp.exe",
-      "sha256": "80c6d1f78063251770265c3a14511226f74c7c6a4886c2aad103fc876cce9458",
-      "size": 15909376
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.73/webapp.exe",
+      "sha256": "565b08fd366b7424ce58ad80b08036f39a582fcd3df4465c5e812e3fced03360",
+      "size": 15910912
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "tXMCCbDHQ2RjV9gN8YIwmt/nVtDuHAU338OqilTkytWWJnpAZ8lm3r163d6SyUWfB3Sp4MWsScsQCHXwTkrAAg==",
+  "signature": "sSiFsq0YQ2dbcnksIalLrr3ikuvOckx4HrWp4ltg55FSGY+ZRWWZVKx5a4MDvKPIXHvUzjI7xPaklqZnwqpcCA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

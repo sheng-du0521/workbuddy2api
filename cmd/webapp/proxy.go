@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -1399,15 +1400,64 @@ func (p *Proxy) refreshIfNeeded(au *auth.Auth) error {
 	return nil
 }
 
-// chatBodyMax 单次 chat 请求体上限（8MB）。
+// chatBodyMaxDefault 推理请求体的默认上限（32MB，v0.31.73）。
 //
-// 为什么从 io.LimitReader 换成 http.MaxBytesReader（v0.31.14 修的真实缺陷）：
-// io.LimitReader 到上限后返回的是 **EOF 而不是错误** —— 于是 8MB 以上的请求体会被
-// **静默截断**，再交给 json.Unmarshal 解析，客户端看到的是
-// `invalid json: unexpected end of JSON input`。那是一条把「请求太大」说成
-// 「JSON 写坏了」的错误消息：开发者会去反复检查自己的序列化，而真正该做的是减量/分段。
-// MaxBytesReader 超限时返回 *http.MaxBytesError，可以据此回 413 并把上限写清楚。
-const chatBodyMax = 8 << 20
+// **为什么从 8MB 提到 32MB**（线上真实故障，2026-10-20/21）：客户端
+// `deepseek-harness/0.2.1-rc.2` 发来的请求体 content_length 在
+// **8.4MB ~ 23.4MB** 之间（长上下文 + 附件），全部卡在 8MB 闸门上 ——
+// 一次都没触达上游，客户端只看到 413。8MB 当初是"够用就好"的估计，
+// 而 agent 类客户端的 body 大小与上下文长度成正比，估计必然被追上。
+//
+// 取 32MB 的两个依据：
+//  1. 覆盖实测最大值（23.4MB）的 1.37 倍，留出增长余量；
+//  2. 单请求内存峰值可预算：body 在实现里会同时存在三份（原始 buf →
+//     解开字段的 map → 重组后的出站 JSON），32MB × 3 ≈ 100MB/请求。
+//     生产 1.6GB / 2 核，按 3 并发算是 ~300MB —— 到顶但仍有余量。
+//
+// **再往上加必须同时改内存预算**，不是改一个常量的事。
+// 需要临时放宽时用环境变量 WB_BODY_MAX_MB（见 applyBodyLimitEnv），不要改代码重发。
+const chatBodyMaxDefault = 32 << 20
+
+// chatBodyMax 生效的推理请求体上限（启动时可由 WB_BODY_MAX_MB 覆盖）。
+//
+// 用包级 var 而不是 const：环境变量要在启动时读一次，之后只读不写（并发安全）。
+var chatBodyMax int64 = chatBodyMaxDefault
+
+const (
+	// bodyLimitEnvKey 覆盖推理请求体上限的环境变量（单位 MB）。
+	bodyLimitEnvKey = "WB_BODY_MAX_MB"
+	// bodyLimitMin / bodyLimitMax 允许的运行期范围。
+	//
+	// 下限 4MB 是"别再往小里配"（小于常见 agent 请求就没意义了）；
+	// 上限 128MB 是内存红线：128MB × 3 份副本 = 384MB/请求，再高就不是"调参"而是"赌机器"。
+	bodyLimitMin = 4 << 20
+	bodyLimitMax = 128 << 20
+)
+
+// applyBodyLimitEnv 启动时读一次环境变量覆盖 chatBodyMax。
+//
+// 非法值**退回默认并 WARN**，不 panic：配置写错不该让服务起不来
+// （与保留天数 retention 的处理同口径）。生效值会打进启动日志 ——
+// "当前到底放行多大"必须能从日志回答，否则下次撞限又要猜。
+func applyBodyLimitEnv() {
+	raw := strings.TrimSpace(os.Getenv(bodyLimitEnvKey))
+	if raw == "" {
+		return
+	}
+	mb, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("WARN: %s=%q 不是整数，按默认 %d MB", bodyLimitEnvKey, raw, chatBodyMaxDefault>>20)
+		return
+	}
+	v := int64(mb) << 20
+	if v < bodyLimitMin || v > bodyLimitMax {
+		log.Printf("WARN: %s=%d MB 超出 %d~%d MB 范围，按默认 %d MB",
+			bodyLimitEnvKey, mb, bodyLimitMin>>20, bodyLimitMax>>20, chatBodyMaxDefault>>20)
+		return
+	}
+	chatBodyMax = v
+	log.Printf("INFO: 推理请求体上限按 %s 设为 %d MB", bodyLimitEnvKey, mb)
+}
 
 // readCappedBody 读入站请求体（硬上限 max）。
 //
@@ -1415,6 +1465,12 @@ const chatBodyMax = 8 << 20
 // 「收到 0 字节就断」与「收到 7.9MB 才断」是两种完全不同的故障（前者是连接根本没
 // 传到/立刻被掐，后者是传输尾部被截断），而 io.ReadAll 在报错时把这个信息丢掉了 ——
 // 它只回一个 error，调用方无从判断请求体到底来了多少。
+//
+// 上限必须走 http.MaxBytesReader 而不是 io.LimitReader（v0.31.14 修的真实缺陷）：
+// LimitReader 到上限后返回的是 **EOF 而不是错误**，超限的请求体会被**静默截断**，
+// 再交给 json.Unmarshal 就变成 `invalid json: unexpected end of JSON input` ——
+// 一条把「请求太大」说成「JSON 写坏了」的消息。MaxBytesReader 超限返回
+// *http.MaxBytesError，可以据此回 413 并把上限写清楚。
 func readCappedBody(w http.ResponseWriter, r *http.Request, max int64) ([]byte, error) {
 	var buf bytes.Buffer
 	_, err := io.Copy(&buf, http.MaxBytesReader(w, r.Body, max))
@@ -1478,7 +1534,10 @@ func (p *Proxy) reportBodyReadFailure(w http.ResponseWriter, r *http.Request, er
 		log.Printf("WARN: [proxy] 请求体超限（上限 %d 字节）：%s", tooLarge.Limit, bodyReadEvidence(r, n, elapsed))
 		writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge,
 			fmt.Sprintf("read body: request body too large (limit %d bytes)", tooLarge.Limit),
-			fmt.Sprintf("request body exceeds the gateway limit of %d bytes; split or shrink the payload", tooLarge.Limit))
+			fmt.Sprintf("request body exceeds the gateway limit of %d bytes; split or shrink the payload "+
+				"(if this is a legitimate long-context request, raise it server-side with %s=<MB>, allowed %d-%d MB; "+
+				"no upstream account was used and retrying the same body will fail the same way)",
+				tooLarge.Limit, bodyLimitEnvKey, bodyLimitMin>>20, bodyLimitMax>>20))
 		return
 	}
 	log.Printf("WARN: [proxy] 请求体读取失败：%v —— %s（成因在发送侧：声明的长度与实际到达的字节不一致，或被中间层截断；该请求未触达任何上游账号）",
