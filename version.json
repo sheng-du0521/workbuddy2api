@@ -1,20 +1,20 @@
 {
-  "version": "0.31.76",
+  "version": "0.31.77",
   "min_supported": "0.24.0",
-  "notes": "v0.31.76：模型组第一步 —— 组名可用（组内自动选型号）。\n\n① 新能力：请求 model 填 wb-group-work（整个号池）或 wb-group-ch<通道id>（某条第三方通道），平台在组内展开成一个**真实模型名**再转发。给 CC Switch / Claude Code 这类只能填一个模型名、又不想到处改配置的客户端一条新路。\n\n② 组是**派生**的，不建成员表：work 的成员 = 号池观测目录（与 poolKnowsModel 同源），ch<N> 的成员 = 该通道 enabled 的映射。号池新增模型、通道停掉映射会立刻反映到组里 —— 两份数据一定会有对不上的那一天。虚拟名写死 wb-group- 前缀，永不与真实模型名冲突。\n\n③ 组内选谁（确定性优先，不随机）：先找「号池认识且有可用账号」的成员，其次「有可用通道」的成员，都没有就取第一个让下游正常失败（错误文案仍由既有链路给，不自造第二套）。**组间不互相兜底** —— 跨组兜底会让「我买的这个组」变成「随机被谁服务」。\n\n④ 展开发生在归一化与选号**之前**，并**同步改写 payload**：之后归一化/选号/计费倍率/台账/模型冷却全按真名走，所以组不会变成第二套计费口径，账单里永远是真实模型名。payload 必须一起改（出站体从 payload 重新编码），这行有单测钉住。\n\n⑤ 可见性：测试对话页下拉把组名排最前并带标签（wb-group-work（work 官组 · 12 个）），空组不列；一键接入的模型字段默认填 wb-group-work；后台通道卡显示「组 wb-group-ch<id>」可点复制；/v1/models 只有**绑定了通道组**的 Key 才多出组名条目（存量 Key 响应逐字节不变）。\n\n⑥ 授权：新增 api_keys.group_scope（逗号分隔组 id，默认空 = 只有 work）。work 对所有 Key 恒可见；通道组需管理员授权；代挂自用 Key 永远只见 work（只用本人账号，接通道组等于用平台的钱给个人用）。**管理后台的勾选界面本版还没做**，临时用 SQL：UPDATE api_keys SET group_scope='ch3' WHERE id=12。\n\n验证：TestApplyGroupExpansionRewritesPayload（展开后 payload[model] 必须被改写、普通模型名 payload 不动）、TestExpandGroupModelOnlyGroupNames（glm-5.3 / wb-group- / wb-groub-work 都不展开）、TestExpandGroupModelWork / TestExpandGroupModelChannel（work 取号池目录；通道组只取 enabled 映射，停用整条通道 → 组立刻不可见）、TestVisibleGroupsHostKeyOnlyWork；全量 go test + jscheck + uitest 通过。\n\n边界：号池为空时 work 组仍存在但成员为 0（不列、不回落内置兜底清单）；组内选的是「此刻可用」，不保证整个请求不被限流/冷却拒绝；授权指向不存在的组会被静默忽略；组名不参与模型级倍率配置（调价请配真实模型名）。",
-  "released_at": 1792531375,
+  "notes": "v0.31.77：管理后台给 Key 授权模型组（补 v0.31.76 那半屏）。\n\n① 入口：后台「用户」页 → 用户卡片操作行新增「组」按钮（余额 · 限额 · 封禁 · 记录 · 组）。放在用户卡而不是通道页 —— 授权是「给谁」的决定，从用户出发才找得到；从通道出发会变成「这条通道给了谁」，那种列表适合排查不适合配置。\n\n② 弹窗：该用户每把 Key 一行（名称 + #id + 掩码 + 状态），通道组逐个复选框。三条刻意的细节：代挂自用 Key **不给复选框**（右侧直接写「只能用 work 官组」，避免让人以为点了会生效）；空组**禁用**并标「（空组）」（勾了必然失败）；work 不出现在勾选项里（它恒可见，勾了等于假装授予过）。\n\n③ 接口拆两个：GET /api/admin/users/{id}/keys（Key 列表只给掩码 + 全部组清单）、POST /api/admin/keys/{id}/groups（设置 scope）。不塞进用户详情：详情是高频只读（用量/返点/提现/代挂账号已经很重），授权是低频写；分开后详情不会被授权的失败牵连，授权也能单独审计。\n\n④ 语义（都有用例钉住）：代挂 Key → 400，不静默改成 work；不存在的组 → 丢弃并在 dropped 回报，不写库；work 不写进 scope；不存在的 Key → 404；返回的是最终生效的 scope 而不是提交值。\n\n验证：TestAdminSetKeyGroups（池 Key 授权生效 / 混入 ch999 被丢弃并回报 / 代挂 Key 400 且库不变 / 不存在的 Key 404 / work 被忽略）；全量 go test + jscheck + uitest 通过；preflight 全链通过。\n\n边界：授权只影响「看见与可用」，已发出的请求不会因取消授权而中断；取消后 wb-group-ch<N> 立即变成未知模型（404），无需重启；组成员仍是派生的（通道停用 = 组消失），后台勾选会同步禁用。",
+  "released_at": 1792531847,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.76/webapp.exe",
-      "sha256": "472af0faed5076900838f4d644e98408bc573a721ea073039cb8e420acf301df",
-      "size": 15945216
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.77/webapp.exe",
+      "sha256": "ced8b2639cd1d1f00f9a4516d11181e9c310400e76f2d936ffa488415167004d",
+      "size": 15963648
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "Shxt+Jh8U1CkwF0JLoXOXhYaFU+KGfWORxEkGv6+Ondz7Y1FzGcxYhAjnFkNefBCuMvlwVZ622i/EF8rnjGlCg==",
+  "signature": "QQHqxHYNJy1gv8MlrkiraeW6bEFptZd9A6bnk8hd2vqz6n8rn/qS3KizYC4TRcuErtjVumlFv0bldR6O7Er1Cg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

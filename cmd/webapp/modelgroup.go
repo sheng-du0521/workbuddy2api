@@ -120,6 +120,38 @@ func (p *Proxy) visibleGroups(k *APIKey) []modelGroupInfo {
 	return out
 }
 
+// allChannelGroups 所有 **enabled** 通道构成的组（不含 work）。
+//
+// 走 ListUpstreams 而不是逐条 groupMembers：这是管理端列表与授权用的，
+// 要的是"全"，通道数量本来就是个位数；热路径（解析单个组名）才需要单条查询。
+func (p *Proxy) allChannelGroups() []modelGroupInfo {
+	ups, err := p.store.ListUpstreams()
+	if err != nil {
+		log.Printf("WARN: [group] 读取通道列表失败：%v", err)
+		return nil
+	}
+	out := make([]modelGroupInfo, 0, len(ups))
+	for _, u := range ups {
+		if !u.Enabled {
+			continue // 停用的通道 = 组不可见（与 groupMembers 的口径一致）
+		}
+		n := 0
+		for _, m := range u.Models {
+			if m.Enabled {
+				n++
+			}
+		}
+		out = append(out, modelGroupInfo{
+			ID:      "ch" + strconv.FormatInt(u.ID, 10),
+			Model:   groupVirtualModel("ch" + strconv.FormatInt(u.ID, 10)),
+			Label:   "通道 · " + u.Name,
+			Kind:    "channel",
+			Members: n,
+		})
+	}
+	return out
+}
+
 // applyGroupExpansion 组名 → 真名，并**同步改写 payload**，返回 (真名, 是否展开)。
 //
 // 为什么单独抽出来（而不是在 ServeChat 里就地写两行）：出站请求体是从 payload

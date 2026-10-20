@@ -1534,6 +1534,32 @@ func (s *Store) SetAPIKeyGroups(userID, id int64, scope string) error {
 	return nil
 }
 
+// GetAPIKeyAnyOwner 管理端按 id 取 Key（**不带 user 条件**）。
+//
+// 与 GetAPIKey 的区别是刻意保留的：用户侧必须带 userID（跨用户查不到 = 404，不泄露存在性）；
+// 管理端本来就是"看所有人的"，再要求它先知道 userID 只会让接口难用。
+// 所以这个函数**只能**在 adminGuard 之后调用。
+func (s *Store) GetAPIKeyAnyOwner(id int64) (*APIKey, error) {
+	k, err := scanAPIKey(s.db.QueryRow(`SELECT `+keyCols+` FROM api_keys WHERE id = ?`, id))
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	return k, err
+}
+
+// SetAPIKeyGroupsByID 管理端按 id 设置可见组（同上：仅 adminGuard 之后使用）。
+func (s *Store) SetAPIKeyGroupsByID(id int64, scope string) error {
+	res, err := s.db.Exec(`UPDATE api_keys SET group_scope = ? WHERE id = ?`,
+		strings.TrimSpace(scope), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // DeleteAPIKey 删除某 key。
 func (s *Store) DeleteAPIKey(userID, id int64) error {
 	res, err := s.db.Exec(`DELETE FROM api_keys WHERE id = ? AND user_id = ?`, id, userID)

@@ -4305,9 +4305,109 @@ function userCard(u) {
   const rec = el('button', 'ghost', '记录');
   rec.title = '余额变动记录：谁在什么时候改了多少、结果如何';
   rec.onclick = () => openBalanceAudits(u);
-  foot.append(add, lim, ban, rec);
+  // 「组」（v0.31.77）：给这个用户的 Key 授权第三方通道组。
+  // 放在用户卡上而不是通道页：授权是"给谁"的决定，从用户出发才找得到；
+  // 从通道出发会变成"这条通道给了谁"，那种列表更适合排查，不适合配置。
+  const grp = el('button', 'ghost', '组');
+  grp.title = '该用户各把 Key 能看见哪些模型组（work 官组恒可见，通道组需在此授权）';
+  grp.onclick = () => openKeyGroups(u);
+  foot.append(add, lim, ban, rec, grp);
   card.appendChild(foot);
   return card;
+}
+
+// openKeyGroups 某用户的 Key 组授权弹窗（v0.31.77）。
+//
+// 只做一件事：勾选。**不在这里改 Key 状态或删 Key** —— 那是「API 密钥」页的职责，
+// 一个弹窗承担两种破坏性操作，误点的代价太高。
+async function openKeyGroups(u) {
+  let d = null;
+  try { d = await api(`/api/admin/users/${u.id}/keys`); }
+  catch (e) { toast('读取密钥失败：' + e.message, 'err'); return; }
+  const keys = (d && d.keys) || [];
+  const groups = (d && d.groups) || [];
+  const m = openModal('模型组授权 · ' + u.username,
+    'work 官组对所有 Key 恒可见；勾选通道组后，该 Key 才能用 wb-group-ch<N> 这个组名。代挂自用 Key 只能用 work。');
+
+  if (!keys.length) {
+    m.body.appendChild(el('div', 'hintbar', '该用户还没有任何密钥。'));
+    return;
+  }
+  const box = el('div', 'card');
+  box.style.background = 'var(--bg-soft, rgba(0,0,0,.02))';
+  for (const k of keys) {
+    const row = el('div');
+    row.style.cssText = 'padding:8px 0;border-bottom:1px solid rgba(127,127,127,.15);';
+    const head = el('div', 'row');
+    head.style.cssText = 'justify-content:space-between;align-items:center;gap:8px;';
+    const left = el('span');
+    left.appendChild(el('b', null, k.name || '未命名'));
+    left.appendChild(el('span', 'mono muted', ' #' + k.id + ' ' + (k.masked || '')));
+    if (k.kind === 'host') left.appendChild(el('span', 'tag', ' 代挂'));
+    if (k.status !== 'active') left.appendChild(el('span', 'tag warn', ' 已停用'));
+    head.appendChild(left);
+
+    if (k.kind === 'host') {
+      // 代挂 Key：明确说清为什么不能勾（不给一堆禁用复选框，让人以为点了会生效）。
+      const why = el('span', 'muted', '只能用 work 官组');
+      why.style.fontSize = '12px';
+      head.appendChild(why);
+      row.appendChild(head);
+      box.appendChild(row);
+      continue;
+    }
+
+    const sel = new Set(splitScope(k.group_scope));
+    const chRow = el('div', 'row');
+    chRow.style.cssText = 'gap:12px;flex-wrap:wrap;margin-top:6px;';
+    for (const g of groups) {
+      if (g.id === 'work') continue; // work 恒可见，不给勾（勾了等于假装授予过）
+      const lab = el('label', 'muted', ' ' + (g.label || g.id) + (g.members ? '' : '（空组）'));
+      lab.style.cssText = 'display:inline-flex;align-items:center;gap:4px;font-size:12px;';
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.checked = sel.has(g.id);
+      cb.disabled = !g.members; // 空组勾了也没用（选它必然失败）
+      cb.onchange = () => { if (cb.checked) sel.add(g.id); else sel.delete(g.id); };
+      lab.prepend(cb);
+      chRow.appendChild(lab);
+    }
+    if (!chRow.children.length) {
+      chRow.appendChild(el('span', 'muted', '还没有启用的通道组（先去「第三方通道」建通道）'));
+    }
+    row.appendChild(head);
+    row.appendChild(chRow);
+
+    const ops = el('div', 'row');
+    ops.style.cssText = 'gap:8px;margin-top:6px;';
+    const save = el('button', '', '保存授权');
+    const hint = el('span', 'muted', '');
+    hint.style.fontSize = '12px';
+    save.onclick = async () => {
+      save.disabled = true;
+      try {
+        const r = await post(`/api/admin/keys/${k.id}/groups`, {
+          group_scope: Array.from(sel).join(','),
+        });
+        hint.textContent = '已保存：' + (r.group_scope || '（仅 work）')
+          + ((r.dropped && r.dropped.length) ? '；已忽略不存在的组：' + r.dropped.join(',') : '');
+        hint.style.color = '#2e7d32';
+      } catch (e) {
+        hint.textContent = '保存失败：' + e.message;
+        hint.style.color = '#c0392b';
+      } finally { save.disabled = false; }
+    };
+    ops.appendChild(save);
+    ops.appendChild(hint);
+    row.appendChild(ops);
+    box.appendChild(row);
+  }
+  m.body.appendChild(box);
+}
+
+// splitScope 逗号分隔的组 scope → 数组（与后端 splitGroups 同语义）。
+function splitScope(s) {
+  return String(s || '').split(',').map((x) => x.trim()).filter((x) => x);
 }
 
 let allUsers = [];

@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.76"
+const version = "0.31.77"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1994,6 +1994,10 @@ func (a *app) routes() *http.ServeMux {
 
 	// 用户详情（v0.21.0）：管理后台用户面板的「查看详情」。
 	mux.HandleFunc("GET /api/admin/users/{id}", a.adminGuard(a.handleAdminUserDetail))
+	// Key 的模型组授权（v0.31.77）：列表与设置分开两个接口，
+	// 让"看详情"这个高频只读操作不被写接口的失败牵连（见 admingroup.go 头注释）。
+	mux.HandleFunc("GET /api/admin/users/{id}/keys", a.adminGuard(a.handleAdminUserKeys))
+	mux.HandleFunc("POST /api/admin/keys/{id}/groups", a.adminGuard(a.handleAdminSetKeyGroups))
 
 	// 账号上架 / 买断（v0.19.0）
 	// 管理端：上架 / 下架指定账号 + 市场台账（在售、可上架候选、买断记录）。
