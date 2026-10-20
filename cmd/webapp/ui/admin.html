@@ -3439,11 +3439,29 @@ function renderPoolDash(d) {
   rk.appendChild(poolKpi('代挂账号', hosting, { d: hosting ? '归属用户的账号' : '暂无代挂' }));
 }
 
-// loadSourceStats 拉取并渲染「来源健康度」（v0.31.37）。
+// SOURCE_HEALTH 来源健康度的展示阈值（v0.31.75）。
+//
+// **只影响展示**：服务端只下发 dead_rate，判定"健康/注意/危险"是纯视觉分级，
+// 不参与任何业务判定（不摘号、不降权、不告警）。写在这里而不是塞进接口：
+// 阈值是"人怎么看"，不是"系统怎么算"。
+const SOURCE_HEALTH = { warn: 0.05, danger: 0.20 };
+
+// sourceHealthOf 失效率 → 徽章文案与主色。
+function sourceHealthOf(rate, total) {
+  if (!total) return { label: '无数据', color: '#8a8f99', bg: 'rgba(127,127,127,.15)' };
+  if (rate > SOURCE_HEALTH.danger) return { label: '危险', color: '#c0392b', bg: 'rgba(192,57,43,.12)' };
+  if (rate >= SOURCE_HEALTH.warn) return { label: '注意', color: '#b9770e', bg: 'rgba(185,119,14,.12)' };
+  return { label: '健康', color: '#2e7d32', bg: 'rgba(46,125,50,.12)' };
+}
+
+// loadSourceStats 拉取并渲染「来源健康度」（v0.31.37，v0.31.75 加可视化）。
 //
 // 口径全部来自服务端（source_stats.go），前端**不重算**：
 // 一旦两边各算一遍，同样的名字早晚会得出两个数字，而运维只会相信先看到的那个。
 // 失败静默：这是辅助观测，不该因为一个统计接口把账号池页弄成错误页。
+//
+// 为什么加可视化：原来只有一行文字 + 两档颜色，"死 1 个"和"死 80 个"都是同一句红字，
+// 看不出这个来源到底还能不能用。现在给失效率大字 + 堆叠条 + 三档徽章。
 async function loadSourceStats() {
   const box = $('accSourceStats');
   if (!box) return;
@@ -3455,8 +3473,11 @@ async function loadSourceStats() {
   box.textContent = '';
   const head = el('div', 'row');
   head.style.justifyContent = 'space-between';
+  head.style.alignItems = 'baseline';
   head.appendChild(el('b', null, '来源健康度'));
-  const hint = el('span', 'muted', '分母 = 该来源全部账号；「仅剩 access」不算失效（还能服务到过期）');
+  // 口径提示必须写在卡上：这个条最容易被误读成"在池比例"。
+  const hint = el('span', 'muted',
+    '条 = 失效 / 仅剩 access / 正常（按全部账号算）；「在池」与「失效」可能重叠');
   hint.style.fontSize = '11px';
   head.appendChild(hint);
   box.appendChild(head);
@@ -3464,22 +3485,63 @@ async function loadSourceStats() {
   const tbl = el('div');
   tbl.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;';
   for (const r of rows) {
-    // 三个来源各自一块：总数 + 真死 + 仅剩 access + 失效率。
-    // 空来源（0 个号）也画出来 —— 它正好说明"这一类还没开始积累"，比隐藏更诚实。
+    // 三个来源各自一块。空来源（0 个号）也画出来 —— 它正好说明"这一类还没开始积累"，
+    // 比隐藏更诚实（也避免"某个来源消失了"被误读成接口出错）。
+    const total = Number(r.total) || 0;
+    const dead = Number(r.dead) || 0;
+    const lost = Number(r.lost) || 0;
+    const rate = typeof r.dead_rate === 'number' ? r.dead_rate : (total ? dead / total : 0);
+    const h = sourceHealthOf(rate, total);
+
     const cell = el('div');
-    cell.style.cssText = 'flex:1;min-width:150px;border:1px solid rgba(127,127,127,.2);'
-      + 'border-radius:8px;padding:8px 10px;';
-    const t = el('div');
-    t.appendChild(el('b', null, r.label || r.source || '历史/未知'));
-    t.appendChild(el('span', 'muted', ' · ' + r.total + ' 个'));
-    cell.appendChild(t);
-    const line2 = el('div', 'muted');
-    line2.style.fontSize = '12px';
-    const rate = (typeof r.dead_rate === 'number') ? (r.dead_rate * 100).toFixed(0) + '%' : '—';
-    line2.textContent = '在池 ' + r.in_pool + ' · 失效 ' + r.dead + '（' + rate + '）· 仅剩 access ' + r.lost;
-    if (r.dead > 0) line2.style.color = '#c0392b';
-    else if (r.lost > 0) line2.style.color = '#b9770e';
-    cell.appendChild(line2);
+    cell.style.cssText = 'flex:1;min-width:210px;border:1px solid rgba(127,127,127,.2);'
+      + 'border-radius:10px;padding:10px 12px;';
+
+    const top = el('div', 'row');
+    top.style.justifyContent = 'space-between';
+    top.style.alignItems = 'center';
+    top.appendChild(el('b', null, r.label || r.source || '历史/未知'));
+    top.appendChild(el('span', 'muted', total + ' 个'));
+    cell.appendChild(top);
+
+    // 主指标：失效率大字 + 三档徽章
+    const mid = el('div', 'row');
+    mid.style.cssText = 'align-items:baseline;gap:8px;margin-top:6px;';
+    const big = el('span', null, total ? (rate * 100).toFixed(0) + '%' : '—');
+    big.style.cssText = 'font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;color:' + h.color;
+    big.title = '失效率 = 失效（token 已死）/ 该来源全部账号';
+    mid.appendChild(big);
+    const badge = el('span', null, h.label);
+    badge.style.cssText = 'font-size:11px;padding:1px 7px;border-radius:999px;color:' + h.color
+      + ';background:' + h.bg + ';border:1px solid ' + h.color + '33;';
+    mid.appendChild(badge);
+    cell.appendChild(mid);
+
+    // 堆叠条：三段互斥（dead 与 lost 在服务端已互斥，剩余算"正常"），
+    // 合起来正好等于 total —— 不能让条长代表别的分母，否则和数字对不上。
+    const bar = el('div');
+    bar.style.cssText = 'display:flex;height:8px;border-radius:4px;overflow:hidden;'
+      + 'background:rgba(127,127,127,.15);margin:8px 0 6px;';
+    const seg = (n, color, title) => {
+      if (n <= 0 || !total) return;
+      const d = el('div');
+      d.style.cssText = 'height:100%;background:' + color + ';';
+      d.style.width = (Math.min(n, total) / total * 100).toFixed(2) + '%';
+      d.title = title;
+      bar.appendChild(d);
+    };
+    seg(dead, '#c0392b', '失效 ' + dead + ' 个（token 已死，需重新登录）');
+    seg(lost, '#b9770e', '仅剩 access ' + lost + ' 个（不能续期，但能服务到过期）');
+    seg(total - dead - lost, '#2e7d32', '正常 ' + Math.max(0, total - dead - lost) + ' 个');
+    cell.appendChild(bar);
+
+    // 明细：在池是"参与消耗"的口径，与上面的失效口径正交，所以只放文字不放条。
+    const det = el('div', 'muted');
+    det.style.fontSize = '12px';
+    det.textContent = '在池 ' + (r.in_pool || 0) + ' · 失效 ' + dead + ' · 仅剩 access ' + lost;
+    det.title = '分母 = 该来源全部账号（含未入池）。「在池」与「失效」是两套口径，可能重叠：'
+      + '在池的号也可能 token 已死。';
+    cell.appendChild(det);
     tbl.appendChild(cell);
   }
   box.appendChild(tbl);

@@ -159,6 +159,10 @@
       <div class="section-head" style="margin-top:18px;"><h2>快捷操作</h2></div>
       <div class="action-grid">
         <button class="action-card" onclick="navGo('keys')"><b>生成调用密钥</b><span>按账号范围绑定，接入任意 OpenAI 兼容客户端</span></button>
+        <!-- 一键接入（v0.31.75）：入口此前只藏在密钥卡的操作区里，
+             不知道有这功能的人永远点不到。这里给一个可发现的入口：
+             有可用 Key 就直接开它的弹窗，没有就先去建 Key。 -->
+        <button class="action-card" onclick="quickOnboard()"><b>一键接入</b><span>把地址 + Key + 模型写进 WorkBuddy / CC Switch 配置</span></button>
         <button class="action-card" onclick="navGo('test')"><b>测试对话</b><span>在页面上直接试一把你的密钥</span></button>
         <button class="action-card" onclick="navGo('wallet')"><b>充值提现</b><span>兑换充值码 / 发起提现申请</span></button>
         <button class="action-card" onclick="navGo('usage')"><b>查看用量账单</b><span>三类消耗 + 逐笔调用与实时态势</span></button>
@@ -1545,6 +1549,59 @@ async function loadKeys() {
 }
 
 // openKeyBindModal 修改既有密钥的账号范围。
+// quickOnboard 概览页「一键接入」入口（v0.31.75）。
+//
+// 语义：有可用 Key 就直接开接入弹窗；没有就跳「API 密钥」页。
+// **多把 Key 时不替用户挑**——随机选一把写进本地配置比让用户多点一下糟得多。
+async function quickOnboard() {
+  let keys = [];
+  try {
+    const d = await api('/api/keys');
+    keys = (d.keys || []).filter((k) => k.status === 'active' && k.revealable !== false);
+  } catch (e) { /* 落到下面统一处理 */ }
+  if (!keys.length) {
+    toast('先建一把密钥再接入', 'err');
+    navGo('keys');
+    return;
+  }
+  if (keys.length === 1) { openOnboardModal(keys[0]); return; }
+  navGo('keys');
+  toast('选一把密钥，点它右边的「接入」', 'ok');
+}
+
+// onboardErrorBlock 生成失败时的**常驻**错误块（v0.31.75）。
+//
+// 原来只 toast：三秒后消失，既截不了图也看不到下一步，用户只能来问"为什么不行"。
+// 这里给「错误码原文 + 按类型给的动作建议 + 一键复制」，让它能被转发。
+function onboardErrorBlock(box, msg) {
+  box.textContent = '';
+  const card = el('div', 'card');
+  card.style.cssText = 'border:1px solid rgba(192,57,43,.35);background:rgba(192,57,43,.06);margin-top:12px;';
+  card.appendChild(el('b', null, '生成失败'));
+  const p = el('div', 'muted', String(msg || '未知错误'));
+  p.style.cssText = 'font-size:12px;margin-top:4px;word-break:break-all;';
+  card.appendChild(p);
+  const s = String(msg || '');
+  let tip = '先确认这把 Key 仍处于启用状态、网络可达，然后重新生成。';
+  if (/404/.test(s)) tip = '这把 Key 不存在或不属于当前账号：回「API 密钥」刷新列表后重试。';
+  else if (/403/.test(s)) tip = '该 Key 已停用：先在密钥卡片上「启用」，再回来生成。';
+  else if (/409|密文/.test(s)) tip = '这把 Key 创建于更早版本（或服务端加密密钥已更换），需要重新生成一把。';
+  else if (/429|频率|too many/i.test(s)) tip = '生成太频繁，等一分钟再试。';
+  const t = el('div', 'muted', '建议：' + tip);
+  t.style.cssText = 'font-size:12px;margin-top:6px;';
+  card.appendChild(t);
+  const row = el('div', 'row');
+  row.style.cssText = 'gap:8px;margin-top:8px;';
+  const cp = el('button', 'ghost', '复制错误');
+  cp.onclick = async () => {
+    if (await writeClipboard(String(msg || ''))) toast('已复制', 'ok');
+    else toast('复制失败，请手动选择', 'err');
+  };
+  row.appendChild(cp);
+  card.appendChild(row);
+  box.appendChild(card);
+}
+
 // openOnboardModal 一键接入（v0.31.69，需求 P3）。
 //
 // 为什么是"下载一个脚本"而不是"服务端直接写"：浏览器不能写本地文件，
@@ -1653,6 +1710,56 @@ async function openOnboardModal(k) {
         '地址 ' + d.base_url + ' · 模型 ' + d.model + ' · Key ' + (d.key_masked || '')));
       box.appendChild(el('div', 'muted',
         '文件里含明文 Key：运行完脚本会自删；若手动保存了副本，用完请删除。'));
+
+      // 「验证连接」（v0.31.75）：脚本跑完 ≠ 接上了。
+      // 用这把 Key 发一次最小请求（max_tokens:1），把"成功"变成有证据的结论；
+      // 失败按状态码给下一步，而不是让用户自己开客户端试。
+      const vRow = el('div', 'row');
+      vRow.style.cssText = 'gap:8px;margin-top:8px;align-items:center;';
+      const bVerify = el('button', 'ghost', '验证连接');
+      const vLine = el('span', 'muted', '');
+      vLine.style.fontSize = '12px';
+      bVerify.onclick = async () => {
+        bVerify.disabled = true;
+        bVerify.textContent = '验证中…';
+        vLine.style.color = '';
+        vLine.textContent = '';
+        try {
+          const rv = await api('/api/keys/' + encodeURIComponent(k.id) + '/reveal');
+          if (!rv.key) throw new Error('这把密钥没有可回显的密文，请重新生成后再验证');
+          // 明文 Key 只在这一刻拿一次，发完即弃（与测试对话页同一纪律）。
+          const t0 = performance.now();
+          const res = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + rv.key, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: d.model, stream: false, max_tokens: 1,
+              messages: [{ role: 'user', content: 'ping' }],
+            }),
+          });
+          const ms = Math.round(performance.now() - t0);
+          if (res.ok) {
+            vLine.style.color = '#2e7d32';
+            vLine.textContent = '✓ 通了：HTTP 200 · ' + ms + 'ms · 模型 ' + d.model;
+          } else {
+            const txt = await res.text();
+            vLine.style.color = '#c0392b';
+            if (res.status === 402) vLine.textContent = '✗ 余额不足（Key 有效，去充值后再试）· ' + ms + 'ms';
+            else if (res.status === 404) vLine.textContent = '✗ 模型名不对或不在该 Key 范围：' + txt.slice(0, 120);
+            else if (res.status === 401) vLine.textContent = '✗ Key 无效或已停用，重新生成一把';
+            else vLine.textContent = '✗ HTTP ' + res.status + '：' + txt.slice(0, 140);
+          }
+        } catch (e) {
+          vLine.style.color = '#c0392b';
+          vLine.textContent = '✗ 请求没发出去：' + (e.message || e);
+        } finally {
+          bVerify.disabled = false;
+          bVerify.textContent = '验证连接';
+        }
+      };
+      vRow.appendChild(bVerify);
+      vRow.appendChild(vLine);
+      box.appendChild(vRow);
       result.appendChild(box);
 
       // ② 兜底：手动配置（不进脚本的人）
@@ -1689,8 +1796,9 @@ async function openOnboardModal(k) {
           : '验证：重启 Claude Code 后 /status 应显示新的 base_url。若 CC Switch 处于 routing 模式，需在它内部再选一次供应商。'));
       gen.textContent = '重新生成';
     } catch (e) {
-      toast(e.message, 'err');
-      gen.textContent = '生成接入包';
+      // 弹窗内常驻错误块（v0.31.75）：toast 会消失，用户截不了图也看不到下一步。
+      onboardErrorBlock(result, e.message || String(e));
+      gen.textContent = '重新生成';
     } finally { gen.disabled = false; }
   };
 }
