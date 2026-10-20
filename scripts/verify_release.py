@@ -27,6 +27,7 @@ import re
 import sys
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -56,7 +57,7 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def fetch(url, dest=None):
+def fetch_once(url, dest=None):
     req = urllib.request.Request(url, method="GET")
     req.add_header("User-Agent", "wb2api-release-check/1")
     try:
@@ -81,6 +82,29 @@ def fetch(url, dest=None):
         return None, "HTTP %d" % e.code
     except Exception as e:  # noqa: BLE001 —— 网络原因千奇百怪，统一报出来即可
         return None, str(e)
+
+
+def fetch(url, dest=None, attempts=3):
+    """下载/探测，**网络类失败重试**，HTTP 4xx/5xx 不重试。
+
+    为什么必须区分（v0.31.63 实测踩到）：发布后立刻校验时偶发
+    "Remote end closed connection without response"（代理/边缘节点抖动），
+    旧实现把它和"资产真的不存在"报成同一句话 —— 于是闸门会随机变红，
+    而人一旦见过它误报，下次就会直接忽略它（闸门就此失效）。
+    404 是确定事实（资产没发），重试只是浪费时间；网络抖动重试两次足够。
+    """
+    last = None
+    for i in range(max(1, attempts)):
+        got, err = fetch_once(url, dest)
+        if err is None:
+            return got, None
+        last = err
+        # HTTP 状态码是**服务器的确定回答**，不重试。
+        if err.startswith("HTTP "):
+            return None, err
+        if i + 1 < attempts:
+            time.sleep(1.5 * (i + 1))
+    return None, "%s（已重试 %d 次）" % (last, attempts)
 
 
 def check_signature(man, relsign):
@@ -111,6 +135,10 @@ def main():
     ap.add_argument("--local", action="store_true", help="同时比对 dist 本地产物")
     ap.add_argument("--skip-download", action="store_true", help="只检查可达性，不下载校验")
     ap.add_argument("--relsign", default="", help="relsign 可执行文件路径（给了就同时校验清单签名）")
+    ap.add_argument("--offline", action="store_true",
+                    help="不联网：只查版本一致 / 签名 / dist 本地产物（CI 与发布前置用）")
+    ap.add_argument("--manifest-only", action="store_true",
+                    help="只查清单本身（版本一致 / 有签名 / assets 非空），不碰网络与 dist（每次 CI 都跑）")
     a = ap.parse_args()
 
     with io.open(os.path.join(ROOT, "version.json"), encoding="utf-8") as f:
@@ -128,6 +156,20 @@ def main():
     if not assets:
         die("version.json 没有任何 assets")
 
+    # --manifest-only：每次 push/PR 都能跑的**轻量闸门**（v0.31.63，F06）。
+    #
+    # 它抓的是"清单与代码不同步"这一类：改了 version 常量却忘了改清单、手改了 JSON
+    # 导致签名失效、assets 被清空。这些在本地看起来毫无异常，却会让所有客户端
+    # 收不到更新（或者收到一个指向空资产的清单）。不需要网络，也不需要先构建。
+    if a.manifest_only:
+        for it in assets:
+            if not (it.get("sha256") or "").strip():
+                die("assets 里有一条没写 sha256 —— 客户端会拒绝下载")
+            if not (it.get("url") or "").strip().startswith("http"):
+                die("assets 里的 url 不是 http(s)：%r" % it.get("url"))
+        print("OK（仅清单）：版本/签名/assets 齐全（v%s）" % ver)
+        return
+
     for it in assets:
         name = it.get("name") or it.get("url", "").rsplit("/", 1)[-1]
         url = it.get("url", "")
@@ -135,6 +177,25 @@ def main():
         want_size = int(it.get("size") or 0)
         print("检查 %s" % name)
         print("  URL %s" % url)
+
+        # --offline：跳过一切网络检查（v0.31.63）。CI 里"资产还没上传"是**正常状态**，
+        # 那时唯一要保证的是「清单声明的 sha/size 与本次构建出的字节一致」——
+        # 也就是"要发的东西就是测过的东西"。上传后由发布后校验再补 URL 可达性。
+        if a.offline:
+            if not a.local:
+                print("  ⚠ --offline 建议配合 --local 使用（否则只校验了版本与签名）")
+                continue
+            lp = os.path.join(ROOT, "dist", name)
+            if not os.path.exists(lp):
+                die("--local 但 dist/%s 不存在（先构建）" % name)
+            lsha, lsize = sha256_file(lp), os.path.getsize(lp)
+            if want_sha and lsha != want_sha:
+                die("dist/%s 与清单 sha 不一致（清单说的不是这次构建的字节）\n  清单 %s\n  实际 %s"
+                    % (name, want_sha, lsha))
+            if want_size and lsize != want_size:
+                die("dist/%s 与清单大小不一致：%d vs %d" % (name, lsize, want_size))
+            print("  本地产物与清单一致 ✓ (%d bytes)" % lsize)
+            continue
 
         if a.skip_download:
             ok, err = fetch(url)
@@ -166,7 +227,10 @@ def main():
                 die("dist/%s 与清单大小不一致：%d vs %d" % (name, lsize, want_size))
             print("  本地 dist 产物一致 ✓")
 
-    print("OK：清单与真实资产一致（v%s）" % ver)
+    if a.offline:
+        print("OK（离线）：清单版本/签名/本地产物一致（v%s）" % ver)
+    else:
+        print("OK：清单与真实资产一致（v%s）" % ver)
 
 
 if __name__ == "__main__":

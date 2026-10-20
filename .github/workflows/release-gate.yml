@@ -1,0 +1,85 @@
+# release-gate.yml 发布后闸门（v0.31.63，审查 F06）。
+#
+# ## 它解决什么
+#
+# 审查原文：「清单超前于资产、发布未依赖 CI」。具体表现：version.json 指着某个版本的
+# 下载地址，而那个 Release 根本没发出来 —— 用户点下载 404，本地一切正常。
+#
+# 本 workflow 在**打 tag 时**替所有人问一句：这个 tag 的资产**真的存在且与清单一致**吗？
+#
+#   tag vX.Y.Z  →  等 Release 出现（发布机 push 之后才跑 release.py，存在时间差）
+#               →  下载清单里声明的资产，逐字节比对 sha256/size
+#               →  任何一项不对，workflow 红
+#
+# ## 为什么等待而不是直接失败
+#
+# 发布顺序是「先 push（tag 先到），再 release（资产后到）」。tag push 会立刻触发本 workflow，
+# 此时 Release 还没建好 —— 直接判红是误报。所以给一个**有限等待**（默认 10 分钟），
+# 超时才判红：那才是真正"只推了 tag 没发资产"的情形。
+#
+# ## 边界（诚实）
+#
+# 本 workflow **不签名、不创建 Release**：私钥只在发布机（见 internal/selfupdate/pubkey.go）。
+# 它只做校验 —— 也就是"发布必须过 CI 这一关"里的那一关。
+name: Release Gate
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要校验的 tag（默认取当前 ref）'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ① tag 与清单版本必须一致：tag v0.31.63 而清单写 0.31.62，说明发错了东西
+      #    （这正是 v0.31.54 那次"清单超前"的形态）。
+      - name: tag 与清单版本一致
+        env:
+          TAG_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          VER=$(python3 -c "import json;print(json.load(open('version.json'))['version'])")
+          echo "tag=$TAG_REF manifest=$VER"
+          if [ "$TAG_REF" != "v$VER" ]; then
+            echo "::error::tag($TAG_REF) 与 version.json 的版本(v$VER) 不一致"
+            exit 1
+          fi
+
+      # ② 清单签名（不需要私钥，只需内置公钥）。
+      - name: 清单签名
+        run: |
+          go build -o /tmp/relsign ./cmd/relsign
+          /tmp/relsign verify -in version.json
+
+      # ③ 资产存在且逐字节一致。给 10 分钟等 Release 出现（发布机 push 后才跑 release.py）。
+      - name: 资产与清单逐字节一致（等待 Release 出现）
+        run: |
+          python3 scripts/verify_release.py --relsign /tmp/relsign || {
+            echo "首次校验失败：Release 可能还没建好，等待重试（最多 10 分钟）"
+            for i in $(seq 1 19); do
+              sleep 30
+              if python3 scripts/verify_release.py --relsign /tmp/relsign; then
+                echo "第 $i 次重试通过"
+                exit 0
+              fi
+            done
+            echo "::error::超时：tag 已推送但资产仍不可用/不一致（清单超前于资产）"
+            exit 1
+          }

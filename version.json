@@ -1,20 +1,20 @@
 {
-  "version": "0.31.62",
+  "version": "0.31.63",
   "min_supported": "0.24.0",
-  "notes": "v0.31.62：审查报告 F02 的最后一块 —— 账目对账。① 新增 GET /api/admin/ledger-check（后台「设置 → 账目对账」卡片，可「立即对账」）：只读检查六条必须永远成立的关系 —— 可提现额度 ≤ 余额、冻结额非负、预扣不残留（>1h）、管理通道不扣费、账号累计收益 == 分成台账、「当日分成+返点 ≤ 平台实收」。② 调度：启动 90s 后跑一次 + 每 6 小时一次；结果落 kv，重启后仍能看上一次；有 high 级发现写 WARN 日志（含 code/count/原因）。③ 只报不改：自动修账会把「一次误判」直接变成「改错账」，修不修由人决定。④ 为什么事务修好了还要对账：事务只管单笔，管不了 v0.31.60 之前已落库的半截账、导库/手工改库、以及将来有人写出第二套扣费或分成。⑤ 新增 7 条用例：干净库零发现 + 六类违规逐个注入（含「当天没有返点行」这种会让 INNER JOIN 整天跳过的情形）+ 后台接口（默认读缓存 / run=1 重跑 / 未登录被挡）。⑥ 上线前用只读 SQL 探测过生产：六条不变式当前全部为 0，不会带来误报。",
-  "released_at": 1792479834,
+  "notes": "v0.31.63：审查报告 F06 落地 —— 发布前置与发布后校验各有**唯一实现**。\n① **preflight.py**：把\"发布前该做什么\"固化成一条可执行链（gofmt → vet → 单测 → 前端 jscheck/uitest → 双平台构建 → relsign → 清单一致性）。CI 与发布机都只调它，不再有\"人在发布机上敲的子集\"。\n② **make_manifest.py**：清单从**真实产物**生成（版本只认 main.go 的 const version；sha256/size 来自刚构建的 exe），顺序固定为 读版本 → 算摘要 → 写清单 → 签名字段，杜绝\"手写清单说假话\"。\n③ **构建改为可重复**：加 -buildvcs=false。默认会嵌入 VCS 标记，同一份源码在不同 commit/机器上构建出不同字节 —— 于是\"清单 sha == 本次构建字节\"这条闸门永远为假。已实测：两次构建逐字节一致。\n④ **CI 加清单闸门**（每次 push/PR）：版本一致 + 签名有效 + assets 齐全（verify_release.py --manifest-only），不联网、不需构建。\n⑤ **新增 release-gate.yml**（tag 触发）：tag 必须等于 v<清单版本>；清单签名可验；然后**下载已发布资产逐字节比对**。Release 没建好时有限等待 10 分钟，超时才判红 —— 抓的正是\"清单超前于资产\"。\n⑥ 修一个会让人不再信任闸门的缺陷：下载校验把网络抖动（Remote end closed）和\"资产不存在\"报成同一句。现在网络失败重试 3 次、HTTP 4xx/5xx 不重试，错误信息区分开。\n边界：私钥不进 CI，workflow 只校验、不签名；release-gate 的重试等待无法在本机复刻（Actions 实跑才算验证）。",
+  "released_at": 1792480655,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.62/webapp.exe",
-      "sha256": "0845ba838ca173cc60bbd8dfef3f1d6c170c64d1235c00072e865c71521e87d7",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.63/webapp.exe",
+      "sha256": "0ca8d4c2306ffb5baa0fe4738b6e1771a0865eb6347a31c3ee21cb70637c23a2",
       "size": 15677952
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "cF3c6s/rjmXj1VfAie3Z7ColEGhxwywakQ8RGPRMFEozcWBWTuZz5uMdM9DjCglI9beEOLmI/7jzQXznl8qwDA==",
+  "signature": "0Ml27/KiSvHRRAMhh7p+ULk/5diXiHbSzhZcQtwSZObRGynWalUTO/JEKt/B/MgLTO8SanP+lVWks+2lZtvMAQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

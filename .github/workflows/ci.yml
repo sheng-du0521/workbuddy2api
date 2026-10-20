@@ -14,6 +14,10 @@
 #
 # 前端（cmd/webapp/ui）没有构建步骤（原生 DOM + 内联脚本，无打包器），
 # 故这里只做「内联脚本语法检查」——等价于 tools/jscheck。
+#
+# v0.31.63（审查 F06）补一节「更新清单闸门」：清单与代码不同步（版本常量改了没改清单、
+# 手改 JSON 把签名弄坏、assets 被清空）在本地看不出任何异常，却会让所有客户端收不到更新。
+# 这一节不需要网络与构建，每次 push/PR 都跑；发布后"资产是否真的存在"由 release-gate.yml 管。
 
 name: CI
 
@@ -61,6 +65,14 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      # 更新清单闸门（v0.31.63，审查 F06）：版本一致 / 签名有效 / assets 齐全。
+      # relsign 用 go run 构建：它是仓库内工具，不需要额外下载。
+      - name: 更新清单校验
+        run: |
+          go build -o /tmp/relsign ./cmd/relsign
+          python3 scripts/verify_release.py --manifest-only --relsign /tmp/relsign
+
 
       # -race 需要 cgo；ubuntu-latest 自带 gcc，故这里能跑（本机 Windows 无 gcc 跑不了）。
       # ⚠️ 显式给 -timeout：Go 默认每包 10 分钟，而 cmd/webapp 是最大的包，
