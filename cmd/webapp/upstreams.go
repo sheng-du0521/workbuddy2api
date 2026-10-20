@@ -476,6 +476,36 @@ func (s *Store) relayPriceCeiling() (map[string]float64, error) {
 	return out, rows.Err()
 }
 
+// relayGroup 通道组（v0.31.76）：通道名 + 其 enabled 模型的用户可见名。
+//
+// 通道不存在或**已停用** → name 为空（调用方据此判定"组不可见"）。
+// 用 LEFT JOIN 是为了区分两件事：
+//   - 通道存在但一条映射都没开 → name 非空、models 空 = 「空组」（要显示，让人知道配了但没选模型）；
+//   - 通道不存在/停用 → name 空 = 组不存在（列表里不出现，请求报"模型不存在"）。
+func (s *Store) relayGroup(id int64) (name string, models []string, err error) {
+	rows, err := s.db.Query(`SELECT u.name, m.model
+		FROM upstreams u
+		LEFT JOIN upstream_models m ON m.upstream_id = u.id AND m.enabled = 1
+		WHERE u.id = ? AND u.enabled = 1
+		ORDER BY m.model`, id)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		var m sql.NullString
+		if err := rows.Scan(&n, &m); err != nil {
+			return "", nil, err
+		}
+		name = n
+		if m.Valid && m.String != "" {
+			models = append(models, m.String)
+		}
+	}
+	return name, models, rows.Err()
+}
+
 // relayModelIDs 所有"可通过通道提供"的模型名（去重、升序）。
 func (s *Store) relayModelIDs() ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT m.model

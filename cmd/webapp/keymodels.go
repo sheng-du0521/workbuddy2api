@@ -42,6 +42,9 @@ type keyModelsResp struct {
 	// Reason 清单为空/受限的原因码（前端只按码换文案，不解析中文）。
 	Reason string `json:"reason,omitempty"`
 	Note   string `json:"note,omitempty"`
+	// Groups 该 Key 能看见的模型组（v0.31.76）：含虚拟模型名与成员数。
+	// 前端用它给下拉加「组」标签，也用它判断"空组"。
+	Groups []modelGroupInfo `json:"groups,omitempty"`
 }
 
 // handleKeyModels GET /api/keys/{id}/models
@@ -95,8 +98,21 @@ func (a *app) handleKeyModels(w http.ResponseWriter, r *http.Request) {
 	if !modelsCacheFresh() {
 		a.refreshModelsCache()
 	}
+	// 模型组（v0.31.76）：控制台**总是**列出 work 官组 ——
+	// 它既是"接入时的默认值"，也是让用户第一次知道"组"这个概念的入口。
+	// （客户端的 /v1/models 只在 Key 绑了通道组时才列组名，避免给存量客户端加噪声。）
+	if a.proxy != nil {
+		resp.Groups = a.proxy.visibleGroups(k)
+	}
 	seen := map[string]bool{}
-	out := make([]string, 0, 32)
+	out := make([]string, 0, 32+len(resp.Groups))
+	for _, g := range resp.Groups {
+		if g.Members == 0 || seen[g.Model] {
+			continue // 空组不列（配了但没选模型，出现在下拉里会一选就失败）
+		}
+		seen[g.Model] = true
+		out = append(out, g.Model)
+	}
 	for _, id := range cachedModelIDs() {
 		if id == "" || seen[id] {
 			continue

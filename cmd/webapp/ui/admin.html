@@ -7999,6 +7999,14 @@ function channelCard(up, poolModels) {
   head.appendChild(el('span', 'mono muted', up.base_url));
   head.appendChild(el('span', 'muted', 'key ' + (up.key_masked || '—')));
   head.appendChild(el('span', 'muted', '优先级 ' + up.priority));
+  // 组名（v0.31.76）：这个通道在模型组体系里的虚拟模型名。
+  // 客户端的「接入」配置可以直接填它（cc/switch 那种只能填一个模型名的场景），
+  // 点击即复制 —— 运维不用手抄 id。
+  const chip = el('span', 'tag accent', '组 ' + (up.group_model || ('wb-group-ch' + up.id)));
+  chip.style.cursor = 'pointer';
+  chip.title = '点一下复制：把这个组名填进客户端 model 字段，组内自动选一个可用模型';
+  chip.onclick = () => copyText(up.group_model || ('wb-group-ch' + up.id));
+  head.appendChild(chip);
   card.appendChild(head);
 
   const meta = el('div', 'sub');

@@ -145,8 +145,14 @@ type APIKey struct {
 	// AccountUIDs 代挂自用 Key 限定的具体账号集合（逗号分隔 uid；空 = 不按账号限定）。
 	// v0.11.0：Key 生成照「API 反代」页，可逐账号勾选参与反代的账号。
 	AccountUIDs string
-	LastUsedAt  int64
-	CreatedAt   int64
+	// GroupScope 该 Key 能看见的**模型组**（逗号分隔组 id；空 = 只有内置 work 官组）。
+	//
+	// v0.31.76：组是**派生**概念，不单独存成员表 ——
+	// `work` 的成员就是号池观测目录，`ch<N>` 的成员就是通道 N 的映射。
+	// 所以这里只存"授权关系"，不存成员，避免两处数据各自漂移。
+	GroupScope string
+	LastUsedAt int64
+	CreatedAt  int64
 }
 
 // HostEarning 一笔「代挂账号在池中为号主赚到」的收益流水（对账用）。
@@ -468,6 +474,8 @@ func (s *Store) migrateUsers() error {
 		{"kind", "kind TEXT NOT NULL DEFAULT ''"},
 		{"host_group", "host_group TEXT NOT NULL DEFAULT ''"},
 		{"account_uids", "account_uids TEXT NOT NULL DEFAULT ''"},
+		// v0.31.76 模型组授权（逗号分隔组 id；空 = 只有 work 官组）。
+		{"group_scope", "group_scope TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn("api_keys", c.col, c.ddl); err != nil {
 			return fmt.Errorf("migrate api_keys column %s: %w", c.col, err)
@@ -1433,12 +1441,13 @@ func (s *Store) CreateAPIKey(userID int64, name, keyHash, keyEnc, prefix, kind, 
 		Kind: kind, HostGroup: hostGroup, AccountUIDs: accountUIDs, CreatedAt: now}, nil
 }
 
-const keyCols = `id, user_id, name, key_hash, key_enc, key_prefix, status, last_used_at, kind, host_group, account_uids, created_at`
+const keyCols = `id, user_id, name, key_hash, key_enc, key_prefix, status, last_used_at, kind, host_group, account_uids, group_scope, created_at`
 
 func scanAPIKey(row interface{ Scan(dest ...any) error }) (*APIKey, error) {
 	var k APIKey
 	err := row.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.KeyEnc,
-		&k.KeyPrefix, &k.Status, &k.LastUsedAt, &k.Kind, &k.HostGroup, &k.AccountUIDs, &k.CreatedAt)
+		&k.KeyPrefix, &k.Status, &k.LastUsedAt, &k.Kind, &k.HostGroup, &k.AccountUIDs,
+		&k.GroupScope, &k.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1500,6 +1509,22 @@ func (s *Store) SetAPIKeyStatus(userID, id int64, status string) error {
 func (s *Store) SetAPIKeyAccounts(userID, id int64, accountUIDs string) error {
 	res, err := s.db.Exec(`UPDATE api_keys SET account_uids = ? WHERE id = ? AND user_id = ?`,
 		strings.TrimSpace(accountUIDs), id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetAPIKeyGroups 更新某 Key 能看见的模型组（逗号分隔组 id；空 = 只有 work 官组）。
+//
+// v0.31.76：只存授权关系，不校验组是否存在 —— 组是派生的（通道删了组就没了），
+// 存一堆 id 也不会让不存在的组冒出来；校验放在"列清单/解析组名"时做。
+func (s *Store) SetAPIKeyGroups(userID, id int64, scope string) error {
+	res, err := s.db.Exec(`UPDATE api_keys SET group_scope = ? WHERE id = ? AND user_id = ?`,
+		strings.TrimSpace(scope), id, userID)
 	if err != nil {
 		return err
 	}

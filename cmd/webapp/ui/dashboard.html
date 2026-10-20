@@ -1649,7 +1649,10 @@ async function openOnboardModal(k) {
   row.style.gap = '8px';
   row.style.alignItems = 'center';
   const inp = el('input');
-  inp.placeholder = '模型名，如 glm-5.3';
+  // 默认填 work 官组的虚拟名（需求 4）：CC Switch / Claude Code 只认一个模型名，
+  // 填组名等于"用号池里此刻能跑的任意模型"，换模型不用改客户端配置。
+  inp.value = 'wb-group-work';
+  inp.placeholder = '模型名，或 wb-group-work（整个号池）';
   inp.style.flex = '1';
   inp.setAttribute('list', 'onboardModelList');
   const dl = el('datalist');
@@ -3127,8 +3130,14 @@ async function loadTestModels(keyID) {
   }
   sel.style.display = '';
   inp.style.display = 'none';
+  // 组名加可读标签（v0.31.76）：`wb-group-work（work 官组 · 12 个）`。
+  // option 的 value 必须是**纯 id**，标签只能放 textContent —— 带着括号发出去就是未知模型。
+  const gmap = {};
+  for (const g of ((d && d.groups) || [])) {
+    gmap[g.model] = (g.label || '组') + (g.members ? ' · ' + g.members + ' 个' : ' · 空组');
+  }
   for (const id of list) {
-    const o = el('option', '', id);
+    const o = el('option', '', id + (gmap[id] ? '（' + gmap[id] + '）' : ''));
     o.value = id;
     sel.appendChild(o);
   }

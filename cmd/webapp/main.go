@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.75"
+const version = "0.31.76"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1538,6 +1538,15 @@ func (a *app) refreshModelsCache() []string {
 
 func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// 模型组（v0.31.76）：只有**绑定了通道组**的 Key 才会多出 `wb-group-*` 条目 ——
+	// 存量客户端（group_scope 为空）看到的响应逐字节不变，不给它们加噪声。
+	if k, _ := r.Context().Value(ctxAPIKeyKey).(*APIKey); k != nil && a.proxy != nil &&
+		len(splitGroups(k.GroupScope)) > 0 {
+		if p := a.modelsPayloadWithGroups(k); p != nil {
+			_, _ = w.Write(p)
+			return
+		}
+	}
 	// 命中缓存直接写副本；未命中走 refresh（内部单飞），再取一次。
 	if p := modelsPayload(); p != nil {
 		_, _ = w.Write(p)
@@ -1549,6 +1558,45 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+}
+
+// modelsPayloadWithGroups 在缓存清单前插入该 Key 可见的组名条目。
+//
+// 只在 Key 绑了通道组时调用（见 handleModels）。组名放最前：客户端模型选择器
+// 通常按返回顺序展示，放前面能让"用一个名字通吃"这条路更容易被发现。
+//
+// 返回 nil 表示"拼不出来"——调用方回落到缓存原文（宁可少两个条目，也不要 500）。
+func (a *app) modelsPayloadWithGroups(k *APIKey) []byte {
+	base := modelsPayload()
+	if base == nil {
+		a.refreshModelsCache()
+		base = modelsPayload()
+	}
+	if base == nil {
+		return nil
+	}
+	var doc struct {
+		Object string           `json:"object"`
+		Data   []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(base, &doc); err != nil {
+		return nil
+	}
+	head := make([]map[string]any, 0, len(doc.Data)+4)
+	for _, g := range a.proxy.visibleGroups(k) {
+		if g.Members == 0 {
+			continue // 空组不列：选它必然失败，不如不给
+		}
+		head = append(head, map[string]any{
+			"id": g.Model, "object": "model", "owned_by": g.Label,
+		})
+	}
+	doc.Data = append(head, doc.Data...)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // fetchModelIDs 调用上游取真实模型列表，带 panic 保护（上游异常不应拖垮进程）。

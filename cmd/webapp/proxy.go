@@ -1571,6 +1571,14 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		payload = map[string]any{}
 	}
 	model, _ := payload["model"].(string)
+	// 模型组（v0.31.76）：`wb-group-xxx` 先展开成组内一个**真实模型名**，之后一切照旧
+	// （归一化 / 选号 / 计费倍率 / 台账 / 冷却全按真名走）。
+	//
+	// 展开必须放在归一化之前：归一化会把"不在已知清单里的名字"当作拼写差异处理，
+	// 而 `wb-group-work` 本来就不该出现在上游模型清单里。
+	if real, ok := p.applyGroupExpansion(payload, model); ok {
+		model = real
+	}
 	// 模型名归一化（v0.31.2）：去空白 / 剥 realm 前缀 / 按已知清单折回规范写法。
 	//
 	// **必须在 Marshal 之前**改 payload：出站请求体是从 payload 重新编码的，

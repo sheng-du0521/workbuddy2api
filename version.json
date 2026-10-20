@@ -1,20 +1,20 @@
 {
-  "version": "0.31.75",
+  "version": "0.31.76",
   "min_supported": "0.24.0",
-  "notes": "v0.31.75：来源健康度可视化 + 一键接入补三个缺口（纯前端，无接口变更）。\n\n① 来源健康度（admin 账号池页）：原来只有一行文字 + 两档颜色，「死 1 个」和「死 80 个」是同一句红字。现在每来源一张卡：失效率大字 + 三档徽章（健康 <5% / 注意 5~20% / 危险 >20% / 0 号显示无数据）+ 三段堆叠条（失效红 / 仅剩 access 黄 / 正常绿，三段互斥且和 = 总数）+ 明细行。\n\n② 口径必须说清：条**不是**在池比例。服务端的「在池」与「失效」是两套正交口径，同一个号可以既在池又 token 已死（source_stats.go:82-91）。所以条只按失效状态分段，在池只作文字展示，卡头印了这条提示，避免被误读成「在池率」。阈值 SOURCE_HEALTH 在前端、只影响展示，服务端只给 dead_rate。\n\n③ 一键接入的三个缺口（功能 v0.31.69 已上线，入口在「API 密钥」→ 密钥卡「接入」）：\n  · 失败不可读 → 弹窗内常驻错误块（错误原文 + 按码给建议：404 查归属 / 403 先启用 / 409 重新生成 / 429 等一分钟）+ 复制按钮。原来只 toast，三秒消失、截不了图；\n  · 入口不可发现 → 概览「快捷操作」加「一键接入」：1 把 Key 直接开弹窗，0 把跳建 Key，多把跳列表让用户自己选（不替用户挑）；\n  · 接完不知道成没成 → 下载卡加「验证连接」：reveal 拿 Key 后发一次 max_tokens:1 的请求，把结果写成一行证据（✓ 200 · 延迟 · 模型 / ✗ 402 余额不足 / ✗ 404 模型名不对 / ✗ 401 Key 失效）。明文只在验证那一刻取一次、发完即弃；不新增后端接口。\n\n验证：jscheck（dashboard/admin 各 2 段内联脚本，errors=0）、uitest 整体 PASS（模拟后端 + 真渲染 700+ 断言）、go test 全绿、preflight 全链通过。\n\n边界：健康度分母是该来源全部账号（含未入池），不是在池账号 —— 用池内做分母会让「未入池但已失效」的号凭空消失、失效率被系统性低估；「验证连接」只证明这一刻这个模型能通（冷却/限流/上游波动仍可能下次拒绝），且它会真实计费一次 max_tokens:1，余额 0 时得到 402 —— 402 本身也是有效证据（Key 有效、只是没钱）。",
-  "released_at": 1792529819,
+  "notes": "v0.31.76：模型组第一步 —— 组名可用（组内自动选型号）。\n\n① 新能力：请求 model 填 wb-group-work（整个号池）或 wb-group-ch<通道id>（某条第三方通道），平台在组内展开成一个**真实模型名**再转发。给 CC Switch / Claude Code 这类只能填一个模型名、又不想到处改配置的客户端一条新路。\n\n② 组是**派生**的，不建成员表：work 的成员 = 号池观测目录（与 poolKnowsModel 同源），ch<N> 的成员 = 该通道 enabled 的映射。号池新增模型、通道停掉映射会立刻反映到组里 —— 两份数据一定会有对不上的那一天。虚拟名写死 wb-group- 前缀，永不与真实模型名冲突。\n\n③ 组内选谁（确定性优先，不随机）：先找「号池认识且有可用账号」的成员，其次「有可用通道」的成员，都没有就取第一个让下游正常失败（错误文案仍由既有链路给，不自造第二套）。**组间不互相兜底** —— 跨组兜底会让「我买的这个组」变成「随机被谁服务」。\n\n④ 展开发生在归一化与选号**之前**，并**同步改写 payload**：之后归一化/选号/计费倍率/台账/模型冷却全按真名走，所以组不会变成第二套计费口径，账单里永远是真实模型名。payload 必须一起改（出站体从 payload 重新编码），这行有单测钉住。\n\n⑤ 可见性：测试对话页下拉把组名排最前并带标签（wb-group-work（work 官组 · 12 个）），空组不列；一键接入的模型字段默认填 wb-group-work；后台通道卡显示「组 wb-group-ch<id>」可点复制；/v1/models 只有**绑定了通道组**的 Key 才多出组名条目（存量 Key 响应逐字节不变）。\n\n⑥ 授权：新增 api_keys.group_scope（逗号分隔组 id，默认空 = 只有 work）。work 对所有 Key 恒可见；通道组需管理员授权；代挂自用 Key 永远只见 work（只用本人账号，接通道组等于用平台的钱给个人用）。**管理后台的勾选界面本版还没做**，临时用 SQL：UPDATE api_keys SET group_scope='ch3' WHERE id=12。\n\n验证：TestApplyGroupExpansionRewritesPayload（展开后 payload[model] 必须被改写、普通模型名 payload 不动）、TestExpandGroupModelOnlyGroupNames（glm-5.3 / wb-group- / wb-groub-work 都不展开）、TestExpandGroupModelWork / TestExpandGroupModelChannel（work 取号池目录；通道组只取 enabled 映射，停用整条通道 → 组立刻不可见）、TestVisibleGroupsHostKeyOnlyWork；全量 go test + jscheck + uitest 通过。\n\n边界：号池为空时 work 组仍存在但成员为 0（不列、不回落内置兜底清单）；组内选的是「此刻可用」，不保证整个请求不被限流/冷却拒绝；授权指向不存在的组会被静默忽略；组名不参与模型级倍率配置（调价请配真实模型名）。",
+  "released_at": 1792531375,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.75/webapp.exe",
-      "sha256": "63e65ac2978755f18ca718a308f28465a4a5bc9d07fdd3caf4834220337a6c86",
-      "size": 15933440
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.76/webapp.exe",
+      "sha256": "472af0faed5076900838f4d644e98408bc573a721ea073039cb8e420acf301df",
+      "size": 15945216
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "bqwLB25p2m0NVS7tnTUAlzW0uuWb6rWnrz1WAW7ygXo3DVPhgGt+6pZ42qOSjJneqoQR3AB2qwl27iLvLAseDQ==",
+  "signature": "Shxt+Jh8U1CkwF0JLoXOXhYaFU+KGfWORxEkGv6+Ondz7Y1FzGcxYhAjnFkNefBCuMvlwVZ622i/EF8rnjGlCg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
