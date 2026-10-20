@@ -549,6 +549,11 @@ func TestCheckUpdateCacheAndSilentFailure(t *testing.T) {
 	if err := a.store.SetKV(kvUpdateManifest, srv.URL); err != nil {
 		t.Fatal(err)
 	}
+	// 本用例只关心缓存/单飞/失败保底，不关心签名：假清单没有私钥可签。
+	// 用正规的口子关掉验签（v0.31.60）——"自建清单的部署"就是这个模式。
+	if err := a.store.SetKV(kvUpdateRequireSig, "0"); err != nil {
+		t.Fatal(err)
+	}
 
 	st := a.checkUpdate(context.Background(), false)
 	if !st.HasUpdate || st.Latest != "9.9.9" {
@@ -617,5 +622,46 @@ func TestUpdateExitCode(t *testing.T) {
 		if got := updateExitCode(c.st); got != c.want {
 			t.Errorf("case %d: updateExitCode = %d, want %d（检查失败必须与『已最新』区分开）", i, got, c.want)
 		}
+	}
+}
+
+// TestCheckUpdateRejectsUnsignedManifest 验签默认开启时，未签名清单必须被整份丢弃
+// （v0.31.60，审查 F07）。
+//
+// 判据有四条，缺一条就等于"验签形同虚设"：
+//  1. 不提示升级（HasUpdate=false，没有 Asset）；
+//  2. 不写缓存（否则伪造清单会在本机存活 12 小时，之后每次刷新都拿它提示升级）；
+//  3. 错误信息可读（运维要能区分"网络问题"与"清单不可信"）；
+//  4. 不触发下载（attachDownload 依赖 HasUpdate/Asset，前两条已保证，这里显式断言一次）。
+func TestCheckUpdateRejectsUnsignedManifest(t *testing.T) {
+	withTestClient(t)
+	a := newUpdateTestApp(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(updateManifest{
+			Version: "9.9.9",
+			Assets: []updateAsset{{
+				OS: runtime.GOOS, Arch: runtime.GOARCH,
+				URL: "https://example.com/x", SHA256: strings.Repeat("a", 64), Size: 1,
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	if err := a.store.SetKV(kvUpdateManifest, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	st := a.checkUpdate(context.Background(), true)
+	if st.HasUpdate || st.Asset != nil {
+		t.Fatalf("未签名清单不得提示升级，得 %+v", st)
+	}
+	if !strings.Contains(st.Error, "签名") {
+		t.Fatalf("错误信息应点明签名问题，得 %q", st.Error)
+	}
+	if blob, _ := a.store.GetKV(kvUpdateLastJSON); strings.TrimSpace(blob) != "" {
+		t.Fatalf("未签名清单不得写缓存，实际写入 %d 字节", len(blob))
+	}
+	if st.Download != nil && st.Download.State == "downloading" {
+		t.Fatal("未签名清单不得触发下载")
 	}
 }
