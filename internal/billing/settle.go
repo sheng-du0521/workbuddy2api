@@ -20,6 +20,7 @@
 package billing
 
 import (
+	"log"
 	"strings"
 
 	"workbuddy2api/internal/usage"
@@ -201,6 +202,15 @@ func (s Settler) Settle(req Request) Result {
 	}
 
 	res.Settled = true
+	// chargeCommitted 本次扣费是否**真的提交到了账本**（v0.31.59，审查 F02）。
+	//
+	// 关键不变量：**只有已提交的实扣才能驱动分成**。
+	// 修复前的行为：SettleReservation 失败时虽然 Settled=false，但函数末尾仍然把
+	// 名义 chargedMicro 写回 Result，并把 HostCreditDue 置为 true —— 调用方据此
+	// 给号主发了可提现收益，而消费者的钱其实一分没扣（预扣随后被释放）。
+	// 审查用临时 SQLite trigger 让 reservation 删除失败复现了这条路径：
+	// settled=false、reportedCharged=5、号主余额 +3。
+	chargeCommitted := hostSelf // 代挂自用：零费用，视为"无需扣费"的已提交状态
 	if !hostSelf {
 		switch {
 		case req.HasReservation:
@@ -212,18 +222,31 @@ func (s Settler) Settle(req Request) Result {
 				// 但必须留痕，否则"账对不上"时无从追查（v0.26.2 那笔孤儿预扣
 				// 就是靠 usage_logs 的 error_msg 才定位到的；结构化之后不必再翻文本）。
 				s.recordFailure(StageSettle, "settle", req, "预扣结算失败："+err.Error())
+			} else {
+				chargeCommitted = true
 			}
 		case chargedMicro > 0:
 			// 无预扣（池内还没有单价数据）→ 退化为事后结算。
 			if _, err := s.Ledger.ChargeUser(req.UserID, chargedMicro); err != nil {
 				// 扣费失败不阻断响应（响应已发出），但要留痕。
+				// ⚠️ 必须同时把 Settled 置 false：没有预扣可释放，"未结算"的语义就是
+				// 这笔钱没有扣成功。此前这里只加标记、Settled 保持 true，调用方据此
+				// 认为账已两清并发分成 —— 属于同一条缺陷的第二个入口。
 				res.ErrMsg = appendMark(res.ErrMsg, "[charge_failed:"+err.Error()+"]")
+				res.Settled = false
 				s.recordFailure(StageCharge, "charge", req, "事后扣费失败："+err.Error())
+			} else {
+				chargeCommitted = true
 			}
+		default:
+			// chargedMicro == 0：没有需要扣的钱（上游缺 credit / 纯缓存命中），
+			// 视为已提交（0 元扣费），分成仍按 consumedCredit 判断。
+			chargeCommitted = true
 		}
 	}
 
-	_ = s.Ledger.InsertUsageLog(&usage.UsageLog{
+	// 流水是事后对账的唯一依据：写失败必须留日志，不能 `_ =` 静默丢弃（审查 F02）。
+	if err := s.Ledger.InsertUsageLog(&usage.UsageLog{
 		UserID:           req.UserID,
 		KeyID:            req.KeyID,
 		Model:            req.Model,
@@ -241,13 +264,23 @@ func (s Settler) Settle(req Request) Result {
 		CacheMissTokens:  req.Usage.CacheMissTokens,
 		CacheWriteTokens: req.Usage.CacheWriteTokens,
 		LatencyMS:        req.Usage.LatencyMS,
-	})
+	}); err != nil {
+		log.Printf("WARN: [billing] 写用量流水失败（本次 charged=%d acct=%s）：%v", chargedMicro, req.UpstreamUID, err)
+	}
 
-	res.ChargedMicro = chargedMicro
+	// 只回传**已提交**的实扣。未提交时为 0：既不让实时态势显示"扣了 5 点"，
+	// 也不让分成按一个不存在的收入去发钱。
+	if chargeCommitted {
+		res.ChargedMicro = chargedMicro
+	} else {
+		res.ChargedMicro = 0
+	}
 	res.ConsumedCredit = consumedCredit
 	// 代挂分成：本次若由某号主的「已入池」代挂账号服务平台流量，
 	// 按「号池积分消耗 × 分成比例」折入号主余额（以本次实收封顶）—— 由调用方执行。
-	res.HostCreditDue = !hostSelf && consumedCredit > 0
+	// 判定必须同时满足：非免费 + 有积分消耗 + **扣费已提交**。
+	// 只有已提交的实扣才构成"平台收入"，也才谈得上分成（审查 F02）。
+	res.HostCreditDue = !hostSelf && consumedCredit > 0 && chargeCommitted
 	return res
 }
 

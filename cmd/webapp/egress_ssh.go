@@ -496,6 +496,14 @@ func (a *app) handleEgressAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
 		return
 	}
+	// 插件停用时不发凭证（v0.31.59）：与 poll 的终态 stop 配套。
+	if !a.pluginEnabled(pluginIDHostEgress) {
+		writeJSON(w, http.StatusGone, map[string]any{
+			"action": "stop", "code": "plugin_disabled",
+			"error": "「平台直属出口」插件已被停用：不再下发隧道凭证。",
+		})
+		return
+	}
 	// v0.31.53：这个端点会下发**受限私钥**。用户端代理下线后，用户身份的
 	// agent 不该再拿到任何凭证 —— 拒在这里比"下去之后再删"可靠得多。
 	if uid > 0 {

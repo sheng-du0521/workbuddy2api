@@ -21,7 +21,8 @@ services:
       - "8780:8780"
     volumes:
       # data 卷 = SQLite（webapp.db + -wal/-shm）+ 管理密钥 + 池状态。
-      # ⚠️ 备份要么先停容器，要么三个 db 文件一起复制（见 README「数据库」一节）。
+      # ⚠️ 在线备份必须用 SQLite 快照（Online Backup API / VACUUM INTO）；
+      #    停容器后的冷备才可以直接复制 db/wal/shm。详见 README「数据与备份」一节。
       # 若容器内 app(uid 10001) 报 permission denied，宿主机执行：
       #   chown -R 10001:10001 ./data
       - ./data:/app/data

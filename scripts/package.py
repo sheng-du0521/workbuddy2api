@@ -52,8 +52,8 @@ DIST = os.path.join(ROOT, "dist")
 DEPLOY = os.path.join(ROOT, "deploy")
 
 # 包里**只允许**出现这些名字（白名单）。任何白名单之外的文件都不进包。
-ALLOW_WINDOWS = {"webapp.exe", "start-webapp.bat", "快速开始.txt", "Web应用使用说明.md"}
-ALLOW_LINUX = {"webapp", "install.sh", "快速开始.txt", "Web应用使用说明.md"}
+ALLOW_WINDOWS = {"webapp.exe", "start-webapp.bat", "快速开始.txt", "Web应用使用说明.md", "scripts"}
+ALLOW_LINUX = {"webapp", "install.sh", "快速开始.txt", "Web应用使用说明.md", "scripts"}
 
 # 出现任何一个就说明打包源目录被污染了 —— 直接中止，不做"跳过"。
 FORBIDDEN = {
@@ -106,6 +106,31 @@ def assert_clean(files):
             sys.exit("拒绝打包：发现疑似凭据或日志 %s" % base)
 
 
+# RUNTIME_SCRIPTS 运行期必须随包发布的 Python 脚本（v0.31.59，审查 F05）。
+#
+# 为什么单独列清单而不是整目录拷：scripts/ 里还有开发/一次性脚本，
+# 整目录进包会把内部工具一起发出去（与"包内不得有敏感文件"的纪律冲突）。
+# growth_run.py 是 Go 调度器真正调用的入口，它 import task_runner / task_common。
+RUNTIME_SCRIPTS = ("growth_run.py", "task_runner.py", "task_common.py")
+
+
+def copy_runtime_scripts(stage):
+    """把调度器需要的脚本按**目录结构**放进包（v0.31.59）。
+
+    修复前：Docker 只复制了 4 个 py，漏了 growth_run.py；Windows/Linux 包
+    则完全不携带 scripts/。结果源码里能用的成长任务，在标准发行包里必然
+    "脚本不存在 → 跳过"，用户看到的是功能缺失而不是配置错误。
+    """
+    src = os.path.join(ROOT, "scripts")
+    dst = os.path.join(stage, "scripts")
+    os.makedirs(dst, exist_ok=True)
+    for name in RUNTIME_SCRIPTS:
+        p = os.path.join(src, name)
+        if not os.path.exists(p):
+            sys.exit("缺少运行期脚本 scripts/%s（发行包无法执行成长任务）" % name)
+        shutil.copy2(p, os.path.join(dst, name))
+
+
 def copy_common(dst, version):
     """放两个平台共用的文件：快速开始 + 完整使用说明。"""
     qs = os.path.join(DEPLOY, "快速开始.txt")
@@ -129,6 +154,7 @@ def make_windows(src, dst, version):
     text = text.replace("@VERSION@", version)
     io.open(os.path.join(stage, "start-webapp.bat"), "w", encoding="utf-8", newline="\r\n").write(text)
     copy_common(stage, version)
+    copy_runtime_scripts(stage)
 
     assert_clean(os.listdir(stage))
     missing = ALLOW_WINDOWS - set(os.listdir(stage))
@@ -138,8 +164,14 @@ def make_windows(src, dst, version):
     name = "wb2api-%s-windows-amd64.zip" % version
     path = os.path.join(dst, name)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in sorted(os.listdir(stage)):
-            z.write(os.path.join(stage, f), f)
+        # 递归写入：scripts/ 是**目录**，只遍历 top-level 会得到一个空目录条目
+        # （即使把脚本复制进来了，解压后也看不见）—— 这正是 F05 的第二个坑。
+        for root, dirs, files in os.walk(stage):
+            dirs.sort()
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, stage).replace(os.sep, "/")
+                z.write(full, rel)
     shutil.rmtree(stage, ignore_errors=True)
     return name, path
 
@@ -157,6 +189,7 @@ def make_linux(src, dst, version):
     shutil.copy2(inst, os.path.join(stage, "install.sh"))
     os.chmod(os.path.join(stage, "install.sh"), 0o755)
     copy_common(stage, version)
+    copy_runtime_scripts(stage)
 
     assert_clean(os.listdir(stage))
     missing = ALLOW_LINUX - set(os.listdir(stage))
@@ -167,14 +200,19 @@ def make_linux(src, dst, version):
     path = os.path.join(dst, name)
     # 用 tarfile 而不是调 tar 命令：Windows 上没有 GNU tar 的一致行为。
     with tarfile.open(path, "w:gz") as t:
-        for f in sorted(os.listdir(stage)):
-            info = t.gettarinfo(os.path.join(stage, f), arcname=f)
-            info.uid = info.gid = 0
-            info.uname = info.gname = "root"
-            # 可执行位必须显式给（否则解压出来 ./webapp 跑不了，用户会以为包坏了）。
-            info.mode = 0o755 if f in ("webapp", "install.sh") else 0o644
-            with open(os.path.join(stage, f), "rb") as fh:
-                t.addfile(info, fh)
+        # 递归写入（含目录条目）：scripts/ 里的脚本必须真的进包，见上。
+        for root, dirs, files in os.walk(stage):
+            dirs.sort()
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, stage).replace(os.sep, "/")
+                info = t.gettarinfo(full, arcname=rel)
+                info.uid = info.gid = 0
+                info.uname = info.gname = "root"
+                # 可执行位必须显式给（否则解压出来 ./webapp 跑不了，用户会以为包坏了）。
+                info.mode = 0o755 if rel in ("webapp", "install.sh") else 0o644
+                with open(full, "rb") as fh:
+                    t.addfile(info, fh)
     shutil.rmtree(stage, ignore_errors=True)
     return name, path
 

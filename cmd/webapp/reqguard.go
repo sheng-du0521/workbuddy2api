@@ -148,11 +148,33 @@ func (a *app) trustedProxy(peer string) bool {
 //
 // 绝不回落到空串：空串会让**所有**请求并进同一个桶，正是本次要修的那个问题。
 func (a *app) clientIP(r *http.Request) string {
+	var set *ipSet
+	if a != nil {
+		set = a.trustedProxies
+	}
+	return clientIPWith(set, r)
+}
+
+// clientIPWith 客户端 IP 的**唯一**解析实现（v0.31.59，审查 F14）。
+//
+// 为什么要把 set 作为参数而不是读 a.trustedProxies：
+// 鉴权日志（包级 `logAuthReject`）也需要同一套规则，但它拿不到 *app。
+// 两处各写一份"读哪个头"的代码，迟早一边改成可信校验、另一边还在裸信 XFF ——
+// 审查发现的就是这个分叉：限流会验证可信代理，日志却无条件采用 XFF 首段。
+func clientIPWith(set *ipSet, r *http.Request) string {
+	if r == nil {
+		return ""
+	}
 	peer := hostOnly(r.RemoteAddr)
 	if peer == "" {
 		peer = r.RemoteAddr
 	}
-	if !a.trustedProxy(peer) {
+	ip := net.ParseIP(peer)
+	if ip == nil {
+		return peer
+	}
+	if !isLoopbackIP(ip) && !set.contains(ip) {
+		// 对端不可信：转发头一律忽略（客户端可以随便伪造）。
 		return peer
 	}
 	if ip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); net.ParseIP(ip) != nil {

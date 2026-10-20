@@ -1031,6 +1031,20 @@ func (a *app) handleEgressAgentPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
 		return
 	}
+	// 插件停用 → 下发终态 stop（v0.31.59，审查 F03）。
+	//
+	// 以前停用插件只拦了浏览器与运维通道，`/api/agent/*` 照常工作：
+	// 已装的 agent 继续每 5 秒 poll、隧道继续跑 —— "停用"名不副实。
+	// agent ≥0.3.8 会把 410 当终态：停掉代理与隧道并退出。
+	if !a.pluginEnabled(pluginIDHostEgress) {
+		writeJSON(w, http.StatusGone, map[string]any{
+			"action": "stop",
+			"code":   "plugin_disabled",
+			"error": "「平台直属出口」插件已被停用：本机 agent 停止接入。" +
+				"重新启用后需要再次运行 agent。",
+		})
+		return
+	}
 	// v0.31.53：用户端代理已下线 —— 用户身份的 agent 一律拒之门外。
 	// 否则这些机器会每 5 秒写一次机器表，页面上"看得见、没线路"，永远清不完。
 	if owner > 0 {

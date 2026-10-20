@@ -316,8 +316,28 @@ SQLite 以 **WAL** 模式打开（默认 rollback journal 下每条 SQL 各 fsyn
 建库要 1080 ms、单次写入 14 ms；WAL 后为 **88 ms / 0.5 ms**，测试包也因此从 10 分钟
 超时降到约 65 秒）。
 
-- 库旁边会有 `webapp.db-wal` 与 `webapp.db-shm`：**备份要么先停服**
-  （`Close` 会 checkpoint 并删掉它们），**要么三个文件一起复制**；
+- 库旁边会有 `webapp.db-wal` 与 `webapp.db-shm`。**在线备份必须用 SQLite 自己的快照机制**，
+  不能"三个文件一起 cp" —— 那只是三次独立的文件读取，中间可能落进一次写入，
+  恢复时表现为"库能打开但账目对不上"（审查报告 F09）：
+  ```bash
+  # 方式 A（推荐，在线、不停服）：SQLite Online Backup API
+  python3 - <<'PY'
+  import sqlite3
+  src = sqlite3.connect("data/webapp.db")
+  dst = sqlite3.connect("data/backup-20261020.db")
+  src.backup(dst)          # 一致性快照，包含 WAL 中已提交的内容
+  dst.close(); src.close()
+  PY
+
+  # 方式 B（SQLite 3.27+）：VACUUM INTO 生成一份紧凑的单文件快照
+  sqlite3 data/webapp.db "VACUUM INTO 'data/backup-20261020.db'"
+
+  # 方式 C（冷备）：确认所有写入者都已停止后，再复制 db/wal/shm 三个文件。
+  #   只停一半进程 = 没有一致性保证。
+  ```
+- 备份要**连 `secret.key`（凭证加密密钥）与 `admin.key` 一起**单独加密保存：
+  只有 db 没有 secret key，恢复出来的账号全部解不开；
+- 恢复后先跑 `PRAGMA integrity_check`，再核对余额/流水，最后才对外服务；
 - **不要放在网络盘 / 云同步目录**（SMB、OneDrive 等）里运行 —— WAL 依赖共享内存；
 - 可回退：`PRAGMA journal_mode=DELETE` 即切回，无需数据迁移。
 

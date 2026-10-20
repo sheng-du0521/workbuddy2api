@@ -699,6 +699,27 @@ func (p *Proxy) ReloadSelection() {
 	p.reloadSelection()
 }
 
+// SelectableUIDsForModel 平台视角下**此刻能服务该模型**的账号集合（v0.31.59）。
+//
+// 与 `allowsSelection` 使用同一份规则（白名单 / 消耗分组 / 出口健康），
+// 因此冷却卡片的 full/partial 与真实选号不会分叉。代价是遍历一次账号表，
+// 但只对有冷却记录的模型调用（通常 0~3 个），且外层有 5 秒缓存。
+func (p *Proxy) SelectableUIDsForModel(model string) []string {
+	cands := p.pool.AvailableUIDsForModel(model)
+	if len(cands) == 0 {
+		return nil
+	}
+	p.selMu.RLock()
+	defer p.selMu.RUnlock()
+	out := make([]string, 0, len(cands))
+	for _, uid := range cands {
+		if p.allowsSelectionLocked(uid, pickScope{}) {
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
 // reloadSelection 真正的重载逻辑；调用方必须持有 cfgMu。
 func (p *Proxy) reloadSelection() {
 	accts, _ := p.store.GetKV(kvProxyAccounts)
@@ -759,6 +780,16 @@ func (p *Proxy) reloadSelection() {
 func (p *Proxy) allowsSelection(uid string, sc pickScope) bool {
 	p.selMu.RLock()
 	defer p.selMu.RUnlock()
+	return p.allowsSelectionLocked(uid, sc)
+}
+
+// allowsSelectionLocked 规则本体；调用方必须持有 selMu 读锁。
+//
+// 抽出来是为了让"状态展示"与"真实选号"共用同一份规则（v0.31.59，审查 F11）：
+// 冷却卡片此前用 pool.AvailableUIDsForModel 判 full/partial，而真实选号还叠加了
+// 白名单、消耗分组、出口健康等条件 —— 于是"全池有号可用"被展示成 partial，
+// 而当前请求实际上一个号都选不出来。
+func (p *Proxy) allowsSelectionLocked(uid string, sc pickScope) bool {
 	if sc.HostUser > 0 {
 		if p.ownerByUID[uid] != sc.HostUser {
 			return false
@@ -2959,7 +2990,10 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 	res := p.billingSettler().Settle(req)
 
 	// 代挂分成：由本包执行（决策在新包的 Result.HostCreditDue）—— 它要查号主与入池状态。
-	if res.HostCreditDue {
+	// 双保险（v0.31.59，审查 F02）：结算包已经保证"未提交实扣不发分成"，
+	// 这里再校一次 Settled / ChargedMicro —— 分成是真金白银的入账，
+	// 不该只依赖上游返回的一个布尔字段。
+	if res.HostCreditDue && res.Settled && res.ChargedMicro > 0 {
 		p.creditHostOwner(upstreamUID, u, model, res.ConsumedCredit, res.ChargedMicro)
 	}
 	return res.Settled, res.ChargedMicro

@@ -45,11 +45,6 @@ type modelCoolingItem struct {
 	LastResumeAt  int64 `json:"last_resume_at,omitempty"`
 	// RetryAfterSec 建议等待秒数（= 与 state 对应的那个恢复时刻）。
 	RetryAfterSec int64 `json:"retry_after_sec"`
-	// Probing 系统会对它做半开探测（6004 才允许）。
-	//
-	// 透出它是为了回答"我要不要一直盯着刷新"：会自动试探的模型，
-	// 用户等通知即可；不试探的只能等自然到期。
-	Probing bool `json:"probing,omitempty"`
 }
 
 // modelCoolingSummary 顶部汇总（一眼看懂"现在有没有事"）。
@@ -124,8 +119,11 @@ func (a *app) buildModelCoolingView() modelCoolingView {
 	for _, m := range models {
 		g := byModel[m]
 		it := modelCoolingItem{Model: m, State: "partial"}
-		// 与生产选号同源：能选出号 = partial，选不出 = full。
-		if len(a.proxy.pool.AvailableUIDsForModel(m)) == 0 {
+		// 与生产选号**完全**同源：不只问"池里有没有健康账号"，还要过白名单、
+		// 消耗分组、出口健康（v0.31.59，审查 F11）。
+		// 修复前只调 pool.AvailableUIDsForModel：唯一允许的账号在冷却、另一个空闲但
+		// 不在白名单里时，卡片显示 partial，而实际选号一个都选不出来 —— 用户会反复重试。
+		if len(a.proxy.SelectableUIDsForModel(m)) == 0 {
 			it.State = "full"
 		}
 		if len(g.reasons) == 1 {

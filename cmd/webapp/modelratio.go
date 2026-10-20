@@ -28,6 +28,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -175,6 +176,50 @@ func (s *Store) PutModelRatio(r *modelRatio) error {
 	return err
 }
 
+// modelRatioDiffItem 一条待写入的差异（批次事务用）。
+type modelRatioDiffItem struct {
+	Model, Kind, Old, New string
+}
+
+// ApplyModelRatioBatch 在**一个事务**里写入本轮全部倍率与差异（v0.31.59，审查 F10）。
+//
+// 修复前的写法是逐模型 Put + AddDiff：第 N 个失败时前 N-1 个已经落库，
+// 差异也可能写了而状态没写 —— 函数返回 error 并打日志说"保留旧口径"，
+// 实际库里已经是半新半旧。审查用注入数据库错误复现：第二个模型失败时，
+// 第一个已存在、差异记录为 2 条。
+//
+// 现在的语义是真正的"全成功或全不写"：调用方先把完整快照算好，再一次提交。
+func (s *Store) ApplyModelRatioBatch(items []*modelRatio, diffs []modelRatioDiffItem) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	for _, d := range diffs {
+		if _, err := tx.Exec(`INSERT INTO model_ratio_diffs (model, kind, old_value, new_value, created_at)
+			VALUES (?,?,?,?,?)`, d.Model, d.Kind, d.Old, d.New, now); err != nil {
+			return err
+		}
+	}
+	for _, r := range items {
+		if _, err := tx.Exec(`INSERT INTO model_ratios
+			(model, name, official_credits, official_badge, official_free, measured_cost_1k,
+			 measured_known, updated_at)
+			VALUES (?,?,?,?,?,?,?,?)
+			ON CONFLICT(model) DO UPDATE SET
+				name=excluded.name, official_credits=excluded.official_credits,
+				official_badge=excluded.official_badge, official_free=excluded.official_free,
+				measured_cost_1k=excluded.measured_cost_1k, measured_known=excluded.measured_known,
+				updated_at=excluded.updated_at`,
+			r.Model, r.Name, r.OfficialCredits, r.OfficialBadge, b2i(r.OfficialFree),
+			r.MeasuredCost1k, b2i(r.MeasuredKnown), r.UpdatedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // GetModelRatio 单条（找不到返回 nil）。
 func (s *Store) GetModelRatio(model string) (*modelRatio, error) {
 	row := s.db.QueryRow(`SELECT model, name, official_credits, official_badge,
@@ -252,6 +297,9 @@ func (a *app) measuredCost1k(model string) (float64, bool) {
 	return f, true
 }
 
+// errModelRatioSyncBusy 已有一轮同步在进行（v0.31.59，审查 F10）。
+var errModelRatioSyncBusy = errors.New("model ratio sync already running")
+
 // modelRatioSyncResult 一次同步的结果（接口回显 + 日志）。
 type modelRatioSyncResult struct {
 	Total     int      `json:"total"`
@@ -268,6 +316,12 @@ type modelRatioSyncResult struct {
 // 失败一律**不改库**（宁可用昨天的口径，也不要把一屏"官方未声明"写进去）。
 func (a *app) syncModelRatios() (modelRatioSyncResult, error) {
 	var res modelRatioSyncResult
+	// 单飞（v0.31.59，审查 F10）：定时任务与管理端按钮可能同时触发。
+	// 两个 run 并发会各写一半差异、各发一条公告，事后无法还原"这轮改了什么"。
+	if !a.modelRatioMu.TryLock() {
+		return res, errModelRatioSyncBusy
+	}
+	defer a.modelRatioMu.Unlock()
 	// 模型目录读取做成可注入钩子（v0.31.47 的教训：需要联网的验证点不注入，
 	// 单测就只能测到"函数能跑"，测不到分支）。
 	fetch := func() ([]upstream.ModelInfo, error) {
@@ -290,6 +344,8 @@ func (a *app) syncModelRatios() (modelRatioSyncResult, error) {
 	}
 	now := time.Now().Unix()
 	var freeFlips, creditChanges, added []string
+	items := make([]*modelRatio, 0, len(infos))
+	diffs := make([]modelRatioDiffItem, 0, 8)
 	for _, mi := range infos {
 		id := strings.TrimSpace(mi.ID)
 		if id == "" {
@@ -313,9 +369,7 @@ func (a *app) syncModelRatios() (modelRatioSyncResult, error) {
 		switch {
 		case prev == nil:
 			added = append(added, id)
-			if err := a.store.AddModelRatioDiff(id, "new_model", "", next.OfficialCredits); err != nil {
-				return res, err
-			}
+			diffs = append(diffs, modelRatioDiffItem{Model: id, Kind: "new_model", New: next.OfficialCredits})
 		default:
 			if prev.OfficialFree != next.OfficialFree {
 				kind := "free_switch"
@@ -323,25 +377,24 @@ func (a *app) syncModelRatios() (modelRatioSyncResult, error) {
 				if !next.OfficialFree {
 					oldV, newV = "免费", "付费"
 				}
-				if err := a.store.AddModelRatioDiff(id, kind, oldV, newV); err != nil {
-					return res, err
-				}
+				diffs = append(diffs, modelRatioDiffItem{Model: id, Kind: kind, Old: oldV, New: newV})
 				freeFlips = append(freeFlips, id+"（"+oldV+"→"+newV+"）")
 				res.FreeFlip++
 			}
 			if prev.OfficialCredits != next.OfficialCredits {
-				if err := a.store.AddModelRatioDiff(id, "credits_change",
-					prev.OfficialCredits, next.OfficialCredits); err != nil {
-					return res, err
-				}
+				diffs = append(diffs, modelRatioDiffItem{Model: id, Kind: "credits_change",
+					Old: prev.OfficialCredits, New: next.OfficialCredits})
 				creditChanges = append(creditChanges, fmt.Sprintf("%s（%s → %s）",
 					id, orDash(prev.OfficialCredits), orDash(next.OfficialCredits)))
 				res.Changed++
 			}
 		}
-		if err := a.store.PutModelRatio(next); err != nil {
-			return res, err
-		}
+		items = append(items, next)
+	}
+	// 全部算完才写：任何一步失败都不留下半批数据。
+	if err := a.store.ApplyModelRatioBatch(items, diffs); err != nil {
+		log.Printf("WARN: [modelratio] 批次写入失败，本轮未生效（库内保持旧口径）：%v", err)
+		return res, err
 	}
 	res.Added = len(added)
 	res.Diffs = append(freeFlips, creditChanges...)
@@ -392,7 +445,12 @@ func (a *app) modelRatioLoop(ctx context.Context) {
 	for {
 		if a.modelRatioDue() {
 			if _, err := a.syncModelRatios(); err != nil {
-				log.Printf("WARN: [modelratio] 同步失败（保留旧口径）：%v", err)
+				// 与手动入口撞车是正常竞争，不是故障，别刷 WARN。
+				if errors.Is(err, errModelRatioSyncBusy) {
+					log.Printf("INFO: [modelratio] 已有一轮同步在跑，本轮跳过")
+				} else {
+					log.Printf("WARN: [modelratio] 同步失败（本轮未写库，库内保持旧口径）：%v", err)
+				}
 			}
 		}
 		select {
@@ -468,6 +526,15 @@ func (a *app) handleAdminModelRatios(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleAdminModelRatioSync(w http.ResponseWriter, r *http.Request) {
 	res, err := a.syncModelRatios()
 	if err != nil {
+		// 单飞冲突不是"内部错误"：明确回 409 并说明"已有一轮在跑"，
+		// 否则运维会看到 500 并反复点（审查 F10）。
+		if errors.Is(err, errModelRatioSyncBusy) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": "已有一轮模型口径同步在进行，请稍后再试",
+				"code":  "sync_in_progress",
+			})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}

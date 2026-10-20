@@ -105,6 +105,13 @@ type Reservation struct {
 	AmountMicro int64
 	Model       string
 	CreatedAt   int64
+	// FrozenWithdrawableMicro 本次预扣**压低了多少可提现额度**（v0.31.59）。
+	//
+	// 预扣的扣减语句是 `withdrawable = MIN(withdrawable, MAX(balance-amount,0))`：
+	// 它把"可提现"压到余额以下，但没有任何地方记录压了多少。释放时只加回 balance，
+	// 于是用户取消一次请求就永久损失一截可提现额度（审查 F01 的复现：100/100 →
+	// 预扣 80 → 释放 → 100/20）。这一列就是那笔"被冻结的额度"。
+	FrozenWithdrawableMicro int64
 }
 
 // ErrInsufficientBalance 预扣时余额不足。
@@ -292,7 +299,8 @@ func (s *Store) migrateUsers() error {
 			key_id       INTEGER NOT NULL DEFAULT 0,
 			amount_micro INTEGER NOT NULL,
 			model        TEXT NOT NULL DEFAULT '',
-			created_at   INTEGER NOT NULL DEFAULT 0
+			created_at   INTEGER NOT NULL DEFAULT 0,
+			frozen_withdrawable_micro INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_reservations_user ON reservations(user_id)`,
 		// 代挂收益台账：每一笔「代挂账号服务平台流量」的分成入账一行，供号主对账。
@@ -383,6 +391,16 @@ func (s *Store) migrateUsers() error {
 	}
 	if err := s.ensureColumn("usage_logs", "attempts", "attempts INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate usage_logs column attempts: %w", err)
+	}
+	// 预扣冻结的可提现额度（v0.31.59，审查 F01）。
+	//
+	// 预扣会把 withdrawable 压低到「扣减后的余额」，但释放时只恢复 balance ——
+	// 结果「预扣 80 → 全额退回」之后余额回到 100、可提现却停在 20。
+	// 这一列记录本次预扣到底压了多少，释放/结算时按它还原。
+	// 历史记录留 0：无法重建当时的分桶，按旧行为处理（不恶化）。
+	if err := s.ensureColumn("reservations", "frozen_withdrawable_micro",
+		"frozen_withdrawable_micro INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate reservations column frozen_withdrawable_micro: %w", err)
 	}
 	// 缓存命中与耗时增量列（v0.26.7）。老库平滑补齐：历史行留 0。
 	//
@@ -1174,6 +1192,16 @@ func (s *Store) ReserveCharge(userID, keyID int64, amountMicro int64, model stri
 		return nil, err
 	}
 	defer tx.Rollback()
+	// 先读旧的分桶（事务内；SQLite 单连接 + 事务保证与下面的扣减是同一时刻的值）。
+	var oldBal, oldWith int64
+	if err := tx.QueryRow(
+		`SELECT balance_micro, withdrawable_micro FROM users WHERE id = ?`, userID).
+		Scan(&oldBal, &oldWith); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
 	res, err := tx.Exec(
 		`UPDATE users SET balance_micro = balance_micro - ?, `+clampWithdrawableSQL+`, updated_at = ?
 		 WHERE id = ? AND balance_micro >= ?`,
@@ -1182,22 +1210,26 @@ func (s *Store) ReserveCharge(userID, keyID int64, amountMicro int64, model stri
 		return nil, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		// 0 行受影响有两种可能：用户不存在，或余额不足。要区分开，
-		// 否则会拿「余额不足」去回应一个已删除的用户。
-		var exists int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, userID).Scan(&exists); err != nil {
-			return nil, err
-		}
-		if exists == 0 {
-			return nil, ErrNotFound
-		}
 		return nil, ErrInsufficientBalance
+	}
+	// 与 clampWithdrawableSQL 同口径地算出"压后"的可提现，差额就是本次冻结额。
+	newBal := oldBal - amountMicro
+	newWith := oldWith
+	if newWith > newBal {
+		newWith = newBal
+	}
+	if newWith < 0 {
+		newWith = 0
+	}
+	frozen := oldWith - newWith
+	if frozen < 0 {
+		frozen = 0
 	}
 	now := time.Now().Unix()
 	ins, err := tx.Exec(
-		`INSERT INTO reservations (user_id, key_id, amount_micro, model, created_at)
-		 VALUES (?,?,?,?,?)`,
-		userID, keyID, amountMicro, model, now)
+		`INSERT INTO reservations (user_id, key_id, amount_micro, model, created_at, frozen_withdrawable_micro)
+		 VALUES (?,?,?,?,?,?)`,
+		userID, keyID, amountMicro, model, now, frozen)
 	if err != nil {
 		return nil, err
 	}
@@ -1208,6 +1240,7 @@ func (s *Store) ReserveCharge(userID, keyID int64, amountMicro int64, model stri
 	return &Reservation{
 		ID: id, UserID: userID, KeyID: keyID,
 		AmountMicro: amountMicro, Model: model, CreatedAt: now,
+		FrozenWithdrawableMicro: frozen,
 	}, nil
 }
 
@@ -1223,9 +1256,10 @@ func (s *Store) SettleReservation(id int64, actualMicro int64) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	var userID, amount int64
-	err = tx.QueryRow(`SELECT user_id, amount_micro FROM reservations WHERE id = ?`, id).
-		Scan(&userID, &amount)
+	var userID, amount, frozen int64
+	err = tx.QueryRow(
+		`SELECT user_id, amount_micro, frozen_withdrawable_micro FROM reservations WHERE id = ?`, id).
+		Scan(&userID, &amount, &frozen)
 	if err == sql.ErrNoRows {
 		return 0, ErrNotFound
 	}
@@ -1236,9 +1270,30 @@ func (s *Store) SettleReservation(id int64, actualMicro int64) (int64, error) {
 		return 0, err
 	}
 	net := amount - actualMicro
+	// 冻结额里有多少该还给用户（v0.31.59，审查 F01）：
+	//   · 实际消耗先吃冻结额度（那部分钱真的花掉了，可提现理应减少）；
+	//   · 剩下的（未花掉的部分）随退款一起恢复到可提现。
+	// 例：预扣 80（冻结 80）、实扣 30 → 恢复 50，可提现净减少 30；
+	//     实扣 0（全额释放）→ 恢复 80，可提现回到原值。
+	restore := frozen
+	if actualMicro > 0 {
+		consume := actualMicro
+		if consume > frozen {
+			consume = frozen
+		}
+		restore = frozen - consume
+	}
+	if restore < 0 {
+		restore = 0
+	}
+	// withdrawable 的上下界都在 SQL 里收：上限是"退还后的余额"，下限靠 restore>=0。
+	// 注意 SQLite 的 UPDATE 表达式读的是**旧值**，所以 balance 那一侧要写成 balance_micro + ?。
 	if _, err := tx.Exec(
-		`UPDATE users SET balance_micro = balance_micro + ?, updated_at = ? WHERE id = ?`,
-		net, time.Now().Unix(), userID); err != nil {
+		`UPDATE users SET balance_micro = balance_micro + ?,
+			withdrawable_micro = MIN(withdrawable_micro + ?, MAX(balance_micro + ?, 0)),
+			updated_at = ?
+		 WHERE id = ?`,
+		net, restore, net, time.Now().Unix(), userID); err != nil {
 		return 0, err
 	}
 	var bal int64

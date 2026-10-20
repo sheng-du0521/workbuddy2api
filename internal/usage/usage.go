@@ -21,6 +21,7 @@ package usage
 
 import (
 	"database/sql"
+	"sort"
 	"strings"
 	"time"
 )
@@ -339,6 +340,14 @@ type UsagePerf struct {
 //   - 命中率用 token 加权（hit / (hit+miss)），不是按请求数 —— 缓存省的是
 //     token 预处理成本，按请求数算会让一个 48 万 token 的请求和一次 100 token
 //     的探活等权，完全没有意义。
+//
+// usagePerfMaxSample 分位数计算的**采样上限**（v0.31.59，审查 F13）。
+//
+// 原实现把窗口内（最长 365 天）所有 latency 读进 slice 再排序：几十万行时
+// 既占内存又长期占用唯一的数据库连接（SetMaxOpenConns(1)），计费写入只能排队。
+// 5 万条足以让 p50/p95 稳定到毫秒级，再多的边际收益远小于它对主链路的影响。
+const usagePerfMaxSample = 50000
+
 func (uq *Queries) UsagePerf(userID int64, days int) (UsagePerf, error) {
 	var p UsagePerf
 	if days <= 0 || days > 365 {
@@ -367,14 +376,26 @@ func (uq *Queries) UsagePerf(userID int64, days int) (UsagePerf, error) {
 	}
 	p.MaxLatencyMS = maxMS.Int64
 
-	// 2) 分位（行数在报告窗口内可控；直接取有序切片算，避免方言依赖）
+	// 2) 分位：**有界采样**（v0.31.59，审查 F13）。
+	//
+	// 取最近 usagePerfMaxSample 条（ORDER BY id DESC），再在内存里排序算分位。
+	// 为什么不取"最小的 N 条"（ORDER BY latency ASC LIMIT N）：那会把长尾全部裁掉，
+	// p95 会系统性偏低 —— 而长尾正是这张报表要回答的问题。
+	sampleArgs := make([]any, 0, len(args)+1)
+	sampleArgs = append(sampleArgs, args...)
+	sampleArgs = append(sampleArgs, usagePerfMaxSample)
 	if p.LatencySampled > 0 {
 		rows, err := uq.db.Query(
-			`SELECT latency_ms FROM usage_logs`+where+` AND latency_ms > 0 ORDER BY latency_ms`, args...)
+			`SELECT latency_ms FROM usage_logs`+where+` AND latency_ms > 0
+			 ORDER BY id DESC LIMIT ?`, sampleArgs...)
 		if err != nil {
 			return p, err
 		}
-		vals := make([]int64, 0, p.LatencySampled)
+		capHint := p.LatencySampled
+		if capHint > usagePerfMaxSample {
+			capHint = usagePerfMaxSample
+		}
+		vals := make([]int64, 0, capHint)
 		for rows.Next() {
 			var v int64
 			if err := rows.Scan(&v); err != nil {
@@ -387,6 +408,7 @@ func (uq *Queries) UsagePerf(userID int64, days int) (UsagePerf, error) {
 		if err := rows.Err(); err != nil {
 			return p, err
 		}
+		sort.Slice(vals, func(i, j int) bool { return vals[i] < vals[j] })
 		p.P50LatencyMS = Percentile(vals, 0.50)
 		p.P95LatencyMS = Percentile(vals, 0.95)
 	}

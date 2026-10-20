@@ -73,14 +73,18 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.58"
+const version = "0.31.59"
 
 type app struct {
-	store  *Store
-	proxy  *Proxy
-	tasks  *taskRunner // 定时任务（签到/旅行/活跃/保活），-no-tasks 时为 nil
-	key    string      // 管理密钥（命令行/脚本运维通道）
-	secret *SecretBox
+	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
+	// 定时任务与管理端按钮共用这把锁：两个入口同时跑会产生重复差异/公告，
+	// 而且各自写一半的批次会让"这次同步到底改了哪些模型"无从回答。
+	modelRatioMu sync.Mutex
+	store        *Store
+	proxy        *Proxy
+	tasks        *taskRunner // 定时任务（签到/旅行/活跃/保活），-no-tasks 时为 nil
+	key          string      // 管理密钥（命令行/脚本运维通道）
+	secret       *SecretBox
 	// 开放注册下的两道闸：注册与登录各自按 IP 限速。
 	registerLimiter *rateLimiter
 	loginLimiter    *rateLimiter
@@ -451,6 +455,9 @@ func main() {
 	// 模型倍率自动同步（v0.31.51，需求一）：启动后补跑 + 之后每小时检查是否满 20 小时。
 	go a.modelRatioLoop(probeCtx)
 
+	// 鉴权日志与限流共用同一份可信代理配置（v0.31.59，审查 F14）。
+	setLogTrustedProxies(proxySet)
+
 	mux := a.routes()
 
 	srv := &http.Server{
@@ -459,9 +466,15 @@ func main() {
 		// CSRF 放在最内层：它需要读 Origin/Host，且拦截时希望已带上安全头。
 		Handler:           recoverer(securityHeaders(limitRequestBody(a.csrfGuard(routeDiagnostics(mux)), maxRequestBody))),
 		ReadHeaderTimeout: 30 * time.Second,
-		// IdleTimeout / ReadTimeout 此前缺失（v0.24.0 补）：只有 ReadHeaderTimeout
-		// 挡不住「连上但不发完请求」的慢速连接占资源。写超时不给 —— 流式回答
-		// 可能长达数分钟，设 WriteTimeout 会把正常长回复掐断（这是刻意的取舍）。
+		// ReadTimeout 限制"把整个请求（含 body）读完"的总时长（v0.31.59，审查 F12）。
+		//
+		// 只有 ReadHeaderTimeout 挡不住 slow-body 攻击：连上后每 20 秒发一个字节，
+		// 头部早已读完、连接却可以占很久。请求体上限（maxRequestBody）管的是**大小**，
+		// 不是**时长**。60 秒对本项目足够：最大的人工请求是几 MB 的账号 JSON 导入。
+		//
+		// 刻意**不设** WriteTimeout：SSE 回答可能长达数分钟，一刀切的写超时会把
+		// 正常长回复掐断（审查 F12 也明确反对"给所有 SSE 设短超时"）。
+		ReadTimeout: 60 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
 	log.Printf("workbuddy2api webapp %s 启动于 http://%s", version, *addr)

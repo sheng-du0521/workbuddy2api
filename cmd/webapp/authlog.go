@@ -25,7 +25,6 @@ package main
 
 import (
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -117,22 +116,23 @@ func shortUA(s string) string {
 	return s
 }
 
-// clientIPOf 取客户端 IP（与限流同口径：优先 X-Forwarded-For 的第一跳）。
+// logTrustedProxies 采信转发头的网段（启动时由 -trusted-proxies 注入）。
 //
-// 只用于日志，因此不做可信代理校验 —— 与 enforceRateLimit 不同：
-// 那个值会参与限流决策，被伪造就是安全问题；日志里的值被伪造只影响排查线索。
+// 只在启动阶段写一次、之后只读，因此不需要锁。
+var logTrustedProxies *ipSet
+
+// setLogTrustedProxies 让鉴权日志与限流共享同一份可信代理配置。
+func setLogTrustedProxies(set *ipSet) { logTrustedProxies = set }
+
+// clientIPOf 取客户端 IP —— 与限流**同一套规则**（v0.31.59，审查 F14）。
+//
+// 修复前这里无条件采用 X-Forwarded-For 的第一段，注释还写着"日志被伪造只影响排查线索"。
+// 实际上这会让直接请求者把任意 IP 写进审计日志，而同一请求在限流里用的是另一个值 ——
+// 两条证据对不上，事后既无法追责也无法关联。
+//
+// 现在：对端不可信时只记 RemoteAddr；可信时按 CF-Connecting-IP → XFF 最右公网 → X-Real-IP 取值。
 func clientIPOf(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return clientIPWith(logTrustedProxies, r)
 }
 
 // maskKeyForLog 把用户送来的 key 变成可核对的指纹（前 10 + 后 4）。

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 # 可选：Go 模块代理。官方 proxy.golang.org 在中国大陆不可达（go mod download
 # 会卡死）；国内机器构建时传 --build-arg GOPROXY=https://goproxy.cn,direct。
@@ -40,6 +40,9 @@ COPY scripts/global_region.py /app/scripts/global_region.py
 COPY scripts/task_common.py /app/scripts/task_common.py
 COPY scripts/task_runner.py /app/scripts/task_runner.py
 COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
+# 成长任务入口（v0.31.59，审查 F05）：Go 调度器直接 exec 这个文件，
+# 漏了它 → 标准镜像里的成长任务必然"脚本不存在"。依赖 task_runner / task_common（已在上）。
+COPY scripts/growth_run.py /app/scripts/growth_run.py
 RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
 USER app

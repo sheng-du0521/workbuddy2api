@@ -23,9 +23,9 @@ import (
 func mcAccounts() []*Account {
 	return []*Account{
 		{UID: "mc-a", Nickname: "甲", Realm: "cn", AccessToken: "ta", RefreshToken: "ra",
-			ExpiresAt: time.Now().Add(time.Hour).Unix(), PoolState: "", ConsumeGroup: "mc"},
+			ExpiresAt: time.Now().Add(time.Hour).Unix(), PoolState: "", ConsumeGroup: cgProxy},
 		{UID: "mc-b", Nickname: "乙", Realm: "cn", AccessToken: "tb", RefreshToken: "rb",
-			ExpiresAt: time.Now().Add(time.Hour).Unix(), PoolState: "", ConsumeGroup: "mc"},
+			ExpiresAt: time.Now().Add(time.Hour).Unix(), PoolState: "", ConsumeGroup: cgProxy},
 	}
 }
 
@@ -128,5 +128,46 @@ func TestModelCoolingEndpointAuth(t *testing.T) {
 	}
 	if _, has := d["summary"]; !has {
 		t.Fatalf("响应必须含 summary（顶部汇总），得 %.200s", body)
+	}
+}
+
+// TestCoolingRespectsSelectionScope 冷却视图必须与**真实选号规则**一致（审查 F11）。
+//
+// 修复前：卡片只问 pool.AvailableUIDsForModel（"池里有没有健康账号"），
+// 而实际选号还要过白名单 / 消耗分组 / 出口健康。
+// 于是"唯一允许的号在冷却、另一个号空闲但不在白名单"时，卡片显示 partial，
+// 用户以为还能用，实际每次请求都选不出账号 —— 比不显示更糟。
+func TestCoolingRespectsSelectionScope(t *testing.T) {
+	store, px, a := newTestApp(t, mcAccounts()...)
+	defer store.Close()
+
+	// 白名单只放 mc-a：mc-b 健康，但不在可用范围内。
+	if err := store.SetKV(kvProxyAccounts, "mc-a"); err != nil {
+		t.Fatalf("SetKV: %v", err)
+	}
+	px.ReloadSelection()
+	// mc-a 对该模型进入冷却 → 此刻一个可选账号都没有。
+	px.pool.CooldownSoftForModel("mc-a", time.Minute, time.Now().Add(time.Minute),
+		"glm-scope", "6004 限额（上游重置 12:00）")
+
+	v := a.buildModelCoolingView()
+	if len(v.Models) != 1 {
+		t.Fatalf("应有 1 个冷却模型，得 %d", len(v.Models))
+	}
+	if v.Models[0].State != "full" {
+		t.Fatalf("唯一允许的号在冷却、另一个不在白名单 → 应判 full，得 %q（假余量）", v.Models[0].State)
+	}
+	if v.Summary.FullModels != 1 {
+		t.Fatalf("summary.full_models 应为 1，得 %d", v.Summary.FullModels)
+	}
+
+	// 放开白名单（mc-b 可用）→ 同一条冷却记录变成 partial。
+	if err := store.SetKV(kvProxyAccounts, ""); err != nil {
+		t.Fatalf("SetKV: %v", err)
+	}
+	px.ReloadSelection()
+	v = a.buildModelCoolingView()
+	if len(v.Models) != 1 || v.Models[0].State != "partial" {
+		t.Fatalf("放开白名单后应回到 partial，得 %+v", v.Models)
 	}
 }

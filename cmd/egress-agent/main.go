@@ -42,6 +42,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -59,7 +60,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.7"
+const agentVersion = "0.3.8"
 
 // pollInterval 轮询间隔。取 5s：
 //   - 用户的体感是"点完几秒内就动起来"；
@@ -184,6 +185,18 @@ func (a *agent) get(path string, out any) error {
 	return a.do(req, out)
 }
 
+// httpStatusError 带状态码的 HTTP 错误（v0.3.8，审查 F03）。
+//
+// 为什么需要类型而不只是字符串：轮询循环必须能**分辨** 410/401/403（终态：停止并退出）
+// 与 5xx/网络错误（临时：退避重试）。按错误文案匹配状态码，会在上游改一句话时静默失效。
+type httpStatusError struct {
+	Code   int
+	Status string
+	Body   string
+}
+
+func (e *httpStatusError) Error() string { return e.Status + ": " + e.Body }
+
 func (a *agent) do(req *http.Request, out any) error {
 	cl := &http.Client{Timeout: 15 * time.Second}
 	resp, err := cl.Do(req)
@@ -192,11 +205,20 @@ func (a *agent) do(req *http.Request, out any) error {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	// 关键（v0.3.8）：**先解析再判状态码**。
+	// 修复前 >=400 直接 return error，body 从未反序列化 —— 而服务端的"停用"
+	// 恰恰是 410 + {"action":"stop"}。于是旧 agent 永远看不到 stop 指令，
+	// 只把 410 当"轮询失败"重试，隧道与代理继续跑（审查 F03 的 A 级复现）。
+	if out != nil && len(raw) > 0 {
+		if jerr := json.Unmarshal(raw, out); jerr != nil && resp.StatusCode < 400 {
+			return jerr
+		}
 	}
-	if out != nil {
-		return json.Unmarshal(raw, out)
+	if resp.StatusCode >= 400 {
+		return &httpStatusError{
+			Code: resp.StatusCode, Status: resp.Status,
+			Body: strings.TrimSpace(string(raw)),
+		}
 	}
 	return nil
 }
@@ -728,6 +750,25 @@ func main() {
 		}
 		spec, err := a.poll()
 		if err != nil {
+			// 终态协议（v0.3.8，审查 F03）：401/403/410 表示"这台机器不再被接纳"，
+			// 不能再当临时故障重试 —— 必须停掉代理与隧道、清掉"应为运行态"标记、退出进程。
+			//
+			// 为什么退出而不是继续轮询：服务端已经明确拒绝，继续每 5 秒打一次只会
+			// 刷日志；而保活循环若还认为 lastAction=start，会把刚停掉的隧道**重新拉起**，
+			// 形成"服务端说停、本机反复起"的拉锯（旧版正是这个行为）。
+			var se *httpStatusError
+			if errors.As(err, &se) && (se.Code == http.StatusGone ||
+				se.Code == http.StatusUnauthorized || se.Code == http.StatusForbidden) {
+				a.stopAll()
+				a.mu.Lock()
+				a.lastAction, a.lastAt = "", 0
+				a.mu.Unlock()
+				log.Printf("[agent] 云端返回 %d（%s）：这台机器已被停用/撤销 —— 已停止代理与隧道并退出。"+
+					"如需重新接入，请重新运行 agent。", se.Code, strings.TrimSpace(se.Body))
+				a.setMsg("云端已停用本机接入（HTTP %d），agent 退出", se.Code)
+				a.report()
+				return
+			}
 			a.setMsg("轮询云端失败（将自动重试）：%v", err)
 		} else {
 			switch spec.Action {

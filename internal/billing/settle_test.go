@@ -171,6 +171,15 @@ func TestSettleFailureReporting(t *testing.T) {
 		if len(f.failures) != 1 || f.failures[0].Stage != StageSettle || f.failures[0].Source != "settle" {
 			t.Fatalf("应记一条 settle 阶段失败台账，得 %+v", f.failures)
 		}
+		// v0.31.59（审查 F02）：结算失败 = 钱没扣成功 → 不得回报实扣、不得触发分成。
+		// 只把 Settled 置 false 是不够的：调用方按 HostCreditDue 发钱，
+		// 名义金额一旦回传，号主就会拿到一笔"用户从未付出"的可提现收益。
+		if res.HostCreditDue {
+			t.Fatal("结算失败仍标记 HostCreditDue=true —— 会给号主发钱，而用户一分未扣")
+		}
+		if res.ChargedMicro != 0 {
+			t.Fatalf("结算失败不应回报实扣，得 %d", res.ChargedMicro)
+		}
 		// 失败也必须落流水（否则"账对不上"时无从追查）
 		if got := f.lastLog(t); !strings.Contains(got.ErrorMsg, "settle_failed") {
 			t.Fatalf("流水应带失败标记，得 %q", got.ErrorMsg)
@@ -180,8 +189,17 @@ func TestSettleFailureReporting(t *testing.T) {
 		f := &fakeLedger{mult: 1, chargeErr: errors.New("disk full")}
 		res := (Settler{Ledger: f}).Settle(okReq())
 
-		if !res.Settled {
-			t.Fatal("扣费失败不该把 settled 置 false（响应已发出，没有预扣要退）")
+		// v0.31.59（审查 F02）语义修正：无预扣时"未结算"就等于"这笔钱没扣成功"。
+		// 此前这里保持 Settled=true，调用方据此认为账已两清并发分成 ——
+		// 与"预扣结算失败仍分成"是同一条缺陷的第二个入口。
+		if res.Settled {
+			t.Fatal("无预扣且扣费失败时必须回报 settled=false（钱没扣成功）")
+		}
+		if res.HostCreditDue {
+			t.Fatal("扣费失败不得触发分成")
+		}
+		if res.ChargedMicro != 0 {
+			t.Fatalf("扣费失败不应回报实扣，得 %d", res.ChargedMicro)
 		}
 		if !strings.Contains(res.ErrMsg, "[charge_failed:disk full]") {
 			t.Fatalf("流水标记缺失：%q", res.ErrMsg)

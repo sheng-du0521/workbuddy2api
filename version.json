@@ -1,16 +1,16 @@
 {
-  "version": "0.31.58",
+  "version": "0.31.59",
   "min_supported": "0.24.0",
-  "notes": "v0.31.58：修复「管理员切换号池代理后，普通用户无法正常使用号池」。根因是配置只改了一半：① `applyHomeEgress` 写完 `kv egress_proxy_default` 只调 `SyncAccounts()`，而它读的是**内存旧默认** —— 新默认在进程内不生效（空出口账号继续走旧出口）；旧默认若是坏的，`egressBad` 仍按旧值把全池判坏 → 整片 503。② `computeEgressBad` 用未规范化字符串查线路状态，默认写成 `HTTP://host:port/` 这类等价形式时查不到线路 → 线路已停用也不会传播到账号。③ 设置页/默认修复/出站口径切换各写一套（只 Reload 不 Sync，或分两步调），留下不一致窗口。④ `assign` 允许绑到 `fail_streak>=阈值` 的线路；写库中途失败直接 500，号池留在半新半旧。修法：新增 `Proxy.cfgMu` 与 `ApplyEgressChange()`（同一把锁内 reload → 重建映射），所有改默认出口的入口统一走它；默认出口改用 `egress.Validate` 规范化后查线路状态；分配拒绝不健康线路（409 `line_unhealthy`）并把写库改成失败回滚（`assign_write_failed`）；`GET /api/egress/home` / apply / assign 新增 `followers`/`follower_hosts` 影响面，用户端状态行显示「跟随默认出口 N 个号（含 M 个代挂号）」，应用前二次确认并说明「线路离线时这些号会全部失败、不会自动回退直连」。已建立连接不受切换影响（新请求才按新快照出站）；计费路径未改动（失败仍释放预扣）。",
-  "released_at": 1792469744,
+  "notes": "v0.31.59：按《全面审查报告 2026-10-19》整改 A 级实证缺陷与低成本 P1/P2。① **F01 预扣释放丢可提现额度**：reservations 新增 frozen_withdrawable_micro，释放/结算按实际消耗还原分桶（预扣 80→全额释放后恢复 100/100，不再永久损失）。② **F02 结算失败仍发分成**：只有**已提交**的实扣才回传 ChargedMicro 并驱动 HostCreditDue；无预扣扣费失败也置 Settled=false；调用方再加双保险；流水写失败不再静默丢弃。③ **F03 agent 忽略 410 stop**：agent 先解析 body 再判状态码，410/401/403 视为终态——stopAll、清 lastAction、退出；服务端在插件停用时向 agent 下发 410 stop（poll/config），agent 0.3.8。④ **F10 模型同步**：单飞锁（并发入口 409 sync_in_progress）+ 整批事务（失败零写入）。⑤ **F11 冷却视图**：full/partial 改用与真实选号同一份规则（白名单/消耗分组/出口健康），删掉从未赋值的 probing。⑥ **F12/F13/F14**：补 ReadTimeout 60s（不设 WriteTimeout）；报表分位改最近 5 万条有界采样；鉴权日志与限流共用同一套可信代理 IP 解析（不可信对端忽略 XFF）。⑦ **F05/F09**：发行包补齐 scripts/growth_run.py 等运行期脚本（含递归打包），Dockerfile 同步；README 备份指引改为 SQLite Online Backup / VACUUM INTO，并强调 secret.key 必须一起备份。⑧ **F08**：go.mod 与 Docker 构建镜像统一到 1.27。仍待处理（有依赖或需独立版本）：F04 SSH 撤权需服务器操作、F06 发布闸门（已加 scripts/verify_release.py）、F07 清单签名需密钥体系、F15/F16/F17/F18 属长期工程。详见 docs/审查问题核对与整改-20261020.md。",
+  "released_at": 1792471214,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.58/webapp.exe",
-      "sha256": "a33f2de3d0ea552c3d4c837069c093dfc5996ee1496af496f1431e1f808b55c5",
-      "size": 15628288
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.59/webapp.exe",
+      "sha256": "a5a03cd1dfcfba10d3a3980f6e2189b652c98f430cfa65a3724eb6aad6599732",
+      "size": 15639552
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
