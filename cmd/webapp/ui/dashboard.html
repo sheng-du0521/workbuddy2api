@@ -213,6 +213,7 @@
         <div class="sub" style="margin:0 0 12px;">
           选一把自己的密钥发一条消息，验证是否跑通。<b>号池计费密钥</b> 会按用量扣余额；
           <b>代挂自用密钥</b> 不扣余额，只用你自己的代挂账号。
+          不知道模型名叫什么时，点「一键拉取全部模型」，<b>点名字即复制</b>（并自动填进模型框）。
         </div>
         <div class="row" style="margin-bottom:10px;">
           <label>密钥</label>
@@ -220,11 +221,13 @@
           <label>模型</label>
           <input type="text" id="testModel" value="deepseek-v4-flash" class="mono" list="modelOpts" style="min-width:180px;">
           <datalist id="modelOpts"></datalist>
+          <button type="button" id="btnTestModels" class="ghost">一键拉取全部模型</button>
           <span class="row tight" style="gap:6px;">
             <span class="switch"><input type="checkbox" id="testStream" checked><i></i></span>
             <span class="muted" style="font-size:12px;">流式</span>
           </span>
         </div>
+        <div id="testModelPanel" class="modelpick hidden"></div>
         <textarea id="testPrompt">用一句话介绍你自己。</textarea>
         <div class="row" style="margin-top:10px;">
           <button id="btnTestSend">发送</button>
@@ -2796,6 +2799,151 @@ $('btnRedeem').onclick = async () => {
 
 let testModelsLoaded = false;
 
+// ======================================================================
+// 一键拉取全部模型（测试对话）
+// ======================================================================
+//
+// 为什么要有它：模型 id 是一串又长又不能拼错的东西（deepseek-v4-flash 这种），
+// 之前用户只能靠输入框的 datalist 补全 —— 但 datalist 只在**聚焦输入**时才给
+// 提示，且看不到"到底有哪些"，于是真实用法变成了"切到别的页看列表、手抄回来"。
+// 这里把 /api/models 的全量 id 铺成一行行按钮：**点一下即复制**，同时填进模型框，
+// 复制与试跑是同一个动作，不必再来回切页。
+//
+// 与「获取模型 ID」弹窗（openModelsModal）的分工：那个是**带倍率**的对照表
+// （给接入客户端用），这里是**挑一个去发消息**（给本页试跑用），所以做成
+// 就地展开的面板而不是弹窗 —— 弹窗会盖住回复区，试跑时反复开关很烦。
+
+let testModelCache = [];
+
+// fillModelOpts 把模型 id 灌进 datalist（输入框补全）。与面板共用一份结果，
+// 免得"拉过面板、输入框补全还是空的"。
+function fillModelOpts(ids) {
+  const dl = $('modelOpts');
+  if (!dl) return;
+  dl.textContent = '';
+  for (const id of (ids || [])) { const o = el('option'); o.value = id; dl.appendChild(o); }
+}
+
+// fetchTestModels 拉一次全量模型并回填缓存（服务端是 5 分钟的上游探测缓存）。
+async function fetchTestModels() {
+  const m = await api('/api/models');
+  const ids = (m && m.models) || [];
+  testModelCache = ids;
+  fillModelOpts(ids); // 顺手补全输入框：拉过的都能补全
+  return ids;
+}
+
+// renderTestModelChips 渲染模型名按钮。kw 为空则全量展示。
+function renderTestModelChips(bar, ids, kw) {
+  bar.textContent = '';
+  const q = String(kw || '').trim().toLowerCase();
+  const shown = q ? ids.filter((x) => String(x).toLowerCase().indexOf(q) >= 0) : ids;
+  if (!shown.length) {
+    bar.appendChild(el('div', 'muted', q ? '没有匹配的模型' : '没有可展示的模型'));
+    return;
+  }
+  const cur = ($('testModel') && $('testModel').value.trim()) || '';
+  for (const id of shown) {
+    const c = el('button', 'chip', id);
+    c.type = 'button';
+    c.dataset.model = String(id);
+    c.title = '点击复制「' + id + '」并填入模型框';
+    if (id === cur) c.classList.add('active');
+    c.onclick = async () => {
+      // 先填框、再复制：即便复制被浏览器拦下（非安全上下文），
+      // 用户至少已经拿到能直接用的模型名，不会"点了没反应"。
+      if ($('testModel')) $('testModel').value = id;
+      for (const b of bar.querySelectorAll('.chip')) b.classList.toggle('active', b === c);
+      if (await writeClipboard(id)) toast('已复制模型名：' + id, 'ok');
+      else toast('已填入模型框；复制被浏览器拦截，请手动选择', 'err');
+    };
+    bar.appendChild(c);
+  }
+}
+
+// renderTestModelPanel 面板骨架：计数行 + 操作行 + 过滤框 + 名字墙。
+function renderTestModelPanel(ids) {
+  const box = $('testModelPanel');
+  if (!box) return null;
+  box.textContent = '';
+  const head = el('div', 'modelpick-head');
+  head.appendChild(el('span', 'n',
+    ids.length ? '共 ' + ids.length + ' 个模型 · 点名字即复制并填入上方模型框' : '模型列表为空'));
+  const ops = el('span', 'row tight');
+  if (ids.length) ops.appendChild(copyBtn(() => ids.join('\n'), '复制全部'));
+  const again = el('button', 'ghost', '重新拉取');
+  again.type = 'button';
+  again.onclick = () => loadTestModels(true);
+  ops.appendChild(again);
+  const close = el('button', 'ghost', '收起');
+  close.type = 'button';
+  close.onclick = () => { box.classList.add('hidden'); };
+  ops.appendChild(close);
+  head.appendChild(ops);
+  box.appendChild(head);
+
+  if (!ids.length) {
+    box.appendChild(el('div', 'hintbar', '暂未探测到模型列表（上游可能不可达，稍后点「重新拉取」）'));
+    return box;
+  }
+  const bar = el('div', 'modelpick-bar');
+  renderTestModelChips(bar, ids, '');
+  box.appendChild(bar);
+  // 过滤框只在模型较多时才有用：十来个模型还给个搜索框，是拿复杂度换噪音。
+  if (ids.length > 12) {
+    const fw = el('div', 'row tight');
+    fw.style.cssText = 'margin-top:8px;';
+    const f = el('input');
+    f.type = 'text';
+    f.className = 'mono';
+    f.placeholder = '过滤模型名…';
+    f.style.cssText = 'min-width:200px;';
+    f.oninput = () => renderTestModelChips(bar, ids, f.value);
+    fw.appendChild(f);
+    box.appendChild(fw);
+  }
+  return box;
+}
+
+// loadTestModels 拉取并展开。「一键拉取」按钮与面板里的「重新拉取」都走这里。
+async function loadTestModels(force) {
+  const box = $('testModelPanel');
+  const btn = $('btnTestModels');
+  if (!box) return;
+  if (!force && !box.classList.contains('hidden')) { // 已展开 → 再点即收起
+    box.classList.add('hidden');
+    return;
+  }
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '拉取中…'; }
+  try {
+    const ids = await fetchTestModels();
+    renderTestModelPanel(ids);
+    box.classList.remove('hidden');
+  } catch (e) {
+    // 失败也要**留在页面上**（toast 几秒就消失，用户只看到面板没开）：
+    // 面板里给出原因和一个能立刻重试的入口。
+    box.textContent = '';
+    const head = el('div', 'modelpick-head');
+    head.appendChild(el('span', 'n', '拉取失败：' + e.message));
+    const ops = el('span', 'row tight');
+    const again = el('button', 'ghost', '重试');
+    again.type = 'button';
+    again.onclick = () => loadTestModels(true);
+    ops.appendChild(again);
+    const close = el('button', 'ghost', '收起');
+    close.type = 'button';
+    close.onclick = () => { box.classList.add('hidden'); };
+    ops.appendChild(close);
+    head.appendChild(ops);
+    box.appendChild(head);
+    box.appendChild(el('div', 'hintbar', '模型列表来自上游探测（服务端缓存 5 分钟），上游不可达时会拉空。'));
+    box.classList.remove('hidden');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label || '一键拉取全部模型'; }
+  }
+}
+
 async function loadTestChat() {
   try {
     const d = await api('/api/keys');
@@ -2821,12 +2969,7 @@ async function loadTestChat() {
   } catch (e) { /* 忽略 */ }
   if (!testModelsLoaded) {
     testModelsLoaded = true;
-    try {
-      const m = await api('/api/models');
-      const dl = $('modelOpts');
-      dl.textContent = '';
-      for (const id of (m.models || [])) { const o = el('option'); o.value = id; dl.appendChild(o); }
-    } catch (e) { /* 忽略 */ }
+    try { await fetchTestModels(); } catch (e) { /* 忽略：不影响发消息，面板里可重试 */ }
   }
 }
 
@@ -2897,6 +3040,7 @@ async function sendTest() {
 }
 
 $('btnTestSend').onclick = sendTest;
+$('btnTestModels').onclick = () => loadTestModels();
 
 // ======================================================================
 // 我的返点
