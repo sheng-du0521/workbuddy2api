@@ -1,20 +1,20 @@
 {
-  "version": "0.31.67",
+  "version": "0.31.68",
   "min_supported": "0.24.0",
-  "notes": "v0.31.67：需求「按实际倍率调整计费」P1 —— 单模型计费倍率**真正参与扣费**，改完即时生效。\n① model_ratios 新增 billing_ratio / billing_scope：ratio=0 表示不参与、回落全局 pricing_multiplier（**不是免费**）。\n② 唯一口径：Proxy.ratioFor(model) 一处判定，结算包只负责乘（Request.Multiplier，0 则回落全局）。\n③ 快照：模型级倍率是一份不可变快照（billMu + ReloadBilling），保证\"一笔请求里只读一版\"；\n   全局倍率仍**实时读**——它只有一个 kv 键，实时读天然免受\"改了没 reload\"的坑。\n④ 新增 POST /api/admin/model-ratios/billing（写 + 校验 + 返回生效值/来源/rev）与\n   POST /api/admin/billing/preview（改之前先试算，与实扣同一公式）。\n⑤ 后台倍率面板新增「计费倍率」列：行内输入 + 保存 + 试算，结果显示在面板提示位。\n⑥ 用例 5 条：按倍率扣 / 0 回落全局 / 改完立即生效 / 越界与非法 scope 被拒且不写库 / 预览==实扣。\n边界：billing_scope=relay 现在只存不参与（等第三方通道 P2）；P1 只覆盖号池计费。",
-  "released_at": 1792490717,
+  "notes": "v0.31.68：需求 P2 —— 第三方模型 API / 中转站通道（录入、启停、探活、分发、计费）。\n① 新增 upstreams / upstream_models 两张表与管理接口（save/delete/toggle/probe/models）。读接口只回 key 掩码，永不回明文；更新时留空 = 不改。\n② 地址校验拦 SSRF：拒私网/回环/链路本地/云元数据 —— 这个地址是**服务端**去请求的，放行回环等于给后台加了个内网探测功能。\n③ 分发「号池优先」：判据是**号池模型目录里有没这个名字**。最初写成\"池内有可用号\"，是错的 —— 池内可用性只看 (账号,模型) 冷却，不认识\"是否支持该模型\"，于是任何模型都返回\"有号\"，通道永远走不到。目录为空时按\"号池认识\"处理（缺数据≠号池没有），避免一次重启把流量全推给第三方。\n④ 计费复用同一条结算链：tokens/1000 × 每 1k 积分 = 折算积分，再走 PointToMicro(积分 × 倍率)；渠道倍率取 billing_scope=relay 的那条，未配回落全局。新增 ScopeRelay，流水可分开统计两条供给的毛利。\n⑤ 通道请求**不做 PrepareOutbound**（那套指纹/角色/efforts 改写是给 workbuddy 上游的，照搬到第三方只会被拒或降智）。流式显式带 stream_options.include_usage；上游不给 usage 时记 no_usage 流水 + 0 费 + WARN（不凭空估）。\n⑥ /v1/models 合并通道模型（owned_by=relay，只追加号池没有的）；缓存里号池与通道分包，避免模型名归一化与分发判定被通道模型污染（那是会自我死锁的一处）。\n⑦ 后台新增「第三方通道」页：通道卡片（探活/编辑/启停/删除）+ 模型映射表（含\"号池优先\"冲突提示）。\n验证：新增 6 条用例（URL 校验 / 掩码 / 不认识才走通道且扣费精确 / 认识则一次都不打通道 / 全失败回 502 而非 404 / 停用即刻不可见 / 流式按 usage 计费）；go test ./... 全绿。\n边界：v1 只支持 openai 兼容协议；通道请求直连（不走号池出口代理）；预扣沿用全局兜底单价而非通道单价；不做\"上游故障自动降级到通道\"。",
+  "released_at": 1792495810,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.67/webapp.exe",
-      "sha256": "f1a785671d8b7751f334cab675b7eded29a76f51293e59ad702a75290f72ab3e",
-      "size": 15712768
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.68/webapp.exe",
+      "sha256": "57d408e140804090fb7c88172dc7d309b0c43267d93104583f4f10a6ee27ba64",
+      "size": 15797248
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "g0l/bYJrv+BxFT/rDcaPpn9QU4pLkVBaXrnOAXhELtlSmgYLsDOK0FSgGXnFLH/DumLNthctsByekWg7l9BbDA==",
+  "signature": "MZ0fjzY/1SiCJykrUqfYyczR4YIZ7RaCIq28Aez8UQbj+lyylipdiQriNjOCq3H6CYVg4axXm9ZL8kG+8u15Cw==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

@@ -1676,6 +1676,21 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	// 两者必须一起维护：释放时按 (uid, model) 递减在途计数（见 releaseHeld）。
 	var heldUID, heldModel string
 	defer func() { p.releaseHeld(&heldUID, &heldModel, model) }()
+	// 通道分发（v0.31.68，需求 P2）：**号池没有这个模型的可用号时**才落第三方 / 中转站。
+	//
+	// 位置刻意在轮转之前、预扣之后：预扣是为"这一笔要花钱"准备的，与走哪条供给无关；
+	// 而放到轮转里（au==nil 时降级）会把"上游临时故障"变成"刷第三方账单"——
+	// 那不是一个可以默认开启的行为。
+	//
+	// handled=false 表示"不该走通道"（号池有号 / 代挂 Key / 没配通道），
+	// 此时 serveRelay 没有写过响应，继续走下面的号池路径。
+	if handled, relaySettled := p.serveRelay(w, r, payload, model, u, key, resv, stickyHash, start, wantStream); handled {
+		if relaySettled {
+			settled = true
+		}
+		return
+	}
+
 	tried := map[string]bool{}
 	// probeAttempt 本次轮转是否由**半开探测**拿到号（v0.31.6）：决定成功时是否
 	// 提前解除该 (账号, 模型) 的 6004 冷却，以及失败时是否补一条可读日志。
@@ -2964,6 +2979,14 @@ func parseUsageJSON(raw json.RawMessage) usageInfo {
 // 为什么要记：此前流水只有最终 upstream_uid，无法回答「同一场对话的多轮是否落到不同
 // 账号」—— 那正是「调用过程中切换账号」这一问题的**观测盲区**（只能靠时间聚类猜）。
 func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui usageInfo, resv *Reservation, status, errMsg, stickyHash string, attempts int) (settled bool, chargedMicro int64) {
+	return p.settleUsageScoped(u, key, model, upstreamUID, ui, resv, status, errMsg, stickyHash, attempts, "")
+}
+
+// settleUsageScoped 与 settleUsage 相同，但可以指定**消费归类**（v0.31.68，需求 P2）。
+//
+// scope 非空时只认 billing.ScopeRelay：pool / host 的归类依赖 KeyKind 等既有事实，
+// 不该由调用方改写（改错就是"平台买单"或者"号主被白嫖"）。
+func (p *Proxy) settleUsageScoped(u *User, key *APIKey, model, upstreamUID string, ui usageInfo, resv *Reservation, status, errMsg, stickyHash string, attempts int, scope string) (settled bool, chargedMicro int64) {
 	// 成功的模型名进入"上游认过"清单（v0.31.2），供模型名写法归一使用。
 	// 只记成功：失败记录里的名字可能正是写法错的，把它写进清单会让下一次
 	// 把**正确**写法归一成错的（最危险的方向）。
@@ -3006,7 +3029,15 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 	// 单模型计费倍率（v0.31.67）：在结算前取一次快照值。
 	// 取不到（未配置）时留 0，结算内部会回落全局 —— 这里**不要**自己兜底成 1，
 	// 否则"全局倍率改成 2"会让所有未配置模型的请求都按 1 倍扣（静默少收一半）。
-	req.Multiplier, _ = p.ratioFor(model)
+	//
+	// 通道请求用另一份视图（v0.31.68）：同一个模型名在号池与通道上成本结构不同，
+	// 共用一个倍率必然有一边亏。
+	if scope == billing.ScopeRelay {
+		req.Scope = billing.ScopeRelay
+		req.Multiplier, _ = p.ratioForRelay(model)
+	} else {
+		req.Multiplier, _ = p.ratioFor(model)
+	}
 
 	res := p.billingSettler().Settle(req)
 	return res.Settled, res.ChargedMicro

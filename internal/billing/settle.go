@@ -34,6 +34,12 @@ import (
 const (
 	ScopePool = "pool" // 走平台号池（平台计费 Key）
 	ScopeHost = "host" // 走号主自己的代挂账号（代挂自用 Key，免费）
+	// ScopeRelay 走第三方 / 中转站通道（v0.31.68，需求 P2）。
+	//
+	// 与 pool 的本质区别：**没有账号**（UpstreamUID 为空）、没有号主因此不产生分成，
+	// 成本口径也不是"上游扣了我们多少积分"而是"对方按 token 收多少"（由通道配置折算成积分）。
+	// 单独一个 scope 是为了让报表能分开看两条供给的毛利 —— 混在 pool 里等于永远查不清。
+	ScopeRelay = "relay"
 
 	// KeyKindHost 代挂自用 Key 的类型标识（与 ScopeHost 同值但语义不同：
 	// 一个是"这把 Key 是什么"，一个是"这条流水算哪类消费"，不要互相替换）。
@@ -192,6 +198,10 @@ type Request struct {
 	// 由调用方**在结算前**解析（需要选号侧状态）；金额由本包算。
 	Host *HostShare
 
+	// Scope 消费归类覆盖（v0.31.68）。空 = 按旧逻辑推断（代挂自用 → host，其余 → pool）。
+	// 只允许 ScopeRelay：pool/host 的判定依赖 KeyKind 等既有事实，不该由调用方改写。
+	Scope string
+
 	// Multiplier 本笔生效的计费倍率（v0.31.67，单模型倍率）。
 	//
 	// 0 = 未指定 → 回落 Ledger.PricingMultiplier()（全局倍率，旧行为）。
@@ -261,7 +271,10 @@ func (s Settler) Settle(req Request) Result {
 	}
 	// 记录实测单价（积分 / 1k token），供后续请求的预扣估算使用
 	// （调用方取历史最大值并持久化 —— 那两步在 Costs / kv，不在这里）。
-	if per1k := Per1kCost(consumedCredit, req.Usage.Total()); per1k > 0 && s.ObserveCost != nil {
+	// relay 的"积分"是按通道单价**折算**的，不是上游实测；写进实测台账会污染
+	// pool 的成本分层（下次预扣按通道价估号池请求，估出来必然离谱）。
+	relayScope := req.Scope == ScopeRelay
+	if per1k := Per1kCost(consumedCredit, req.Usage.Total()); per1k > 0 && s.ObserveCost != nil && !relayScope {
 		s.ObserveCost(req.Model, per1k)
 	}
 	// 扣费 = 号池积分消耗 × 倍率。倍率即「1 号池积分折多少点」。
@@ -273,6 +286,12 @@ func (s Settler) Settle(req Request) Result {
 		chargedMicro = 0
 		res.Scope = ScopeHost
 		res.ErrMsg = appendMark(res.ErrMsg, "[host_self]")
+	}
+
+	if relayScope {
+		// 通道消费：scope 明确标成 relay，且**不**打 host_self 标记（即便 Key 是代挂类型 ——
+		// 代挂 Key 根本不允许走通道，serveRelay 已拦，这里只是兜底不产生矛盾标签）。
+		res.Scope = ScopeRelay
 	}
 
 	res.Settled = true

@@ -30,6 +30,8 @@
       <div class="nav-group">扩展</div>
       <!-- v0.31.52（需求一）：官方倍率/免费标识与实测计费口径的对照面板。 -->
       <button class="nav-item" data-nav="ratios" data-on="loadModelRatios" data-title="模型倍率" data-sub="官方 credits / 免费标识 vs 本站实测积分；变化台账与手动同步"><span class="ico">⚖</span>模型倍率</button>
+      <!-- v0.31.68（需求 P2）：第三方模型 API / 中转站通道。 -->
+      <button class="nav-item" data-nav="channels" data-on="loadChannels" data-title="第三方通道" data-sub="第三方模型 API / 中转站：录入、启停、探活与模型映射；号池优先分发"><span class="ico">🔌</span>第三方通道</button>
       <button class="nav-item" data-nav="plugins" data-on="loadPlugins" data-title="插件" data-sub="可独立启停的功能扩展；停用只影响入口与执行，不改动任何数据"><span class="ico">🧩</span>插件</button>
       <div class="nav-group">经营</div>
       <button class="nav-item" data-nav="users" data-on="loadUsers" data-title="用户" data-sub="余额、限额与封禁"><span class="ico">👤</span>用户</button>
@@ -1704,6 +1706,30 @@
           <span class="muted" style="font-size:12px;">新增模型 / 免费状态翻转 / 倍率变更</span>
         </div>
         <div id="mrDiffs" class="sub">加载中…</div>
+      </div>
+    </section>
+
+    <!-- v0.31.68（需求 P2）：第三方 / 中转站通道。
+         分发规则是「号池优先」：只有号池模型目录里**没有**的模型才会走通道。 -->
+    <section class="pane" data-pane="channels">
+      <div class="card">
+        <div class="section-head">
+          <h2>第三方 / 中转站通道</h2>
+          <span class="slot-refresh" data-refresh="loadChannels" data-refresh-label="刷新"></span>
+        </div>
+        <div class="sub" style="margin:0 0 10px;">
+          这是号池之外的<b>第二条供给</b>，走标准 OpenAI 兼容协议（<code>base_url</code> + <code>/chat/completions</code>）。
+          <br>分发规则：<b>号池优先</b> —— 号池模型目录里有同名模型就永远走号池；只有号池<b>没有</b>的模型才落到通道。
+          代价：号池目录为空（刚部署 / 账号还没同步）时，<b>不会</b>把流量推到通道（缺数据不等于号池没有）。
+          <br>计费：<code>tokens / 1000 × 每 1k 积分 × 倍率</code>。倍率取「模型倍率」页里
+          <code>billing_scope=relay</code> 的那条，没配则回落全局倍率 —— 与号池同一条结算链。
+        </div>
+        <div class="row" style="gap:8px;align-items:center;margin:0 0 10px;">
+          <button id="btnChNew" title="新增一条通道：填 base_url 与 key，再用「探活」确认可用">新增通道</button>
+          <span id="chHint" class="muted" style="font-size:12px;"></span>
+        </div>
+        <div id="chForm" style="display:none;"></div>
+        <div id="chList">加载中…</div>
       </div>
     </section>
 
@@ -5674,6 +5700,7 @@ function extLink(href, text) {
 
 if ($('btnCheckUpdate')) $('btnCheckUpdate').onclick = () => loadUpdateStatus(true);
 if ($('btnLedgerCheck')) $('btnLedgerCheck').onclick = () => loadLedgerCheck(true);
+if ($('btnChNew')) $('btnChNew').onclick = () => showChannelForm(null);
 if ($('btnDataUsage')) $('btnDataUsage').onclick = () => loadDataUsage(false);
 if ($('btnPruneLogs')) $('btnPruneLogs').onclick = () => {
   // 删数据不可逆：必须让人显式确认，且说明"按当前保留策略"而不是"全删"。
@@ -7807,6 +7834,305 @@ async function loadEgress(silent) {
 // 前端只用来分组文案，**不做判定** —— 判定永远在服务端。
 const EGR_CODE_POOLED = 'account_pooled';
 const EGR_CODE_FOREIGN = 'foreign_account';
+
+// loadChannels 第三方 / 中转站通道（v0.31.68，需求 P2）。
+//
+// 这一页要回答三个问题，缺一个就会出事故：
+//   1. 我配的 key 到底通不通？（探活按钮 → 服务端 GET /models，免费且不耗额度）
+//   2. 这个模型现在会走通道，还是会被号池抢走？（pool_models 命中就标「号池优先」）
+//   3. 改了之后什么时候生效？（停用/加模型会立刻作废模型缓存；计费倍率走快照，保存即生效）
+async function loadChannels() {
+  const box = $('chList');
+  if (!box) return;
+  let d;
+  try { d = await api('/api/admin/upstreams'); }
+  catch (e) { box.textContent = ''; box.appendChild(el('div', 'credit-err', '读取失败：' + e.message)); return; }
+  box.textContent = '';
+  const list = (d && d.upstreams) || [];
+  const poolModels = (d && d.pool_models) || {};
+  if (!list.length) {
+    box.appendChild(el('div', 'hintbar',
+      '还没有配置通道。点「新增通道」填 base_url 与 API Key，然后用「探活」确认可用，再添加模型映射。'));
+    return;
+  }
+  for (const up of list) box.appendChild(channelCard(up, poolModels));
+}
+
+// channelCard 一条通道（含模型映射表）。
+function channelCard(up, poolModels) {
+  const card = el('div', 'card');
+  card.style.marginTop = '12px';
+
+  const head = el('div', 'row');
+  head.style.gap = '8px';
+  head.style.alignItems = 'center';
+  const title = el('strong', '', up.name);
+  head.appendChild(title);
+  head.appendChild(el('span', up.enabled ? 'tag ok' : 'tag warn', up.enabled ? '启用' : '停用'));
+  head.appendChild(el('span', 'mono muted', up.base_url));
+  head.appendChild(el('span', 'muted', 'key ' + (up.key_masked || '—')));
+  head.appendChild(el('span', 'muted', '优先级 ' + up.priority));
+  card.appendChild(head);
+
+  const meta = el('div', 'sub');
+  meta.style.margin = '6px 0';
+  meta.textContent = up.last_probe_at
+    ? ('上次探活 ' + fmtClock(up.last_probe_at) + '：' + (up.last_probe_ok ? '✓ ' : '✗ ') + (up.last_probe_msg || ''))
+    : '还没探活过（建议先点「探活」确认地址与 key 可用）';
+  card.appendChild(meta);
+
+  const ops = el('div', 'row');
+  ops.style.gap = '6px';
+  const hint = $('chHint');
+  const say = (msg) => { if (hint) hint.textContent = msg; };
+
+  const bProbe = el('button', 'ghost', '探活');
+  bProbe.title = '服务端 GET {base_url}/models：验证地址、key 与可用模型；不消耗对方额度';
+  bProbe.onclick = async () => {
+    bProbe.disabled = true;
+    say('探活中…');
+    try {
+      const r = await post('/api/admin/upstreams/probe', { id: up.id });
+      if (r.ok) {
+        say('探活通过：' + r.count + ' 个模型可用（可加到下方映射）');
+      } else {
+        // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
+        say('探活失败：' + r.error);
+      }
+      loadChannels();
+    } catch (e) { say('探活失败：' + e.message); }
+    finally { bProbe.disabled = false; }
+  };
+  ops.appendChild(bProbe);
+
+  const bEdit = el('button', 'ghost', '编辑');
+  bEdit.onclick = () => showChannelForm(up);
+  ops.appendChild(bEdit);
+
+  const bToggle = el('button', 'ghost', up.enabled ? '停用' : '启用');
+  bToggle.onclick = async () => {
+    bToggle.disabled = true;
+    try {
+      await post('/api/admin/upstreams/toggle', { id: up.id, enabled: !up.enabled });
+      say((up.enabled ? '已停用' : '已启用') + '「' + up.name + '」：模型列表已即时刷新');
+      loadChannels();
+    } catch (e) { say('操作失败：' + e.message); }
+    finally { bToggle.disabled = false; }
+  };
+  ops.appendChild(bToggle);
+
+  const bDel = el('button', 'ghost', '删除');
+  bDel.onclick = async () => {
+    if (!confirm('删除通道「' + up.name + '」？\n它的所有模型映射会一起删掉，不可撤销。')) return;
+    bDel.disabled = true;
+    try {
+      await post('/api/admin/upstreams/delete', { id: up.id });
+      say('已删除「' + up.name + '」');
+      loadChannels();
+    } catch (e) { say('删除失败：' + e.message); }
+    finally { bDel.disabled = false; }
+  };
+  ops.appendChild(bDel);
+  card.appendChild(ops);
+
+  // ---- 模型映射 ----
+  const tbl = el('div');
+  tbl.style.marginTop = '10px';
+  const head2 = el('div', 'code-gen-row');
+  for (const t of ['模型（客户端请求的名字）', '上游模型名', '每 1k 积分', '状态', '操作']) {
+    const c = el('span', 'muted', t);
+    c.style.fontWeight = '600';
+    head2.appendChild(c);
+  }
+  tbl.appendChild(head2);
+
+  const models = up.models || [];
+  if (!models.length) {
+    tbl.appendChild(el('div', 'muted', '还没有模型映射：通道本身不会提供任何模型，必须在这里逐个添加。'));
+  }
+  for (const m of models) {
+    const r = el('div', 'code-gen-row');
+    r.appendChild(el('span', 'mono', m.model));
+    r.appendChild(el('span', 'mono muted', m.remote_model || '（同名）'));
+    r.appendChild(el('span', 'mono', String(m.credit_per_1k)));
+    // 号池优先提示：这里最容易误解 —— 配了却永远不走通道，运维会以为"通道坏了"。
+    if (poolModels[m.model]) {
+      const t = el('span', 'tag warn', '号池优先');
+      t.title = '号池模型目录里也有这个名字，请求会走号池，通道这条映射不会生效';
+      r.appendChild(t);
+    } else {
+      r.appendChild(el('span', m.enabled ? 'tag ok' : 'tag warn', m.enabled ? '启用' : '停用'));
+    }
+    const ac = el('div', 'row');
+    ac.style.gap = '4px';
+    const bT = el('button', 'ghost', m.enabled ? '停用' : '启用');
+    bT.style.padding = '2px 8px';
+    bT.onclick = async () => {
+      try {
+        await post('/api/admin/upstreams/models/save', {
+          id: m.id, upstream_id: up.id, model: m.model,
+          remote_model: m.remote_model, credit_per_1k: m.credit_per_1k, enabled: !m.enabled,
+        });
+        loadChannels();
+      } catch (e) { say('操作失败：' + e.message); }
+    };
+    const bD = el('button', 'ghost', '删除');
+    bD.style.padding = '2px 8px';
+    bD.onclick = async () => {
+      if (!confirm('删除模型映射「' + m.model + '」？')) return;
+      try {
+        await post('/api/admin/upstreams/models/delete', { id: m.id });
+        loadChannels();
+      } catch (e) { say('删除失败：' + e.message); }
+    };
+    ac.appendChild(bT);
+    ac.appendChild(bD);
+    r.appendChild(ac);
+    tbl.appendChild(r);
+  }
+  card.appendChild(tbl);
+
+  // 新增映射（行内三格 + 添加）
+  const add = el('div', 'row');
+  add.style.gap = '6px';
+  add.style.marginTop = '8px';
+  const iModel = el('input');
+  iModel.placeholder = '模型名（客户端写的）';
+  iModel.style.width = '190px';
+  const iRemote = el('input');
+  iRemote.placeholder = '上游模型名（可空=同名）';
+  iRemote.style.width = '190px';
+  const iPrice = el('input');
+  iPrice.type = 'number';
+  iPrice.min = '0';
+  iPrice.step = '0.01';
+  iPrice.placeholder = '积分/1k';
+  iPrice.style.width = '90px';
+  const bAdd = el('button', 'ghost', '添加模型');
+  bAdd.onclick = async () => {
+    const model = iModel.value.trim();
+    if (!model) { say('模型名不能为空'); return; }
+    const price = Number(iPrice.value || 0);
+    if (!isFinite(price) || price < 0) { say('每 1k 积分必须 ≥ 0'); return; }
+    bAdd.disabled = true;
+    try {
+      await post('/api/admin/upstreams/models/save', {
+        upstream_id: up.id, model: model, remote_model: iRemote.value.trim(),
+        credit_per_1k: price, enabled: true,
+      });
+      iModel.value = ''; iRemote.value = ''; iPrice.value = '';
+      say('已添加 ' + model + (poolModels[model] ? '（注意：号池也有同名模型，会优先走号池）' : ''));
+      loadChannels();
+    } catch (e) { say('添加失败：' + e.message); }
+    finally { bAdd.disabled = false; }
+  };
+  add.appendChild(iModel);
+  add.appendChild(iRemote);
+  add.appendChild(iPrice);
+  add.appendChild(bAdd);
+  card.appendChild(add);
+  return card;
+}
+
+// showChannelForm 新增/编辑通道（内联表单，不弹窗：字段少，弹窗反而遮住上下文）。
+function showChannelForm(up) {
+  const box = $('chForm');
+  if (!box) return;
+  const editing = !!(up && up.id);
+  box.style.display = '';
+  box.textContent = '';
+  const card = el('div', 'card');
+  card.style.background = 'var(--bg-soft, rgba(0,0,0,.02))';
+  card.appendChild(el('strong', '', editing ? '编辑通道「' + up.name + '」' : '新增通道'));
+
+  const row1 = el('div', 'row');
+  row1.style.gap = '6px';
+  row1.style.marginTop = '8px';
+  const iName = el('input');
+  iName.placeholder = '名称（唯一，如 relay-a）';
+  iName.style.width = '200px';
+  iName.value = editing ? up.name : '';
+  const iBase = el('input');
+  iBase.placeholder = 'https://api.example.com/v1';
+  iBase.style.width = '320px';
+  iBase.value = editing ? up.base_url : '';
+  const iPrio = el('input');
+  iPrio.type = 'number';
+  iPrio.placeholder = '优先级';
+  iPrio.style.width = '90px';
+  iPrio.value = editing ? String(up.priority) : '100';
+  iPrio.title = '越小越先选（只在多条通道之间排序；号池永远优先于所有通道）';
+  row1.appendChild(iName);
+  row1.appendChild(iBase);
+  row1.appendChild(iPrio);
+  card.appendChild(row1);
+
+  const row2 = el('div', 'row');
+  row2.style.gap = '6px';
+  row2.style.marginTop = '6px';
+  const iKey = el('input');
+  iKey.type = 'password';
+  iKey.placeholder = editing ? '留空 = 不修改（不回显原 key）' : 'API Key（sk-…）';
+  iKey.style.width = '320px';
+  const iNote = el('input');
+  iNote.placeholder = '备注（可选）';
+  iNote.style.width = '260px';
+  iNote.value = editing ? (up.note || '') : '';
+  const chk = el('input');
+  chk.type = 'checkbox';
+  chk.checked = editing ? !!up.enabled : true;
+  const lab = el('label', 'muted', '启用');
+  lab.style.display = 'inline-flex';
+  lab.style.alignItems = 'center';
+  lab.style.gap = '4px';
+  lab.prepend(chk);
+  row2.appendChild(iKey);
+  row2.appendChild(iNote);
+  row2.appendChild(lab);
+  card.appendChild(row2);
+
+  const tip = el('div', 'muted');
+  tip.style.fontSize = '12px';
+  tip.style.marginTop = '6px';
+  tip.textContent = '地址不能指向内网/回环（服务端会去请求它 —— 那等于给后台开了个内网探测功能）。' +
+    '保存后请点「探活」确认 key 有效；探活只调 /models，不消耗对方额度。';
+  card.appendChild(tip);
+
+  const ops = el('div', 'row');
+  ops.style.gap = '6px';
+  ops.style.marginTop = '8px';
+  const hint = $('chHint');
+  const bSave = el('button', '', '保存');
+  bSave.onclick = async () => {
+    const name = iName.value.trim();
+    const base = iBase.value.trim();
+    if (!name) { if (hint) hint.textContent = '名称不能为空'; return; }
+    if (!base) { if (hint) hint.textContent = '地址不能为空'; return; }
+    bSave.disabled = true;
+    try {
+      const payload = {
+        name: name, base_url: base, api_key: iKey.value,
+        priority: Number(iPrio.value || 100), note: iNote.value.trim(), enabled: chk.checked,
+      };
+      if (editing) payload.id = up.id;
+      await post('/api/admin/upstreams/save', payload);
+      if (hint) hint.textContent = editing ? '已保存' : '已新增「' + name + '」，下一步点「探活」确认可用';
+      box.style.display = 'none';
+      box.textContent = '';
+      loadChannels();
+    } catch (e) {
+      if (hint) hint.textContent = '保存失败：' + e.message;
+    } finally { bSave.disabled = false; }
+  };
+  const bCancel = el('button', 'ghost', '取消');
+  bCancel.onclick = () => { box.style.display = 'none'; box.textContent = ''; };
+  ops.appendChild(bSave);
+  ops.appendChild(bCancel);
+  card.appendChild(ops);
+
+  box.appendChild(card);
+  iName.focus();
+}
 
 // loadModelRatios 模型倍率面板（v0.31.52，需求一）。
 //

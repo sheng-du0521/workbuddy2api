@@ -54,6 +54,11 @@ const (
 type billingSnapshot struct {
 	// model 模型 → 倍率（只放 >0 的：0 = 不参与，放进来反而会让判断变复杂）。
 	model map[string]float64
+	// relay 通道（第三方/中转站）的模型倍率（v0.31.68）。
+	//
+	// **必须与 model 分开**：同一个模型名可以既在号池又有通道（号池优先分发），
+	// 而两边的成本结构完全不同 —— 一个 map 会让"给通道定 0.8 倍"顺手把号池也降成 0.8。
+	relay map[string]float64
 	// rev 本快照的版本号。
 	rev int64
 	// at 加载时刻（排障用）。
@@ -80,6 +85,24 @@ func (p *Proxy) ratioFor(model string) (ratio float64, source string) {
 	return p.store.PricingMultiplier(), "global"
 }
 
+// ratioForRelay 通道请求生效的倍率（v0.31.68）。
+//
+// 与 ratioFor 分开是有意的：**同一个模型名在两条供给上可以有不同倍率**。
+// 号池的成本是"上游扣我们的积分"，通道的成本是"对方按 token 收费"折算来的积分，
+// 两者混用一个倍率必然有一边亏。未配置 relay 倍率时回落全局（与 pool 同规则）：
+// 不给通道单独定价 ≠ 通道免费。
+func (p *Proxy) ratioForRelay(model string) (ratio float64, source string) {
+	p.billMu.RLock()
+	snap := p.billView
+	p.billMu.RUnlock()
+	if snap != nil {
+		if r, ok := snap.relay[model]; ok && r > 0 {
+			return r, "model"
+		}
+	}
+	return p.store.PricingMultiplier(), "global"
+}
+
 // ReloadBilling 重新加载倍率快照并原子替换（v0.31.67）。
 //
 // 锁内只做"读库 + 构造新快照"，写完指针就返回 —— 不做任何网络/写库动作，
@@ -92,14 +115,20 @@ func (p *Proxy) ReloadBilling() {
 	}
 	snap := &billingSnapshot{
 		model: make(map[string]float64, len(list)),
+		relay: make(map[string]float64),
 		at:    time.Now(),
 	}
 	for _, r := range list {
-		if r.BillingRatio > 0 && r.BillingScope != "relay" {
-			// 只把"号池/未标注"的倍率放进 pool 视图；relay 的倍率属于第三方通道
-			// （P2 接入），现在放进来会让号池的同一模型被按通道价收费。
-			snap.model[r.Model] = r.BillingRatio
+		if r.BillingRatio <= 0 {
+			continue
 		}
+		if r.BillingScope == "relay" {
+			snap.relay[r.Model] = r.BillingRatio
+			continue
+		}
+		// 只把"号池/未标注"的倍率放进 pool 视图；relay 的倍率属于第三方通道，
+		// 放进来会让号池的同一模型被按通道价收费。
+		snap.model[r.Model] = r.BillingRatio
 	}
 	p.billMu.Lock()
 	if p.billView != nil {

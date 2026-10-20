@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.67"
+const version = "0.31.68"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1367,7 +1367,17 @@ var modelsCache struct {
 	mu      sync.RWMutex
 	at      time.Time
 	payload []byte
-	ids     []string
+	// ids **只放号池**（上游返回的模型清单）。
+	//
+	// v0.31.68 的关键修正：通道模型必须单独放 relayIDs，不能混进 ids。
+	// 因为 ids 有三处读者都假设"这是号池能力"：
+	//   · knownModelIDs → 模型名归一化（把通道模型当号池模型去归一，会把请求
+	//     改写成上游不认的名字）；
+	//   · relay 的"号池优先"判定（一旦混进来就变成"号池永远认识该模型"，
+	//     通道永远走不到 —— 死锁，且看起来像"通道配了但不用"）。
+	// ids 与 relayIDs 只用于拼 payload，对外语义由 owned_by 区分。
+	ids      []string
+	relayIDs []string
 }
 
 // modelsCacheTTL 模型列表缓存有效期。
@@ -1470,7 +1480,12 @@ func (a *app) refreshModelsCache() []string {
 	if len(ids) == 0 {
 		ids = fallbackModels
 	}
-	data := make([]map[string]any, 0, len(ids))
+	// 通道模型合并（v0.31.68，需求 P2）：号池优先，**只追加号池没有的**。
+	//
+	// 同名不追加是有意的：客户端看到两个同名条目（不同 owned_by）无法判断走哪条，
+	// 而实际路由永远是号池优先 —— 那等于给客户端一个它控制不了的选择。
+	relayIDs := a.relayVisibleModels(ids)
+	data := make([]map[string]any, 0, len(ids)+len(relayIDs))
 	for _, id := range ids {
 		data = append(data, map[string]any{
 			"id":       id,
@@ -1479,10 +1494,22 @@ func (a *app) refreshModelsCache() []string {
 			"owned_by": "workbuddy",
 		})
 	}
+	for _, id := range relayIDs {
+		data = append(data, map[string]any{
+			"id":       id,
+			"object":   "model",
+			"created":  time.Now().Unix(),
+			"owned_by": "relay", // 客户端据此分辨"这个模型来自第三方通道"
+		})
+	}
+	if len(relayIDs) > 0 {
+		log.Printf("INFO: [relay] /v1/models 合并 %d 个通道模型（号池 %d 个）", len(relayIDs), len(ids))
+	}
 	payload, _ := json.Marshal(map[string]any{"object": "list", "data": data})
 	modelsCache.at = time.Now()
 	modelsCache.payload = payload
 	modelsCache.ids = ids
+	modelsCache.relayIDs = relayIDs
 	return copyIDs(ids)
 }
 
@@ -1632,6 +1659,16 @@ func (a *app) routes() *http.ServeMux {
 	// 单模型计费倍率（v0.31.67）：写 + 试算。改完即时生效（快照切换）。
 	mux.HandleFunc("POST /api/admin/model-ratios/billing", a.adminGuard(a.handleAdminSetBillingRatio))
 	mux.HandleFunc("POST /api/admin/billing/preview", a.adminGuard(a.handleAdminBillingPreview))
+
+	// 第三方 / 中转站通道（v0.31.68，需求 P2）：配置录入 / 编辑 / 启停 / 探活 / 模型映射。
+	// 全部走 adminGuard：这些接口里有第三方 key 的写入面，绝不能对普通用户开放。
+	mux.HandleFunc("GET /api/admin/upstreams", a.adminGuard(a.handleAdminUpstreams))
+	mux.HandleFunc("POST /api/admin/upstreams/save", a.adminGuard(a.handleAdminUpstreamSave))
+	mux.HandleFunc("POST /api/admin/upstreams/delete", a.adminGuard(a.handleAdminUpstreamDelete))
+	mux.HandleFunc("POST /api/admin/upstreams/toggle", a.adminGuard(a.handleAdminUpstreamToggle))
+	mux.HandleFunc("POST /api/admin/upstreams/probe", a.adminGuard(a.handleAdminUpstreamProbe))
+	mux.HandleFunc("POST /api/admin/upstreams/models/save", a.adminGuard(a.handleAdminUpstreamModelSave))
+	mux.HandleFunc("POST /api/admin/upstreams/models/delete", a.adminGuard(a.handleAdminUpstreamModelDelete))
 	mux.HandleFunc("GET /api/referral", a.userGuard(a.handleReferral))
 	// 站内公告（v0.17.8）：用户侧只读启用中的公告，用于弹窗与概览卡片。
 	mux.HandleFunc("GET /api/announcements", a.userGuard(a.handleUserAnnouncements))

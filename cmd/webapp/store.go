@@ -205,6 +205,11 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// 第三方 / 中转站通道（v0.31.68，需求 P2）：独立建表，与通道配置一起自洽。
+	if err := s.migrateUpstreams(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// 强制越界审计（v0.31.50，需求二）：独立建表，随线路池一起迁移。
 	if err := s.migrateEgressForceAudit(); err != nil {
 		db.Close()
