@@ -1507,6 +1507,21 @@
       </div>
 
       <div class="card">
+        <h2>账目对账</h2>
+        <div class="sub" style="margin:0 0 12px;">
+          只读检查几条<b>必须永远成立</b>的账目关系：可提现额度 ≤ 余额、冻结额非负、预扣不残留、
+          管理通道不扣费、账号累计收益 == 分成台账、单日「分成+返点」≤「平台实收」。
+          发现问题<b>只显示、不自动改账</b>（误判会直接变成改错账）。
+          <br>启动 90 秒后跑一次，之后每 6 小时一次；结果落库，重启后仍能看到上一次。
+        </div>
+        <div class="row">
+          <button class="ghost" id="btnLedgerCheck">立即对账</button>
+          <span id="ledgerHint" class="muted">只读，不改任何数据</span>
+        </div>
+        <div id="ledgerStatus" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="card">
         <h2>用户代挂 · 分成 / 返点</h2>
         <div class="sub" style="margin:0 0 12px;">
           用户的代挂账号经审批进入号池后参与平台反代。每完成一次请求，平台按
@@ -4524,6 +4539,7 @@ async function loadSettings() {
     if ($('setUpdateCheck')) $('setUpdateCheck').checked = d.update_check_enabled !== false;
     if ($('setUpdateManifest')) $('setUpdateManifest').value = d.update_manifest_url || '';
     loadUpdateStatus(false);
+    loadLedgerCheck(false);
     // 调价历史（v0.27.0）：与倍率输入框同屏，改完保存能立刻看到"刚刚这一次"进去了。
     loadMultiplierHistory();
     if ($('deviceTokenHint')) {
@@ -5438,6 +5454,47 @@ async function loadFpCfgCount() {
   } catch (e) { box.textContent = ''; }
 }
 
+// loadLedgerCheck 渲染账目对账结果（v0.31.62）。全部用 el() 构造，不用 innerHTML：
+// detail 里可能带库里的值（如账号 uid），拼 HTML 就是把数据当代码执行。
+async function loadLedgerCheck(force) {
+  const box = $('ledgerStatus');
+  if (!box) return;
+  box.textContent = '';
+  box.appendChild(el('div', 'muted', force ? '对账中…' : '读取中…'));
+  let d;
+  try { d = await api('/api/admin/ledger-check' + (force ? '?run=1' : '')); }
+  catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'credit-err', '对账失败：' + e.message));
+    return;
+  }
+  box.textContent = '';
+  const head = el('div', 'row');
+  head.style.gap = '10px';
+  if (d.at) {
+    head.appendChild(el('span', 'muted',
+      '上次 ' + fmtClock(d.at) + '（' + (d.reason || '') + '，' + (d.duration_ms || 0) + 'ms）'));
+  }
+  box.appendChild(head);
+  if (d.error) {
+    box.appendChild(el('div', 'credit-err', '对账执行失败：' + d.error));
+    return;
+  }
+  const fs = (d && d.findings) || [];
+  if (!fs.length) {
+    box.appendChild(el('div', 'muted', '未发现异常。'));
+    return;
+  }
+  if (!d.ok) {
+    box.appendChild(el('div', 'credit-err', '发现 ' + fs.length + ' 类高风险异常：'));
+  }
+  for (const f of fs) {
+    const high = f.severity === 'high';
+    box.appendChild(el('div', high ? 'credit-err' : 'muted',
+      (high ? '⚠ ' : '· ') + f.code + '：' + f.count + ' 处 —— ' + (f.detail || '')));
+  }
+}
+
 async function loadUpdateStatus(force) {
   const box = $('updateStatus');
   if (!box) return;
@@ -5571,6 +5628,7 @@ function extLink(href, text) {
 }
 
 if ($('btnCheckUpdate')) $('btnCheckUpdate').onclick = () => loadUpdateStatus(true);
+if ($('btnLedgerCheck')) $('btnLedgerCheck').onclick = () => loadLedgerCheck(true);
 // 「应用更新」：只生成替换脚本 + 回操作指引，**不自动替换、不自动重启**。
 // 打开一个可复制的对话框而不是直接执行 —— 执行意味着停服务，必须由人决定时机。
 if ($('btnApplyUpdate')) $('btnApplyUpdate').onclick = async () => {

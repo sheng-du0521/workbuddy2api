@@ -1,20 +1,20 @@
 {
-  "version": "0.31.61",
+  "version": "0.31.62",
   "min_supported": "0.24.0",
-  "notes": "v0.31.61：审查报告 F04（隧道凭证边界）落地 + 清单密钥可轮换。① **F04 实测发现真问题**：给用户密钥放回 `port-forwarding` 之后，`-L`/`-D` 也被一起放开 —— 在生产 sshd（OpenSSH 8.9p1）上用真实穿透复现：能经服务器读到 127.0.0.1 的 SSH banner，`-D` 的 SOCKS5 CONNECT 直接返回 0x00（即用户可把任意流量以服务器身份转出去）。现在每条隧道 key 追加 `permitopen=\"127.0.0.1:1\"`（哨兵：只白名单一个永不监听的目标），实测 `-R` 正常、`-L` 被关闭、`-D` 被拒、exec 仍被 `command=` 顶替。② **⚠️ 实测推翻直觉写法**：`permitopen=\"none\"`（sshd_config 的写法）在 authorized_keys 里会被判为非法选项、**整条 key 静默丢弃**（现象：隧道全挂 + 只有 Permission denied）。`:0` 同样如此。所以用哨兵端口而不是 none。③ 生产已给存量 2 条（uid 9915/9916）补上该限制，改前备份 authorized_keys.wb2api.<时间戳>、只改本服务条目、其他行逐字节未变（有指纹核对）。④ 新增 `scripts/ssh_audit.py`（**只读**体检：缺 command=/permitlisten/permitopen、非法写法、段外端口、重复公钥），退出码可接巡检。⑤ 清单验签支持**多公钥**（轮换窗口内新旧共存，任一把通过即可），key_id 命中但内容被改时报“签名无效”而不是笼统失败。⑥ 仍未做：sshd Match + 专用非 root 隧道用户（需改生产 sshd 配置，风险高于收益，见 docs）。",
-  "released_at": 1792478411,
+  "notes": "v0.31.62：审查报告 F02 的最后一块 —— 账目对账。① 新增 GET /api/admin/ledger-check（后台「设置 → 账目对账」卡片，可「立即对账」）：只读检查六条必须永远成立的关系 —— 可提现额度 ≤ 余额、冻结额非负、预扣不残留（>1h）、管理通道不扣费、账号累计收益 == 分成台账、「当日分成+返点 ≤ 平台实收」。② 调度：启动 90s 后跑一次 + 每 6 小时一次；结果落 kv，重启后仍能看上一次；有 high 级发现写 WARN 日志（含 code/count/原因）。③ 只报不改：自动修账会把「一次误判」直接变成「改错账」，修不修由人决定。④ 为什么事务修好了还要对账：事务只管单笔，管不了 v0.31.60 之前已落库的半截账、导库/手工改库、以及将来有人写出第二套扣费或分成。⑤ 新增 7 条用例：干净库零发现 + 六类违规逐个注入（含「当天没有返点行」这种会让 INNER JOIN 整天跳过的情形）+ 后台接口（默认读缓存 / run=1 重跑 / 未登录被挡）。⑥ 上线前用只读 SQL 探测过生产：六条不变式当前全部为 0，不会带来误报。",
+  "released_at": 1792479834,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.61/webapp.exe",
-      "sha256": "0f796bbfb264e9d88f4cbcf9039be503e37cf4fa2efcf906edbee4818efc4979",
-      "size": 15660032
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.62/webapp.exe",
+      "sha256": "0845ba838ca173cc60bbd8dfef3f1d6c170c64d1235c00072e865c71521e87d7",
+      "size": 15677952
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "t5PpT9oYGD0n/DOrUBc/wxFxtILtCk7SSojgA0kwkTg8/65RtqH8+hBVcd/W+cZ3TKsTAQkLA2jk36z4m9PbBQ==",
+  "signature": "cF3c6s/rjmXj1VfAie3Z7ColEGhxwywakQ8RGPRMFEozcWBWTuZz5uMdM9DjCglI9beEOLmI/7jzQXznl8qwDA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
