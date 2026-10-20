@@ -1,20 +1,20 @@
 {
-  "version": "0.31.64",
+  "version": "0.31.65",
   "min_supported": "0.24.0",
-  "notes": "v0.31.64：审查报告 F15 的第一块 —— 制品验收（对**构建产物**做真实冒烟），并修掉它抓到的真实缺陷。\n① **scripts/smoke.py**：把刚构建的二进制真起起来，走一遍 健康检查 → 首页（验证 go:embed 前端没漏）→ 启动日志版本 == version.json → 注册 → 登录（拿到会话 cookie）→ 建 Key → GET /v1/models 200 → 收尾断言无 panic、db 与表都在。端口由系统分配（固定\"测试端口\"迟早撞车），-no-tasks 避免触发真实出站任务。\n② **它抓到真缺陷**：全新机器上 `webapp -db ./data/webapp.db` 直接 `migrate: unable to open database file (14)` —— SQLite 不建父目录，而\"先 mkdir 再启动\"只写在部署文档里，报错也完全指不到真因。现在 OpenStore 自己 MkdirAll 父目录，并补了用例钉住。\n③ 接进 `preflight.py`（默认执行，`--skip-smoke` 可跳），于是 CI 与发布机都会跑 —— 这是唯一能发现\"单测全绿但产物起不来\"的检查。\n④ 边界：冒烟不起真上游、不验证计费链路（那需要真账号）；它保证的是\"产物可用\"，不是\"业务全对\"。",
-  "released_at": 1792483418,
+  "notes": "v0.31.65：审查 F15 的第二块 —— 真浏览器端到端（补上 jsdom 测不到的那一层）。\n① **tools/e2e.mjs**：用本机已装的 Edge/Chrome（playwright-core 的 channel，不下载 Chromium）真实打开页面：注册表单 → 提交 → 跳转控制台 → 切「API 密钥」→ 生成密钥 → 断言明文出现在弹窗里，并收集 pageerror 与所有 4xx/5xx 请求。没有浏览器时**返回 3（跳过）**而不是假装通过。\n② 接进 `scripts/smoke.py --browser`（preflight 默认带上，`--no-browser` 可关）：于是\"成品冒烟\"从 API 层扩到浏览器层。\n③ **它第一次跑就暴露了一个 UI 事实**：登录页是「登录/注册」两个 pane 切换，注册表单默认 hidden —— 直接 fill 会一直等不到可见元素。API 层完全看不到这件事。\n④ 只放行**一条**预期内的失败：登录前 `/api/auth/me` 探测返回 401 是正常回答；其它任何 4xx/5xx 都判失败（把所有 401 一起放过等于顺手放过真正的认证回归）。\n⑤ 失败信息带**具体 URL**（`http 404: <url>`），不再只说\"Failed to load resource\"——401 与 404 的处置完全不同。\n边界：本机 Edge 跑通了；CI 的 ubuntu runner 没有 Edge/Chrome，会走\"跳过\"分支（日志里明确写\"未执行，不是通过\"）。",
+  "released_at": 1792484044,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.64/webapp.exe",
-      "sha256": "15cdbc8dd0500d60d34f6b569710af0ea594f497d2772083915a731f0d777611",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.65/webapp.exe",
+      "sha256": "d2e77cfc9be92f7954482c890c80f071726f2d20cbce188870c5580cceb88621",
       "size": 15677952
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "Wimos6i730rqyz9QtOowVqlAahD/F2LQJsU2ut6pPoodGyE1/7sYnK6mpnlR0VutQpuh0jsCXevdV0A5Qf5MCQ==",
+  "signature": "SSimEw6hovAidAUMY/lm+R7yKja+nJ5hAkjujqjZf+5edMXCXYG0ncUGP4re7VBCO2285WFcA1lPBIJtfkwxDA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

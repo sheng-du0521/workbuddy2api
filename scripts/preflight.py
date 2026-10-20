@@ -77,6 +77,8 @@ def main():
     ap.add_argument("--no-node", action="store_true", help="跳过前端检查（没装 node 时）")
     ap.add_argument("--skip-smoke", action="store_true",
                     help="跳过成品冒烟（冒烟会真起一个进程，约 3~5 秒）")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="冒烟里**不**跑真浏览器端到端（默认会跑；没有 Edge/Chrome 时自动跳过）")
     ap.add_argument("--expect-manifest", action="store_true",
                     help="要求清单声明的 sha/size 就是本次构建的字节（发布机在 make_manifest 之后用）")
     a = ap.parse_args()
@@ -138,8 +140,11 @@ def main():
     # --build-only 的意义就是"只构建"（清单还没盖章时跑检查必然红），所以这里也要跳过。
     if not a.build_only and not a.skip_smoke:
         exe_name = "webapp.exe" if os.name == "nt" else "webapp-linux"
-        run("成品冒烟（真起进程）", [sys.executable, os.path.join("scripts", "smoke.py"),
-                            "--exe", os.path.join("dist", exe_name)])
+        smoke_cmd = [sys.executable, os.path.join("scripts", "smoke.py"),
+                     "--exe", os.path.join("dist", exe_name)]
+        if not a.no_browser:
+            smoke_cmd.append("--browser")
+        run("成品冒烟（真起进程）", smoke_cmd)
 
     # ⑦ 清单一致性（版本一致 + 签名可用）。**sha 比对是否算失败，取决于你是谁**：
     #

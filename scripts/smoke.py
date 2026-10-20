@@ -107,6 +107,8 @@ def main():
     default_exe = os.path.join("dist", "webapp.exe" if os.name == "nt" else "webapp-linux")
     ap.add_argument("--exe", default=default_exe)
     ap.add_argument("--keep", action="store_true", help="保留临时数据目录")
+    ap.add_argument("--browser", action="store_true",
+                    help="API 走完后用真浏览器（Edge/Chrome）再走一遍注册→控制台→生成密钥")
     a = ap.parse_args()
 
     exe = a.exe if os.path.isabs(a.exe) else os.path.join(ROOT, a.exe)
@@ -186,6 +188,24 @@ def main():
         if "data" not in models:
             die("/v1/models 缺少 data 字段：%s" % body[:200].decode("utf-8", "replace"))
         print("/v1/models 200（%d 个模型）" % len(models.get("data") or []))
+
+        # ③b 真浏览器端到端（v0.31.65，审查 F15）：jsdom 测不到布局/真实 fetch/浏览器报错。
+        # 没有 Edge/Chrome 时 e2e.mjs 返回 3（跳过）——**跳过不等于通过**，这里会打警告，
+        # 让看日志的人知道"这一层今天没验"。
+        if a.browser:
+            node = shutil.which("node")
+            if not node:
+                print("⚠ 没有 node，跳过真浏览器端到端")
+            else:
+                e2e = os.path.join(ROOT, "tools", "e2e.mjs")
+                shot = os.path.join(tmp, "dashboard.png")
+                rc = subprocess.call([node, e2e, "--base", base, "--shot", shot])
+                if rc == 3:
+                    print("⚠ 本机没有 Edge/Chrome，真浏览器端到端**未执行**（不是通过）")
+                elif rc != 0:
+                    die("真浏览器端到端失败（exit=%d）" % rc)
+                else:
+                    print("真浏览器端到端通过")
 
         # ④ 服务仍然活着（上面任何一步把进程搞挂了，这里会暴露）
         code, _, _ = req("GET", base + "/healthz")
