@@ -176,7 +176,7 @@ func (a *app) updateTrust() selfupdate.Trust {
 	if v, _ := a.store.GetKV(kvUpdateRequireSig); strings.TrimSpace(v) == "0" {
 		required = false
 	}
-	return selfupdate.Trust{Required: required, Pub: selfupdate.DefaultPublicKey()}
+	return selfupdate.Trust{Required: required, Pubs: selfupdate.DefaultPublicKeys()}
 }
 
 // markVerified 把验签结果写进对前端的状态（v0.31.60，F07）。
@@ -202,7 +202,7 @@ func (a *app) markVerified(st *updateStatus, m *updateManifest) {
 func (a *app) manifestTrusted(m *updateManifest) error {
 	t := a.updateTrust()
 	err := t.Check(m)
-	if err != nil && t.Required && len(t.Pub) == 0 {
+	if err != nil && t.Required && len(t.Pubs) == 0 {
 		// 公钥缺失是**构建问题**，不该被运维误读成"清单被篡改"。
 		if perr := selfupdate.PublicKeyErr(); perr != nil {
 			return fmt.Errorf("内置公钥解析失败：%w", perr)

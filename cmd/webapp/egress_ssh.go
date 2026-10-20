@@ -18,11 +18,38 @@
 //
 //  2. 写进 `authorized_keys` 时**带限制**：
 //
-//     restrict,port-forwarding,permitlisten="127.0.0.1:12010",...,"127.0.0.1:12019"
+//     restrict,command="/bin/true",port-forwarding,permitopen="127.0.0.1:1",
+//     permitlisten="127.0.0.1:12010",...,"127.0.0.1:12019"
 //
 //     `restrict` 关掉 pty / agent 转发 / X11 / 用户 rc，只放回端口转发；
 //     `command="/bin/true"` **顶替掉任何 exec/shell 请求**；
+//     `permitopen="127.0.0.1:1"` 禁掉**本地/动态转发**（-L / -D）—— 见下「审查 F04」；
 //     `permitlisten` 把这个用户**锁在自己的端口段内**。
+//
+//     ## 审查 F04（v0.31.61）：`restrict` 之后为什么还要 `permitopen`
+//
+//     `restrict` 只是把转发**默认关掉**，而我们要用 `-R`，所以后面必须加回
+//     `port-forwarding`；加回之后 `-L` / `-D` 也一起被放开了 —— 于是用户可以在
+//     自己机器上开一个 SOCKS（`ssh -D`），**把任意流量以服务器身份转出去**：
+//     对方看到的是服务器的 IP，审计日志里只有一条"某用户建了隧道"。
+//     2026-10-20 在生产 sshd（OpenSSH 8.9p1）上用真实穿透复现过：
+//     只有本文件原先那串选项时，`-L` 能读到服务器 SSH banner、`-D` 的
+//     SOCKS5 CONNECT 返回 0x00（即经服务器访问到了 127.0.0.1:8780）。
+//
+//     ## ⚠️ 为什么写的是 `127.0.0.1:1` 而不是 `none`（实测推翻了直觉写法）
+//
+//     `PermitOpen none` 是 **sshd_config** 的写法；写成 authorized_keys 的选项
+//     `permitopen="none"` 会被 sshd **判定为选项非法、整条 key 静默丢弃** ——
+//     现象是"所有隧道突然连不上、日志里只有 Permission denied (publickey)"，
+//     极难定位（同一批实验里 `permitopen="127.0.0.1:0"` 也是同样的整条失效）。
+//     所以这里用一个**永远不会有人监听**的目标 `127.0.0.1:1`（tcpmux）当哨兵：
+//     `permitopen` 只白名单这一个目的地，等于把 -L / -D 关掉，
+//     而 `permitlisten`/`-R` 走 tcpip-forward，**不受 permitopen 管辖**。
+//
+//     同一批实测（生产 sshd，真穿透）：`-R` 建立成功；`-L` 连接被关闭；
+//     `-D` SOCKS 返回 0x0 以外的 REP（被拒）；`exec` 输出为空（被 command= 顶替）。
+//     隔离验证脚本：`scripts/ssh_audit.py` 负责**只读**体检线上写法，
+//     `D:/_ro/audit_ssh_opts2.sh` 是那次实测用的穿透脚本（不入库）。
 //
 //     ⚠️ 实测教训（2026-10-17，在隔离的临时 sshd 实例上验的）：**`restrict` 并不禁止 exec**
 //     —— 它只禁 pty / agent 转发 / X11 / user-rc /（默认的）端口转发，`ssh host 'cmd'`
@@ -175,7 +202,8 @@ func (a *app) egressAuthorizeKey(uid int64, pubKeyLine string) (string, error) {
 
 	// ⚠️ 顺序与内容都别动：`restrict` 在前（关掉一切），后面逐项放回。
 	// `command="/bin/true"` 是**必需**的，不是保险 —— 见文件头「实测教训」。
-	opts := []string{"restrict", "command=\"/bin/true\"", "port-forwarding"}
+	// 最后一项是"关掉 -L/-D"的哨兵（`none` 会让 sshd 丢掉整条 key，见文件头实测）。
+	opts := []string{"restrict", "command=\"/bin/true\"", "port-forwarding", "permitopen=\"127.0.0.1:1\""}
 	base, span := egressPortSegOf(uid)
 	for i := 0; i < span; i++ {
 		opts = append(opts, fmt.Sprintf("permitlisten=\"127.0.0.1:%d\"", base+i))

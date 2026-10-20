@@ -1,20 +1,20 @@
 {
-  "version": "0.31.60",
+  "version": "0.31.61",
   "min_supported": "0.24.0",
-  "notes": "v0.31.60：审查报告 F02（资金事务化）与 F07（清单独立签名）落地。① **F02 结算四落点单事务**：用户余额 / 用量流水 / 号主分成 / 上级返点此前是四次独立提交，任何一步失败都留下半截账（扣了钱没流水、发了分成没扣到钱）。现在收敛为 Store.CommitSettlement 一个事务：要么四个落点全在，要么一分不动并补一条零费流水留痕；新增 3 条故障注入用例（usage_logs / host_earnings 触发器）钉住回滚语义。② **F07 清单签名**：新增 cmd/relsign（ed25519，keygen/sign/verify），version.json 带 sig_alg/key_id/signature；客户端**先验签再使用**，验签不过则整份丢弃（不提示升级、不触发下载、不写缓存），状态接口下发 verified/signed_by/verify_note；签的是语义字段（改 sha256/url/版本/体积/平台任一项必然验不过，重排缩进不影响）。公钥内置进二进制，私钥仅存发布机。③ **F06 部分**：发布前必须先签名并通过 relsign verify。运维注意：自建清单的部署请把 update_signature_required 设为 0，否则更新检查会因无签名而失败。",
-  "released_at": 1792474692,
+  "notes": "v0.31.61：审查报告 F04（隧道凭证边界）落地 + 清单密钥可轮换。① **F04 实测发现真问题**：给用户密钥放回 `port-forwarding` 之后，`-L`/`-D` 也被一起放开 —— 在生产 sshd（OpenSSH 8.9p1）上用真实穿透复现：能经服务器读到 127.0.0.1 的 SSH banner，`-D` 的 SOCKS5 CONNECT 直接返回 0x00（即用户可把任意流量以服务器身份转出去）。现在每条隧道 key 追加 `permitopen=\"127.0.0.1:1\"`（哨兵：只白名单一个永不监听的目标），实测 `-R` 正常、`-L` 被关闭、`-D` 被拒、exec 仍被 `command=` 顶替。② **⚠️ 实测推翻直觉写法**：`permitopen=\"none\"`（sshd_config 的写法）在 authorized_keys 里会被判为非法选项、**整条 key 静默丢弃**（现象：隧道全挂 + 只有 Permission denied）。`:0` 同样如此。所以用哨兵端口而不是 none。③ 生产已给存量 2 条（uid 9915/9916）补上该限制，改前备份 authorized_keys.wb2api.<时间戳>、只改本服务条目、其他行逐字节未变（有指纹核对）。④ 新增 `scripts/ssh_audit.py`（**只读**体检：缺 command=/permitlisten/permitopen、非法写法、段外端口、重复公钥），退出码可接巡检。⑤ 清单验签支持**多公钥**（轮换窗口内新旧共存，任一把通过即可），key_id 命中但内容被改时报“签名无效”而不是笼统失败。⑥ 仍未做：sshd Match + 专用非 root 隧道用户（需改生产 sshd 配置，风险高于收益，见 docs）。",
+  "released_at": 1792478411,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.60/webapp.exe",
-      "sha256": "c954dba96cd5e5a4dace7e6ff8b319ad3b61b4def137e21b66073fcee78600e2",
-      "size": 15659520
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.61/webapp.exe",
+      "sha256": "0f796bbfb264e9d88f4cbcf9039be503e37cf4fa2efcf906edbee4818efc4979",
+      "size": 15660032
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "kYsyfwQkVKOZl43epPIOOxVDNiJhJ2MqK8+RLThNHUVugnLkqWVAT2tVnMkwFjm4d1JktDA0PPT9xGycru56Aw==",
+  "signature": "t5PpT9oYGD0n/DOrUBc/wxFxtILtCk7SSojgA0kwkTg8/65RtqH8+hBVcd/W+cZ3TKsTAQkLA2jk36z4m9PbBQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

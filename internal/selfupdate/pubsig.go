@@ -169,7 +169,8 @@ func VerifyManifest(pub ed25519.PublicKey, m *Manifest) error {
 // 默认必须是 true：默认不验签等于没有签名 —— 这正是审查 F07 指出的问题。
 type Trust struct {
 	Required bool
-	Pub      ed25519.PublicKey
+	// Pubs 可接受的公钥集合（轮换窗口内会有多把）。任一通过即算通过。
+	Pubs []ed25519.PublicKey
 }
 
 // Check 按策略校验。返回 nil 表示"可以信任这份清单"。
@@ -180,5 +181,45 @@ func (t Trust) Check(m *Manifest) error {
 	if !t.Required {
 		return nil
 	}
-	return VerifyManifest(t.Pub, m)
+	if len(t.Pubs) == 0 {
+		return errors.New("内置公钥不可用（构建时未注入或长度非法）")
+	}
+	return VerifyManifestAny(t.Pubs, m)
+}
+
+// VerifyManifestAny 用**一组**公钥验签：任一通过即通过。
+//
+// 为什么会有一组：轮换密钥时，老客户端只认旧钥、新客户端认新旧两把，中间必然有
+// 一个"两种客户端共存"的窗口。只支持单钥的话，换钥当天所有未升级的客户端
+// 都会拒绝新清单 —— 于是"安全改进"变成了"更新通道断掉"。
+//
+// 错误选择的讲究：全部失败时**优先回传最有信息量的那个**。
+// 若清单的 key_id 能对上某把钥匙，说明"清单是这把钥匙签的"，此时密码学校验失败
+// 就是"内容被改过"（ErrBadSignature）；一句笼统的"验签失败"会让人以为是换钥问题。
+func VerifyManifestAny(pubs []ed25519.PublicKey, m *Manifest) error {
+	if m == nil {
+		return errors.New("清单为空")
+	}
+	if len(pubs) == 0 {
+		return errors.New("没有可用公钥")
+	}
+	kid := strings.TrimSpace(m.KeyID)
+	var firstErr error
+	for _, pub := range pubs {
+		err := VerifyManifest(pub, m)
+		if err == nil {
+			return nil
+		}
+		// key_id 明确指向这把钥匙 → 它的失败原因最有价值，直接返回。
+		if kid != "" && strings.EqualFold(kid, KeyID(pub)) {
+			return err
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		firstErr = ErrBadSignature
+	}
+	return firstErr
 }

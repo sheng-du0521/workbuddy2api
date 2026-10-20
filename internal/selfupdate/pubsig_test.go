@@ -165,7 +165,37 @@ func TestTrustPolicy(t *testing.T) {
 	if err := (Trust{Required: false}).Check(m); err != nil {
 		t.Fatalf("关闭验签时应放行，得 %v", err)
 	}
-	if err := (Trust{Required: true, Pub: pub}).Check(m); !errors.Is(err, ErrUnsigned) {
+	if err := (Trust{Required: true, Pubs: []ed25519.PublicKey{pub}}).Check(m); !errors.Is(err, ErrUnsigned) {
 		t.Fatalf("开启验签时缺签名必须拒绝，得 %v", err)
+	}
+}
+
+// S6：轮换窗口 —— 一组公钥里**任一把**通过即可；且 key_id 能定位到具体那把。
+//
+// 没有这条，换密钥就等于"所有未升级客户端当天收不到更新"（它们只认旧钥），
+// 于是安全改进反而先把更新通道打断。
+func TestVerifyManifestAnyRotationWindow(t *testing.T) {
+	oldPub, _ := testKey(t)
+	newPub, newPriv := testKey(t)
+
+	m := sampleManifest()
+	mustSign(t, newPriv, m)
+
+	// 只认旧钥 → 必须失败（这就是换钥瞬间的老客户端）。
+	if err := VerifyManifestAny([]ed25519.PublicKey{oldPub}, m); err == nil {
+		t.Fatal("只有旧公钥时应验签失败")
+	}
+	// 新旧共存 → 通过（新客户端）。
+	if err := VerifyManifestAny([]ed25519.PublicKey{oldPub, newPub}, m); err != nil {
+		t.Fatalf("轮换窗口内（新旧共存）应通过：%v", err)
+	}
+	// key_id 命中新钥但内容被改 → 必须报"签名无效"，而不是笼统的"失败"。
+	m.Version = "9.9.9"
+	if err := VerifyManifestAny([]ed25519.PublicKey{oldPub, newPub}, m); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("key_id 命中但内容被改应报 ErrBadSignature，得 %v", err)
+	}
+	// 空集合必须失败（默认放行是最危险的失败方向）。
+	if err := VerifyManifestAny(nil, sampleManifest()); err == nil {
+		t.Fatal("没有公钥时必须失败")
 	}
 }

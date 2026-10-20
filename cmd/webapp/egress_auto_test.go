@@ -153,6 +153,15 @@ func TestEgressAuthKeyRestrictions(t *testing.T) {
 			t.Errorf("限制行应包含 %q，得 %q", want, line)
 		}
 	}
+	// 审查 F04（v0.31.61）：`port-forwarding` 加回来之后 -L / -D 也一起放开了，
+	// 用户可以用 `ssh -D 1080 -N` 把任意流量以**服务器身份**转出去。
+	// `permitopen="none"` 只关 direct-tcpip（-L/-D），不影响 -R（tcpip-forward）。
+	// ⚠️ 写 `permitopen="none"` 会让 sshd 把**整条 key** 判为非法选项并静默丢弃
+	// （2026-10-20 在生产 sshd 实测：隧道全挂、只有 Permission denied (publickey)）。
+	// 所以哨兵是"永不监听的 127.0.0.1:1"。
+	if !strings.Contains(line, `permitopen="127.0.0.1:1"`) {
+		t.Errorf("限制行必须用 permitopen=\"127.0.0.1:1\" 禁掉 -L/-D（写 none 会整条 key 失效）：%q", line)
+	}
 	// ⚠️ `command=` 是**必需项**（实测：`restrict` 不禁 exec，少了它就是一把 root
 	// shell 的钥匙）。断言它存在且被顶替成无害命令，避免后人"清理"掉它。
 	if !strings.Contains(line, `command="/bin/true"`) {
