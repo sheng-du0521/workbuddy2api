@@ -74,6 +74,24 @@ type UpstreamModel struct {
 	VerifiedAt int64 `json:"verified_at"`
 	CreatedAt  int64 `json:"created_at"`
 	UpdatedAt  int64 `json:"updated_at"`
+
+	// Recent **仅响应态、不落库**（v0.31.72）：近 7 天该模型经通道的真实调用概况。
+	//
+	// 为什么需要它：通道最常见的两个"以为在跑其实在亏"的现场——
+	//  1. 配了映射但号池同名 → 一次都没走到（total=0）；
+	//  2. 走到了但上游不回 usage → 每单 0 费（no_usage 占比高，日志里只有 WARN）。
+	// 两者从配置界面都看不出来，只有摊开统计才看得见。
+	// 只在后台列表接口里填充；路由侧（relayCandidates）永远为 nil。
+	Recent *relayModelStat `json:"recent,omitempty"`
+}
+
+// relayModelStat 某模型近 N 天经通道的调用概况（只读统计，来自 usage_logs）。
+type relayModelStat struct {
+	Total    int     `json:"total"`     // 总调用次数
+	NoUsage  int     `json:"no_usage"`  // 上游未回 usage（本次 0 费）
+	ZeroFee  int     `json:"zero_fee"`  // 实扣为 0（含 no_usage 与"单价 0"）
+	LeakRate float64 `json:"leak_rate"` // 0 费占比（0~1），查询时算好，前端直接显示
+	LastAt   int64   `json:"last_at"`   // 最后一次调用时间（0 = 从未）
 }
 
 // UpstreamModelView 只读视图（给 /v1/models 合并与路由用，不含 key）。
@@ -478,6 +496,39 @@ func (s *Store) relayModelIDs() ([]string, error) {
 	return out, rows.Err()
 }
 
+// relayModelStats 近 N 天**经通道**的调用概况（model → 统计）。
+//
+// 只查 scope='relay'：号池的流水混进来会把"号池正常"读成"通道正常"。
+// 单位是"模型名"，归到具体通道由调用方做（一个模型名可能配在多条通道上，
+// 那种情况下统计是合并口径 —— 比不显示好，但不能说成"某条通道"的数字）。
+func (s *Store) relayModelStats(since int64) (map[string]*relayModelStat, error) {
+	rows, err := s.db.Query(`SELECT model,
+			COUNT(*),
+			SUM(CASE WHEN status = 'no_usage' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN charged_micro = 0 THEN 1 ELSE 0 END),
+			MAX(created_at)
+		FROM usage_logs
+		WHERE scope = 'relay' AND created_at >= ?
+		GROUP BY model`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]*relayModelStat{}
+	for rows.Next() {
+		var model string
+		var st relayModelStat
+		if err := rows.Scan(&model, &st.Total, &st.NoUsage, &st.ZeroFee, &st.LastAt); err != nil {
+			return nil, err
+		}
+		if st.Total > 0 {
+			st.LeakRate = float64(st.ZeroFee) / float64(st.Total)
+		}
+		out[model] = &st
+	}
+	return out, rows.Err()
+}
+
 // relayModelSet 同上，但返回 set（合并 /v1/models 时要按名字判重）。
 func (s *Store) relayModelSet() map[string]bool {
 	ids, err := s.relayModelIDs()
@@ -544,6 +595,69 @@ func probeUpstream(ctx context.Context, u Upstream) ([]string, error) {
 	return ids, nil
 }
 
+// probeUpstreamBilling 尽力读取上游的计费倍率。
+//
+// **为什么是"尽力而为"**：这是 Sub2API 的私有端点 `GET /v1/sub2api/billing`
+// （返回 object=sub2api.key_billing、effective_rate_multiplier 等），标准 OpenAI 兼容
+// 站点没有。读到它，运营就能把"我方 credit_per_1k × 倍率"和"上游倍率"摆在一起核毛利；
+// 读不到就说明对面不是 sub2，直接忽略 ——
+// **绝不能因为这一项失败把探活结论改成失败**，否则"非 sub2 站点"会被误判成"通道坏了"。
+//
+// 返回 (effective_rate_multiplier, 说明文案, 是否读到)。
+func probeUpstreamBilling(ctx context.Context, base, key string) (float64, string, bool) {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return 0, "", false
+	}
+	trimmed := strings.TrimRight(base, "/")
+	var cands []string
+	// base 已带 /v1（最常见）→ 直接拼；否则用 origin 补 /v1（sub2 的 Anthropic 文档
+	// 让客户端填不带 /v1 的根路径，两种填法都得试）。
+	if strings.HasSuffix(trimmed, "/v1") {
+		cands = append(cands, trimmed+"/sub2api/billing")
+	}
+	cands = append(cands, u.Scheme+"://"+u.Host+"/v1/sub2api/billing")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, target := range cands {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if rerr != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Accept", "application/json")
+		resp, derr := client.Do(req)
+		if derr != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			continue
+		}
+		var parsed struct {
+			Object                  string  `json:"object"`
+			BillingScope            string  `json:"billing_scope"`
+			EffectiveRateMultiplier float64 `json:"effective_rate_multiplier"`
+			PeakRateEnabled         bool    `json:"peak_rate_enabled"`
+		}
+		if json.Unmarshal(body, &parsed) != nil || !strings.HasPrefix(parsed.Object, "sub2api.") {
+			continue
+		}
+		note := fmt.Sprintf("上游倍率 %.4g", parsed.EffectiveRateMultiplier)
+		if parsed.BillingScope != "" {
+			note += "（计费口径 " + parsed.BillingScope
+			if parsed.PeakRateEnabled {
+				note += "，含高峰倍率"
+			}
+			note += "）"
+		}
+		log.Printf("INFO: [relay] 读到上游计费信息：%s ← %s", note, target)
+		return parsed.EffectiveRateMultiplier, note, true
+	}
+	return 0, "", false
+}
+
 // truncateStr 截断用于错误文案（不截断会把整段 HTML 错误页塞进日志）。
 func truncateStr(s string, n int) string {
 	if len(s) <= n {
@@ -574,6 +688,23 @@ func (a *app) handleAdminUpstreams(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		poolSet[id] = true
 	}
+
+	// 近 7 天通道调用概况（只读）：把"配了却没走到"和"走到了却 0 费"摊开给人看。
+	//
+	// 统计失败**不能**让整个列表挂掉 —— 那是把"看不见数字"升级成"看不见通道"，
+	// 反而更难排查。失败就打 WARN，列表照发（recent 字段为空）。
+	if stats, serr := a.store.relayModelStats(time.Now().Add(-7 * 24 * time.Hour).Unix()); serr != nil {
+		log.Printf("WARN: [relay] 读取通道调用统计失败（列表照常返回）：%v", serr)
+	} else {
+		for i := range list {
+			for j := range list[i].Models {
+				if st := stats[list[i].Models[j].Model]; st != nil {
+					list[i].Models[j].Recent = st
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"upstreams":   list,
 		"pool_models": poolSet, // 前端据此提示"该模型号池也有，将优先走号池"
@@ -674,10 +805,17 @@ func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ids, perr := probeUpstream(ctx, *target)
 	msg := ""
+	billNote := ""
 	if perr != nil {
 		msg = perr.Error()
 	} else {
 		msg = fmt.Sprintf("可用模型 %d 个", len(ids))
+		// 探活成功后再顺手读上游倍率（失败静默）：对非 sub2 站点这一项不存在，
+		// 不能让它影响"通道是否可用"的结论。
+		if _, note, ok := probeUpstreamBilling(ctx, target.BaseURL, target.APIKey); ok {
+			billNote = note
+			msg += "；" + note
+		}
 	}
 	// 探活结果落库：后台列表要能显示"上次探活什么时候、结果如何"，
 	// 否则运维每次都要手动点一遍才知道通道还活着。
@@ -688,7 +826,9 @@ func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": perr.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": ids, "count": len(ids)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "models": ids, "count": len(ids), "billing_note": billNote,
+	})
 }
 
 func (a *app) handleAdminUpstreamModelSave(w http.ResponseWriter, r *http.Request) {

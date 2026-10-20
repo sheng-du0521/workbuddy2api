@@ -7959,7 +7959,7 @@ function channelCard(up, poolModels) {
     try {
       const r = await post('/api/admin/upstreams/probe', { id: up.id });
       if (r.ok) {
-        say('探活通过：' + r.count + ' 个模型可用（可加到下方映射）');
+        say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '') + '（可加到下方映射）');
       } else {
         // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
         say('探活失败：' + r.error);
@@ -8004,7 +8004,7 @@ function channelCard(up, poolModels) {
   const tbl = el('div');
   tbl.style.marginTop = '10px';
   const head2 = el('div', 'code-gen-row');
-  for (const t of ['模型（客户端请求的名字）', '上游模型名', '每 1k 积分', '状态', '操作']) {
+  for (const t of ['模型（客户端请求的名字）', '上游模型名', '每 1k 积分', '近 7 天', '状态', '操作']) {
     const c = el('span', 'muted', t);
     c.style.fontWeight = '600';
     head2.appendChild(c);
@@ -8020,6 +8020,21 @@ function channelCard(up, poolModels) {
     r.appendChild(el('span', 'mono', m.model));
     r.appendChild(el('span', 'mono muted', m.remote_model || '（同名）'));
     r.appendChild(el('span', 'mono', String(m.credit_per_1k)));
+    // 近 7 天通道调用（只读统计）：两个"以为在跑其实在亏"的现场靠这一列现形 ——
+    // ① 一次都没有（被号池抢走 / 没人用）；② 走了但 0 费（上游没回 usage）。
+    const st = m.recent;
+    if (!st || !st.total) {
+      const c = el('span', 'muted', '—');
+      c.title = '近 7 天没有经这个模型名走过的通道调用：要么没人用，要么被号池抢走了（看右边状态列）';
+      r.appendChild(c);
+    } else {
+      const leak = st.zero_fee / st.total;
+      const txt = st.total + ' 次' + (st.zero_fee ? ' / 0 费 ' + st.zero_fee + '（' + Math.round(leak * 100) + '%）' : '');
+      const c = leak >= 0.2 ? el('span', 'tag err', txt) : el('span', 'mono muted', txt);
+      c.title = '近 7 天经通道的调用共 ' + st.total + ' 次，其中上游未回 usage ' + st.no_usage +
+        ' 次、实扣为 0 共 ' + st.zero_fee + ' 次。\n0 费 = 这一单白送：多为上游不支持 stream_options.include_usage。';
+      r.appendChild(c);
+    }
     // 号池优先提示：这里最容易误解 —— 配了却永远不走通道，运维会以为"通道坏了"。
     if (poolModels[m.model]) {
       const t = el('span', 'tag warn', '号池优先');
@@ -8056,6 +8071,25 @@ function channelCard(up, poolModels) {
     tbl.appendChild(r);
   }
   card.appendChild(tbl);
+
+  // 通道级汇总（近 7 天）：只在这一页回答一个问题 —— "这条通道是真的在跑，还是在白送？"
+  // 一次都没跑过也值得显式说出来，否则"配了没生效"永远只能靠猜。
+  let stTotal = 0, stZero = 0, stNoUsage = 0;
+  for (const m of models) {
+    if (!m.recent) continue;
+    stTotal += m.recent.total;
+    stZero += m.recent.zero_fee;
+    stNoUsage += m.recent.no_usage;
+  }
+  if (stTotal > 0) {
+    const leak = stZero / stTotal;
+    const sum = el('div', leak >= 0.2 ? 'credit-err' : 'muted');
+    sum.style.marginTop = '6px';
+    sum.textContent = '近 7 天通道调用 ' + stTotal + ' 次，其中 0 费 ' + stZero + ' 次（' +
+      Math.round(leak * 100) + '%）、上游未回 usage ' + stNoUsage + ' 次' +
+      (leak >= 0.2 ? ' —— 0 费占比偏高，多半是对面不回 usage，这一单是白送的。' : '');
+    card.appendChild(sum);
+  }
 
   // 新增映射（行内三格 + 添加）
   const add = el('div', 'row');

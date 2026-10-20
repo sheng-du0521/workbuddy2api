@@ -1,20 +1,20 @@
 {
-  "version": "0.31.71",
+  "version": "0.31.72",
   "min_supported": "0.24.0",
-  "notes": "v0.31.71：通道单价参与预扣（P2 收尾 —— 钱要挡在花出去之前）。\n\n① 修的问题：relay 请求此前只能按**全局兜底单价**估预扣，而兜底价是管理员随手填的一个数。通道单价高时会严重低估 —— 余额 10 点的用户也能发起一次实际消耗 500 点的请求，结算后余额变负数（\"预扣\"形同虚设）。通道单价低时又高估，余额略低就被 402 误拒。\n\n② 现在三级回落：号池实测价（costPer1k，最准）→ 通道配置单价 × **通道倍率**（不是全局倍率）→ 全局兜底单价。次序是刻意的：同名模型号池优先分发，号池的实测价才是这笔请求的真实成本。\n\n③ 用**快照**而不是每请求查库：预扣在每个请求的入口，SQLite 只有一条连接，每请求一次 SELECT 会和结算/心跳抢锁。通道配置变更频率极低，变更时刷新一次即可。新增 Proxy.relayPrice + ReloadRelayPrices()，启动时初始化（否则前几个通道请求会按\"没有单价\"估，数额可能差一个数量级）。\n\n④ 配置变更收敛到一个入口 `channelConfigChanged()`：作废模型缓存 + 刷新单价快照。**两件事必须一起做** —— 只作废缓存不改价，会出现\"停用了通道、预扣还按旧价冻结\"；只改价不作废缓存，会出现\"关了通道还能看见模型\"。5 个写入口（保存/删除/启停通道、增删改映射）全部改调它。\n\n⑤ 多条通道挂同一模型时取**最高**单价（MAX 而不是平均）：预扣的作用是挡住刷爆，宁可高估（多冻结、事后多退），不能低估。\n\n验证：5 条用例 —— 单价×倍率精确匹配（5000 微点 / 倍率 2 → 10000）、停用即刻失效、号池价优先于通道价、多通道取最高、**端到端 402（余额不足被拦、零出站、余额不变）**。\n\n踩到的坑（记进用例注释）：构造 payload 时 `max_tokens` 必须是 **float64** —— payload 来自 json.Unmarshal 到 map[string]any，数字一律 float64。传 int 会让 RequestMaxTokens 的类型断言失败、静默回落 DefaultMaxTokens(4096)，断言就变成\"期望 5000、实际 20480\"，而且看起来像预扣算错了。\n\n边界：预扣仍是上界估算（prompt 估算 + max_tokens），不是真分词；通道单价取配置值，不随对方调价自动更新（对方涨价只能人工改）；号池实测价为 0（冷启动/新模型）时会先用通道价，可能略高估。",
-  "released_at": 1792515852,
+  "notes": "v0.31.72：通道看得见（接入 Sub2API 前的两个盲区）。\n\n① 后台通道页新增「近 7 天」统计：每个模型映射显示 总调用次数 / 0 费次数（占比），卡片底部给通道级汇总，0 费占比 >=20% 标红。口径来自 usage_logs 且只算 scope=relay —— 号池流水混进来会把「号池正常」读成「通道正常」。\n\n② 三个指标各自回答一个问题：total=0 说明配了却一次没走到（被号池同名抢走 / 没人用）；no_usage 高说明对面不支持 stream_options.include_usage；zero_fee 高说明这一单在白送。不再需要翻日志才能发现「通道在漏钱」。\n\n③ 探活顺带读 Sub2API 的 GET /v1/sub2api/billing，把 effective_rate_multiplier 拼进探活结论，用于核对毛利（我方售价 ≈ credit_per_1k × 倍率 要高于上游扣费）。两种 base_url 填法都试；**读不到不算失败** —— 私有端点，非 sub2 站点天生没有，判错会把所有正常通道标成故障。\n\n④ 统计失败不让列表挂掉（WARN + recent 留空 + 界面显示「—」）：把「看不见数字」升级成「看不见通道」只会更难排查。\n\n验证：TestRelayModelStats（只算 relay / 窗口外不计 / 0 费占比 2-3 精确 / 空窗口空 map）、TestProbeUpstreamBillingSub2API（三种 base 填法都读到 1.5）、TestProbeUpstreamBillingNonSub2（404 / 非 sub2 对象 / 非 JSON / 401 一律安静放弃）。\n\n边界：统计是「模型名」口径，同模型名配在两条通道上时数字合并；上游倍率是探活那一刻的快照，对方调价不自动同步；0 费仍不估算（通道没有估算基准，估出来就是假账），只能看见不能自动修正。",
+  "released_at": 1792522442,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.71/webapp.exe",
-      "sha256": "e7d5e36fd8e788abb362dde98f8af71e3cd1c9038cb81eba3de46c358d62b185",
-      "size": 15898112
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.72/webapp.exe",
+      "sha256": "80c6d1f78063251770265c3a14511226f74c7c6a4886c2aad103fc876cce9458",
+      "size": 15909376
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "UNEfbBm3yFdSs2vr+1+tDSqEYYIuUdeYB4uUDIJl+ur7GmCMMBGijms6WZoAsuEkb62okv5NK7RAU80r1wJrDg==",
+  "signature": "tXMCCbDHQ2RjV9gN8YIwmt/nVtDuHAU338OqilTkytWWJnpAZ8lm3r163d6SyUWfB3Sp4MWsScsQCHXwTkrAAg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
