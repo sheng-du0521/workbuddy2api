@@ -1519,6 +1519,13 @@
           <span id="ledgerHint" class="muted">只读，不改任何数据</span>
         </div>
         <div id="ledgerStatus" style="margin-top:12px;"></div>
+        <div style="border-top:1px solid var(--line);margin:14px 0 0;"></div>
+        <div class="row" style="margin-top:10px;">
+          <button class="ghost" id="btnDataUsage">刷新数据体积</button>
+          <button class="ghost" id="btnPruneLogs"
+            title="按 usage_log_retention_days（默认 180 天）删除过期用量流水，不可撤销">清理过期流水</button>
+        </div>
+        <div id="dataUsageBox" style="margin-top:10px;"></div>
       </div>
 
       <div class="card">
@@ -4540,6 +4547,7 @@ async function loadSettings() {
     if ($('setUpdateManifest')) $('setUpdateManifest').value = d.update_manifest_url || '';
     loadUpdateStatus(false);
     loadLedgerCheck(false);
+    loadDataUsage(false);
     // 调价历史（v0.27.0）：与倍率输入框同屏，改完保存能立刻看到"刚刚这一次"进去了。
     loadMultiplierHistory();
     if ($('deviceTokenHint')) {
@@ -5495,6 +5503,43 @@ async function loadLedgerCheck(force) {
   }
 }
 
+// loadDataUsage 数据体积与保留策略（v0.31.66）。
+//
+// 为什么放在「账目对账」卡里：这两件事读者是同一个（运维），而且"库有多大 / 流水有多少行"
+// 正是判断"该不该清理"的依据 —— 分开放两个卡片只会让人少看一半。
+async function loadDataUsage(prune) {
+  const box = $('dataUsageBox');
+  if (!box) return;
+  box.textContent = '';
+  box.appendChild(el('div', 'muted', prune ? '清理中…' : '读取中…'));
+  let d;
+  try { d = await api('/api/admin/data-usage' + (prune ? '?prune=1' : '')); }
+  catch (e) { box.textContent = ''; box.appendChild(el('div', 'credit-err', '读取失败：' + e.message)); return; }
+  box.textContent = '';
+  const s = (d && d.snapshot) || {};
+  const mb = (n) => ((Number(n) || 0) / 1048576).toFixed(1) + ' MB';
+  const day = (ts) => ts ? fmtClock(ts) : '—';
+  box.appendChild(el('div', 'muted',
+    '库文件 ' + mb(s.file_bytes) + '（WAL ' + mb(s.wal_bytes) + '，可回收 ' + mb(s.reclaimable_bytes) + '）'));
+  box.appendChild(el('div', 'muted',
+    '用量流水 ' + (s.usage_logs || 0) + ' 行；最早 ' + day(s.oldest_log) + '；保留 ' +
+    ((s.retention_days || 0) > 0 ? s.retention_days + ' 天' : '永久（不清理）')));
+  if (s.last_prune) {
+    const p = s.last_prune;
+    let line = '上次清理 ' + fmtClock(p.at) + '：' + (p.skipped ? '已跳过（保留策略为永久）' : '删除 ' + (p.deleted || 0) + ' 行');
+    if (p.error) line += '（失败：' + p.error + '）';
+    box.appendChild(el('div', p.error ? 'credit-err' : 'muted', line));
+  }
+  if (d && d.prune && !d.prune.skipped && !d.prune.error) {
+    box.appendChild(el('div', 'muted', '本次删除 ' + (d.prune.deleted || 0) + ' 行'));
+  }
+  // 不自动 VACUUM：整库重写期间会锁死服务，必须人在低峰做。这里只提示"该做了"。
+  if ((s.reclaimable_bytes || 0) > 32 * 1048576) {
+    box.appendChild(el('div', 'muted',
+      '可回收空间较大：低峰期可执行 sqlite3 webapp.db "VACUUM"（会锁库，别在高峰做）'));
+  }
+}
+
 async function loadUpdateStatus(force) {
   const box = $('updateStatus');
   if (!box) return;
@@ -5629,6 +5674,12 @@ function extLink(href, text) {
 
 if ($('btnCheckUpdate')) $('btnCheckUpdate').onclick = () => loadUpdateStatus(true);
 if ($('btnLedgerCheck')) $('btnLedgerCheck').onclick = () => loadLedgerCheck(true);
+if ($('btnDataUsage')) $('btnDataUsage').onclick = () => loadDataUsage(false);
+if ($('btnPruneLogs')) $('btnPruneLogs').onclick = () => {
+  // 删数据不可逆：必须让人显式确认，且说明"按当前保留策略"而不是"全删"。
+  if (!confirm('按当前保留策略（usage_log_retention_days，默认 180 天）删除过期用量流水？\n此操作不可撤销。')) return;
+  loadDataUsage(true);
+};
 // 「应用更新」：只生成替换脚本 + 回操作指引，**不自动替换、不自动重启**。
 // 打开一个可复制的对话框而不是直接执行 —— 执行意味着停服务，必须由人决定时机。
 if ($('btnApplyUpdate')) $('btnApplyUpdate').onclick = async () => {

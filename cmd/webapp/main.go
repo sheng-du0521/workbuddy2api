@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.65"
+const version = "0.31.66"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -457,6 +457,10 @@ func main() {
 	// 账目对账（v0.31.62）：启动 90s 后一次 + 每 6 小时一次。只读 SELECT，
 	// 不参与任何写路径；发现问题只告警，**不自动改账**（误判会变成改错账）。
 	go a.ledgerCheckLoop(probeCtx)
+
+	// 用量流水保留策略（v0.31.66）：启动 2 分钟后一次 + 每 24 小时一次，
+	// 按 usage_log_retention_days（默认 180 天，0=永久）分批删除过期行。
+	go a.pruneLoop(probeCtx)
 
 	// 鉴权日志与限流共用同一份可信代理配置（v0.31.59，审查 F14）。
 	setLogTrustedProxies(proxySet)
@@ -1683,6 +1687,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/admin/status", a.adminGuard(a.handleStatus))
 	// 账目对账（v0.31.62，审查 F02 收尾）：只读不变式检查，GET ?run=1 立即重跑。
 	mux.HandleFunc("GET /api/admin/ledger-check", a.adminGuard(a.handleAdminLedgerCheck))
+	// 数据体积与流水保留（v0.31.66）：GET 只读快照，?prune=1 立即清理一次。
+	mux.HandleFunc("GET /api/admin/data-usage", a.adminGuard(a.handleAdminDataUsage))
 	// 账号来源健康度（v0.31.37）：把"扫码登录是不是更容易掉线"变成可计算的数字。
 	// 只读聚合，零出站（见 source_stats.go 的口径说明）。
 	mux.HandleFunc("GET /api/admin/accounts/source-stats", a.adminGuard(a.handleAccountSourceStats))
