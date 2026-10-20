@@ -75,6 +75,8 @@ def main():
     ap.add_argument("--fast", action="store_true", help="跳过 go test")
     ap.add_argument("--build-only", action="store_true", help="只构建，不跑任何检查")
     ap.add_argument("--no-node", action="store_true", help="跳过前端检查（没装 node 时）")
+    ap.add_argument("--skip-smoke", action="store_true",
+                    help="跳过成品冒烟（冒烟会真起一个进程，约 3~5 秒）")
     ap.add_argument("--expect-manifest", action="store_true",
                     help="要求清单声明的 sha/size 就是本次构建的字节（发布机在 make_manifest 之后用）")
     a = ap.parse_args()
@@ -127,7 +129,19 @@ def main():
     run("构建 relsign", [go, "build", "-o", os.path.join("dist", relsign_name), "./cmd/relsign"],
         env=build_env)
 
-    # ⑥ 清单一致性（版本一致 + 签名可用）。**sha 比对是否算失败，取决于你是谁**：
+    # ⑥ 成品冒烟：把**刚构建的二进制**真起起来，走一遍注册/登录/建 Key/列模型。
+    #
+    # 这一步是审查 F15「制品验收不足」的直接补丁，也是唯一能抓到这些的检查：
+    # go:embed 的前端漏文件（单测照绿、用户白屏）、启动期数据库迁移写错、
+    # 启动参数/端口/日志路径。**它已经抓到过一个真实缺陷**（v0.31.64：
+    # 全新机器上数据目录不存在时首启直接失败，见 OpenStore 的注释）。
+    # --build-only 的意义就是"只构建"（清单还没盖章时跑检查必然红），所以这里也要跳过。
+    if not a.build_only and not a.skip_smoke:
+        exe_name = "webapp.exe" if os.name == "nt" else "webapp-linux"
+        run("成品冒烟（真起进程）", [sys.executable, os.path.join("scripts", "smoke.py"),
+                            "--exe", os.path.join("dist", exe_name)])
+
+    # ⑦ 清单一致性（版本一致 + 签名可用）。**sha 比对是否算失败，取决于你是谁**：
     #
     #    - 发布机：先 make_manifest 盖章（用本次构建的 sha 写清单），再跑本脚本 → 必须一致；
     #    - CI：从 tag 重新构建，虽然已用 -buildvcs=false 追求可重复，但 Go 版本/工具链

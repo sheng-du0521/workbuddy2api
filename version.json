@@ -1,20 +1,20 @@
 {
-  "version": "0.31.63",
+  "version": "0.31.64",
   "min_supported": "0.24.0",
-  "notes": "v0.31.63：审查报告 F06 落地 —— 发布前置与发布后校验各有**唯一实现**。\n① **preflight.py**：把\"发布前该做什么\"固化成一条可执行链（gofmt → vet → 单测 → 前端 jscheck/uitest → 双平台构建 → relsign → 清单一致性）。CI 与发布机都只调它，不再有\"人在发布机上敲的子集\"。\n② **make_manifest.py**：清单从**真实产物**生成（版本只认 main.go 的 const version；sha256/size 来自刚构建的 exe），顺序固定为 读版本 → 算摘要 → 写清单 → 签名字段，杜绝\"手写清单说假话\"。\n③ **构建改为可重复**：加 -buildvcs=false。默认会嵌入 VCS 标记，同一份源码在不同 commit/机器上构建出不同字节 —— 于是\"清单 sha == 本次构建字节\"这条闸门永远为假。已实测：两次构建逐字节一致。\n④ **CI 加清单闸门**（每次 push/PR）：版本一致 + 签名有效 + assets 齐全（verify_release.py --manifest-only），不联网、不需构建。\n⑤ **新增 release-gate.yml**（tag 触发）：tag 必须等于 v<清单版本>；清单签名可验；然后**下载已发布资产逐字节比对**。Release 没建好时有限等待 10 分钟，超时才判红 —— 抓的正是\"清单超前于资产\"。\n⑥ 修一个会让人不再信任闸门的缺陷：下载校验把网络抖动（Remote end closed）和\"资产不存在\"报成同一句。现在网络失败重试 3 次、HTTP 4xx/5xx 不重试，错误信息区分开。\n边界：私钥不进 CI，workflow 只校验、不签名；release-gate 的重试等待无法在本机复刻（Actions 实跑才算验证）。",
-  "released_at": 1792480655,
+  "notes": "v0.31.64：审查报告 F15 的第一块 —— 制品验收（对**构建产物**做真实冒烟），并修掉它抓到的真实缺陷。\n① **scripts/smoke.py**：把刚构建的二进制真起起来，走一遍 健康检查 → 首页（验证 go:embed 前端没漏）→ 启动日志版本 == version.json → 注册 → 登录（拿到会话 cookie）→ 建 Key → GET /v1/models 200 → 收尾断言无 panic、db 与表都在。端口由系统分配（固定\"测试端口\"迟早撞车），-no-tasks 避免触发真实出站任务。\n② **它抓到真缺陷**：全新机器上 `webapp -db ./data/webapp.db` 直接 `migrate: unable to open database file (14)` —— SQLite 不建父目录，而\"先 mkdir 再启动\"只写在部署文档里，报错也完全指不到真因。现在 OpenStore 自己 MkdirAll 父目录，并补了用例钉住。\n③ 接进 `preflight.py`（默认执行，`--skip-smoke` 可跳），于是 CI 与发布机都会跑 —— 这是唯一能发现\"单测全绿但产物起不来\"的检查。\n④ 边界：冒烟不起真上游、不验证计费链路（那需要真账号）；它保证的是\"产物可用\"，不是\"业务全对\"。",
+  "released_at": 1792483418,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.63/webapp.exe",
-      "sha256": "0ca8d4c2306ffb5baa0fe4738b6e1771a0865eb6347a31c3ee21cb70637c23a2",
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.64/webapp.exe",
+      "sha256": "15cdbc8dd0500d60d34f6b569710af0ea594f497d2772083915a731f0d777611",
       "size": 15677952
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "0Ml27/KiSvHRRAMhh7p+ULk/5diXiHbSzhZcQtwSZObRGynWalUTO/JEKt/B/MgLTO8SanP+lVWks+2lZtvMAQ==",
+  "signature": "Wimos6i730rqyz9QtOowVqlAahD/F2LQJsU2ut6pPoodGyE1/7sYnK6mpnlR0VutQpuh0jsCXevdV0A5Qf5MCQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

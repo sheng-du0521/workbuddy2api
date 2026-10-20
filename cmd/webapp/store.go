@@ -7,6 +7,8 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -170,6 +172,18 @@ func (s *Store) decField(v string) string {
 //   - 可回退：`PRAGMA journal_mode=DELETE` 即切回（SQLite 会自动 checkpoint），
 //     **无需任何数据迁移**。
 func OpenStore(path string) (*Store, error) {
+	// 数据目录不存在时**自己建**（v0.31.64，冒烟测试发现的真实首启缺陷）。
+	//
+	// 现场形态：全新机器上 `webapp -db ./data/webapp.db` 直接报
+	// `migrate: unable to open database file (14)` —— SQLite 不会替你创建父目录，
+	// 而"先 mkdir 再启动"这件事只存在于部署文档里。新用户第一次运行就撞上，
+	// 报错文本还完全指不到"目录不存在"。
+	// 这里只建父目录，不建文件：文件由 SQLite 自己建（权限/属主交给它更合理）。
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("创建数据目录 %s 失败: %w", dir, err)
+		}
+	}
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
