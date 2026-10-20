@@ -388,6 +388,19 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
    免得按钮贴着「已处置」那行显得像是它的一部分。 */
 .action-row { margin-top: 10px; }
 
+/* ---------- 测试对话：一键拉取模型 ---------- */
+/* 就地展开的名字墙（不是弹窗）：弹窗会盖住回复区，而这里的下一步就是「填模型、
+   发消息」，来回开关很烦。每个名字是一个按钮，点一下即复制。 */
+.modelpick { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin: 0 0 10px; }
+.modelpick-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.modelpick-head .n { font-size: 12px; color: var(--muted); }
+.modelpick-bar { display: flex; flex-wrap: wrap; gap: 6px; max-height: 220px; overflow-y: auto; padding: 2px 0; }
+.modelpick-bar .chip { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+/* 通道模型（owned_by=relay）：虚线边，与号池模型一眼分开 —— 只有号池没有它
+   才会走第三方通道，调试时"这个模型为什么走别处"的答案就在这一圈虚线上。 */
+.modelpick-bar .chip.relay { border-style: dashed; }
+.modelpick-bar .muted { font-size: 12px; padding: 4px 2px; }
+
 /* ---------- 积分卡片（大总额 + N 个积分包 + 逐包进度条/到期） ---------- */
 .credit { margin: 10px 0 2px; }
 .credit-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }

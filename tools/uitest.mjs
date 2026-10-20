@@ -3404,11 +3404,275 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-setup: 未接入时有「下载安装包」入口（无需复制任何参数）');
   }
 
+  // v0.31.68：测试对话页的「一键拉取全部模型」必须**真的能点、点了真的复制**。
+  //
+  // 这条按行为验（不按源码文本验）的原因和开关那条一样：按钮在 HTML 里长得完全
+  // 正常，但"点了没反应"这类故障只有真点一下才看得见 —— 而复制恰恰是这条链路上
+  // 最贵的一环（模型 id 手抄错一个字符，请求就是 400，用户只会觉得"这个站坏了"）。
+  // 刻意给 13 个模型：>12 才会出现过滤框，顺带把过滤也验掉。
+  const tmBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'dashboard.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const MODELS = {
+      models: Array.from({ length: 12 }, (_, i) => 'filler-model-' + i).concat(['kimi-k2.5']),
+    };
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/dashboard.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.__copied = [];
+        // ⚠️ 必须用 defineProperty：jsdom 的 navigator.clipboard 是只读访问器，
+        // 直接赋值会被静默忽略 → 落到 execCommand 兜底 → jsdom 里必然失败，
+        // 于是"复制"永远失败而断言只会看到"没复制"，看不出是桩没生效。
+        Object.defineProperty(win.navigator, 'clipboard', {
+          configurable: true,
+          value: { writeText: (t) => { win.__copied.push(String(t)); return Promise.resolve(); } },
+        });
+        win.fetch = (url) => {
+          const u = String(url);
+          const body = (b) => Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve(JSON.stringify(b)), json: () => Promise.resolve(b) });
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return body({ user: { id: 2, username: 'u2', is_admin: false } });
+          }
+          if (u.indexOf('/api/models') >= 0) return body(MODELS);
+          return body({});
+        };
+        win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+        win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
+      },
+    });
+    const w = dom.window;
+    const doc = w.document;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 40 && typeof w.navGo !== 'function'; i++) await wait(100);
+    const nav = Array.from(doc.querySelectorAll('.nav-item')).find((x) => x.dataset.nav === 'test');
+    if (nav) { nav.dispatchEvent(new w.MouseEvent('click', { bubbles: true })); await wait(300); }
+
+    const btn = doc.getElementById('btnTestModels');
+    const box = doc.getElementById('testModelPanel');
+    if (!btn) tmBad.push('测试对话页缺少「一键拉取全部模型」按钮');
+    if (!box) tmBad.push('测试对话页缺少模型面板容器 #testModelPanel');
+    if (btn && box) {
+      if (!box.classList.contains('hidden')) tmBad.push('模型面板默认应折叠（不该一进页就摊开一屏模型名）');
+      btn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+      await wait(400);
+      if (box.classList.contains('hidden')) tmBad.push('点「一键拉取全部模型」后面板未展开');
+      const chips = () => Array.from(box.querySelectorAll('.chip'));
+      if (chips().length !== MODELS.models.length) {
+        tmBad.push(`面板模型数 = ${chips().length}，want ${MODELS.models.length}（必须拉全量，不是前几个）`);
+      }
+      // 补全也要跟着全量：拉过面板后输入框的 datalist 不该还是空的。
+      const opts = doc.querySelectorAll('#modelOpts option');
+      if (opts.length !== MODELS.models.length) {
+        tmBad.push(`输入框补全数 = ${opts.length}，want ${MODELS.models.length}（拉到的模型应同时进补全）`);
+      }
+      // 点名字 → 复制 + 填框（复制失败也必须填框，否则等于"点了没反应"）。
+      const target = chips().find((c) => c.dataset.model === 'kimi-k2.5');
+      if (!target) {
+        tmBad.push('面板里找不到 kimi-k2.5（模型名未按 id 渲染）');
+      } else {
+        target.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        await wait(250);
+        if (!w.__copied.includes('kimi-k2.5')) tmBad.push('点模型名没有复制到剪贴板');
+        if (doc.getElementById('testModel').value !== 'kimi-k2.5') {
+          tmBad.push('点模型名没有填进模型输入框（复制被拦时至少要能用）');
+        }
+      }
+      // 复制全部：一次性把所有 id 带走（换行分隔，粘到客户端就能用）。
+      const cpAll = box.querySelector('.icon-btn');
+      if (!cpAll) {
+        tmBad.push('面板缺少「复制全部」按钮');
+      } else {
+        cpAll.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        await wait(250);
+        const last = w.__copied[w.__copied.length - 1];
+        if (last !== MODELS.models.join('\n')) tmBad.push('「复制全部」未复制全量模型 id');
+      }
+      // 过滤：13 个模型时必须有过滤框，且输入后只留命中的。
+      const filter = box.querySelector('input[type="text"]');
+      if (!filter) {
+        tmBad.push('模型多于 12 个时应给出过滤框');
+      } else {
+        filter.value = 'kimi';
+        filter.dispatchEvent(new w.Event('input', { bubbles: true }));
+        await wait(150);
+        if (chips().length !== 1) tmBad.push(`过滤后模型数 = ${chips().length}，want 1`);
+        filter.value = '不存在的模型';
+        filter.dispatchEvent(new w.Event('input', { bubbles: true }));
+        await wait(150);
+        if (chips().length !== 0) tmBad.push('过滤无命中时应给出空提示而不是一片空白');
+      }
+      // 再点一次按钮 = 收起（同一个按钮开关，不需要再去找关闭按钮）。
+      btn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+      await wait(300);
+      if (!box.classList.contains('hidden')) tmBad.push('再点一次按钮未收起面板');
+    }
+    try { w.close(); } catch (e) {}
+  }
+  tmBad.forEach((m) => console.log('  [FAIL] test-models-picker: ' + m));
+  if (!tmBad.length) {
+    console.log('  [ok] test-models-picker: 一键拉取全量模型 + 点名字即复制并填框 + 复制全部 + 过滤');
+  }
+
+  // v0.31.69：管理后台「调试对话」页的「一键拉取全部模型」。
+  //
+  // 与控制台那条是同一套行为级验法（真点按钮、真点模型名、真读剪贴板），
+  // 但后台这一侧多验两件**只有后台才有**的事：
+  //   ① 走的是 GET /v1/models（与调试对话同一个管理密钥），而不是另开一个管理端
+  //      接口 —— 目录口径必须与客户端看到的完全一致，否则会出现"后台能选、
+  //      客户端 400"这种两套口径的事故；
+  //   ② 第三方 / 中转站通道补进来的模型（owned_by=relay）要被标出来 ——
+  //      调试时"这个模型为什么走别处"的答案就在这一个标记上。
+  const amBad = [];
+  {
+    const html = fs.readFileSync(path.join(UI, 'admin.html'), 'utf8')
+      .replace('<script src="/app.js"></script>', '<script>' + APP_JS + '</script>');
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', () => {});
+    vc.on('error', () => {});
+    const POOL = Array.from({ length: 12 }, (_, i) => 'filler-model-' + i).concat(['kimi-k2.5']);
+    const RELAY = ['relay-model-x'];
+    const CATALOG = {
+      object: 'list',
+      data: POOL.map((id) => ({ id: id, owned_by: 'workbuddy' }))
+        .concat(RELAY.map((id) => ({ id: id, owned_by: 'relay' }))),
+    };
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      url: 'http://127.0.0.1:8780/admin.html',
+      beforeParse(win) {
+        win.__autoConfirm = true;
+        win.__autoPrompt = null;
+        win.__copied = [];
+        win.__v1models = 0;
+        // ⚠️ 必须用 defineProperty：jsdom 的 navigator.clipboard 是只读访问器，
+        // 直接赋值会被静默忽略 → 落到 execCommand 兜底 → jsdom 里必然失败。
+        Object.defineProperty(win.navigator, 'clipboard', {
+          configurable: true,
+          value: { writeText: (t) => { win.__copied.push(String(t)); return Promise.resolve(); } },
+        });
+        win.fetch = (url) => {
+          const u = String(url);
+          const body = (b) => Promise.resolve({ ok: true, status: 200,
+            text: () => Promise.resolve(JSON.stringify(b)), json: () => Promise.resolve(b) });
+          if (u.indexOf('/api/auth/me') >= 0) {
+            return body({ user: { id: 1, username: 'admin', is_admin: true } });
+          }
+          if (u.indexOf('/api/admin/key') >= 0) return body({ key: 'ak-test-admin' });
+          if (u.indexOf('/v1/models') >= 0) { win.__v1models++; return body(CATALOG); }
+          return body({});
+        };
+        win.confirm = () => true; win.prompt = () => '1'; win.alert = () => {};
+        win.open = () => ({ closed: false, location: { href: '' }, close() {} });
+        if (win.Element && !win.Element.prototype.scrollIntoView) {
+          win.Element.prototype.scrollIntoView = function () {};
+        }
+      },
+    });
+    const w = dom.window;
+    const doc = w.document;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    // 管理密钥是 init() 里异步取回来的，取到之前面板会走 /api/models 兜底 ——
+    // 要验的是主路径（/v1/models），所以先等它到位。
+    for (let i = 0; i < 40; i++) {
+      let k = '';
+      try { k = String(w.eval('adminKey') || ''); } catch (e) { k = ''; }
+      if (k) break;
+      await wait(100);
+    }
+    const nav = Array.from(doc.querySelectorAll('.nav-item')).find((x) => x.dataset.nav === 'test');
+    if (nav) { nav.dispatchEvent(new w.MouseEvent('click', { bubbles: true })); await wait(300); }
+
+    const btn = doc.getElementById('btnAdminModels');
+    const box = doc.getElementById('adminModelPanel');
+    if (!btn) amBad.push('调试对话页缺少「一键拉取全部模型」按钮');
+    if (!box) amBad.push('调试对话页缺少模型面板容器 #adminModelPanel');
+    if (btn && box) {
+      if (!box.classList.contains('hidden')) amBad.push('模型面板默认应折叠（不该一进页就摊开一屏模型名）');
+      btn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+      await wait(400);
+      if (box.classList.contains('hidden')) amBad.push('点「一键拉取全部模型」后面板未展开');
+      if (!w.__v1models) {
+        amBad.push('应走 GET /v1/models（与管理密钥同一条凭据，目录口径须与客户端一致）');
+      }
+      const chips = () => Array.from(box.querySelectorAll('.chip'));
+      const want = POOL.length + RELAY.length;
+      if (chips().length !== want) {
+        amBad.push(`面板模型数 = ${chips().length}，want ${want}（号池 + 通道都要在，不能只拉号池）`);
+      }
+      // 补全也要跟着全量：拉过面板后输入框的 datalist 不该还是空的。
+      const opts = doc.querySelectorAll('#adminModelOpts option');
+      if (opts.length !== want) {
+        amBad.push(`输入框补全数 = ${opts.length}，want ${want}（拉到的模型应同时进补全）`);
+      }
+      const relayChip = chips().find((c) => c.dataset.model === 'relay-model-x');
+      if (!relayChip) amBad.push('面板里缺少通道模型 relay-model-x');
+      else if (!relayChip.classList.contains('relay')) {
+        amBad.push('通道模型未标记（调试时无从判断它为什么走第三方通道）');
+      }
+      // 点名字 → 复制 + 填框（复制失败也必须填框，否则等于"点了没反应"）。
+      const target = chips().find((c) => c.dataset.model === 'kimi-k2.5');
+      if (!target) {
+        amBad.push('面板里找不到 kimi-k2.5（模型名未按 id 渲染）');
+      } else {
+        target.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        await wait(250);
+        if (!w.__copied.includes('kimi-k2.5')) amBad.push('点模型名没有复制到剪贴板');
+        if (doc.getElementById('model').value !== 'kimi-k2.5') {
+          amBad.push('点模型名没有填进模型输入框（复制被拦时至少要能用）');
+        }
+      }
+      // 复制全部：一次性把所有 id 带走（换行分隔，粘到客户端就能用）。
+      const cpAll = box.querySelector('.icon-btn');
+      if (!cpAll) {
+        amBad.push('面板缺少「复制全部」按钮');
+      } else {
+        cpAll.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        await wait(250);
+        const last = w.__copied[w.__copied.length - 1];
+        if (last !== POOL.concat(RELAY).join('\n')) amBad.push('「复制全部」未复制全量模型 id');
+      }
+      // 过滤：13 个模型时必须有过滤框，且输入后只留命中的。
+      const filter = box.querySelector('input[type="text"]');
+      if (!filter) {
+        amBad.push('模型多于 12 个时应给出过滤框');
+      } else {
+        filter.value = 'kimi';
+        filter.dispatchEvent(new w.Event('input', { bubbles: true }));
+        await wait(150);
+        if (chips().length !== 1) amBad.push(`过滤后模型数 = ${chips().length}，want 1`);
+        filter.value = '不存在的模型';
+        filter.dispatchEvent(new w.Event('input', { bubbles: true }));
+        await wait(150);
+        if (chips().length !== 0) amBad.push('过滤无命中时应给出空提示而不是一片空白');
+      }
+      // 再点一次按钮 = 收起（同一个按钮开关，不需要再去找关闭按钮）。
+      btn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+      await wait(300);
+      if (!box.classList.contains('hidden')) amBad.push('再点一次按钮未收起面板');
+    }
+    try { w.close(); } catch (e) {}
+  }
+  amBad.forEach((m) => console.log('  [FAIL] admin-models-picker: ' + m));
+  if (!amBad.length) {
+    console.log('  [ok] admin-models-picker: 后台调试对话一键拉全量（号池+通道）+ 点名字即复制并填框');
+  }
+
   const c = await run('admin-login.html', null, []);
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
     && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
-    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && egrPluginBad.length === 0 && egrSwitchBad.length === 0 && mcBad.length === 0;
+    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && egrPluginBad.length === 0 && egrSwitchBad.length === 0 && mcBad.length === 0 && tmBad.length === 0 && amBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

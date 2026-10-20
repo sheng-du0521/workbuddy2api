@@ -1752,12 +1752,16 @@
         <h2>调试对话（用管理密钥直连，不走用户计费）</h2>
         <div class="row" style="margin-bottom:10px;">
           <label>模型</label>
-          <input type="text" id="model" value="deepseek-v4-flash" class="mono">
+          <input type="text" id="model" value="deepseek-v4-flash" class="mono" list="adminModelOpts" style="min-width:180px;">
+          <datalist id="adminModelOpts"></datalist>
+          <button type="button" id="btnAdminModels" class="ghost"
+            title="拉取当前可用模型的全量列表（号池 + 第三方通道）；点列表里的名字即复制并填入模型框">一键拉取全部模型</button>
           <span class="row tight" style="gap:6px;">
             <span class="switch"><input type="checkbox" id="stream" checked><i></i></span>
             <span class="muted" style="font-size:12px;">流式</span>
           </span>
         </div>
+        <div id="adminModelPanel" class="modelpick hidden"></div>
         <textarea id="prompt">用一句话介绍你自己。</textarea>
         <div class="row" style="margin-top:10px;">
           <button id="btnSend">发送</button>
@@ -6765,6 +6769,173 @@ $('btnSend').onclick = async () => {
     $('btnSend').disabled = false;
   }
 };
+
+// ======================================================================
+// 调试对话 · 一键拉取全部模型（v0.31.69）
+//
+// 与管理端同一条凭据：调试对话本来就用管理密钥直连 /v1/chat/completions，
+// 拉模型也就用同一个密钥打 /v1/models —— 于是面板里看到的目录与客户端看到的
+// **完全一致**（含第三方通道补进来的模型，owned_by=relay），不必为后台再加一个
+// 管理端接口，也不会出现"后台能选、客户端 400"这种两套口径。
+//
+// 与控制台那个面板刻意保持同构（同样折叠、点名字复制并填框、复制全部、>12 个给
+// 过滤框）：两处都是"发消息前先挑模型"，交互一旦不一致，来回切换的人就要重新学。
+// ======================================================================
+
+// adminModelCache 最近一次拉到的模型（{id, relay}）。只是给「复制全部」用，
+// 不做持久：服务端本来就有 5 分钟的上游探测缓存。
+let adminModelCache = [];
+
+// fetchAdminModels 拉一次全量模型，并顺手回填输入框补全。
+async function fetchAdminModels() {
+  let items = [];
+  if (adminKey) {
+    const res = await fetch('/v1/models', {
+      headers: { 'Authorization': 'Bearer ' + adminKey },
+    });
+    if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+    const d = await res.json();
+    // owned_by=relay = 第三方 / 中转站通道补的模型：只有号池没有它才会走到通道。
+    // 面板里标出来，否则调试时会凭空多一个问题："这个模型为什么慢 / 为什么走别处"。
+    items = ((d && d.data) || []).map((x) => ({
+      id: String((x && x.id) || ''),
+      relay: !!x && x.owned_by === 'relay',
+    }));
+  } else {
+    // 管理密钥没取到（接口失败 / 还没初始化完）时退回控制台那一份：
+    // 少了通道模型，但总比"点一下报 401"强 —— 401 在这里会被读成"站坏了"。
+    const m = await api('/api/models');
+    items = ((m && m.models) || []).map((id) => ({ id: String(id), relay: false }));
+  }
+  items = items.filter((x) => x.id);
+  adminModelCache = items;
+  fillAdminModelOpts(items);
+  return items;
+}
+
+function fillAdminModelOpts(items) {
+  const dl = $('adminModelOpts');
+  if (!dl) return;
+  dl.textContent = '';
+  for (const it of (items || [])) { const o = el('option'); o.value = it.id; dl.appendChild(o); }
+}
+
+// renderAdminModelChips 渲染模型名按钮。kw 为空则全量展示。
+function renderAdminModelChips(bar, items, kw) {
+  bar.textContent = '';
+  const q = String(kw || '').trim().toLowerCase();
+  const shown = q ? items.filter((x) => x.id.toLowerCase().indexOf(q) >= 0) : items;
+  if (!shown.length) {
+    bar.appendChild(el('div', 'muted', q ? '没有匹配的模型' : '没有可展示的模型'));
+    return;
+  }
+  const cur = ($('model') && $('model').value.trim()) || '';
+  for (const it of shown) {
+    const c = el('button', 'chip' + (it.relay ? ' relay' : ''), it.id);
+    c.type = 'button';
+    c.dataset.model = it.id;
+    c.title = '点击复制「' + it.id + '」并填入模型框' + (it.relay ? '（来自第三方 / 中转站通道）' : '');
+    if (it.id === cur) c.classList.add('active');
+    c.onclick = async () => {
+      // 先填框、再复制：即便复制被浏览器拦下（非安全上下文 / 无权限），
+      // 用户至少已经拿到能直接用的模型名，不会"点了没反应"。
+      if ($('model')) $('model').value = it.id;
+      for (const b of bar.querySelectorAll('.chip')) b.classList.toggle('active', b === c);
+      if (await writeClipboard(it.id)) toast('已复制模型名：' + it.id, 'ok');
+      else toast('已填入模型框；复制被浏览器拦截，请手动选择', 'err');
+    };
+    bar.appendChild(c);
+  }
+}
+
+// renderAdminModelPanel 面板骨架：计数行 + 操作行 + 名字墙 + 过滤框。
+function renderAdminModelPanel(items) {
+  const box = $('adminModelPanel');
+  if (!box) return null;
+  box.textContent = '';
+  const relay = items.filter((x) => x.relay).length;
+  const head = el('div', 'modelpick-head');
+  head.appendChild(el('span', 'n', items.length
+    ? '共 ' + items.length + ' 个模型'
+      + (relay ? '（号池 ' + (items.length - relay) + ' · 通道 ' + relay + '）' : '')
+      + ' · 点名字即复制并填入上方模型框'
+    : '模型列表为空'));
+  const ops = el('span', 'row tight');
+  if (items.length) ops.appendChild(copyBtn(() => items.map((x) => x.id).join('\n'), '复制全部'));
+  const again = el('button', 'ghost', '重新拉取');
+  again.type = 'button';
+  again.onclick = () => loadAdminModels(true);
+  ops.appendChild(again);
+  const close = el('button', 'ghost', '收起');
+  close.type = 'button';
+  close.onclick = () => { box.classList.add('hidden'); };
+  ops.appendChild(close);
+  head.appendChild(ops);
+  box.appendChild(head);
+
+  if (!items.length) {
+    box.appendChild(el('div', 'hintbar', '暂未探测到模型列表（上游可能不可达，稍后点「重新拉取」）'));
+    return box;
+  }
+  const bar = el('div', 'modelpick-bar');
+  renderAdminModelChips(bar, items, '');
+  box.appendChild(bar);
+  // 过滤框只在模型较多时才有用：十来个模型还给个搜索框，是拿复杂度换噪音。
+  if (items.length > 12) {
+    const fw = el('div', 'row tight');
+    fw.style.cssText = 'margin-top:8px;';
+    const f = el('input');
+    f.type = 'text';
+    f.className = 'mono';
+    f.placeholder = '过滤模型名…';
+    f.style.cssText = 'min-width:200px;';
+    f.oninput = () => renderAdminModelChips(bar, items, f.value);
+    fw.appendChild(f);
+    box.appendChild(fw);
+  }
+  return box;
+}
+
+// loadAdminModels 拉取并展开。「一键拉取」按钮与面板里的「重新拉取」都走这里。
+async function loadAdminModels(force) {
+  const box = $('adminModelPanel');
+  const btn = $('btnAdminModels');
+  if (!box) return;
+  if (!force && !box.classList.contains('hidden')) { // 已展开 → 再点即收起
+    box.classList.add('hidden');
+    return;
+  }
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '拉取中…'; }
+  try {
+    const items = await fetchAdminModels();
+    renderAdminModelPanel(items);
+    box.classList.remove('hidden');
+  } catch (e) {
+    // 失败也要**留在页面上**（toast 几秒就消失，用户只看到面板没开）：
+    // 面板里给出原因和一个能立刻重试的入口。
+    box.textContent = '';
+    const head = el('div', 'modelpick-head');
+    head.appendChild(el('span', 'n', '拉取失败：' + e.message));
+    const ops = el('span', 'row tight');
+    const again = el('button', 'ghost', '重试');
+    again.type = 'button';
+    again.onclick = () => loadAdminModels(true);
+    ops.appendChild(again);
+    const close = el('button', 'ghost', '收起');
+    close.type = 'button';
+    close.onclick = () => { box.classList.add('hidden'); };
+    ops.appendChild(close);
+    head.appendChild(ops);
+    box.appendChild(head);
+    box.appendChild(el('div', 'hintbar', '模型目录来自上游探测（服务端缓存 5 分钟），上游不可达时会拉空。'));
+    box.classList.remove('hidden');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label || '一键拉取全部模型'; }
+  }
+}
+
+$('btnAdminModels').onclick = () => loadAdminModels();
 
 // ======================================================================
 // 代理（v0.14.0 出口代理；v0.17.9 拆三块；v0.31.36 合回「代理总览」）
