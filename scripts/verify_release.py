@@ -200,7 +200,9 @@ def main():
         if a.skip_download:
             ok, err = fetch(url)
             if not ok:
-                die("%s 不可达：%s（清单指向了未发布的资产）" % (name, err))
+                hint = ("（清单指向了未发布的资产）" if err.startswith("HTTP 404")
+                        else "（网络/代理问题，先重试或换网络，别改清单）")
+                die("%s 不可达：%s %s" % (name, err, hint))
             print("  可达 ✓")
             continue
 
@@ -208,7 +210,11 @@ def main():
             dst = os.path.join(td, name)
             got, err = fetch(url, dst)
             if err:
-                die("%s 下载失败：%s（清单指向了未发布的资产？）" % (name, err))
+                # 只有 404 才是"资产没发"；代理/网络抖动要**说成网络问题**，
+                # 否则人会去改清单（改错方向），或者干脆不再相信这个校验。
+                hint = ("（清单指向了未发布的资产）" if err.startswith("HTTP 404")
+                        else "（网络/代理问题，先重试或换网络，别改清单）")
+                die("%s 下载失败：%s %s" % (name, err, hint))
             got_sha, got_size = got
             if want_size and got_size != want_size:
                 die("%s 大小不一致：清单 %d，实际 %d" % (name, want_size, got_size))
