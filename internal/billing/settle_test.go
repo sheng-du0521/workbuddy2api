@@ -43,6 +43,11 @@ type fakeLedger struct {
 	settleErr error
 	chargeErr error
 
+	// commits 记录每次 CommitSettlement 的**完整计划**（v0.31.60）：
+	// 现在钱的四个落点是一次提交，用例必须能断言"这一笔计划里到底有什么"，
+	// 而不是分别去看扣费/settle/日志三个切片。
+	commits []Settlement
+	// settles/charges 由 CommitSettlement 按计划回填，保持既有断言写法可用。
 	settles  []struct{ ID, Micro int64 }
 	charges  []struct{ User, Micro int64 }
 	logs     []*usage.UsageLog
@@ -51,20 +56,24 @@ type fakeLedger struct {
 
 func (f *fakeLedger) PricingMultiplier() float64 { return f.mult }
 
-func (f *fakeLedger) SettleReservation(id int64, chargedMicro int64) (int64, error) {
-	if f.settleErr != nil {
-		return 0, f.settleErr
+// CommitSettlement 模拟"一个事务"：出错时**什么都不记**（连流水也不记），
+// 这正是事务化要表达的语义 —— 旧假账本会先记 settle 再记 charge，掩盖了半截账。
+func (f *fakeLedger) CommitSettlement(st Settlement) error {
+	if st.HasReservation && f.settleErr != nil {
+		return f.settleErr
 	}
-	f.settles = append(f.settles, struct{ ID, Micro int64 }{id, chargedMicro})
-	return 1, nil
-}
-
-func (f *fakeLedger) ChargeUser(userID int64, micro int64) (int64, error) {
-	if f.chargeErr != nil {
-		return 0, f.chargeErr
+	if !st.HasReservation && st.ChargedMicro > 0 && f.chargeErr != nil {
+		return f.chargeErr
 	}
-	f.charges = append(f.charges, struct{ User, Micro int64 }{userID, micro})
-	return 1, nil
+	f.commits = append(f.commits, st)
+	if st.HasReservation {
+		f.settles = append(f.settles, struct{ ID, Micro int64 }{st.ReservationID, st.ChargedMicro})
+	} else if st.ChargedMicro > 0 {
+		f.charges = append(f.charges, struct{ User, Micro int64 }{st.UserID, st.ChargedMicro})
+	}
+	log := st.Log
+	f.logs = append(f.logs, &log)
+	return nil
 }
 
 func (f *fakeLedger) InsertUsageLog(e *usage.UsageLog) error {
@@ -116,8 +125,12 @@ func TestSettleWithReservationDoesNotChargeBalance(t *testing.T) {
 	if len(f.charges) != 0 {
 		t.Fatalf("有预扣时不得再直接扣余额（会收两次钱），得 %+v", f.charges)
 	}
-	if !res.HostCreditDue || res.ConsumedCredit != 2.5 || res.Scope != ScopePool {
+	// 本用例没给 Host 意图 → 这笔不产生分成（due=false），但消费积分与 scope 必须正确。
+	if res.HostCreditDue || res.ConsumedCredit != 2.5 || res.Scope != ScopePool {
 		t.Fatalf("结果字段不对：due=%v credit=%v scope=%q", res.HostCreditDue, res.ConsumedCredit, res.Scope)
+	}
+	if len(f.commits) != 1 || f.commits[0].Host != nil {
+		t.Fatalf("无号主意图时不得生成分成入账，得 %+v", f.commits)
 	}
 }
 

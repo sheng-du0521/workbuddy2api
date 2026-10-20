@@ -581,7 +581,12 @@ func (s *Store) SetAccountPoolState(uid, state, note string) error {
 
 // AddAccountEarned 累加某账号为号主产生的收益（微点）。
 func (s *Store) AddAccountEarned(uid string, micro int64) error {
-	_, err := s.db.Exec(`UPDATE accounts SET earned_micro = earned_micro + ?, updated_at = ? WHERE uid = ?`,
+	return addAccountEarnedTx(s.db, uid, micro)
+}
+
+// addAccountEarnedTx 账号累计收益的写入（事务内也走它，见 store_settlement.go）。
+func addAccountEarnedTx(db execer, uid string, micro int64) error {
+	_, err := db.Exec(`UPDATE accounts SET earned_micro = earned_micro + ?, updated_at = ? WHERE uid = ?`,
 		micro, time.Now().Unix(), uid)
 	return err
 }

@@ -1,17 +1,20 @@
 {
-  "version": "0.31.59",
+  "version": "0.31.60",
   "min_supported": "0.24.0",
-  "notes": "v0.31.59：按《全面审查报告 2026-10-19》整改 A 级实证缺陷与低成本 P1/P2。① **F01 预扣释放丢可提现额度**：reservations 新增 frozen_withdrawable_micro，释放/结算按实际消耗还原分桶（预扣 80→全额释放后恢复 100/100，不再永久损失）。② **F02 结算失败仍发分成**：只有**已提交**的实扣才回传 ChargedMicro 并驱动 HostCreditDue；无预扣扣费失败也置 Settled=false；调用方再加双保险；流水写失败不再静默丢弃。③ **F03 agent 忽略 410 stop**：agent 先解析 body 再判状态码，410/401/403 视为终态——stopAll、清 lastAction、退出；服务端在插件停用时向 agent 下发 410 stop（poll/config），agent 0.3.8。④ **F10 模型同步**：单飞锁（并发入口 409 sync_in_progress）+ 整批事务（失败零写入）。⑤ **F11 冷却视图**：full/partial 改用与真实选号同一份规则（白名单/消耗分组/出口健康），删掉从未赋值的 probing。⑥ **F12/F13/F14**：补 ReadTimeout 60s（不设 WriteTimeout）；报表分位改最近 5 万条有界采样；鉴权日志与限流共用同一套可信代理 IP 解析（不可信对端忽略 XFF）。⑦ **F05/F09**：发行包补齐 scripts/growth_run.py 等运行期脚本（含递归打包），Dockerfile 同步；README 备份指引改为 SQLite Online Backup / VACUUM INTO，并强调 secret.key 必须一起备份。⑧ **F08**：go.mod 与 Docker 构建镜像统一到 1.27。仍待处理（有依赖或需独立版本）：F04 SSH 撤权需服务器操作、F06 发布闸门（已加 scripts/verify_release.py）、F07 清单签名需密钥体系、F15/F16/F17/F18 属长期工程。详见 docs/审查问题核对与整改-20261020.md。",
-  "released_at": 1792471214,
+  "notes": "v0.31.60：审查报告 F02（资金事务化）与 F07（清单独立签名）落地。① **F02 结算四落点单事务**：用户余额 / 用量流水 / 号主分成 / 上级返点此前是四次独立提交，任何一步失败都留下半截账（扣了钱没流水、发了分成没扣到钱）。现在收敛为 Store.CommitSettlement 一个事务：要么四个落点全在，要么一分不动并补一条零费流水留痕；新增 3 条故障注入用例（usage_logs / host_earnings 触发器）钉住回滚语义。② **F07 清单签名**：新增 cmd/relsign（ed25519，keygen/sign/verify），version.json 带 sig_alg/key_id/signature；客户端**先验签再使用**，验签不过则整份丢弃（不提示升级、不触发下载、不写缓存），状态接口下发 verified/signed_by/verify_note；签的是语义字段（改 sha256/url/版本/体积/平台任一项必然验不过，重排缩进不影响）。公钥内置进二进制，私钥仅存发布机。③ **F06 部分**：发布前必须先签名并通过 relsign verify。运维注意：自建清单的部署请把 update_signature_required 设为 0，否则更新检查会因无签名而失败。",
+  "released_at": 1792474692,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.59/webapp.exe",
-      "sha256": "a5a03cd1dfcfba10d3a3980f6e2189b652c98f430cfa65a3724eb6aad6599732",
-      "size": 15639552
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.60/webapp.exe",
+      "sha256": "c954dba96cd5e5a4dace7e6ff8b319ad3b61b4def137e21b66073fcee78600e2",
+      "size": 15659520
     }
   ],
+  "sig_alg": "ed25519",
+  "key_id": "b899cc8d",
+  "signature": "kYsyfwQkVKOZl43epPIOOxVDNiJhJ2MqK8+RLThNHUVugnLkqWVAT2tVnMkwFjm4d1JktDA0PPT9xGycru56Aw==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

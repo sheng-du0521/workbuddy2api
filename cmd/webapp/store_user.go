@@ -478,10 +478,14 @@ func (s *Store) migrateUsers() error {
 
 // InsertHostEarning 记一笔代挂分成入账。
 func (s *Store) InsertHostEarning(e *HostEarning) error {
+	return insertHostEarningTx(s.db, e)
+}
+
+func insertHostEarningTx(db execer, e *HostEarning) error {
 	if e.CreatedAt == 0 {
 		e.CreatedAt = time.Now().Unix()
 	}
-	_, err := s.db.Exec(`INSERT INTO host_earnings
+	_, err := db.Exec(`INSERT INTO host_earnings
 		(account_uid, owner_user_id, from_user_id, model, charged_micro, earned_micro, created_at)
 		VALUES (?,?,?,?,?,?,?)`,
 		e.AccountUID, e.OwnerUserID, e.FromUserID, e.Model, e.Charged, e.Earned, e.CreatedAt)
@@ -905,7 +909,20 @@ func (s *Store) CreditWithdrawable(id int64, micro int64) error {
 	if micro <= 0 {
 		return nil
 	}
-	res, err := s.db.Exec(
+	return creditWithdrawableTx(s.db, id, micro)
+}
+
+// execer 同时被 *sql.DB 与 *sql.Tx 满足 —— 让"同一段 SQL"既能独立执行也能进事务，
+// 不必为事务版本再抄一遍（v0.31.60）。
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func creditWithdrawableTx(db execer, id int64, micro int64) error {
+	if micro <= 0 {
+		return nil
+	}
+	res, err := db.Exec(
 		`UPDATE users SET balance_micro = balance_micro + ?,
 			withdrawable_micro = withdrawable_micro + ?, updated_at = ?
 		 WHERE id = ?`,
@@ -955,6 +972,18 @@ func (s *Store) ChargeUser(id int64, micro int64) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	bal, err := chargeUserTx(tx, id, micro)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return bal, nil
+}
+
+// chargeUserTx 事后扣费的唯一实现（事务由调用方给，见 store_settlement.go）。
+func chargeUserTx(tx *sql.Tx, id int64, micro int64) (int64, error) {
 	if _, err := tx.Exec(
 		`UPDATE users SET balance_micro = balance_micro - ?, `+clampWithdrawableSQL+`, updated_at = ?
 		 WHERE id = ?`,
@@ -963,9 +992,6 @@ func (s *Store) ChargeUser(id int64, micro int64) (int64, error) {
 	}
 	var bal int64
 	if err := tx.QueryRow(`SELECT balance_micro FROM users WHERE id = ?`, id).Scan(&bal); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return bal, nil
@@ -1256,8 +1282,23 @@ func (s *Store) SettleReservation(id int64, actualMicro int64) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	bal, err := settleReservationTx(tx, id, actualMicro)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return bal, nil
+}
+
+// settleReservationTx 预扣对账的**唯一实现**，事务由调用方给（v0.31.60，审查 F02）。
+//
+// 抽成 tx 版本是为了让"扣费 + 流水 + 分成 + 返点"能挂在同一个事务里提交；
+// 独立入口 SettleReservation 只是它的一层事务包装，两份逻辑不会漂移。
+func settleReservationTx(tx *sql.Tx, id int64, actualMicro int64) (int64, error) {
 	var userID, amount, frozen int64
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		`SELECT user_id, amount_micro, frozen_withdrawable_micro FROM reservations WHERE id = ?`, id).
 		Scan(&userID, &amount, &frozen)
 	if err == sql.ErrNoRows {
@@ -1298,9 +1339,6 @@ func (s *Store) SettleReservation(id int64, actualMicro int64) (int64, error) {
 	}
 	var bal int64
 	if err := tx.QueryRow(`SELECT balance_micro FROM users WHERE id = ?`, userID).Scan(&bal); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return bal, nil
@@ -1492,23 +1530,31 @@ func (s *Store) TouchAPIKey(id int64) {
 
 // InsertUsageLog 写一笔流水。
 func (s *Store) InsertUsageLog(l *UsageLog) error {
+	_, err := s.db.Exec(insertUsageLogSQL, usageLogArgs(l)...)
+	return err
+}
+
+// insertUsageLogSQL 与 usageLogArgs 把"流水怎么落库"收成一份（v0.31.60）：
+// 独立写入（管理通道 / 结算失败补痕）与事务内写入（CommitSettlement）必须**逐字段一致**，
+// 两处各抄一遍列表，迟早出现"少写一列、静默丢字段"。
+const insertUsageLogSQL = `INSERT INTO usage_logs (user_id, key_id, model, prompt_tokens, completion_tokens,
+		 upstream_credit, charged_micro, upstream_uid, scope, status, error_msg, created_at,
+		 sticky_key_hash, attempts, cache_hit_tokens, cache_miss_tokens, cache_write_tokens, latency_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+func usageLogArgs(l *UsageLog) []any {
 	if l.CreatedAt == 0 {
 		l.CreatedAt = time.Now().Unix()
 	}
 	if l.Scope == "" {
 		l.Scope = ScopePool
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO usage_logs (user_id, key_id, model, prompt_tokens, completion_tokens,
-		 upstream_credit, charged_micro, upstream_uid, scope, status, error_msg, created_at,
-		 sticky_key_hash, attempts, cache_hit_tokens, cache_miss_tokens, cache_write_tokens, latency_ms)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	return []any{
 		l.UserID, l.KeyID, l.Model, l.PromptTokens, l.CompletionTokens,
 		l.UpstreamCredit, l.ChargedMicro, l.UpstreamUID, l.Scope, l.Status, l.ErrorMsg, l.CreatedAt,
 		l.StickyKeyHash, l.Attempts,
 		l.CacheHitTokens, l.CacheMissTokens, l.CacheWriteTokens, l.LatencyMS,
-	)
-	return err
+	}
 }
 
 // UsageDaily 按本地自然日聚合近 days 天的用量；userID <= 0 表示全站。
@@ -1530,10 +1576,14 @@ func (s *Store) UsageDaily(userID int64, days int) ([]UsageDailyStat, error) {
 
 // InsertRebate 记一笔返点。
 func (s *Store) InsertRebate(r *Rebate) error {
+	return insertRebateTx(s.db, r)
+}
+
+func insertRebateTx(db execer, r *Rebate) error {
 	if r.CreatedAt == 0 {
 		r.CreatedAt = time.Now().Unix()
 	}
-	res, err := s.db.Exec(`INSERT INTO rebates
+	res, err := db.Exec(`INSERT INTO rebates
 		(kind, beneficiary, from_user_id, account_uid, base_micro, rebate_micro, note, created_at)
 		VALUES (?,?,?,?,?,?,?,?)`,
 		r.Kind, r.Beneficiary, r.FromUserID, r.AccountUID, r.BaseMicro, r.RebateMicro, r.Note, r.CreatedAt)

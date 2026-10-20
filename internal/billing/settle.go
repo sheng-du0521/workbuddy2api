@@ -78,16 +78,71 @@ func (u Usage) Total() int { return u.PromptTokens + u.CompletionTokens }
 
 // Ledger 结算需要的**账本写入面**。由 cmd/webapp 的 Store 适配实现。
 //
-// 只列真正用到的 5 个方法：接口越窄，测试就越好造假对象，也越不容易把
-// "结算"偷偷扩大成"什么都干"。
+// v0.31.60（审查 F02 的收尾）：写入面从"四个各自独立的方法"收敛成
+// **一个 CommitSettlement**。原因是钱的四个落点（用户余额 / 用量流水 / 号主分成 /
+// 上级返点）此前是四条独立语句四次提交，任何一次失败都会留下"账只记了一半"的中间态：
+// 扣了钱没流水、发了分成没扣到钱、返点发了却没记分成。原子性是账本的基本要求，
+// 不能靠调用方按顺序调用来近似。
+//
+// 只列真正用到的 3 个方法：接口越窄，测试就越好造假对象。
 type Ledger interface {
 	PricingMultiplier() float64
-	SettleReservation(id int64, chargedMicro int64) (int64, error)
-	ChargeUser(userID int64, micro int64) (int64, error)
+	// CommitSettlement 在**同一个事务**里落地一笔结算的全部写入。
+	// 返回错误 = 这一笔一分钱都没动（不是"部分成功"）。
+	CommitSettlement(st Settlement) error
+	// InsertUsageLog 只在 CommitSettlement 失败后**降级补痕**用：钱不动，
+	// 但"上游确实消耗了 token"这个事实不能跟着丢掉，否则对账时连痕迹都没了。
 	InsertUsageLog(*usage.UsageLog) error
 	// RecordConsumeFailure 记一条**账目类**失败（结算/扣费失败）。
 	// 用散字段而不是结构体：失败台账的结构体属于展示/查询层，不该被结算反向依赖。
 	RecordConsumeFailure(stage, source, model, uid string, userID, keyID int64, attempt int, detail string)
+}
+
+// HostShare 号主分成的**意图**：调用方只回答"谁、比例多少、上级是谁"，
+// **金额一律由本包算**（HostEarn / ReferralRebate 是唯一口径）。
+//
+// 为什么这样切：资格（是不是代挂、有没有入池）依赖选号侧状态，只有 cmd/webapp 有；
+// 金额是纯公式，只有这里能保证"分成与返点不会各算一遍、两处漂移"。
+type HostShare struct {
+	OwnerUserID   int64
+	Ratio         float64
+	ReferrerID    int64   // 号主的上级推广人；<=0 或等于本人 = 没有返点
+	ReferrerRatio float64 // 按**上级**解析的推广比例
+}
+
+// HostCredit 号主分成的一笔入账（金额已算定）。
+type HostCredit struct {
+	OwnerUserID  int64
+	AccountUID   string
+	FromUserID   int64
+	Model        string
+	ChargedMicro int64
+	EarnedMicro  int64
+}
+
+// ReferralCredit 上级推广返点的一笔入账（金额已算定，且已被平台留成钳过）。
+type ReferralCredit struct {
+	Beneficiary int64
+	FromUserID  int64 // 产生收益的号主（不是消费者）
+	AccountUID  string
+	BaseMicro   int64 // 基数 = 号主本次收益
+	RebateMicro int64
+	Note        string
+}
+
+// Settlement 一笔结算要在**同一个事务**里落地的全部写入。
+//
+// 字段都是"已经算定的数"：账本层不做任何判断（该不该扣、该不该发），
+// 只负责把这几件事一起提交或一起放弃。
+type Settlement struct {
+	UserID         int64
+	HasReservation bool
+	ReservationID  int64
+	ChargedMicro   int64
+	Log            usage.UsageLog
+	// Host 为 nil = 本笔不发分成；Referral 为 nil = 不发推广返点。
+	Host     *HostCredit
+	Referral *ReferralCredit
 }
 
 // Estimator 估算缺失 credit 的钩子（单价来源与观测表都在调用方）。
@@ -132,6 +187,10 @@ type Request struct {
 	ErrMsg     string
 	StickyHash string
 	Attempts   int
+
+	// Host 号主分成意图（v0.31.60）：nil = 本笔无可分成的号主。
+	// 由调用方**在结算前**解析（需要选号侧状态）；金额由本包算。
+	Host *HostShare
 }
 
 // Result 一次结算的输出。
@@ -149,9 +208,11 @@ type Result struct {
 	// ConsumedCredit 本次号池积分消耗（上游 direct 口径，估不出时按 0）。
 	// 分成/返点以它为基数（不是平台实收），故必须回传。
 	ConsumedCredit float64
-	// HostCreditDue=true 表示调用方应当触发"号主分成"（本次非免费、且有积分消耗）。
-	// 判定放在这里是因为它依赖 hostSelf 与 consumedCredit，两者都在本函数内确定；
-	// 但**执行**留给调用方 —— 它需要选号侧状态（号主是谁 / 是否已入池）。
+	// HostCreditDue=true 表示**本笔已经给号主入账了分成**（与扣费同一事务）。
+	//
+	// v0.31.60 起它只是**观测标记**，调用方不再据此发钱 —— 分成已随
+	// Store.CommitSettlement 一起提交（审查 F02）。保留字段是为了让实时态势与
+	// 用例能区分"这笔产生分成"与"这笔没产生"。
 	HostCreditDue bool
 }
 
@@ -210,78 +271,121 @@ func (s Settler) Settle(req Request) Result {
 	// 给号主发了可提现收益，而消费者的钱其实一分没扣（预扣随后被释放）。
 	// 审查用临时 SQLite trigger 让 reservation 删除失败复现了这条路径：
 	// settled=false、reportedCharged=5、号主余额 +3。
-	chargeCommitted := hostSelf // 代挂自用：零费用，视为"无需扣费"的已提交状态
+
+	// 这一笔的全部落点一次组装（v0.31.60，F02 收尾）。
+	//
+	// 顺序很关键：**分成/返点金额在提交之前算定**，随同一事务落地。
+	// 旧实现是"先扣费、再写流水、再由调用方另发分成"，四步四提交 ——
+	// 中间任何一步失败都留下半截账（已扣钱无流水、已发分成未收到钱）。
+	st := Settlement{
+		UserID:         req.UserID,
+		HasReservation: req.HasReservation,
+		ReservationID:  req.ReservationID,
+		ChargedMicro:   chargedMicro,
+		Log: usage.UsageLog{
+			UserID:           req.UserID,
+			KeyID:            req.KeyID,
+			Model:            req.Model,
+			PromptTokens:     req.Usage.PromptTokens,
+			CompletionTokens: req.Usage.CompletionTokens,
+			UpstreamCredit:   consumedCredit,
+			ChargedMicro:     chargedMicro,
+			UpstreamUID:      req.UpstreamUID,
+			Scope:            res.Scope,
+			Status:           req.Status,
+			ErrorMsg:         res.ErrMsg,
+			StickyKeyHash:    req.StickyHash,
+			Attempts:         req.Attempts,
+			CacheHitTokens:   req.Usage.CacheHitTokens,
+			CacheMissTokens:  req.Usage.CacheMissTokens,
+			CacheWriteTokens: req.Usage.CacheWriteTokens,
+			LatencyMS:        req.Usage.LatencyMS,
+		},
+	}
 	if !hostSelf {
-		switch {
-		case req.HasReservation:
-			// 预扣-结算：退还冻结额、扣实际消耗，净额即多退少补。
-			if _, err := s.Ledger.SettleReservation(req.ReservationID, chargedMicro); err != nil {
-				res.ErrMsg = appendMark(res.ErrMsg, "[settle_failed:"+err.Error()+"]")
-				res.Settled = false // 交给调用方 defer 释放，避免预扣悬空
-				// 结算失败是**账目类**失败：响应已经发出，钱的方向对用户有利，
-				// 但必须留痕，否则"账对不上"时无从追查（v0.26.2 那笔孤儿预扣
-				// 就是靠 usage_logs 的 error_msg 才定位到的；结构化之后不必再翻文本）。
-				s.recordFailure(StageSettle, "settle", req, "预扣结算失败："+err.Error())
-			} else {
-				chargeCommitted = true
+		st.Host, st.Referral = planHostCredit(req, consumedCredit, chargedMicro)
+	}
+
+	if err := s.Ledger.CommitSettlement(st); err != nil {
+		// 整笔放弃：钱一分没动（事务回滚），所以既不能报 chargedMicro，
+		// 也不能发分成 —— 但**必须留痕**，否则"这笔请求哪去了"无从追查。
+		stage := StageCharge
+		detail := "事后扣费失败：" + err.Error()
+		if req.HasReservation {
+			stage = StageSettle
+			detail = "预扣结算失败：" + err.Error()
+		}
+		res.ErrMsg = appendMark(res.ErrMsg, "["+stage+"_failed:"+err.Error()+"]")
+		res.Settled = false
+		res.ChargedMicro = 0
+		res.ConsumedCredit = consumedCredit
+		res.HostCreditDue = false
+		// 降级补痕：用量事实（token / 积分 / 上游账号）不能因为钱没动就消失。
+		// ChargedMicro 记 0 —— 报表按 charged_micro 汇总，写名义值等于虚增平台收入。
+		fallback := st.Log
+		fallback.ChargedMicro = 0
+		fallback.ErrorMsg = res.ErrMsg
+		if lerr := s.Ledger.InsertUsageLog(&fallback); lerr != nil {
+			log.Printf("WARN: [billing] 结算失败后补写用量流水也失败（acct=%s）：%v", req.UpstreamUID, lerr)
+		}
+		s.recordFailure(stage, stage, req, detail)
+		return res
+	}
+
+	res.ChargedMicro = chargedMicro
+	res.ConsumedCredit = consumedCredit
+	// 代挂分成已随本事务入账；HostCreditDue 现在只作"这笔发了分成"的观测标记
+	// （调用方**不再**需要、也不应该再自己发一次）。
+	res.HostCreditDue = st.Host != nil
+	return res
+}
+
+// planHostCredit 把"号主意图"折算成两笔已定金额的入账（纯函数，无 IO）。
+//
+// 分层（v0.31.60）：资格（代挂/入池/比例）由调用方在 Request.Host 里回答；
+// 金额只在这里算一次。这样"分成不得超平台实收""返点不得侵占留成"两条硬约束
+// 只有 HostEarn / ReferralRebate 一处实现，不会因为调用方换人而漂移。
+func planHostCredit(req Request, consumedCredit float64, chargedMicro int64) (*HostCredit, *ReferralCredit) {
+	return PlanHostCredit(req.Host, req.UpstreamUID, req.Model, req.UserID, consumedCredit, chargedMicro)
+}
+
+// PlanHostCredit 把"号主意图"折算成两笔已定金额的入账（纯函数，无 IO）。
+//
+// 导出是为了让"只有分成、没有扣费"的路径（测试夹具 / 事后补账）复用**同一套金额口径**：
+// 分成与返点的两条硬约束（不得超平台实收、不得侵占留成）只有 HostEarn / ReferralRebate
+// 一处实现，任何调用方都不能自己再算一遍。
+func PlanHostCredit(share *HostShare, accountUID, model string, fromUserID int64, consumedCredit float64, chargedMicro int64) (*HostCredit, *ReferralCredit) {
+	h := share
+	if h == nil || h.OwnerUserID <= 0 || h.Ratio <= 0 || consumedCredit <= 0 {
+		return nil, nil
+	}
+	earn := HostEarn(consumedCredit, h.Ratio, chargedMicro)
+	if earn <= 0 {
+		return nil, nil
+	}
+	hc := &HostCredit{
+		OwnerUserID:  h.OwnerUserID,
+		AccountUID:   accountUID,
+		FromUserID:   fromUserID,
+		Model:        model,
+		ChargedMicro: chargedMicro,
+		EarnedMicro:  earn,
+	}
+	var ref *ReferralCredit
+	// 自荐守卫：referred_by 指向自己 = 脏数据，不得一笔收益吃两次。
+	if h.ReferrerID > 0 && h.ReferrerID != h.OwnerUserID && h.ReferrerRatio > 0 {
+		if rb := ReferralRebate(earn, h.ReferrerRatio, chargedMicro); rb > 0 {
+			ref = &ReferralCredit{
+				Beneficiary: h.ReferrerID,
+				FromUserID:  h.OwnerUserID,
+				AccountUID:  accountUID,
+				BaseMicro:   earn,
+				RebateMicro: rb,
+				Note:        model,
 			}
-		case chargedMicro > 0:
-			// 无预扣（池内还没有单价数据）→ 退化为事后结算。
-			if _, err := s.Ledger.ChargeUser(req.UserID, chargedMicro); err != nil {
-				// 扣费失败不阻断响应（响应已发出），但要留痕。
-				// ⚠️ 必须同时把 Settled 置 false：没有预扣可释放，"未结算"的语义就是
-				// 这笔钱没有扣成功。此前这里只加标记、Settled 保持 true，调用方据此
-				// 认为账已两清并发分成 —— 属于同一条缺陷的第二个入口。
-				res.ErrMsg = appendMark(res.ErrMsg, "[charge_failed:"+err.Error()+"]")
-				res.Settled = false
-				s.recordFailure(StageCharge, "charge", req, "事后扣费失败："+err.Error())
-			} else {
-				chargeCommitted = true
-			}
-		default:
-			// chargedMicro == 0：没有需要扣的钱（上游缺 credit / 纯缓存命中），
-			// 视为已提交（0 元扣费），分成仍按 consumedCredit 判断。
-			chargeCommitted = true
 		}
 	}
-
-	// 流水是事后对账的唯一依据：写失败必须留日志，不能 `_ =` 静默丢弃（审查 F02）。
-	if err := s.Ledger.InsertUsageLog(&usage.UsageLog{
-		UserID:           req.UserID,
-		KeyID:            req.KeyID,
-		Model:            req.Model,
-		PromptTokens:     req.Usage.PromptTokens,
-		CompletionTokens: req.Usage.CompletionTokens,
-		UpstreamCredit:   consumedCredit,
-		ChargedMicro:     chargedMicro,
-		UpstreamUID:      req.UpstreamUID,
-		Scope:            res.Scope,
-		Status:           req.Status,
-		ErrorMsg:         res.ErrMsg,
-		StickyKeyHash:    req.StickyHash,
-		Attempts:         req.Attempts,
-		CacheHitTokens:   req.Usage.CacheHitTokens,
-		CacheMissTokens:  req.Usage.CacheMissTokens,
-		CacheWriteTokens: req.Usage.CacheWriteTokens,
-		LatencyMS:        req.Usage.LatencyMS,
-	}); err != nil {
-		log.Printf("WARN: [billing] 写用量流水失败（本次 charged=%d acct=%s）：%v", chargedMicro, req.UpstreamUID, err)
-	}
-
-	// 只回传**已提交**的实扣。未提交时为 0：既不让实时态势显示"扣了 5 点"，
-	// 也不让分成按一个不存在的收入去发钱。
-	if chargeCommitted {
-		res.ChargedMicro = chargedMicro
-	} else {
-		res.ChargedMicro = 0
-	}
-	res.ConsumedCredit = consumedCredit
-	// 代挂分成：本次若由某号主的「已入池」代挂账号服务平台流量，
-	// 按「号池积分消耗 × 分成比例」折入号主余额（以本次实收封顶）—— 由调用方执行。
-	// 判定必须同时满足：非免费 + 有积分消耗 + **扣费已提交**。
-	// 只有已提交的实扣才构成"平台收入"，也才谈得上分成（审查 F02）。
-	res.HostCreditDue = !hostSelf && consumedCredit > 0 && chargeCommitted
-	return res
+	return hc, ref
 }
 
 // settleAdminChannel 管理密钥通道（无用户可扣）。

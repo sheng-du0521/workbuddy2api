@@ -5475,6 +5475,16 @@ function renderUpdateStatus(d) {
       '更新源 ' + d.manifest_url + (d.manifest_used && d.manifest_used !== d.manifest_url
         ? '（实际命中 ' + d.manifest_used + '）' : '')));
   }
+  // 清单验签（v0.31.60，审查 F07）：签名是"这份清单有没有被改过"的唯一证据。
+  // 不显示的话，面板上"有新版本"与"有人投毒了清单"长得一模一样。
+  // 老后端不下发这两个字段，因此这里是"有才渲染"，不会多出一行空话。
+  if (d.verified) {
+    box.appendChild(el('div', 'muted', '清单签名 已校验（key ' + (d.signed_by || '—') + '）'));
+  } else if (d.verify_note) {
+    box.appendChild(el('div', 'muted', '清单签名 ' + d.verify_note));
+  } else if (d.latest) {
+    box.appendChild(el('div', 'credit-err', '清单签名 未校验（本二进制无内置公钥或清单未签名）'));
+  }
 
   if (d.enabled === false) { box.appendChild(el('div', 'muted', '版本检查已关闭。')); return; }
   if (d.error && !d.latest) { box.appendChild(el('div', 'credit-err', '检查未成功：' + d.error)); return; }

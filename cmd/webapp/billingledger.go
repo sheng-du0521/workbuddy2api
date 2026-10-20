@@ -17,12 +17,10 @@ type storeLedger struct{ s *Store }
 
 func (l storeLedger) PricingMultiplier() float64 { return l.s.PricingMultiplier() }
 
-func (l storeLedger) SettleReservation(id int64, chargedMicro int64) (int64, error) {
-	return l.s.SettleReservation(id, chargedMicro)
-}
-
-func (l storeLedger) ChargeUser(userID int64, micro int64) (int64, error) {
-	return l.s.ChargeUser(userID, micro)
+// CommitSettlement 同事务落地一笔结算（扣费 / 流水 / 分成 / 返点）。
+// 会 panic 的实现（比如把四条语句各自提交）比报错更糟：错误能被上层转成"钱没动"。
+func (l storeLedger) CommitSettlement(st billing.Settlement) error {
+	return l.s.CommitSettlement(st)
 }
 
 func (l storeLedger) InsertUsageLog(e *usage.UsageLog) error {

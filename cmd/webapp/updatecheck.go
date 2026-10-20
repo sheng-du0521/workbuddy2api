@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -161,6 +162,71 @@ func (a *app) updateSkipVersion() string {
 //
 // 用**相对间隔**（now - lastAt < TTL）而不是绝对时间点判断，且 lastAt 由本机
 // 自己写 —— 系统时钟被改动时最坏结果是多查一次，不会卡死。
+// ---------------------------------------------------------------- 清单验签（v0.31.60，F07）
+
+// kvUpdateRequireSig 清单验签开关。默认开启：**默认不验签等于没有签名**。
+//
+// 只有"用自己的清单、自己发版"的部署才该关掉（它没有我们的公钥）。
+// 关闭不是"跳过校验"，而是把信任模型换回"信这条通道" —— 面板上必须能看出来。
+const kvUpdateRequireSig = "update_signature_required"
+
+// updateTrust 当前生效的验签策略。
+func (a *app) updateTrust() selfupdate.Trust {
+	required := true
+	if v, _ := a.store.GetKV(kvUpdateRequireSig); strings.TrimSpace(v) == "0" {
+		required = false
+	}
+	return selfupdate.Trust{Required: required, Pub: selfupdate.DefaultPublicKey()}
+}
+
+// markVerified 把验签结果写进对前端的状态（v0.31.60，F07）。
+//
+// 只在下发到界面时调用；`Decide` 保持纯函数（它不认识策略与公钥）。
+func (a *app) markVerified(st *updateStatus, m *updateManifest) {
+	if st == nil || m == nil {
+		return
+	}
+	if !a.updateTrust().Required {
+		st.VerifyNote = "验签已关闭（update_signature_required=0）"
+		return
+	}
+	st.Verified = true
+	st.SignedBy = m.KeyID
+}
+
+// manifestTrusted 校验一份清单；失败时返回**给人看的原因**（不是只给个 false）。
+//
+// 失败语义是 fail-closed：不提示升级、不触发下载、不写缓存。
+// 清单同时决定"下载哪个文件"和"它的 sha256 是多少"，通道被投毒时两者会一起被改，
+// 所以这里必须挡住整份清单，而不是"只提示不下载"。
+func (a *app) manifestTrusted(m *updateManifest) error {
+	t := a.updateTrust()
+	err := t.Check(m)
+	if err != nil && t.Required && len(t.Pub) == 0 {
+		// 公钥缺失是**构建问题**，不该被运维误读成"清单被篡改"。
+		if perr := selfupdate.PublicKeyErr(); perr != nil {
+			return fmt.Errorf("内置公钥解析失败：%w", perr)
+		}
+		return fmt.Errorf("本二进制未内置更新公钥，无法校验清单（可在设置里关闭验签）")
+	}
+	return err
+}
+
+// cachedTrustedManifest 取缓存清单并验签；验签不过**当作没有缓存**。
+//
+// 为什么当没有缓存而不是直接报错：缓存是本机写的，它过期/被手改都可能，
+// 此时正确动作是"去拉一份新的"，而不是拿着不可信的旧内容告诉用户"有更新"。
+func (a *app) cachedTrustedManifest() *updateManifest {
+	m := a.cachedManifest()
+	if m == nil {
+		return nil
+	}
+	if err := a.manifestTrusted(m); err != nil {
+		return nil
+	}
+	return m
+}
+
 func (a *app) updateCacheFresh(now time.Time) bool {
 	v, _ := a.store.GetKV(kvUpdateLastAt)
 	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
@@ -190,10 +256,11 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 		return st
 	}
 	if !force && a.updateCacheFresh(now) {
-		if m := a.cachedManifest(); m != nil {
+		if m := a.cachedTrustedManifest(); m != nil {
 			out := decideUpdate(version, m, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL = true, st.ManifestURL
 			out.ManifestUse = a.updateManifestUsed()
+			a.markVerified(&out, m)
 			a.attachDownload(&out)
 			return out
 		}
@@ -203,10 +270,11 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 	updateFetchMu.Lock()
 	defer updateFetchMu.Unlock()
 	if !force && a.updateCacheFresh(time.Now()) {
-		if m := a.cachedManifest(); m != nil {
+		if m := a.cachedTrustedManifest(); m != nil {
 			out := decideUpdate(version, m, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL = true, st.ManifestURL
 			out.ManifestUse = a.updateManifestUsed()
+			a.markVerified(&out, m)
 			a.attachDownload(&out)
 			return out
 		}
@@ -217,11 +285,31 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 		// 失败：**保留上一次的好结果**（如果有），只把 error 标出来。
 		// 覆盖成空会让"暂时网络不通"看起来像"项目已停止维护"。
 		st.Error = err.Error()
-		if m2 := a.cachedManifest(); m2 != nil {
+		if m2 := a.cachedTrustedManifest(); m2 != nil {
 			out := decideUpdate(version, m2, st.Skipped, a.updateLastCheckAt())
 			out.Enabled, out.ManifestURL, out.Error = true, st.ManifestURL, st.Error
 			out.ManifestUse = a.updateManifestUsed()
 			out.Stale = true
+			a.markVerified(&out, m2)
+			a.attachDownload(&out)
+			return out
+		}
+		a.attachDownload(&st)
+		return st
+	}
+
+	// 验签（v0.31.60，F07）：**先校验再使用**，不通过就整份丢弃。
+	// 顺序不能反 —— 先写缓存再校验的话，一份伪造清单会被缓存在本机，
+	// 之后 12 小时内的每次页面刷新都会拿它去提示升级。
+	if terr := a.manifestTrusted(m); terr != nil {
+		st.Error = "更新清单未通过签名校验：" + terr.Error()
+		// 保留上一条**已验签通过**的旧结果（如果有），并标明来自过期缓存。
+		if m2 := a.cachedTrustedManifest(); m2 != nil {
+			out := decideUpdate(version, m2, st.Skipped, a.updateLastCheckAt())
+			out.Enabled, out.ManifestURL, out.Error = true, st.ManifestURL, st.Error
+			out.ManifestUse = a.updateManifestUsed()
+			out.Stale = true
+			a.markVerified(&out, m2)
 			a.attachDownload(&out)
 			return out
 		}
@@ -241,6 +329,7 @@ func (a *app) checkUpdate(ctx context.Context, force bool) updateStatus {
 	// 自动下载（v0.26.7）：发现新版本且清单给了本机平台的产物时**异步**下载。
 	// 必须异步 —— 这里处在 HTTP 请求路径上，而一次 20MB 的下载远超本次请求
 	// 的预算（候选数 × 8s）。状态通过 Download 字段随每次刷新回报。
+	a.markVerified(&out, m)
 	a.attachDownload(&out)
 	return out
 }

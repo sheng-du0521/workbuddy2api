@@ -2987,125 +2987,66 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 		req.ReservationID = resv.ID
 	}
 
-	res := p.billingSettler().Settle(req)
-
-	// 代挂分成：由本包执行（决策在新包的 Result.HostCreditDue）—— 它要查号主与入池状态。
-	// 双保险（v0.31.59，审查 F02）：结算包已经保证"未提交实扣不发分成"，
-	// 这里再校一次 Settled / ChargedMicro —— 分成是真金白银的入账，
-	// 不该只依赖上游返回的一个布尔字段。
-	if res.HostCreditDue && res.Settled && res.ChargedMicro > 0 {
-		p.creditHostOwner(upstreamUID, u, model, res.ConsumedCredit, res.ChargedMicro)
+	// 代挂分成的**资格**在本包解析（要查号主与入池状态），**金额与入账**交给
+	// internal/billing —— 它把"扣费+流水+分成+返点"放进同一个事务（v0.31.60，审查 F02）。
+	// 此前是先结算、再回来发分成，两次提交之间进程被杀就是"扣了钱没发分成"。
+	if u != nil {
+		req.Host = p.hostShareFor(upstreamUID)
 	}
+
+	res := p.billingSettler().Settle(req)
 	return res.Settled, res.ChargedMicro
 }
 
-// logAdminChannelUsage 已随结算编排一起下沉 internal/billing（v0.31.11）：
-// 它是 `Settler.Settle` 里 `HasUser=false` 那条分支（settleAdminChannel），
-// 口径与计费路径共用一份实现。本包不再有这个函数 —— 如果你在找它，
-// 去 internal/billing/settle.go 搜 `settleAdminChannel`。
-// creditHostOwner 把一次平台请求的分成记入所服务账号的号主余额。
+// hostShareFor 解析"这笔收益该给谁"（分成资格 + 上级推广资格）。
 //
-// 计分成基数（v0.12.0 起）：**号池账号本次被消耗的积分 consumedCredit**，
-// 而不是「平台向调用方收取的点数 chargedMicro」。原因：后者已经乘过计费倍率，
-// 会让倍率变成号主收益的隐形缩放因子 —— 倍率 < 1 时号主结构性亏损
-// （被扣 1 积分却只拿到 0.1×比例 点）。改成积分口径后，号主收益只取决于
-// 自己账号被消耗了多少积分，与平台定价倍率解耦。
-//
-// 但设硬上限：分成不得超过平台该次实收（chargedMicro）。否则当
-// 「倍率 < 分成比例」时平台会倒贴。
-//
-//	earn = min(round(consumedCredit × ratio), chargedMicro)
-//
-// 推论（运维须知）：要让平台每次都有留成，必须保证「计费倍率 > 代挂分成比例」。
-//
-// 仅在「账号是代挂 + 已入池 + 比例为正值」时生效；分成不足 1 微点则跳过（避免刷零流水）。
-// 失败只记日志：分成是激励，不应影响主请求的响应与计费。
-func (p *Proxy) creditHostOwner(uid string, from *User, model string, consumedCredit float64, chargedMicro int64) {
-	if uid == "" || consumedCredit <= 0 {
-		return
+// 只回答三个事实：是不是代挂号、有没有入池、比例多少（以及号主的上级是谁）。
+// **金额一律不算** —— 那是 billing.HostEarn / ReferralRebate 的职责，
+// 两处各算一遍必然漂移（本项目最贵的一类缺陷）。
+func (p *Proxy) hostShareFor(uid string) *billing.HostShare {
+	if uid == "" {
+		return nil
 	}
 	p.selMu.RLock()
 	owner := p.ownerByUID[uid]
 	inPool := p.poolInByUID[uid]
 	p.selMu.RUnlock()
 	if owner <= 0 || !inPool {
-		return
+		return nil
 	}
 	// 比例解析放在拿到 owner 之后（v0.17.7）：逐用户覆盖优先于全局配置，
 	// 所以必须先知道这笔收益归谁，才能取到正确的比例。
 	ratio := p.hostRatioFor(owner)
 	if ratio <= 0 {
-		return
+		return nil
 	}
-	// 收益公式与"平台实收封顶"在 internal/billing.HostEarn（含 math.Round 口径）。
-	// 为什么下沉：这条公式与推广返点的"平台留成"约束是**成对的钱的规则**，
-	// 两处各写一份必然漂移（本项目最贵的一类缺陷）；且它是"算错不崩、只让账目静默偏移"
-	// 的典型，必须能被独立单测钉住。
-	earn := billing.HostEarn(consumedCredit, ratio, chargedMicro)
-	if earn <= 0 {
-		return
-	}
-	// 号池收益计**可提现额度**（v0.21.0：返点收益可提现）。
-	if err := p.store.CreditWithdrawable(owner, earn); err != nil {
-		log.Printf("host earning credit failed (owner=%d uid=%s): %v", owner, uid, err)
-		return
-	}
-	_ = p.store.AddAccountEarned(uid, earn)
-	var fromID int64
-	if from != nil {
-		fromID = from.ID
-	}
-	_ = p.store.InsertHostEarning(&HostEarning{
-		AccountUID:  uid,
-		OwnerUserID: owner,
-		FromUserID:  fromID,
-		Model:       model,
-		Charged:     chargedMicro,
-		Earned:      earn,
-	})
-	// 推广返点：号主如果是由别人邀请进来的（referred_by>0），上级再按推广比例分一杯。
-	p.creditReferrerOfPool(owner, uid, model, chargedMicro, earn)
-}
-
-// creditReferrerOfPool 号主的代挂账号在池中赚到收益时，给其上级发推广返点。
-//
-// 计返基数取「号主本次收益（earn）」而非平台收费，避免上级的返点吃掉平台全部留成：
-// 平台本次留成 = charged - earn，返点从中出，故上限钳到「留成余额」。
-func (p *Proxy) creditReferrerOfPool(owner int64, uid, model string, chargedMicro, earn int64) {
-	if owner <= 0 || earn <= 0 {
-		return
-	}
+	hs := &billing.HostShare{OwnerUserID: owner, Ratio: ratio}
+	// 上级推广：比例按**收益人（上级）**解析 —— 这个比例描述的是「上级能从下级
+	// 收益里抽多少」，属于上级的属性，不是下级号主的属性。
 	up, err := p.store.GetUserByID(owner)
 	if err != nil || up == nil || up.ReferredBy <= 0 || up.ReferredBy == owner {
-		return
+		return hs
 	}
-	// 比例按**收益人（上级）**解析（v0.17.7）：这个比例描述的是「上级能从下级收益里
-	// 抽多少」，属于上级的属性，不是下级号主的属性。用错对象会让「给 A 设的比例」
-	// 在 A 的下级身上失效。
-	ratio := p.referralRatioFor(up.ReferredBy)
-	if ratio <= 0 {
-		return
+	if r := p.referralRatioFor(up.ReferredBy); r > 0 {
+		hs.ReferrerID = up.ReferredBy
+		hs.ReferrerRatio = r
 	}
-	// 返点公式与"不侵占平台留成"的钳位在 internal/billing.ReferralRebate。
-	rebate := billing.ReferralRebate(earn, ratio, chargedMicro)
-	if rebate <= 0 {
-		return
-	}
-	// 推广返点计**可提现额度**（v0.21.0）。
-	if err := p.store.CreditWithdrawable(up.ReferredBy, rebate); err != nil {
-		log.Printf("referral pool rebate failed (referrer=%d owner=%d): %v", up.ReferredBy, owner, err)
-		return
-	}
-	_ = p.store.InsertRebate(&Rebate{
-		Kind:        RebateReferralPool,
-		Beneficiary: up.ReferredBy,
-		FromUserID:  owner,
-		AccountUID:  uid,
-		BaseMicro:   earn,
-		RebateMicro: rebate,
-		Note:        model,
-	})
+	return hs
 }
+
+// logAdminChannelUsage 已随结算编排一起下沉 internal/billing（v0.31.11）：
+// 它是 `Settler.Settle` 里 `HasUser=false` 那条分支（settleAdminChannel），
+// 口径与计费路径共用一份实现。本包不再有这个函数 —— 如果你在找它，
+// 去 internal/billing/settle.go 搜 `settleAdminChannel`。
+// creditHostOwner / creditReferrerOfPool 已于 v0.31.60 **删除**（审查 F02 收尾）：
+//
+// 它们原本由 settleUsage 在结算之后调用，于是"扣费"与"发分成"是两次独立提交，
+// 中间任何一步失败就是半截账（扣了钱没发分成 / 发了分成没扣到钱）。
+// 现在改成：资格解析留在本包的 hostShareFor（见上），金额与入账由
+// internal/billing.planHostCredit + Store.CommitSettlement 在**同一个事务**里落地。
+//
+// 如果你在找"号主分成到底怎么算"：去 internal/billing 搜 HostEarn；
+// "怎么入账"：搜 CommitSettlement。**不要**在本包再写一遍入账逻辑。
 
 // estimateCredit 用实测成本估算缺失的 credit：per1k × tokens / 1000。
 //

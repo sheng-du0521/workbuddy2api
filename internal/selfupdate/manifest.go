@@ -232,6 +232,13 @@ type Manifest struct {
 	ReleasedAt   int64   `json:"released_at,omitempty"`
 	URL          string  `json:"url,omitempty"`
 	Assets       []Asset `json:"assets,omitempty"`
+
+	// 独立签名（v0.31.60，审查 F07）。字段名对外可见，**别改** ——
+	// 改了等于让所有已发布客户端把新清单判成"未签名"。
+	// 三者由 cmd/relsign 在发布机上填，见 pubsig.go。
+	SigAlg    string `json:"sig_alg,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
 // Status 交给前端的完整状态。
@@ -256,6 +263,14 @@ type Status struct {
 	Asset       *Asset `json:"asset,omitempty"`         // 匹配当前平台+架构的产物
 	Error       string `json:"error,omitempty"`         // 上次检查的失败原因（空=成功）
 	Stale       bool   `json:"stale"`                   // 结果来自过期缓存（离线时）
+
+	// 清单验签结果（v0.31.60，审查 F07）。
+	//
+	// 为什么要下发到界面：签名是"有没有被投毒"的唯一证据，只写日志的话，
+	// 运维在面板上看到"有新版本"根本无法分辨这是官方清单还是被改过的清单。
+	Verified   bool   `json:"verified"`              // 这份清单的签名已校验通过
+	SignedBy   string `json:"signed_by,omitempty"`   // 签名密钥短标识（key_id）
+	VerifyNote string `json:"verify_note,omitempty"` // 未校验时的原因（如"验签已关闭"）
 
 	// ---- 自动下载（v0.26.7）----
 	// AutoDownload 自动下载开关的当前值（面板据此显示"自动/手动"）。

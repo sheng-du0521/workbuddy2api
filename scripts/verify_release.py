@@ -15,7 +15,8 @@
   1. version.json 的 version 与本地 `cmd/webapp/main.go` 的 const version 一致；
   2. 每个 asset 的 URL 可达（HTTP 200）；
   3. 下载后 sha256 与 size 与清单**逐字节一致**；
-  4. --local：清单 sha/size 与 dist 里的同名产物一致（防止"测的与发的是两份"）。
+  4. --local：清单 sha/size 与 dist 里的同名产物一致（防止"测的与发的是两份"）；
+  5. --relsign：清单签名可用密码学校验通过（v0.31.60，审查 F07）。
 """
 import argparse
 import hashlib
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import tempfile
 import urllib.error
 import urllib.request
@@ -81,10 +83,34 @@ def fetch(url, dest=None):
         return None, str(e)
 
 
+def check_signature(man, relsign):
+    """校验清单的独立签名（v0.31.60，审查 F07）。
+
+    为什么发布前必须验：清单决定了客户端"下哪个文件、sha256 是多少"。
+    如果它没签名（或签名与内容不符），客户端会 fail-closed 拒绝整份清单 ——
+    结果不是"更新提醒不显示"，而是"用户永远收不到更新"。这种失败在本地完全看不出来
+    （文件都在、URL 都通），只有等到有人发现版本一直不涨。所以必须在上传前拦住。
+    """
+    sig = (man.get("signature") or "").strip()
+    kid = (man.get("key_id") or "").strip()
+    alg = (man.get("sig_alg") or "").strip()
+    if not sig:
+        die("清单没有签名（缺 signature）—— 客户端会 fail-closed 拒绝整份清单。"
+            "先跑：relsign sign -key <私钥> -in version.json")
+    print("清单签名 %s key_id=%s" % (alg or "(未标算法)", kid or "(未标 key_id)"))
+    if not relsign:
+        print("  ⚠ 未提供 --relsign，只确认'有签名'，未做密码学校验")
+        return
+    code = subprocess.call([relsign, "verify", "-in", os.path.join(ROOT, "version.json")])
+    if code != 0:
+        die("清单签名校验失败（exit=%d）—— 内容与签名不符，拒绝发布" % code)
+    print("  签名校验通过 ✓")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", action="store_true", help="同时比对 dist 本地产物")
     ap.add_argument("--skip-download", action="store_true", help="只检查可达性，不下载校验")
+    ap.add_argument("--relsign", default="", help="relsign 可执行文件路径（给了就同时校验清单签名）")
     a = ap.parse_args()
 
     with io.open(os.path.join(ROOT, "version.json"), encoding="utf-8") as f:
@@ -95,6 +121,8 @@ def main():
     print("清单版本 %s / 代码版本 %s" % (ver, lv))
     if ver != lv:
         die("version.json 与 main.go 的 const version 不一致（会发布一个'说 A 发 B'的版本）")
+
+    check_signature(man, a.relsign)
 
     assets = man.get("assets") or []
     if not assets:
