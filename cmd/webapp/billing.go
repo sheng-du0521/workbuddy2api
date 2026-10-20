@@ -393,10 +393,41 @@ func (a *app) handleListKeys(w http.ResponseWriter, r *http.Request) {
 			"created_at":   k.CreatedAt,
 			// revealable：能否「显式查看」（有密文且启用了加密才可解）。前端据此决定
 			// 按钮是否可用，避免点开才发现是老库无密文 / 服务端以 -secret none 启动。
-			"revealable": a.secret != nil && strings.TrimSpace(k.KeyEnc) != "",
+			"revealable":  a.secret != nil && strings.TrimSpace(k.KeyEnc) != "",
+			"group_scope": k.GroupScope,
+			// stale_groups（v0.31.78）：scope 里**已经不存在**的组。
+			//
+			// 授权指向不存在的组是允许的（组被删/通道停用），但**必须让人看见** ——
+			// 静默忽略会让用户以为"我明明授权过"，然后去反复重试一个 404。
+			"stale_groups": a.staleGroups(k),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"keys": out})
+}
+
+// staleGroups 该 Key 的 scope 里已失效的组 id（组被删 / 通道停用）。
+//
+// 一次拿全表比对，不逐组查库：这个函数在"列 Key"时对每把 Key 调一次，
+// 逐组查会把一屏 20 把 Key 变成 20×N 次 SQL（本项目只有一条连接）。
+func (a *app) staleGroups(k *APIKey) []string {
+	if k == nil || a.proxy == nil {
+		return nil
+	}
+	want := splitGroups(k.GroupScope)
+	if len(want) == 0 {
+		return nil
+	}
+	valid := map[string]bool{groupWorkID: true}
+	for _, g := range a.proxy.allChannelGroups() {
+		valid[g.ID] = true
+	}
+	var out []string
+	for _, gid := range want {
+		if !valid[gid] {
+			out = append(out, gid)
+		}
+	}
+	return out
 }
 
 // handleRevealKey 显式取回某把 key 的完整明文（本人限定、单把）。

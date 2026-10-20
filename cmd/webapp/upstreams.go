@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -476,6 +477,23 @@ func (s *Store) relayPriceCeiling() (map[string]float64, error) {
 	return out, rows.Err()
 }
 
+// CountKeysByGroup 有多少把 Key 的可见组里含这个组（用于「停用/删除前先看影响面」）。
+//
+// SQL 里用 `',' || group_scope || ',' LIKE '%,ch3,%'` 而不是 `LIKE '%ch3%'`：
+// 后者会把 ch13 / ch30 一起算进来 —— 一个看起来只是"数字不准"的错误，
+// 会让运维以为"只有 3 把 Key 受影响"，实际停了 15 把。
+func (s *Store) CountKeysByGroup(gid string) (int, error) {
+	gid = strings.TrimSpace(gid)
+	if gid == "" {
+		return 0, nil
+	}
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM api_keys WHERE (',' || group_scope || ',') LIKE ?`,
+		"%,"+gid+",%").Scan(&n)
+	return n, err
+}
+
 // relayGroup 通道组（v0.31.76）：通道名 + 其 enabled 模型的用户可见名。
 //
 // 通道不存在或**已停用** → name 为空（调用方据此判定"组不可见"）。
@@ -739,7 +757,28 @@ func (a *app) handleAdminUpstreams(w http.ResponseWriter, r *http.Request) {
 		"upstreams":   list,
 		"pool_models": poolSet, // 前端据此提示"该模型号池也有，将优先走号池"
 		"count":       len(list),
+		// affected_keys（v0.31.78）：通道 id → 有多少把 Key 授权了这个通道组。
+		// 停用/删除通道前必须能看到影响面 —— 否则「我先停一下」停掉的是别人的线上调用。
+		"affected_keys": a.affectedKeysByChannel(list),
 	})
+}
+
+// affectedKeysByChannel 统计每个通道组被多少把 Key 授权。
+//
+// 读失败**不影响列表**：这是"事前预警"的辅助信息，不该因为它让通道页打不开。
+func (a *app) affectedKeysByChannel(list []Upstream) map[string]int {
+	out := make(map[string]int, len(list))
+	for _, u := range list {
+		n, err := a.store.CountKeysByGroup("ch" + strconv.FormatInt(u.ID, 10))
+		if err != nil {
+			log.Printf("WARN: [relay] 统计通道 %d 的授权 Key 数失败：%v", u.ID, err)
+			continue
+		}
+		if n > 0 {
+			out[strconv.FormatInt(u.ID, 10)] = n
+		}
+	}
+	return out
 }
 
 func (a *app) handleAdminUpstreamSave(w http.ResponseWriter, r *http.Request) {

@@ -8082,11 +8082,11 @@ async function loadChannels() {
       '还没有配置通道。点「新增通道」填 base_url 与 API Key，然后用「探活」确认可用，再添加模型映射。'));
     return;
   }
-  for (const up of list) box.appendChild(channelCard(up, poolModels));
+  for (const up of list) box.appendChild(channelCard(up, poolModels, (d && d.affected_keys) || {}));
 }
 
 // channelCard 一条通道（含模型映射表）。
-function channelCard(up, poolModels) {
+function channelCard(up, poolModels, affected) {
   const card = el('div', 'card');
   card.style.marginTop = '12px';
 
@@ -8107,6 +8107,15 @@ function channelCard(up, poolModels) {
   chip.title = '点一下复制：把这个组名填进客户端 model 字段，组内自动选一个可用模型';
   chip.onclick = () => copyText(up.group_model || ('wb-group-ch' + up.id));
   head.appendChild(chip);
+  // 影响面（v0.31.78）：有 Key 授权了这个组时，停用/删除之前必须先看见。
+  // 启用状态用黄（预警），停用状态用红（已经在影响）—— 同一件事，两种语气。
+  const n = (affected && affected[String(up.id)]) || 0;
+  if (n > 0) {
+    const tag = el('span', up.enabled ? 'tag warn' : 'tag err', '影响 ' + n + ' 把 Key');
+    tag.title = '有 ' + n + ' 把 Key 的可见组里含这个组；停用或删除后，它们的 wb-group-ch'
+      + up.id + ' 会立即变成未知模型（404），已发出的请求不受影响。';
+    head.appendChild(tag);
+  }
   card.appendChild(head);
 
   const meta = el('div', 'sub');

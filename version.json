@@ -1,20 +1,20 @@
 {
-  "version": "0.31.77",
+  "version": "0.31.78",
   "min_supported": "0.24.0",
-  "notes": "v0.31.77：管理后台给 Key 授权模型组（补 v0.31.76 那半屏）。\n\n① 入口：后台「用户」页 → 用户卡片操作行新增「组」按钮（余额 · 限额 · 封禁 · 记录 · 组）。放在用户卡而不是通道页 —— 授权是「给谁」的决定，从用户出发才找得到；从通道出发会变成「这条通道给了谁」，那种列表适合排查不适合配置。\n\n② 弹窗：该用户每把 Key 一行（名称 + #id + 掩码 + 状态），通道组逐个复选框。三条刻意的细节：代挂自用 Key **不给复选框**（右侧直接写「只能用 work 官组」，避免让人以为点了会生效）；空组**禁用**并标「（空组）」（勾了必然失败）；work 不出现在勾选项里（它恒可见，勾了等于假装授予过）。\n\n③ 接口拆两个：GET /api/admin/users/{id}/keys（Key 列表只给掩码 + 全部组清单）、POST /api/admin/keys/{id}/groups（设置 scope）。不塞进用户详情：详情是高频只读（用量/返点/提现/代挂账号已经很重），授权是低频写；分开后详情不会被授权的失败牵连，授权也能单独审计。\n\n④ 语义（都有用例钉住）：代挂 Key → 400，不静默改成 work；不存在的组 → 丢弃并在 dropped 回报，不写库；work 不写进 scope；不存在的 Key → 404；返回的是最终生效的 scope 而不是提交值。\n\n验证：TestAdminSetKeyGroups（池 Key 授权生效 / 混入 ch999 被丢弃并回报 / 代挂 Key 400 且库不变 / 不存在的 Key 404 / work 被忽略）；全量 go test + jscheck + uitest 通过；preflight 全链通过。\n\n边界：授权只影响「看见与可用」，已发出的请求不会因取消授权而中断；取消后 wb-group-ch<N> 立即变成未知模型（404），无需重启；组成员仍是派生的（通道停用 = 组消失），后台勾选会同步禁用。",
-  "released_at": 1792531847,
+  "notes": "v0.31.78：需求 7 收尾（空模型 400 + 通道影响面 + 组失效可见）。三件都是静默失效类修补：不算错钱，但会让人找错方向。\n\n① 未指定模型 → 400（此前 503）：body 里没有 model 时会一路走到选号、按空名字选，最后给 503 no available account —— 客户端看到的是「服务挂了」，而真正该做的是把 model 填上。空模型是请求的问题，用 5xx 表达会让 SDK 重试一个永远不会成功的请求。现在在读体之后、选号之前直接 400 + gateway_hint（指向 GET /v1/models 与 wb-group-work），零出站零扣费。\n\n② 通道卡显示「影响 N 把 Key」：停用/删除通道前必须知道有多少把 Key 授权了它的组，否则「我先停一下」停掉的是别人的线上调用。后端 /api/admin/upstreams 新增 affected_keys；前端启用态黄标（预警）、停用态红标（已经在影响）。统计 SQL 用 (',' || group_scope || ',') LIKE '%,ch3,%' 而不是 LIKE '%ch3%' —— 后者会把 ch13/ch30 算进来，让人以为只有 3 把受影响、实际停了 15 把。统计失败不影响通道列表（WARN + 不显示标签）。\n\n③ 控制台「组失效」提示：授权指向的组可能被删/停用（后端允许这种悬空授权，因为组可能重建），此前静默忽略，用户看到组不见了却不知道为什么。现在密钥卡显示「组失效：ch3」，tooltip 说明 wb-group-ch3 会 404、请让管理员重新授权；GET /api/keys 新增 stale_groups。\n\n验证：TestCountKeysByGroupExact（ch3 / ch13 / ch30 交叉，前缀相似不能算成同一组：ch3 应命中 2 把而不是 3 把）；全量 go test + jscheck + uitest + preflight 通过。\n\n边界：影响面是打开页面那一刻的快照；空模型检查只看 model 字段（wb-group-* 也算指定了模型，展开失败才 404）；「组失效」不自动清 scope —— 组重建后授权自动恢复生效。",
+  "released_at": 1792532888,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.77/webapp.exe",
-      "sha256": "ced8b2639cd1d1f00f9a4516d11181e9c310400e76f2d936ffa488415167004d",
-      "size": 15963648
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.78/webapp.exe",
+      "sha256": "60120b08e81d5ab31ba084d81a6faf0a584e429c8589b9c5e20ccad0d715bed3",
+      "size": 15968768
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "QQHqxHYNJy1gv8MlrkiraeW6bEFptZd9A6bnk8hd2vqz6n8rn/qS3KizYC4TRcuErtjVumlFv0bldR6O7Er1Cg==",
+  "signature": "JacOz/hvgXfstruNqd1lkHkKvgskY9e2PUQ1xBQGt4ruQhjBI4qyYm6rsjnpFW+HL2/TMvc95zkebtMbQgt+Dw==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

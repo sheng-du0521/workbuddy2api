@@ -1571,6 +1571,18 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		payload = map[string]any{}
 	}
 	model, _ := payload["model"].(string)
+	// 未指定模型（需求 7）：400，零出站、零扣费。
+	//
+	// 此前空 model 会一路走到选号（按空名字选），最后给出 503/404 —— 客户端看到的是
+	// "服务不可用"，而真正该做的是"把 model 填上"。空模型是**请求的问题**，
+	// 用 5xx 表达会让 SDK 去重试一个永远不会成功的请求。
+	if strings.TrimSpace(model) == "" {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model is required",
+			"request body has no model; GET /v1/models lists the models available to this key "+
+				"(or use wb-group-work to let the server pick one from the pool); "+
+				"no upstream account was used")
+		return
+	}
 	// 模型组（v0.31.76）：`wb-group-xxx` 先展开成组内一个**真实模型名**，之后一切照旧
 	// （归一化 / 选号 / 计费倍率 / 台账 / 冷却全按真名走）。
 	//

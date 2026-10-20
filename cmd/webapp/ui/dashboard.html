@@ -1862,6 +1862,15 @@ function renderKeyCards() {
 
     const chips = el('div', 'chips');
     chips.appendChild(el('span', 'tag ' + (host ? 'accent' : ''), keyScopeLabel(k)));
+    // 组失效（v0.31.78）：授权指向的组已被删除/停用。
+    // 后端允许这种"悬空授权"（组可能重建），但必须让人看见 —— 否则用户会以为
+    // "我明明授权过"，然后反复重试一个必然 404 的组名。
+    if ((k.stale_groups || []).length) {
+      const t = el('span', 'tag warn', '组失效：' + k.stale_groups.join(', '));
+      t.title = '这些模型组已被删除或停用；该 Key 的 wb-group-<组> 现在会返回 404。'
+        + '请让管理员在该用户卡片上重新授权。';
+      chips.appendChild(t);
+    }
     if (host) chips.appendChild(el('span', 'tag ok', '不扣余额'));
     chips.appendChild(el('span', 'tag ' + (active ? 'ok' : 'warn'), active ? '启用' : '已禁用'));
     card.appendChild(chips);
