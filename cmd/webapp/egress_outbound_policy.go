@@ -226,8 +226,9 @@ func (a *app) egressPolicyToServer(dryRun bool) (map[string]any, error) {
 	// 默认已是空、运行时仍在用旧默认（overview 会同时显示"36 个未指定"和
 	// "默认 11080"，两个数字自相矛盾）。这类"改了库没改内存"的 bug 不会报错，
 	// 只会让"我明明切换了，怎么还在走住宅 IP"变成一个反复出现的疑问。
-	a.proxy.ReloadSelection()
-	_ = a.proxy.SyncAccounts()
+	if err := a.proxy.ApplyEgressChange(); err != nil {
+		log.Printf("WARN: [egress] 出站口径变更后重建失败：%v", err)
+	}
 
 	log.Printf("INFO: [egress] 出站口径切到「统一走服务器」：清空 %d 个账号出口、全局默认 %q → 空（备份 %d 条）",
 		cleared, def, len(backup.Rows))
@@ -291,8 +292,9 @@ func (a *app) egressPolicyRestore(dryRun bool) (map[string]any, error) {
 		}
 		restored++
 	}
-	a.proxy.ReloadSelection()
-	_ = a.proxy.SyncAccounts()
+	if err := a.proxy.ApplyEgressChange(); err != nil {
+		log.Printf("WARN: [egress] 出站口径变更后重建失败：%v", err)
+	}
 	log.Printf("INFO: [egress] 出站口径从备份恢复：%d 个号，跳过 %d 条", restored, skipped)
 	res["restored"] = restored
 	return res, nil

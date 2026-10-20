@@ -1,16 +1,16 @@
 {
-  "version": "0.31.57",
+  "version": "0.31.58",
   "min_supported": "0.24.0",
-  "notes": "v0.31.57：修复「管理员在用户控制台里看不到 / 用不了拉起代理插件」。① **入口消失的真因**：`/api/plugins`（控制台用的接口）无条件按 user 视角过滤，`Audience=admin` 的插件对管理员也不下发 —— 注册表里有条目、界面上没有入口。改为按**登录者身份**：活跃管理员额外下发 admin 插件；普通用户仍只看到 user/both（能力没开回去）。② **启停语义**：插件视图新增 `scope`（platform/user）。管理员在控制台里对平台插件的开关 = **平台级**（写 `plugin_enabled_<id>`），不再被 403；普通用户调该接口一律 403 `platform_only`。卡片上标「平台能力」+「全局启用（平台级）」，避免被误当成个人偏好。③ **停用是真停用**：新增 `egressPluginGate`，插件停用时 home/pull/apply/release/repair/install 全部 403 `plugin_disabled`（含 X-Admin-Key 运维通道）——此前停用只把按钮变灰，直接调接口仍能拉起隧道。安装包也不再签发。④ **异常与状态**：控制台面板按 `plugin_disabled` / `platform_only` / 其他 分流（分别给「去插件页启用」「仅管理员」「重试」），重复拉起不再静默 return（提示上一次仍在跑，最长 90 秒），明显离线（>120s 无心跳）的机器在前端就被拦住并说清离线多久。⑤ 生产数据：平台级开关此前被置 0（21:57 管理端停用），已重新启用并清理该插件的残留用户级停用偏好。⑥ 面板与插件页说明补齐入口位置（侧栏「插件」→「平台直属出口」→「打开」）、触发方式（下载安装包 → 双击运行 → 一键拉起）与展示形式（独立面板）。",
-  "released_at": 1792420482,
+  "notes": "v0.31.58：修复「管理员切换号池代理后，普通用户无法正常使用号池」。根因是配置只改了一半：① `applyHomeEgress` 写完 `kv egress_proxy_default` 只调 `SyncAccounts()`，而它读的是**内存旧默认** —— 新默认在进程内不生效（空出口账号继续走旧出口）；旧默认若是坏的，`egressBad` 仍按旧值把全池判坏 → 整片 503。② `computeEgressBad` 用未规范化字符串查线路状态，默认写成 `HTTP://host:port/` 这类等价形式时查不到线路 → 线路已停用也不会传播到账号。③ 设置页/默认修复/出站口径切换各写一套（只 Reload 不 Sync，或分两步调），留下不一致窗口。④ `assign` 允许绑到 `fail_streak>=阈值` 的线路；写库中途失败直接 500，号池留在半新半旧。修法：新增 `Proxy.cfgMu` 与 `ApplyEgressChange()`（同一把锁内 reload → 重建映射），所有改默认出口的入口统一走它；默认出口改用 `egress.Validate` 规范化后查线路状态；分配拒绝不健康线路（409 `line_unhealthy`）并把写库改成失败回滚（`assign_write_failed`）；`GET /api/egress/home` / apply / assign 新增 `followers`/`follower_hosts` 影响面，用户端状态行显示「跟随默认出口 N 个号（含 M 个代挂号）」，应用前二次确认并说明「线路离线时这些号会全部失败、不会自动回退直连」。已建立连接不受切换影响（新请求才按新快照出站）；计费路径未改动（失败仍释放预扣）。",
+  "released_at": 1792469744,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.57/webapp.exe",
-      "sha256": "b5c1da4226a0a3bf4c7bc479bfe3da9503cf48882726acc53408fa6bc378028c",
-      "size": 15612928
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.58/webapp.exe",
+      "sha256": "a33f2de3d0ea552c3d4c837069c093dfc5996ee1496af496f1431e1f808b55c5",
+      "size": 15628288
     }
   ],
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"

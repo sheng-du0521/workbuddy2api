@@ -435,17 +435,45 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		if !req.DryRun {
-			for _, it := range plan {
+			// 与主路径同一条纪律（v0.31.58）：逐个写 + 失败倒序回滚。
+			// 直连/清空同样会改一批账号的出口，半途失败同样会把号池留在半新半旧状态。
+			type wrote struct {
+				uid  string
+				prev string
+			}
+			written := make([]wrote, 0, len(plan))
+			for _, acc := range targets {
+				written = append(written, wrote{uid: acc.UID, prev: acc.EgressProxy})
+			}
+			for i, it := range plan {
 				if err := a.store.SetAccountEgress(it.UID, it.Proxy); err != nil {
-					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+					rolled := 0
+					for j := i - 1; j >= 0; j-- {
+						if rerr := a.store.SetAccountEgress(written[j].uid, written[j].prev); rerr != nil {
+							log.Printf("WARN: [egress] 回滚 %s 失败：%v", written[j].uid, rerr)
+							continue
+						}
+						rolled++
+					}
+					_ = a.proxy.ApplyEgressChange()
+					writeJSON(w, http.StatusInternalServerError, map[string]any{
+						"error":       fmt.Sprintf("写入账号 %s 失败：%v；已回滚 %d 个", it.UID, err, rolled),
+						"code":        "assign_write_failed",
+						"rolled_back": rolled,
+					})
 					return
 				}
 			}
-			_ = a.proxy.SyncAccounts()
+			// 统一走原子入口：默认出口与账号映射必须来自同一快照。
+			if err := a.proxy.ApplyEgressChange(); err != nil {
+				log.Printf("WARN: [egress] 直连/清空后重建失败：%v", err)
+			}
 		}
+		followers, followerHosts := a.egressFollowerCounts()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"assigned": len(plan), "mode": label, "dry_run": req.DryRun,
 			"plan": plan, "per_proxy": map[string]int{}, "warnings": []string{},
+			"followers": followers, "follower_hosts": followerHosts,
 		})
 		return
 	}
@@ -463,6 +491,26 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		}
 		if wantURL != "" && strings.TrimSpace(p.URL) != wantURL {
 			continue // 指定了线路 → 只用它
+		}
+		// 运行态不健康（连续探活失败但被手工启用）→ 不能作为分配目标（v0.31.58）。
+		//
+		// 绑上去的号会在下一次 SyncAccounts 时被 computeEgressBad 判为出口异常、
+		// **立刻退出平台选号** —— 管理员看到的是"分配成功"，用户看到的是整片 503。
+		// 拒绝比"先绑再挂"好：它把问题挡在切换之前，并指向真正的修法（探活/修复）。
+		if p.FailStreak >= egressFailThreshold {
+			if wantURL != "" && strings.TrimSpace(p.URL) == wantURL {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error": fmt.Sprintf("这条线路连续 %d 次探活失败，不能作为分配目标："+
+						"先把代理拉起并通过探活（管理后台「代理」页的「探活」或「修复」）再分配",
+						p.FailStreak),
+					"code":        "line_unhealthy",
+					"fail_streak": p.FailStreak,
+					"proxy":       p.URL,
+					"hint":        "直接绑上去的话，这些账号会被判出口异常并立即退出平台选号 —— 普通用户会看到 503",
+				})
+				return
+			}
+			continue
 		}
 		// 用户提供的线路（owner>0）默认不进自动候选（v0.31.23），
 		// 除非管理员显式勾了 include_user_lines（v0.31.32）。
@@ -546,6 +594,10 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range targets {
 		byUID[acc.UID] = acc
 	}
+	// 影响面：有多少号"跟随全局默认"（v0.31.58）。
+	// 它们不参与本次分配，但普通 Key 不绑号 → 请求会随机落到它们身上，
+	// 于是"号池里出现第二条出口"这件事会让普通用户的出口 IP 漂移。
+	followers, followerHosts := a.egressFollowerCounts()
 	byURL := make(map[string]*EgressProxy, len(usable))
 	for _, p := range usable {
 		byURL[p.URL] = p
@@ -577,11 +629,40 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !req.DryRun {
+		// 逐个写入 + 失败回滚（v0.31.58）。
+		//
+		// 此前是"写到第 N 个失败就直接 500"：前 N-1 个已经改库、内存却还没同步 ——
+		// 一次失败的切换把号池留在**半新半旧**的状态，而管理员只看到一句错误。
+		// 现在记录每个号的原值，失败时倒序写回并重建映射，保证"要么全切、要么不动"。
+		type wrote struct {
+			uid  string
+			prev string
+		}
+		written := make([]wrote, 0, len(plan))
 		for _, it := range plan {
+			prev := ""
+			if acc := byUID[it.UID]; acc != nil {
+				prev = acc.EgressProxy
+			}
 			if err := a.store.SetAccountEgress(it.UID, it.Proxy); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				rolled := 0
+				for i := len(written) - 1; i >= 0; i-- {
+					if rerr := a.store.SetAccountEgress(written[i].uid, written[i].prev); rerr != nil {
+						log.Printf("WARN: [egress] 回滚 %s 的出口失败：%v（原值 %q）", written[i].uid, rerr, written[i].prev)
+						continue
+					}
+					rolled++
+				}
+				_ = a.proxy.ApplyEgressChange()
+				log.Printf("WARN: [egress] 分配中断：%s 写入失败，已回滚 %d/%d 个号", it.UID, rolled, len(written))
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error":       fmt.Sprintf("写入账号 %s 的出口失败：%v；已回滚 %d 个已改动的号", it.UID, err, rolled),
+					"code":        "assign_write_failed",
+					"rolled_back": rolled,
+				})
 				return
 			}
+			written = append(written, wrote{uid: it.UID, prev: prev})
 		}
 		// 强制越界必须落审计（v0.31.50）：谁、对哪些号、什么理由、结果如何。
 		// 这条链路会**把凭证送进别人的家庭网络**，日志会被轮转，表不会。
@@ -611,7 +692,11 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// 分配后必须重同步：egressBad 与 egressByUID 都在这条路径上重建。
-		_ = a.proxy.SyncAccounts()
+		// 走 ApplyEgressChange 而不是 SyncAccounts：它同时重载默认出口，
+		// 保证"账号映射"与"默认出口"来自同一个自洽快照（v0.31.58）。
+		if err := a.proxy.ApplyEgressChange(); err != nil {
+			log.Printf("WARN: [egress] 分配后重建选号映射失败：%v", err)
+		}
 	}
 
 	// 统计每条线路分到几个号，便于一眼看出是否均衡。
@@ -650,6 +735,11 @@ func (a *app) handleEgressAssign(w http.ResponseWriter, r *http.Request) {
 		// merged_exits 被折叠的线路 → 代表线路。前端据此解释"为什么只用了 1 条"，
 		// 而不是让人怀疑分配少派了线路。
 		"merged_exits": mergedExits,
+		// followers / follower_hosts：当前**跟随全局默认**的账号数（v0.31.58）。
+		// 分配本身不动它们，但只要号池里存在第二条出口，普通 Key（不绑号）的请求
+		// 就会在这些号与其它号之间随机落点 —— 出口 IP 随之漂移。管理员需要看到这个数字。
+		"followers":      followers,
+		"follower_hosts": followerHosts,
 	})
 }
 
@@ -1473,4 +1563,35 @@ func targets2UIDs(targets []*Account) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// egressFollowerCounts 统计"跟随全局默认出口"的账号数（v0.31.58）。
+//
+// 定义严格按运行期口径：`egress_proxy` 为空且不是显式 direct —— 它们会继承
+// `defaultEgress`，因此默认出口一改，这批号的出站路径就跟着改。
+// host 数单独返回：代挂号跟着漂移时，受影响的不只是平台流量，还有号主的号。
+func (a *app) egressFollowerCounts() (total, host int) {
+	list, err := a.store.ListAccounts()
+	if err != nil {
+		return 0, 0
+	}
+	for _, acc := range list {
+		if acc == nil {
+			continue
+		}
+		raw := strings.TrimSpace(acc.EgressProxy)
+		if raw != "" && !egress.IsDirect(raw) {
+			continue
+		}
+		// 显式 direct 不跟随默认，但它的出口同样"不是被分配的"。
+		// 这里只统计**跟随默认**的：direct 改默认也不受影响。
+		if raw != "" {
+			continue
+		}
+		total++
+		if acc.OwnerUserID > 0 {
+			host++
+		}
+	}
+	return total, host
 }

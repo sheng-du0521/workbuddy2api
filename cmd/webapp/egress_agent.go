@@ -1218,8 +1218,14 @@ type egressHomeView struct {
 	ProxyID       string           `json:"proxy_id,omitempty"`
 	DefaultEgress string           `json:"default_egress"`
 	// BoundAccounts / Carrying 汇总取"最近上报那台"（见下方 ActiveMachine）。
-	BoundAccounts int   `json:"bound_accounts"`
-	Carrying      bool  `json:"carrying"`
+	BoundAccounts int  `json:"bound_accounts"`
+	Carrying      bool `json:"carrying"`
+	// Followers / FollowerHosts 有多少号**跟随全局默认出口**（v0.31.58）。
+	//
+	// 这是"切换默认出口"的真实影响面：它们没有显式绑定，默认一改就全部跟着改。
+	// 前端在应用前据此二次确认；合计里单独报代挂号数量（那部分流量属于号主）。
+	Followers     int   `json:"followers"`
+	FollowerHosts int   `json:"follower_hosts"`
 	AppliedAt     int64 `json:"applied_at"`
 	Ready         bool  `json:"ready"`
 	// ActiveMachine 上面那批汇总字段属于哪台机器（无则空）。
@@ -1475,6 +1481,7 @@ func (a *app) buildEgressHomeView(r *http.Request, scope egressScope) egressHome
 	v := egressHomeView{
 		PollSec: egressAgentPollSec, CanManage: true, ManageScope: scope.kind(),
 	}
+	v.Followers, v.FollowerHosts = a.egressFollowerCounts()
 	if scope.Platform {
 		v.DefaultEgress = def
 	}
@@ -2161,6 +2168,10 @@ type egressHomeApplyResult struct {
 	DefaultOK bool   `json:"default_ok"`
 	Probed    bool   `json:"probed"`
 	ExitIP    string `json:"exit_ip,omitempty"`
+	// Followers / FollowerHosts 本次切换会让多少号改走这条线路（v0.31.58）。
+	// 只在 DefaultOK 时有意义：不设默认就不改变任何"跟随"关系。
+	Followers     int `json:"followers,omitempty"`
+	FollowerHosts int `json:"follower_hosts,omitempty"`
 	// Warnings 本次**刻意没做**的事（v0.31.35）。例如：这条 URL 已被某个用户认领，
 	// 平台视角就不再把它设成全局默认。
 	//
@@ -2331,6 +2342,8 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeAppl
 
 	// 2) 全局默认出口（只有平台自己的线路才配得上）
 	if !userOwnedLine {
+		// 先算影响面：这些号在本次 apply 之后会立刻改走这条线路。
+		res.Followers, res.FollowerHosts = a.egressFollowerCounts()
 		if err := a.store.SetKV(kvEgressDefault, url); err != nil {
 			return res, err
 		}
@@ -2349,7 +2362,15 @@ func (a *app) applyHomeEgress(tunnelPort int, scope egressScope) (egressHomeAppl
 	// 就一定会漂移（v0.31.41 的血泪教训）。
 	_ = a.store.SetKV(kvEgressAppliedAt, fmt.Sprintf("%d", now))
 	// 池以库为准重建：全局默认出口刚可能变化，选号映射要跟着变。
-	_ = a.proxy.SyncAccounts()
+	//
+	// ⚠️ 必须走 `ApplyEgressChange`（重载 + 重建，同一把锁），不能只调 SyncAccounts（v0.31.58）。
+	// `SyncAccounts` 用的是**内存里的** defaultEgress，而这里刚写的是库 —— 只调它等于：
+	//   ① 新默认在进程内永远不生效（ResolveEgress 仍返回旧值）；
+	//   ② egressBad 仍按旧默认评估（旧默认坏了 → 全池被判坏；旧默认为空 → 新线路坏了也不判）。
+	// 现场表现就是"管理员点完应用，普通用户要么还是走老出口，要么整片 503"。
+	if err := a.proxy.ApplyEgressChange(); err != nil {
+		log.Printf("WARN: [egress] 应用默认出口后重建选号映射失败：%v（配置已落库，下次重同步会自愈）", err)
+	}
 	log.Printf("INFO: [egress] 平台线路已应用 proxy=%s url=%s default=%v（不改任何账号出口）",
 		hit.ID, url, res.DefaultOK)
 	return res, nil

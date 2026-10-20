@@ -112,7 +112,9 @@ func (a *app) handleEgressDefaultRepair(w http.ResponseWriter, r *http.Request) 
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		a.proxy.ReloadSelection()
+		if err := a.proxy.ApplyEgressChange(); err != nil {
+			log.Printf("WARN: [egress] 清空默认出口后重建失败：%v", err)
+		}
 		log.Printf("WARN: [egress] 全局默认出口已清空（%q → 直连），未指定出口的账号将走服务器本机 IP", before)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"default_egress": "", "before": before, "mode": mode,
@@ -161,7 +163,9 @@ func (a *app) handleEgressDefaultRepair(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	a.proxy.ReloadSelection()
+	if err := a.proxy.ApplyEgressChange(); err != nil {
+		log.Printf("WARN: [egress] 修复默认出口后重建失败：%v", err)
+	}
 	log.Printf("INFO: [egress] 全局默认出口已修复：%q → %q（%s）", before, pick.URL, pick.Name)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"default_egress": strings.TrimSpace(pick.URL),

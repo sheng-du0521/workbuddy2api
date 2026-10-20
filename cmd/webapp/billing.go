@@ -1805,7 +1805,12 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		reloadSel = true
 	}
 	if reloadSel {
-		a.proxy.ReloadSelection()
+		// 保存设置可能改了全局默认出口 → 必须连 egressBad 一起重算（v0.31.58）。
+		// 只调 ReloadSelection 会让"默认线路已停用"这类状态继续按旧值判定：
+		// 账号照常被选中，请求从一个坏出口发出。
+		if err := a.proxy.ApplyEgressChange(); err != nil {
+			log.Printf("WARN: [settings] 重载出口配置失败：%v", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, a.settingsView())
 }

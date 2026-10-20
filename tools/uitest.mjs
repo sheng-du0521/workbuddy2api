@@ -2548,6 +2548,53 @@ function run(pageFile, meOverride, plan) {
     console.log('  [ok] egress-plugin: 管理员可见 + scope 下发 + 停用真的拦住出口端点');
   }
 
+  // v0.31.58：管理员切换号池出口时，普通用户不能因此不可用。
+  // 守三件事：① 切换走**原子入口**（重载+重建同一把锁）；② 默认出口用规范 URL 判线路状态；
+  // ③ 失败要么零改动、要么回滚；前端必须把影响面（跟随默认的号数）显示出来。
+  const egrSwitchBad = [];
+  {
+    const ROOT = path.resolve(UI, '..', '..', '..');
+    const px = fs.readFileSync(path.join(ROOT, 'cmd/webapp/proxy.go'), 'utf8');
+    const pool = fs.readFileSync(path.join(ROOT, 'cmd/webapp/egress_pool.go'), 'utf8');
+    const agent = fs.readFileSync(path.join(ROOT, 'cmd/webapp/egress_agent.go'), 'utf8');
+
+    if (px.indexOf('func (p *Proxy) ApplyEgressChange()') < 0) {
+      egrSwitchBad.push('缺少 ApplyEgressChange（重载与重建会分成两步，留下不一致窗口）');
+    }
+    if (px.indexOf('else if st, ok := lines[norm]; ok') < 0) {
+      egrSwitchBad.push('默认出口没用规范化 URL 查线路状态（等价写法会漏判坏线路）');
+    }
+    const a0 = agent.indexOf('func (a *app) applyHomeEgress(');
+    const a1 = agent.indexOf('// userNameByID', a0);
+    const applyBody = a0 >= 0 && a1 > a0 ? agent.slice(a0, a1) : '';
+    if (!applyBody) {
+      egrSwitchBad.push('找不到 applyHomeEgress（守卫失去着力点）');
+    } else {
+      if (applyBody.indexOf('ApplyEgressChange') < 0) {
+        egrSwitchBad.push('apply 没走原子入口（写完库不同步内存 = 切换不生效）');
+      }
+      if (applyBody.indexOf('egressFollowerCounts') < 0) {
+        egrSwitchBad.push('apply 没统计影响面（管理员看不到会带走多少号）');
+      }
+    }
+    if (pool.indexOf('line_unhealthy') < 0) {
+      egrSwitchBad.push('分配没拒绝不健康线路（绑上去即被判定出口异常）');
+    }
+    if (pool.indexOf('assign_write_failed') < 0) {
+      egrSwitchBad.push('分配写库失败没有回滚标记（会留下半新半旧的号池）');
+    }
+    if (!APP_JS.includes('跟随默认出口')) {
+      egrSwitchBad.push('页面没显示「跟随默认出口」的影响面');
+    }
+    if (!APP_JS.includes('不会自动回退直连')) {
+      egrSwitchBad.push('应用前没有说明「失败不会自动回退直连」');
+    }
+  }
+  egrSwitchBad.forEach((m) => console.log('  [FAIL] egress-switch: ' + m));
+  if (!egrSwitchBad.length) {
+    console.log('  [ok] egress-switch: 切换原子生效 + 规范判定 + 失败零改动/回滚 + 影响面可见');
+  }
+
   // v0.31.55：用户端必须有「模型可用状态」（模型冷却）卡片。
   //
   // 这条需求此前只有管理端有（账号卡里的"模型级冷却"列表）。用户端缺它时，
@@ -3361,7 +3408,7 @@ function run(pageFile, meOverride, plan) {
   const d = await run('index.html', null, []);
   const allOk = a && b && b2 && c && d && dupBad.length === 0 && probeBad.length === 0
     && delBad.length === 0 && routeBad.length === 0 && switchBad.length === 0
-    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && egrPluginBad.length === 0 && mcBad.length === 0;
+    && egrBad.length === 0 && egrSelfBad.length === 0 && egrSetupBad.length === 0 && egrAdminBad.length === 0 && egrPluginBad.length === 0 && egrSwitchBad.length === 0 && mcBad.length === 0;
   console.log('\nOVERALL: ' + (allOk ? 'PASS' : 'FAIL'));
   process.exit(allOk ? 0 : 1);
 })();

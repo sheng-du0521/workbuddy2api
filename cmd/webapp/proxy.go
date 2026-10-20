@@ -163,6 +163,18 @@ type Proxy struct {
 	costMu    sync.RWMutex
 	costPer1k map[string]float64
 
+	// cfgMu 串行化「配置重载 + 映射重建」（v0.31.58）。
+	//
+	// 为什么必须是一把独立的锁：`ReloadSelection` 写的是**内存里的默认出口**，
+	// 而 `SyncAccountsReport` 用这个内存值去算 `egressBad`。两者若并发/乱序：
+	//   · apply 先写库、再 Sync（读到的还是旧默认）→ 切换"看起来成功、其实没生效"；
+	//   · 两个并发切换 → em 是新的、bad 是按旧默认算的，出现"配置串用"。
+	// 这把锁覆盖"读库 → 算 bad → 替换映射"整段，使对外可见的永远是一个**自洽快照**。
+	//
+	// ⚠️ 持锁期间不得回调本类型的公开方法（会自死锁）；`onAccountsAdded` 是异步的，
+	// 目前安全，改动它时要重新确认这一点。
+	cfgMu sync.Mutex
+
 	// selMu 保护反代选号过滤（分组/白名单）与出站路由（每账号代理/默认代理/节流间隔）。
 	selMu         sync.RWMutex
 	allowUIDs     map[string]bool   // nil = 全部账号
@@ -457,10 +469,18 @@ func computeEgressBad(all []*Account, defEgress string, lines map[string]lineSta
 	// 默认出口自身的问题（格式错 / 运行态不可用）会波及所有"未指定出口"的账号，
 	// 影响面比单个账号大得多，必须一并标出。
 	defBad := ""
-	if defEgress != "" {
-		if _, err := egress.Validate(defEgress); err != nil {
+	if defEgress != "" && !egress.IsDirect(defEgress) {
+		// 必须用**规范化后**的 URL 去查线路状态（v0.31.58）。
+		//
+		// 原来的写法是 `lines[strings.TrimSpace(defEgress)]`，而 `loadLineStates`
+		// 的键是 `egress.Validate` 规范化过的 URL（scheme 小写、去尾斜杠、补默认端口）。
+		// 只要管理员把默认出口写成 `HTTP://host:port/` 这类等价形式，就查不到那条线路，
+		// 于是"默认线路已被停用/连续探活失败"**不会**传播到跟随它的账号 ——
+		// 这些号照常被选中、从一个坏出口发出请求，表现就是"切换代理后号池全挂"，
+		// 而且按默认出口排障时看不出任何异常。
+		if norm, err := egress.Validate(defEgress); err != nil {
 			defBad = "全局默认出口代理配置有误：" + err.Error()
-		} else if st, ok := lines[strings.TrimSpace(defEgress)]; ok {
+		} else if st, ok := lines[norm]; ok {
 			if reason := st.unusableReason(); reason != "" {
 				defBad = "全局默认" + reason + "（" + st.Name + "）"
 			}
@@ -499,6 +519,10 @@ func computeEgressBad(all []*Account, defEgress string, lines map[string]lineSta
 // 而线路启停是每 5 分钟一次的探活结果 —— 为了一次健康判定去重载号池，
 // 会把在途请求与冷却状态都搅一遍。这里只需要替换一个 map。
 func (p *Proxy) RefreshEgressBad() {
+	// 与切换共用同一把锁（v0.31.58）：否则"切到一半"时可能按旧默认重算出一份
+	// 与 em 不匹配的 bad 表，随后被探活循环固化下来。
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
 	all, err := p.store.ListAccounts()
 	if err != nil {
 		return
@@ -517,6 +541,13 @@ func (p *Proxy) RefreshEgressBad() {
 }
 
 func (p *Proxy) SyncAccountsReport() (SyncReport, error) {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	return p.syncAccountsReport()
+}
+
+// syncAccountsReport 真正的重建逻辑；调用方必须持有 cfgMu。
+func (p *Proxy) syncAccountsReport() (SyncReport, error) {
 	all, err := p.store.ListAccounts()
 	if err != nil {
 		return SyncReport{}, err
@@ -645,9 +676,31 @@ func splitKVSet(csv string) map[string]bool {
 	return out
 }
 
+// ApplyEgressChange 一次性完成「重载默认出口 + 重建选号映射」（v0.31.58）。
+//
+// 这是**切换出口**唯一应该调用的入口。分开调用两个方法会留下一个窗口：
+// 重载完成、重建未完成时，新请求读到旧映射；反过来则是 `egressBad` 按旧默认算。
+// 这个窗口正是"管理员一换代理，普通用户就开始报错"的成因之一。
+//
+// 顺序固定为 reload → sync：先让内存里的默认出口追上库，再用它评估每条线路可用性。
+func (p *Proxy) ApplyEgressChange() error {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	p.reloadSelection()
+	_, err := p.syncAccountsReport()
+	return err
+}
+
 // ReloadSelection 从 kv 读回反代选号（白名单/分组）+ 防封（最小复用间隔/默认出站代理）配置。
 // 管理员改设置或账号分组后调用；只改过滤/路由参数，不触碰池状态。
 func (p *Proxy) ReloadSelection() {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	p.reloadSelection()
+}
+
+// reloadSelection 真正的重载逻辑；调用方必须持有 cfgMu。
+func (p *Proxy) reloadSelection() {
 	accts, _ := p.store.GetKV(kvProxyAccounts)
 	groups, _ := p.store.GetKV(kvProxyGroups)
 	gap, _ := p.store.GetKV(kvProxyMinGap)

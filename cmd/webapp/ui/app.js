@@ -3721,6 +3721,9 @@ function renderEgressHome(box, v) {
   rows.push(['全局默认出口', v.default_egress || '（空 = 直连）']);
   rows.push(['承载账号', (bound || 0) + ' 个' +
     (cur && cur.carrying ? '（承重中）' : '（待命）')]);
+  // 跟随默认出口（v0.31.58）：切换默认会带走这批号，页面上必须先说清楚人数。
+  rows.push(['跟随默认出口', (v.followers || 0) + ' 个号' +
+    (v.follower_hosts ? '（含 ' + v.follower_hosts + ' 个代挂号）' : '')]);
   rows.push(['隧道端口', '127.0.0.1:' + (ports.tunnel_port || '?')
     + '（本机代理端口 ' + (ports.proxy_port || '?') + '）']);
   if (curMsg) rows.push(['最近状态', curMsg]);
@@ -3877,6 +3880,19 @@ function renderEgressHome(box, v) {
     applyBtn.title = '把这条线路登记进线路池，并设为**全局默认出口**。' +
       '不会修改任何账号的出口绑定 —— 逐号分配请在管理后台「代理」页完成';
     applyBtn.addEventListener('click', async () => {
+      // 切换默认出口的影响面必须可见（v0.31.58）：
+      // 它带走的是"所有未显式绑定出口的号"，而这条线路一旦离线，这些号会全部失败
+      //（不会自动回退直连）。这不是能靠"再点一次"补救的决定，所以先确认。
+      const fol = Number(v.followers) || 0;
+      if (fol > 0) {
+        const fh = Number(v.follower_hosts) || 0;
+        const ok = await confirmAsk(
+          '把全局默认出口切到这条线路？\n\n' +
+          '跟随默认的 ' + fol + ' 个号' + (fh ? '（其中 ' + fh + ' 个代挂号）' : '') +
+          '会立刻改走它。\n' +
+          '这条线路一旦离线 / 被停用，这些号的请求会全部失败（不会自动回退直连）。');
+        if (!ok) { applyBtn.disabled = false; return; }
+      }
       applyBtn.disabled = true;
       try {
         const d = await post('/api/egress/home/apply', { machine: egressSelMachine });
@@ -4094,6 +4110,7 @@ async function egressPull(v) {
         // v0.31.53：自动应用只立线路（不改账号出口），所以文案也必须这么说 ——
         // 否则运维会以为"拉起=号都搬过来了"，而实际分配要在管理后台做。
         toast('已就绪并自动应用：默认出口' + (ap.default_ok ? '已设置' : '未设置') +
+          (ap.followers ? '，' + ap.followers + ' 个跟随默认的号已改走它' : '') +
           '（未改动任何账号出口）', 'ok');
       } catch (e) {
         toast(egressMsg('已就绪，但自动应用失败：' + (e && e.message ? e.message : e)), 'bad');
