@@ -116,10 +116,17 @@ func (s pickScope) isPlatform() bool { return s.HostUser == 0 }
 // 与 cmd/server 的关系：选号/冷却/熔断/粘性/成本分层全部复用 internal/pool 与
 // internal/session（即原网关真正的资产），webapp 只负责 Web 侧的入口与持久化。
 type Proxy struct {
-	store *Store
-	uc    *upstream.Client
-	pool  *pool.Pool
-	sess  *session.Router
+	// billMu / billView 单模型计费倍率的**不可变快照**（v0.31.67）。
+	//
+	// 为什么不直接每次读库：结算在请求末尾，每笔都查一次 model_ratios 是纯浪费；
+	// 更重要的是"一次请求里读两次配置"会读到两个版本 —— 扣费用的倍率与流水里
+	// 记录的倍率可能不是同一个。快照把"这一笔用哪一版"钉住。
+	billMu   sync.RWMutex
+	billView *billingSnapshot
+	store    *Store
+	uc       *upstream.Client
+	pool     *pool.Pool
+	sess     *session.Router
 	// sessStore 粘性绑定的持久化后端（v0.17.5）。独立持有引用是为了在 Close 时
 	// 排空它内部的异步写队列 —— Router 只按接口持有，关不到它。
 	sessStore *stickyStore
@@ -367,6 +374,9 @@ func NewProxy(store *Store, stateFp string) *Proxy {
 	_ = px.SyncAccounts()
 	px.ReloadSelection()
 	px.loadObservedCosts()
+	// 单模型计费倍率快照（v0.31.67）：必须在返回前加载一次，
+	// 否则第一批请求会走"快照为空 → 回落全局"的分支（数值没错，但版本号缺失）。
+	px.ReloadBilling()
 	return px
 }
 
@@ -2993,6 +3003,10 @@ func (p *Proxy) settleUsage(u *User, key *APIKey, model, upstreamUID string, ui 
 	if u != nil {
 		req.Host = p.hostShareFor(upstreamUID)
 	}
+	// 单模型计费倍率（v0.31.67）：在结算前取一次快照值。
+	// 取不到（未配置）时留 0，结算内部会回落全局 —— 这里**不要**自己兜底成 1，
+	// 否则"全局倍率改成 2"会让所有未配置模型的请求都按 1 倍扣（静默少收一半）。
+	req.Multiplier, _ = p.ratioFor(model)
 
 	res := p.billingSettler().Settle(req)
 	return res.Settled, res.ChargedMicro

@@ -191,6 +191,13 @@ type Request struct {
 	// Host 号主分成意图（v0.31.60）：nil = 本笔无可分成的号主。
 	// 由调用方**在结算前**解析（需要选号侧状态）；金额由本包算。
 	Host *HostShare
+
+	// Multiplier 本笔生效的计费倍率（v0.31.67，单模型倍率）。
+	//
+	// 0 = 未指定 → 回落 Ledger.PricingMultiplier()（全局倍率，旧行为）。
+	// 为什么由调用方传：倍率依赖"模型 → 倍率"快照，而那份快照属于 cmd/webapp
+	// （它才有 store 与热更新）；本包只负责"乘上去"，不认识配置从哪来。
+	Multiplier float64
 }
 
 // Result 一次结算的输出。
@@ -230,7 +237,13 @@ func (s Settler) Settle(req Request) Result {
 	}
 
 	res := Result{ErrMsg: req.ErrMsg, Scope: ScopePool}
-	mult := s.Ledger.PricingMultiplier()
+	// 倍率来源：请求级（单模型倍率）优先，否则全局。
+	// **绝不把 0 当"免费"**：0 只会来自"调用方没传"，此时必须回落全局 ——
+	// 否则一个漏传的调用点就能让所有请求免费（比多收更危险的失败方向）。
+	mult := req.Multiplier
+	if mult <= 0 {
+		mult = s.Ledger.PricingMultiplier()
+	}
 
 	// consumedCredit = 号池账号本次被消耗的积分（上游 direct 口径）。
 	consumedCredit := req.Usage.Credit

@@ -68,6 +68,21 @@ type modelRatio struct {
 	// 只做提示，不改计费。
 	Drift     string `json:"drift,omitempty"`
 	UpdatedAt int64  `json:"updated_at"`
+
+	// BillingRatio 单模型**计费**倍率（v0.31.67，需求"按实际倍率调整计费规则"）。
+	//
+	// 与 MeasuredCost1k 的区别必须分清：
+	//   - MeasuredCost1k 是**观测**（上游扣了我们多少积分/1k），用于估预扣；
+	//   - BillingRatio 是**定价**（我们要向用户收多少倍），直接乘进扣费。
+	//
+	// 0 = 不参与（回落全局 pricing_multiplier）。这是刻意的默认：
+	// 新增模型不会因为"没人配过"而被按 0 收费（0 会让服务变成免费）。
+	BillingRatio float64 `json:"billing_ratio"`
+	// BillingScope 作用域："" = 未启用模型级倍率；"pool" = 号池；"relay" = 第三方通道。
+	//
+	// 现在只有 pool 真正参与扣费（relay 通道随 P2 一起接）。保留字段是为了
+	// 让库里先能区分"这条倍率是给谁定的"，避免 P2 时再做一次数据迁移。
+	BillingScope string `json:"billing_scope"`
 }
 
 // modelRatioDiff 一次被记录下来的变化（待人工复核队列）。
@@ -111,6 +126,16 @@ func (s *Store) migrateModelRatio() error {
 		"measured_known INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate model_ratios(measured_known): %w", err)
 	}
+	// 单模型计费倍率（v0.31.67）：billing_ratio=0 表示"不参与"，回落全局倍率。
+	// 用 ensureColumn 传**列定义**（不是整条 ALTER）—— 这是本项目踩过的坑。
+	if err := s.ensureColumn("model_ratios", "billing_ratio",
+		"billing_ratio REAL NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate model_ratios(billing_ratio): %w", err)
+	}
+	if err := s.ensureColumn("model_ratios", "billing_scope",
+		"billing_scope TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate model_ratios(billing_scope): %w", err)
+	}
 	// 存量回填：值非 0 的一定有记录。
 	if _, err := s.db.Exec(`UPDATE model_ratios SET measured_known = 1
 		WHERE measured_cost_1k > 0 AND measured_known = 0`); err != nil {
@@ -122,7 +147,8 @@ func (s *Store) migrateModelRatio() error {
 // ListModelRatios 全量倍率（按 model 排序，保证界面稳定）。
 func (s *Store) ListModelRatios() ([]*modelRatio, error) {
 	rows, err := s.db.Query(`SELECT model, name, official_credits, official_badge,
-		official_free, measured_cost_1k, measured_known, updated_at FROM model_ratios ORDER BY model`)
+		official_free, measured_cost_1k, measured_known, updated_at,
+		COALESCE(billing_ratio,0), COALESCE(billing_scope,'') FROM model_ratios ORDER BY model`)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +158,8 @@ func (s *Store) ListModelRatios() ([]*modelRatio, error) {
 		var r modelRatio
 		var free, known int
 		if err := rows.Scan(&r.Model, &r.Name, &r.OfficialCredits, &r.OfficialBadge,
-			&free, &r.MeasuredCost1k, &known, &r.UpdatedAt); err != nil {
+			&free, &r.MeasuredCost1k, &known, &r.UpdatedAt,
+			&r.BillingRatio, &r.BillingScope); err != nil {
 			return nil, err
 		}
 		r.OfficialFree = free != 0

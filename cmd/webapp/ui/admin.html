@@ -7853,7 +7853,7 @@ async function loadModelRatios() {
     return;
   }
   const head = el('div', 'code-gen-row');
-  for (const t of ['模型', '官方倍率', '标签', '免费', '实测积分/1k', '状态']) {
+  for (const t of ['模型', '官方倍率', '标签', '免费', '实测积分/1k', '状态', '计费倍率']) {
     const c = el('span', 'muted', t);
     c.style.fontWeight = '600';
     head.appendChild(c);
@@ -7867,6 +7867,57 @@ async function loadModelRatios() {
     r.appendChild(el('span', m.official_free ? 'tag ok' : 'muted', m.official_free ? '免费' : '—'));
     r.appendChild(el('span', 'mono', Number(m.measured_cost_1k) > 0 ? String(m.measured_cost_1k) : '未实测'));
     r.appendChild(el('span', m.drift ? 'tag warn' : 'muted', m.drift ? '口径待核对' : '—'));
+    // 计费倍率（v0.31.67）：留空/0 = 不参与，回落全局；改了立即生效（服务端换快照）。
+    // 保存前可以先点「试算」看 1000 token 会扣多少 —— 改倍率是定价行为，不该靠猜。
+    const cell = el('div', 'row');
+    cell.style.gap = '4px';
+    const inp = el('input');
+    inp.type = 'number';
+    inp.min = '0';
+    inp.max = '100';
+    inp.step = '0.1';
+    inp.style.width = '68px';
+    inp.placeholder = '0=全局';
+    inp.value = Number(m.billing_ratio) > 0 ? String(m.billing_ratio) : '';
+    const bSave = el('button', 'ghost', '保存');
+    bSave.style.padding = '2px 8px';
+    const bTry = el('button', 'ghost', '试算');
+    bTry.style.padding = '2px 8px';
+    const hint = $('mrSyncHint');
+    bSave.onclick = async () => {
+      const raw = inp.value.trim();
+      const v = raw === '' ? 0 : Number(raw);
+      if (!isFinite(v) || v < 0 || v > 100) { if (hint) hint.textContent = '倍率必须在 0–100 之间（0 = 回落全局）'; return; }
+      bSave.disabled = true;
+      try {
+        const d = await post('/api/admin/model-ratios/billing',
+          { model: m.model, billing_ratio: v, billing_scope: '' });
+        if (hint) {
+          hint.textContent = '已保存 ' + m.model + '：生效 ' + d.effective_ratio +
+            '（' + (d.source === 'model' ? '模型倍率' : '回落全局') + '，rev=' + d.rev + '）';
+        }
+        loadModelRatios();
+      } catch (e) {
+        if (hint) hint.textContent = '保存失败：' + e.message;
+      } finally { bSave.disabled = false; }
+    };
+    bTry.onclick = async () => {
+      bTry.disabled = true;
+      try {
+        const d = await post('/api/admin/billing/preview', { model: m.model, tokens: 1000 });
+        if (hint) {
+          hint.textContent = '试算 ' + m.model + '：1000 token ≈ 扣 ' + d.charged_points +
+            ' 点（积分 ' + Number(d.credit).toFixed(4) + '，倍率 ' + d.ratio +
+            '，' + (d.credit_estimated ? '按实测单价估算' : '按给定积分') + '）';
+        }
+      } catch (e) {
+        if (hint) hint.textContent = '试算失败：' + e.message;
+      } finally { bTry.disabled = false; }
+    };
+    cell.appendChild(inp);
+    cell.appendChild(bSave);
+    cell.appendChild(bTry);
+    r.appendChild(cell);
     box.appendChild(r);
   }
 

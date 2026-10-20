@@ -1,20 +1,20 @@
 {
-  "version": "0.31.66",
+  "version": "0.31.67",
   "min_supported": "0.24.0",
-  "notes": "v0.31.66：长期技术债「usage_logs 无保留策略」落地 + 后台数据体积可见。\n① **分批清理**：Store.PruneUsageLogs 按 created_at 分批（每批 2000）删除过期流水。分批不是性能优化而是**安全**：一次性 DELETE 在几十万行上会长时间持有写锁，把正在结算的请求堵住 —— \"清理把线上搞挂\"的经典形态。\n② **默认 180 天，0/负数 = 永久保留**。为什么不是 30 天：删数据不可逆，180 天覆盖\"上季度对账 + 一次年度复核\"，而 180 天的流水仍然只有几万行。\n③ **配置写错不猜**：`180天` 这类非法值**退回默认并 WARN**，既不当成\"永久\"（让人以为在清理）也不当成 0（可能删光）。\n④ **调度**：启动 2 分钟后一次 + 每 24 小时一次；结果落 kv，high 级信息写日志（删了多少行、cutoff、耗时）。\n⑤ **后台「设置 → 账目对账」新增\"数据体积\"区**：库文件/WAL/可回收字节、流水行数与最早时间、生效的保留天数、上次清理结果；带「清理过期流水」按钮（二次确认，说明是按策略而不是全删）。\n⑥ **不自动 VACUUM**：整库重写期间会锁死服务。接口只把 `reclaimable_bytes` 摆出来，超过 32MB 时提示\"低峰手动 VACUUM\"。\n⑦ 新增 `GET /api/admin/data-usage`（只读）+ `?prune=1`（立即清理）。\n边界：清理只作用于 usage_logs；consume_failures / host_earnings 等账目表保留不动（对账与收益追溯要用）。",
-  "released_at": 1792485279,
+  "notes": "v0.31.67：需求「按实际倍率调整计费」P1 —— 单模型计费倍率**真正参与扣费**，改完即时生效。\n① model_ratios 新增 billing_ratio / billing_scope：ratio=0 表示不参与、回落全局 pricing_multiplier（**不是免费**）。\n② 唯一口径：Proxy.ratioFor(model) 一处判定，结算包只负责乘（Request.Multiplier，0 则回落全局）。\n③ 快照：模型级倍率是一份不可变快照（billMu + ReloadBilling），保证\"一笔请求里只读一版\"；\n   全局倍率仍**实时读**——它只有一个 kv 键，实时读天然免受\"改了没 reload\"的坑。\n④ 新增 POST /api/admin/model-ratios/billing（写 + 校验 + 返回生效值/来源/rev）与\n   POST /api/admin/billing/preview（改之前先试算，与实扣同一公式）。\n⑤ 后台倍率面板新增「计费倍率」列：行内输入 + 保存 + 试算，结果显示在面板提示位。\n⑥ 用例 5 条：按倍率扣 / 0 回落全局 / 改完立即生效 / 越界与非法 scope 被拒且不写库 / 预览==实扣。\n边界：billing_scope=relay 现在只存不参与（等第三方通道 P2）；P1 只覆盖号池计费。",
+  "released_at": 1792490717,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.66/webapp.exe",
-      "sha256": "12b86e795ca5e6e1547636b287c44dbe92bfbbb6c885dc57df237df4debc61ec",
-      "size": 15693824
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.67/webapp.exe",
+      "sha256": "f1a785671d8b7751f334cab675b7eded29a76f51293e59ad702a75290f72ab3e",
+      "size": 15712768
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "xHXC6kWDmb59FkGZQzToNP150XpN03GhMnnP1CkG8jpjtInWxRPCx4BQ7HsFDCQpTQ0UKFOCNCQagcPMEaO4CA==",
+  "signature": "g0l/bYJrv+BxFT/rDcaPpn9QU4pLkVBaXrnOAXhELtlSmgYLsDOK0FSgGXnFLH/DumLNthctsByekWg7l9BbDA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

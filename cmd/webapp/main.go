@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.66"
+const version = "0.31.67"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1629,6 +1629,9 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/models/cooling", a.userGuard(a.handleModelCooling))
 	mux.HandleFunc("GET /api/admin/model-ratios", a.adminGuard(a.handleAdminModelRatios))
 	mux.HandleFunc("POST /api/admin/model-ratios/sync", a.adminGuard(a.handleAdminModelRatioSync))
+	// 单模型计费倍率（v0.31.67）：写 + 试算。改完即时生效（快照切换）。
+	mux.HandleFunc("POST /api/admin/model-ratios/billing", a.adminGuard(a.handleAdminSetBillingRatio))
+	mux.HandleFunc("POST /api/admin/billing/preview", a.adminGuard(a.handleAdminBillingPreview))
 	mux.HandleFunc("GET /api/referral", a.userGuard(a.handleReferral))
 	// 站内公告（v0.17.8）：用户侧只读启用中的公告，用于弹窗与概览卡片。
 	mux.HandleFunc("GET /api/announcements", a.userGuard(a.handleUserAnnouncements))
