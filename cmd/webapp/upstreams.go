@@ -433,6 +433,31 @@ func (s *Store) relayCandidates(model string) ([]UpstreamModelView, error) {
 	return out, rows.Err()
 }
 
+// relayPriceCeiling 通道模型的**最高**单价（model → credit/1k），供预扣估算使用。
+//
+// 为什么取 MAX 而不是平均：预扣的作用是"挡住刷爆余额"，宁可高估（多冻结、事后多退），
+// 也不能低估（低估等于没保护）。同一模型挂在多条通道上时，取最贵的那条。
+func (s *Store) relayPriceCeiling() (map[string]float64, error) {
+	rows, err := s.db.Query(`SELECT m.model, MAX(m.credit_per_1k)
+		FROM upstream_models m JOIN upstreams u ON u.id = m.upstream_id
+		WHERE u.enabled = 1 AND m.enabled = 1 AND m.credit_per_1k > 0
+		GROUP BY m.model`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]float64{}
+	for rows.Next() {
+		var model string
+		var price float64
+		if err := rows.Scan(&model, &price); err != nil {
+			return nil, err
+		}
+		out[model] = price
+	}
+	return out, rows.Err()
+}
+
 // relayModelIDs 所有"可通过通道提供"的模型名（去重、升序）。
 func (s *Store) relayModelIDs() ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT m.model
@@ -571,6 +596,7 @@ func (a *app) handleAdminUpstreamSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, map[string]any{"error": err.Error()})
 		return
 	}
+	a.channelConfigChanged()
 	log.Printf("INFO: [relay] 保存通道 id=%d name=%q base=%s enabled=%v", id, u.Name, u.BaseURL, u.Enabled)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "ok": true})
 }
@@ -591,6 +617,7 @@ func (a *app) handleAdminUpstreamDelete(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	a.channelConfigChanged()
 	log.Printf("WARN: [relay] 删除通道 id=%d（其模型映射一并删除）", req.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -614,7 +641,7 @@ func (a *app) handleAdminUpstreamToggle(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	// 停用即刻从 /v1/models 消失（缓存最多 5 分钟）→ 主动作废缓存，避免"关了还能看见"。
-	invalidateModelsCache()
+	a.channelConfigChanged()
 	log.Printf("INFO: [relay] 通道 id=%d enabled=%v", req.ID, req.Enabled)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -675,7 +702,7 @@ func (a *app) handleAdminUpstreamModelSave(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	invalidateModelsCache()
+	a.channelConfigChanged()
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "ok": true})
 }
 
@@ -691,8 +718,20 @@ func (a *app) handleAdminUpstreamModelDelete(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	invalidateModelsCache()
+	a.channelConfigChanged()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// channelConfigChanged 通道配置变更后的**唯一收尾**（v0.31.71）。
+//
+// 两件事必须一起做，漏一件就是一个"改了不生效"的现场：
+//  1. 作废模型缓存 —— 否则停用通道后客户端还能看到那个模型（最长 5 分钟）；
+//  2. 刷新通道单价快照 —— 否则预扣仍按旧单价估（改价对"防刷爆"不起作用）。
+func (a *app) channelConfigChanged() {
+	invalidateModelsCache()
+	if a.proxy != nil {
+		a.proxy.ReloadRelayPrices()
+	}
 }
 
 // invalidateModelsCache 让 /v1/models 立刻重建（配置变更后必须调）。

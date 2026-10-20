@@ -176,11 +176,18 @@ func fakeRelay(t *testing.T, promptTok, compTok int, status int, streamReply boo
 // 而校验刻意拒绝回环。校验本身由 TestValidateUpstreamURL 单独覆盖）。
 func seedRelay(t *testing.T, store *Store, baseURL, model string, creditPer1k float64, enabled bool) (int64, int64) {
 	t.Helper()
+	return seedRelayNamed(t, store, "relay-test-"+model, baseURL, model, creditPer1k, enabled)
+}
+
+// seedRelayNamed 同 seedRelay，但通道名可指定（upstreams.name 有唯一索引，
+// 要测"同一模型挂在多条通道上"就必须能起不同名字）。
+func seedRelayNamed(t *testing.T, store *Store, name, baseURL, model string, creditPer1k float64, enabled bool) (int64, int64) {
+	t.Helper()
 	now := time.Now().Unix()
 	en := boolToInt(enabled)
 	res, err := store.db.Exec(`INSERT INTO upstreams
 		(name, kind, base_url, api_key, enabled, priority, note, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)`, "relay-test-"+model, "openai", baseURL, "sk-relay-test", en, 10, "", now, now)
+		VALUES (?,?,?,?,?,?,?,?,?)`, name, "openai", baseURL, "sk-relay-test", en, 10, "", now, now)
 	if err != nil {
 		t.Fatalf("插入通道：%v", err)
 	}

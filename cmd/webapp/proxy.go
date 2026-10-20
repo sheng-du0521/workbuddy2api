@@ -165,6 +165,14 @@ type Proxy struct {
 	// 与 onCreditChanged 同口径：用回调而非反向持有 *app，避免形成依赖环。
 	// 只在「首次同步建基线之后」触发（见 SyncAccountsReport 的 prev 判断）。
 	onAccountsAdded func(uids []string)
+	// relayMu / relayPrice 通道模型的配置单价（model → credit/1k），用于预扣估算。
+	//
+	// 为什么不直接查库：预扣在**每个请求**的入口，SQLite 只有一条连接，
+	// 每请求一次 SELECT 会和结算/心跳抢同一把锁。通道配置变更频率极低，
+	// 变更时刷新一次快照即可（见 ReloadRelayPrices）。
+	relayMu    sync.RWMutex
+	relayPrice map[string]float64
+
 	// costPer1k 观测到的「模型 → credit/1k token」实测单价，用于预扣估算。
 	// 见 observeCost：取历史最大值并持久化到 kv，重启后由 loadObservedCosts 读回。
 	costMu    sync.RWMutex
@@ -335,6 +343,7 @@ func NewProxy(store *Store, stateFp string) *Proxy {
 		sess:              sess,
 		sessStore:         sessStore,
 		costPer1k:         map[string]float64{},
+		relayPrice:        map[string]float64{},
 		lastHit:           map[string]int64{},
 		clients:           map[string]*http.Client{},
 		groupByUID:        map[string]string{},
@@ -377,6 +386,9 @@ func NewProxy(store *Store, stateFp string) *Proxy {
 	// 单模型计费倍率快照（v0.31.67）：必须在返回前加载一次，
 	// 否则第一批请求会走"快照为空 → 回落全局"的分支（数值没错，但版本号缺失）。
 	px.ReloadBilling()
+	// 通道单价快照（v0.31.71）：启动时先加载一次，否则前几个通道请求会按
+	// "没有单价 → 全局兜底" 估预扣（数额可能差一个数量级）。
+	px.ReloadRelayPrices()
 	return px
 }
 

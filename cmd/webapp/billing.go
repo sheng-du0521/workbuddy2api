@@ -105,6 +105,20 @@ func (p *Proxy) reserveUnitPrice(model string) (float64, bool) {
 	if ok && per1k > 0 {
 		return per1k * mult, true // 积分/1k → 点/1k
 	}
+	// 通道模型（v0.31.71）：配置了的单价 × **通道倍率**（不是全局倍率）。
+	//
+	// 此前这类请求只能退到全局兜底价，而兜底价是"随便配的一个数"——
+	// 通道单价高时它会严重低估，预扣挡不住，结算时把余额扣成负数；
+	// 通道单价低时又高估，余额略低就被 402 误拒。
+	//
+	// 顺序刻意在号池实测**之后**：同名模型号池优先分发，号池的实测价才是准的。
+	if price, ok := p.relayPriceFor(model); ok {
+		ratio, _ := p.ratioForRelay(model)
+		if ratio <= 0 {
+			ratio = mult // 理论上 ratioForRelay 不会返回 0，这里只做兜底
+		}
+		return price * ratio, true // credit/1k × 倍率 = 点/1k
+	}
 	if v, err := p.store.GetKV(settingReserveRate); err == nil && strings.TrimSpace(v) != "" {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 {
 			return f, true // 已是点/1k，直接用
@@ -2025,4 +2039,35 @@ func (a *app) handleAdminSetUserRatios(w http.ResponseWriter, r *http.Request) {
 			refGlobal),
 		"rate": a.moneyRate(),
 	})
+}
+
+// relayPriceFor 取通道配置里该模型的单价（credit/1k）。
+//
+// 缺失 = 这个模型没有配通道（或通道被停用），由调用方继续往下一档回落。
+func (p *Proxy) relayPriceFor(model string) (float64, bool) {
+	p.relayMu.RLock()
+	defer p.relayMu.RUnlock()
+	v, ok := p.relayPrice[model]
+	if !ok || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// ReloadRelayPrices 重新加载通道单价快照（v0.31.71）。
+//
+// 在**通道/映射变更**时调用：管理员把某模型的单价从 1 改成 5，下一个请求的预扣
+// 就必须按 5 算 —— 否则"改完不生效"只会在结算对账时才被发现。
+func (p *Proxy) ReloadRelayPrices() {
+	prices, err := p.store.relayPriceCeiling()
+	if err != nil {
+		log.Printf("WARN: [relay] 加载通道单价失败，沿用旧快照：%v", err)
+		return
+	}
+	p.relayMu.Lock()
+	p.relayPrice = prices
+	p.relayMu.Unlock()
+	if len(prices) > 0 {
+		log.Printf("INFO: [relay] 通道单价快照已刷新（%d 个模型）", len(prices))
+	}
 }
