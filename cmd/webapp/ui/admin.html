@@ -8277,7 +8277,9 @@ async function loadModelRatios() {
     box.appendChild(el('div', 'hintbar', '还没有同步数据：点上方「立即同步官方口径」（不产生额外计费）。'));
     return;
   }
-  const head = el('div', 'code-gen-row');
+  // 表格用 .ratio-row（grid 固定列模板，v0.31.74）：.code-gen-row 是 flex+space-between，
+  // 列宽随内容变，7 列会长短不齐。表头与数据行共用同一个类，天然对齐。
+  const head = el('div', 'ratio-row');
   for (const t of ['模型', '官方倍率', '标签', '免费', '实测积分/1k', '状态', '计费倍率']) {
     const c = el('span', 'muted', t);
     c.style.fontWeight = '600';
@@ -8285,8 +8287,10 @@ async function loadModelRatios() {
   }
   box.appendChild(head);
   for (const m of models) {
-    const r = el('div', 'code-gen-row');
-    r.appendChild(el('span', 'mono', m.model));
+    const r = el('div', 'ratio-row');
+    const cellModel = el('span', 'mono cell-model', m.model);
+    cellModel.title = m.model;
+    r.appendChild(cellModel);
     r.appendChild(el('span', 'mono', m.official_credits || '—'));
     r.appendChild(el('span', 'mono muted', m.official_badge || '—'));
     r.appendChild(el('span', m.official_free ? 'tag ok' : 'muted', m.official_free ? '免费' : '—'));
@@ -8294,7 +8298,7 @@ async function loadModelRatios() {
     r.appendChild(el('span', m.drift ? 'tag warn' : 'muted', m.drift ? '口径待核对' : '—'));
     // 计费倍率（v0.31.67）：留空/0 = 不参与，回落全局；改了立即生效（服务端换快照）。
     // 保存前可以先点「试算」看 1000 token 会扣多少 —— 改倍率是定价行为，不该靠猜。
-    const cell = el('div', 'row');
+    const cell = el('div', 'cell-ops');
     cell.style.gap = '4px';
     const inp = el('input');
     inp.type = 'number';

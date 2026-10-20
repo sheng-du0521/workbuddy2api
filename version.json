@@ -1,20 +1,20 @@
 {
-  "version": "0.31.73",
+  "version": "0.31.74",
   "min_supported": "0.24.0",
-  "notes": "v0.31.73：推理请求体上限 8MB → 32MB（并可运行期调整）。\n\n① 现场：客户端 deepseek-harness 收到的 413 是**我们自己**发的 —— 生产日志显示 content_length 在 8.4MB ~ 23.4MB，全部卡在 8MB 闸门，一次都没触达上游（不耗账号、不产生流水）。8MB 当初是「够用就好」的估计，而 agent 类客户端的 body 与上下文长度成正比，估计必然被追上。\n\n② chatBodyMax 8MB → 32MB：覆盖实测最大值（23.4MB）的 1.37 倍。内存预算：body 在实现里同时存在三份（原始 buf → 字段 map → 重组 JSON），32MB × 3 ≈ 100MB/请求，生产 1.6GB / 3 并发约 300MB。再往上加必须同时改内存预算。\n\n③ 上限按路径分（bodyLimitFor 是唯一口径）：/v1/* 用 chatBodyMax，其余用 16MB 兜底 —— 放宽推理不等于放宽未鉴权的注册/登录/导入接口。此前是两层嵌套（外 16MB / 内 8MB），内层先触发但报错写内层数字，同一个 413 会看到两个上限。\n\n④ 可运行期调整：环境变量 WB_BODY_MAX_MB（4~128 MB），启动时读一次，非法/越界退回默认 + WARN，生效值打进启动日志 —— 「当前到底放行多大」必须能从日志回答。\n\n⑤ 413 的 gateway_hint 补可执行下一步：上限值、环境变量名与允许范围、以及「未使用任何上游账号、原样重发仍然失败」，避免客户端白重试。\n\n验证：TestBodyLimitForPath（/v1 三个入口走推理上限，注册/导入/healthz 走 16MB）、TestLimitRequestBodyByPath（真中间件真读体：9MB 在 /v1 放行、13MB 仍 413、9MB 非 /v1 放行、17MB 仍 413）、TestApplyBodyLimitEnv（64 生效；abc/-1/0/2/999/64.5 全退回默认）、TestTooLargeHintMentionsEnv。\n\n边界：32MB 是网关侧上限，与上游能接受多大无关（超上游限制时由上游返回 413/11115，我们只透传、不重试、不冷却账号）；ReadTimeout 仍 60 秒，慢网络上大 body 可能先超时（408 可重试）；1.6GB 小机器不要配 128MB。",
-  "released_at": 1792523142,
+  "notes": "v0.31.74：倍率表对齐 + 余额不足有下一步 + 测试对话只列可用模型。\n\n① 模型倍率表列对不齐：根因是 .code-gen-row 用 flex + space-between，7 列宽度各自由内容决定（模型名长短、标签有无、未实测三个字都会让下一行漂移）。新增 .ratio-row（grid 固定列模板，表头与数据行共用同一个类）：数字列右对齐 + tabular-nums，模型名超长省略 + title，计费列 input 固定宽，窄屏降两行。刻意不动 .code-gen-row（另有 3 处在用）。\n\n② 余额不足从「一坨 JSON」变成「有下一步」：拦截时机不变（鉴权中间件内、读 body 前、选号前，402 = 零出站零扣费；代挂 Key 与 requireBalance=false 豁免）。402 补 gateway_hint：说清去哪充值、以及代挂 Key 不扣余额这条替代路径；消费闸超额另给 quota_exceeded（余额还有，是限额到了）。控制台：概览余额卡 <5 点标红 + 去充值链接、<=0 变「已用完」，负余额照原样显示不截断；测试对话页 402 改结构化提示 + 「去充值」「改用代挂 Key」两个按钮。\n\n③ 测试对话的模型下拉只列「这把 Key 能用」的：新接口 GET /api/keys/{id}/models，与 /v1/models 同源（号池 cachedModelIDs ∪ 通道 relayModelIDs），测试页/一键接入弹窗/v1/models 三处一个来源。换成 select，选中即生效，换密钥自动重拉并按模型名（不是索引）保留上次选择。清单不可知时切手填而不是给假清单：代挂 Key 绑定的号一个都不在池 → reason=host_accounts_not_in_pool + 允许手填；接口失败同样切手填、不弹错。\n\n④ 为什么余额阈值用固定 5 点而不用近 3 天日均：新用户日均 0 → 阈值 0 → 永远不提醒，而新用户最需要知道充多少够跑一天；日均随项目节奏跳变、解释不清；且每次打开概览都要多一次聚合查询，与结算抢同一条 SQLite 连接。阈值只影响展示，拦截线永远是 balance<=0。\n\n验证：TestKeyModelsOwnershipAndStatus（本人 200 / 跨用户 404 而非 403 / 停用 403）、TestKeyModelsHostKeyNotInPool（号不在池 → 空清单 + 允许手填，不回落池目录）；全量 go test 通过；preflight 的 gofmt/vet/前端/jscheck/冒烟/真浏览器 E2E 全绿。\n\n边界：/api/keys/{id}/models 是辅助选择接口，通道表读失败只丢通道部分、不做成 500；下拉是配置事实，冷却/限流仍可能在调用时拒绝；调阈值不放宽拦截。",
+  "released_at": 1792529088,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.73/webapp.exe",
-      "sha256": "565b08fd366b7424ce58ad80b08036f39a582fcd3df4465c5e812e3fced03360",
-      "size": 15910912
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.74/webapp.exe",
+      "sha256": "8a88a26b9e3497af78cf7387fadbee72f4c6d08c74ba3b635f38eaa3d20f807d",
+      "size": 15924736
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "sSiFsq0YQ2dbcnksIalLrr3ikuvOckx4HrWp4ltg55FSGY+ZRWWZVKx5a4MDvKPIXHvUzjI7xPaklqZnwqpcCA==",
+  "signature": "QZUSIbnzUWG+YCeJjzPIlui8TlHw+EzMzAfnoSjbFAB4vLC0/24WeyTA8rXDYMMLK7kJXOxdztyDD5dDg9srDw==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

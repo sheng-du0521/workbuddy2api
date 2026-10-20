@@ -313,12 +313,22 @@ func (a *app) apiKeyGuardOpt(next http.HandlerFunc, requireBalance bool) http.Ha
 			if u.BalanceMicro <= 0 {
 				// 余额耗尽：硬拦截。允许上一笔把余额打成负数（在途请求不中断），
 				// 但负余额状态下不再放行新请求。
-				writeOpenAIError(w, http.StatusPaymentRequired, "insufficient balance, please redeem a code")
+				//
+				// hint（v0.31.74）：402 在这个项目里有个特殊处境 —— 客户端只会把它
+				// 当"付钱问题"显示，用户看不出该去哪、也不知道还有一条不花钱的路。
+				// 所以 hint 必须同时给出「去哪充值」和「代挂 Key 不扣余额」两个出口。
+				writeOpenAIErrorHint(w, http.StatusPaymentRequired,
+					"insufficient balance, please redeem a code",
+					"balance_exhausted: this key is billed from your account balance; "+
+						"redeem a recharge code in the console (Wallet -> Redeem) and retry, "+
+						"or switch to a host-billed key (bound to your own accounts, no balance deducted)")
 				return
 			}
 			// 消费闸：余额可能一次充很多，日/月上限能把单日突发消费按住。
 			if msg := a.quotaExceeded(u); msg != "" {
-				writeOpenAIError(w, http.StatusPaymentRequired, msg)
+				writeOpenAIErrorHint(w, http.StatusPaymentRequired, msg,
+					"quota_exceeded: a daily/monthly spending cap was hit (balance is still positive); "+
+						"wait for the window to reset or ask the admin to raise the cap for this account")
 				return
 			}
 		}

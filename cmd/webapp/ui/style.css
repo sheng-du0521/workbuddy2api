@@ -611,6 +611,32 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .code-gen-row .mono { font-size: 12.5px; }
 .code-name .mono { font-size: 13px; }
 
+/* ---------- 模型倍率表（v0.31.74，需求 4：列必须逐行对齐） ----------
+   .code-gen-row 是 flex + space-between，每列宽度由该行内容决定 ——
+   模型名长短、标签有无都会让下一行的列位置横向漂移，所以倍率表不能用它。
+   这里用固定 grid 模板：表头与数据行**共用同一个类**，天然对齐；
+   数字列右对齐 + tabular-nums（0.05 与 1.2345 宽度不跳）。 */
+.ratio-row {
+  display: grid; align-items: center; gap: 8px;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  grid-template-columns: minmax(150px, 1.7fr) 88px 84px 52px 104px 96px 188px;
+}
+.ratio-row .mono { font-size: 12.5px; }
+/* 官方倍率、实测积分：数字列右对齐 */
+.ratio-row > span:nth-child(2),
+.ratio-row > span:nth-child(5) { text-align: right; font-variant-numeric: tabular-nums; }
+/* 模型名超长：省略号 + title 看全名（hover） */
+.ratio-row > .cell-model { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 计费倍率操作区：input 固定宽，按钮不收缩 */
+.ratio-row > .cell-ops { display: flex; gap: 4px; justify-content: flex-end; align-items: center; }
+.ratio-row > .cell-ops > button { flex: 0 0 auto; }
+/* 窄屏：降两行，宁可换行也不横向滚动 */
+@media (max-width: 720px) {
+  .ratio-row { grid-template-columns: 1fr 1fr 1fr; }
+  .ratio-row > .cell-model { grid-column: 1 / -1; }
+  .ratio-row > .cell-ops { grid-column: 1 / -1; justify-content: flex-start; }
+}
+
 /* ---------- 登录页（面板分离：用户 / 管理两套） ---------- */
 .login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
 .login-panel { width: 100%; max-width: 400px; }

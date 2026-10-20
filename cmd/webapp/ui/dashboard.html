@@ -82,7 +82,7 @@
       </div>
 
       <div class="kpis" id="ovKpis">
-        <div class="kpi-card hl"><div class="k">余额 · 点</div><div class="v" id="balance">—</div><div class="d" id="balanceCny">≈ ¥0.00</div><div class="d" id="multNote">计费倍率 —</div></div>
+        <div class="kpi-card hl"><div class="k">余额 · 点</div><div class="v" id="balance">—</div><div class="d" id="balanceCny">≈ ¥0.00</div><div class="d" id="balanceLow" style="display:none;"></div><div class="d" id="multNote">计费倍率 —</div></div>
         <div class="kpi-card"><div class="k">累计请求</div><div class="v" id="reqs">—</div></div>
         <div class="kpi-card"><div class="k">累计 token</div><div class="v" id="tokens">—</div></div>
         <div class="kpi-card"><div class="k">累计消费</div><div class="v"><span id="charged">—</span><span class="u">点</span></div></div>
@@ -218,8 +218,11 @@
           <label>密钥</label>
           <select id="testKey" style="min-width:260px;"></select>
           <label>模型</label>
-          <input type="text" id="testModel" value="deepseek-v4-flash" class="mono" list="modelOpts" style="min-width:180px;">
-          <datalist id="modelOpts"></datalist>
+          <!-- 下拉只列「这把 Key 可用」的模型（v0.31.74）：来源 /api/keys/{id}/models，
+               与 /v1/models 同源。清单不可知时（代挂号未入池）自动切成手填，
+               见 loadTestModels —— 不给一份会 404 的假清单。 -->
+          <select id="testModelSel" class="mono" style="min-width:210px;"></select>
+          <input type="text" id="testModel" class="mono" placeholder="手填模型名" style="min-width:210px;display:none;">
           <span class="row tight" style="gap:6px;">
             <span class="switch"><input type="checkbox" id="testStream" checked><i></i></span>
             <span class="muted" style="font-size:12px;">流式</span>
@@ -727,6 +730,35 @@ async function loadOvSplit() {
   if (!totalReq) box.appendChild(el('div', 'muted', '近 14 天还没有调用记录。'));
 }
 
+// LOW_BALANCE_POINTS 余额"偏低"阈值（点）。**只影响展示**，拦截线永远是 balance<=0
+// （见 billing.go 的 402 分支）。取固定 5 点而不是近 3 天日均：自适应在新用户身上
+// 算出来是 0，等于"最需要提醒的人永远收不到提醒"，而且日均会随项目节奏跳、解释不清。
+const LOW_BALANCE_POINTS = 5;
+
+// renderBalanceLow 余额卡的「偏低 / 已用完」提示（v0.31.74）。
+//
+// 两个状态分开说：< 5 点 = 偏低（还能用，但该充了）；<= 0 = 已用完（请求已被 402 拦）。
+// 负余额（在途请求结算后被打成负）照原样标红，**不截断成 0** —— 截断会让人以为"刚好用完"。
+function renderBalanceLow(bal) {
+  const box = $('balanceLow');
+  const val = $('balance');
+  if (!box) return;
+  const exhausted = bal <= 0;
+  const low = bal < LOW_BALANCE_POINTS;
+  if (val) val.style.color = low ? '#c0392b' : '';
+  box.style.display = low ? '' : 'none';
+  box.textContent = '';
+  if (!low) return;
+  box.style.color = exhausted ? '#c0392b' : '#b9770e';
+  box.appendChild(document.createTextNode(exhausted ? '余额已用完（请求会被拦下）· ' : '余额偏低 · '));
+  const a = el('a', '', '去充值 →');
+  a.href = 'javascript:void(0)';
+  a.style.color = 'inherit';
+  a.style.textDecoration = 'underline';
+  a.onclick = () => navGo('wallet');
+  box.appendChild(a);
+}
+
 async function loadTop() {
   const d = await api('/api/usage?limit=1');
   const s = d.summary || {};
@@ -736,6 +768,10 @@ async function loadTop() {
   setTxt('balanceCny', s.balance_cny === undefined
     ? ('≈ ' + fmtMoney(cnyOf(s.balance, s.rate)))
     : ('≈ ' + fmtMoney(s.balance_cny) + ' · ' + fmtRate(s.rate)));
+  // 余额偏低提示（v0.31.74）：阈值只影响**展示**，拦截线永远是 balance<=0
+  // （见 billing.go 的 402 分支）。5 点是固定值，理由见 docs/需求规格补充-七项：
+  // 自适应日均在冷启动时算出来是 0，等于"新用户永远不提醒"。
+  renderBalanceLow(Number(s.balance) || 0);
   setTxt('reqs', fmtNum(s.requests));
   setTxt('tokens', fmtNum(s.tokens));
   setTxt('charged', fmtPoints(s.charged));
@@ -1565,12 +1601,15 @@ async function openOnboardModal(k) {
   row.appendChild(dl);
   m.body.appendChild(row);
   // 候选列表：拉不到就让用户手填（不能因为模型目录接口失败而让整个功能不可用）。
-  api('/api/models').then((r) => {
+  // v0.31.74：改用**该密钥**的可用模型（与测试对话页、/v1/models 同源）——
+  // 用平台全集会让用户接上一个这把 Key 根本调不通的模型，接完才发现。
+  api('/api/keys/' + encodeURIComponent(k.id) + '/models').then((r) => {
     for (const id of (r.models || [])) {
       const o = el('option');
       o.value = id;
       dl.appendChild(o);
     }
+    if (!(r.models || []).length && r.note) inp.placeholder = r.note;
   }).catch(() => {});
 
   const hint = el('div', 'muted');
@@ -2952,6 +2991,44 @@ $('btnRedeem').onclick = async () => {
 
 let testModelsLoaded = false;
 
+// loadTestModels 拉「该密钥可用模型」并填下拉（v0.31.74）。
+//
+// 三种情形都要能用，不能因为清单取不到就把测试功能变成不可用：
+//   · 正常 → 下拉列出可用模型，保留上次选择（**按名字匹配**，不按索引：
+//     列表顺序会随号池变化，按索引会把"上次选的 glm-5.3"变成"另一个模型的第 3 行"）；
+//   · 清单为空（代挂号未入池/号池还没观测到）→ 切成手填，placeholder 用后端给的 note；
+//   · 接口失败（老后端/密钥停用）→ 同样切手填，不弹错。
+async function loadTestModels(keyID) {
+  const sel = $('testModelSel'), inp = $('testModel');
+  if (!sel || !inp) return;
+  const saved = localStorage.getItem('wb_test_model') || '';
+  sel.textContent = '';
+  let d = null;
+  try { d = await api('/api/keys/' + encodeURIComponent(keyID) + '/models'); }
+  catch (e) { d = null; }
+  const list = (d && d.models) || [];
+  if (!list.length) {
+    sel.style.display = 'none';
+    inp.style.display = '';
+    inp.value = saved;
+    inp.placeholder = (d && d.note) || '手填模型名（该密钥未列出可用模型）';
+    if (d && d.reason === 'host_accounts_not_in_pool') {
+      inp.title = '绑定的账号还没进号池，平台没有观测到它们的模型；直接填模型名即可测试';
+    }
+    return;
+  }
+  sel.style.display = '';
+  inp.style.display = 'none';
+  for (const id of list) {
+    const o = el('option', '', id);
+    o.value = id;
+    sel.appendChild(o);
+  }
+  if (saved && list.includes(saved)) sel.value = saved;
+  else if (inp.value && list.includes(inp.value.trim())) sel.value = inp.value.trim();
+  localStorage.setItem('wb_test_model', sel.value);
+}
+
 async function loadTestChat() {
   try {
     const d = await api('/api/keys');
@@ -2974,16 +3051,11 @@ async function loadTestChat() {
     } else if (Array.from(sel.options).some((o) => o.value === cur)) {
       sel.value = cur;
     }
+    // 换密钥 → 模型清单跟着换（这正是此前"只加载一次"的毛病）。
+    sel.onchange = () => { if (sel.value) loadTestModels(sel.value); };
+    if (sel.value) await loadTestModels(sel.value);
   } catch (e) { /* 忽略 */ }
-  if (!testModelsLoaded) {
-    testModelsLoaded = true;
-    try {
-      const m = await api('/api/models');
-      const dl = $('modelOpts');
-      dl.textContent = '';
-      for (const id of (m.models || [])) { const o = el('option'); o.value = id; dl.appendChild(o); }
-    } catch (e) { /* 忽略 */ }
-  }
+  testModelsLoaded = true;
 }
 
 async function sendTest() {
@@ -2992,6 +3064,16 @@ async function sendTest() {
   out.textContent = '';
   const keyID = $('testKey').value;
   if (!keyID) { toast('请先创建一把可用的密钥', 'err'); return; }
+  // 模型取值：下拉可见就用下拉，否则用手填框（清单不可知时的兜底）。
+  // 空值当场拦下（需求 7）：后端也会回 400，但让用户点完才看到报错是最差的一种。
+  const selEl = $('testModelSel');
+  const model = (selEl && selEl.style.display !== 'none') ? selEl.value : $('testModel').value.trim();
+  if (!model) {
+    toast(selEl && selEl.style.display !== 'none'
+      ? '请先选一个模型' : '请填一个模型名（可从「API 密钥」页的可用模型复制）', 'err');
+    return;
+  }
+  localStorage.setItem('wb_test_model', model);
   $('testHint').textContent = '请求中…';
   $('btnTestSend').disabled = true;
   // 明文在发送这一刻才单取（本页全程不缓存）：既满足「初始渲染无明文」，
@@ -3017,7 +3099,7 @@ async function sendTest() {
     const res = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: $('testModel').value.trim(), stream, messages: [{ role: 'user', content: $('testPrompt').value }] }),
+      body: JSON.stringify({ model: model, stream, messages: [{ role: 'user', content: $('testPrompt').value }] }),
     });
     if (!res.ok) throw new Error(await res.text());
     if (!stream) {
@@ -3044,8 +3126,38 @@ async function sendTest() {
     }
     $('testHint').textContent = '完成';
   } catch (e) {
+    const raw = String(e.message || '');
+    // 402 不把 JSON 原文扔给用户（v0.31.74）：余额问题有明确下一步，而一坨 JSON
+    // 只会让人来问"是不是挂了"。这里给「去充值 / 改用代挂 Key」两个出口。
+    let errCode = 0;
+    try { const j = JSON.parse(raw); errCode = (j && j.error && j.error.code) || j.code || 0; } catch (_) {}
+    if (errCode === 402) {
+      out.className = 'code';
+      out.textContent = '';
+      out.style.fontFamily = 'inherit';
+      const box = el('div');
+      box.appendChild(el('div', '', '余额不足，本次请求没有发出（未扣费）。'));
+      const why = el('div', 'muted', '号池计费 Key 按用量扣余额，余额为 0 时请求会在入口被直接拦下。');
+      why.style.fontSize = '12px';
+      box.appendChild(why);
+      const row = el('div', 'row');
+      row.style.gap = '8px';
+      row.style.marginTop = '8px';
+      const b1 = el('button', '', '去充值');
+      b1.onclick = () => navGo('wallet');
+      const b2 = el('button', 'ghost', '改用代挂 Key');
+      b2.title = '代挂自用 Key 只用你自己的账号，不扣余额';
+      b2.onclick = () => navGo('keys');
+      row.appendChild(b1);
+      row.appendChild(b2);
+      box.appendChild(row);
+      out.appendChild(box);
+      $('testHint').textContent = '余额不足';
+      toast('余额不足：去「充值提现」兑换充值码，或换一把代挂 Key', 'err');
+      return;
+    }
     out.className = 'code err';
-    out.textContent = e.message;
+    out.textContent = raw;
     $('testHint').textContent = '失败';
   } finally {
     $('btnTestSend').disabled = false;

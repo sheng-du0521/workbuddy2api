@@ -553,6 +553,17 @@ const FX = {
     ],
   },
   '/api/keys/1/reveal': { id: 1, key: 'sk-wb-abcdefghijklmnop', masked: 'sk-wb-••••••••mnop' },
+  // v0.31.74：测试对话页的模型下拉改读「该密钥的可用模型」（与 /v1/models 同源）。
+  // 这里给 2 个，断言下拉渲染 2 个 option —— 原来断言的是 datalist#modelOpts。
+  '/api/keys/1/models': {
+    models: ['deepseek-v4-flash', 'glm-5.2'], count: 2, kind: 'pool', manual_allowed: true,
+  },
+  // 代挂 Key（id=2）绑的号不在池：清单不可知 → 前端应切成手填（不给假清单）。
+  '/api/keys/2/models': {
+    models: [], count: 0, kind: 'host', manual_allowed: true,
+    reason: 'host_accounts_not_in_pool',
+    note: '该密钥绑定的账号尚未进入号池，平台还没有观测到它们的模型；可直接手填模型名测试',
+  },
   // 站内公告（v0.17.8，用户侧只回启用中的）
   // v0.22.0：接口只回「生效中」的公告，并带 state / time_window 派生字段。
   // 这里给一条**置顶 + 有时限**的，用来断言「📌 置顶」与「有效期至」都被渲染。
@@ -1711,7 +1722,7 @@ function run(pageFile, meOverride, plan) {
     // 不再带 nav（避免 clickNav 触发的重新渲染把刚展开的明文冲掉）。
     { click: ['#keyCards .ecard .icon-btn'],
       textIn: [['#keyCards', 'sk-wb-abcdefghijklmnop']] },
-    { nav: 'test', counts: [['testKey', 2], ['modelOpts', 2]] },
+    { nav: 'test', counts: [['testKey', 2], ['testModelSel', 2]] },
     { nav: 'usage', counts: [['bkCards', 3], ['usKpis', 6], ['usChart', 1], ['usModels', 1], ['myDailyTable', 1], ['usFeed', 1]] },
 
     // ================================================================
