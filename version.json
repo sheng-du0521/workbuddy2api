@@ -1,20 +1,20 @@
 {
-  "version": "0.31.68",
+  "version": "0.31.69",
   "min_supported": "0.24.0",
-  "notes": "v0.31.68：需求 P2 —— 第三方模型 API / 中转站通道（录入、启停、探活、分发、计费）。\n① 新增 upstreams / upstream_models 两张表与管理接口（save/delete/toggle/probe/models）。读接口只回 key 掩码，永不回明文；更新时留空 = 不改。\n② 地址校验拦 SSRF：拒私网/回环/链路本地/云元数据 —— 这个地址是**服务端**去请求的，放行回环等于给后台加了个内网探测功能。\n③ 分发「号池优先」：判据是**号池模型目录里有没这个名字**。最初写成\"池内有可用号\"，是错的 —— 池内可用性只看 (账号,模型) 冷却，不认识\"是否支持该模型\"，于是任何模型都返回\"有号\"，通道永远走不到。目录为空时按\"号池认识\"处理（缺数据≠号池没有），避免一次重启把流量全推给第三方。\n④ 计费复用同一条结算链：tokens/1000 × 每 1k 积分 = 折算积分，再走 PointToMicro(积分 × 倍率)；渠道倍率取 billing_scope=relay 的那条，未配回落全局。新增 ScopeRelay，流水可分开统计两条供给的毛利。\n⑤ 通道请求**不做 PrepareOutbound**（那套指纹/角色/efforts 改写是给 workbuddy 上游的，照搬到第三方只会被拒或降智）。流式显式带 stream_options.include_usage；上游不给 usage 时记 no_usage 流水 + 0 费 + WARN（不凭空估）。\n⑥ /v1/models 合并通道模型（owned_by=relay，只追加号池没有的）；缓存里号池与通道分包，避免模型名归一化与分发判定被通道模型污染（那是会自我死锁的一处）。\n⑦ 后台新增「第三方通道」页：通道卡片（探活/编辑/启停/删除）+ 模型映射表（含\"号池优先\"冲突提示）。\n验证：新增 6 条用例（URL 校验 / 掩码 / 不认识才走通道且扣费精确 / 认识则一次都不打通道 / 全失败回 502 而非 404 / 停用即刻不可见 / 流式按 usage 计费）；go test ./... 全绿。\n边界：v1 只支持 openai 兼容协议；通道请求直连（不走号池出口代理）；预扣沿用全局兜底单价而非通道单价；不做\"上游故障自动降级到通道\"。",
-  "released_at": 1792495810,
+  "notes": "v0.31.69：需求 P3 —— 一键接入（WorkBuddy / CC Switch）。\n\n① 控制台「API 密钥」每张卡新增「接入」：选目标 → 填模型 → 生成一次性脚本（Windows .bat / macOS+Linux .sh），双击即写入客户端配置。脚本会**先备份**（models.json.wb2api.bak）、**按 id 去重替换**（不是追加）、写完后读回校验，并自删（含明文 Key）。\n\n② 为什么不是\"服务端代写\"：浏览器不能写本地文件；用户端 agent 已于 v0.31.53 整体下线（`/api/agent/poll` 对 owner>0 回 410），普通用户没有可用 agent。一次性脚本不需要常驻进程、也不需要给它\"能写任意路径\"的权限。\n\n③ 三个真问题只有\"真跑\"才能发现（静态断言全绿而实际是坏的）：\n（a）.bat 本体含中文 → cmd 在 chcp 生效前按本地代码页解析，直接报 \"'ey，运行后请删除。' is not recognized\"；\n（b）Write-Host 'a' + 'b' 在 PS 里不是拼接，\"+\" 被当成第三个参数原样打印；\n（c）del \"%~f0\" 紧跟执行会报 \"The batch file cannot be found.\"（句柄未释放），需先 (goto) 2>nul 再删。\n这三条现在都有用例**真跑 .bat** 钉住（USERPROFILE 指向临时目录，不碰本机配置）。\n\n④ 注入防护：模型名拒绝引号/反斜杠/$/反引号/控制字符；.bat 用 -EncodedCommand（传输层只剩 base64，外部输入与命令行语法完全解耦）；写文件用 UTF-8 **无 BOM**（PS 5.1 的 Out-File 带 BOM，多数 JSON 解析器不认，表现为\"模型没出现\"）。\n\n⑤ 接口与 reveal 同一纪律：归属校验下推 SQL（跨用户 404）、停用 Key 409、不写日志、错误笼统；返回脚本含明文 Key，因此只对 active + 有密文的 Key 显示入口。\n\n⑥ 冒烟脚本改用真实 secret 文件（原来 -secret none）：禁用加密时 revealable 恒为 false，「查看/复制/接入」三颗按钮根本不会渲染 —— 真浏览器 E2E 点了「接入」却没有那颗按钮才暴露出来。\n\n验证：新增 4 条用例（脚本内容 / 模型名校验 / 接口权限 / 真跑 .bat 三种场景）；E2E 扩到\"注册→控制台→生成密钥→一键接入\"；go test ./... 全绿。\n\n边界：CC Switch 写的是 ~/.claude/settings.json 的 env（它自己的 providers 表是第三方 SSOT，不直接改）；macOS/Linux 脚本需要 python3 处理 JSON；未做\"接入后自动验证能连通\"。",
+  "released_at": 1792514019,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.68/webapp.exe",
-      "sha256": "57d408e140804090fb7c88172dc7d309b0c43267d93104583f4f10a6ee27ba64",
-      "size": 15797248
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.69/webapp.exe",
+      "sha256": "290aaf36a0700579342b370763fe6c286b554286256f0b4408ce6d0e7f34604b",
+      "size": 15824896
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "MZ0fjzY/1SiCJykrUqfYyczR4YIZ7RaCIq28Aez8UQbj+lyylipdiQriNjOCq3H6CYVg4axXm9ZL8kG+8u15Cw==",
+  "signature": "FYYu0wcJWDvS8ORSKJAnNVFsvQY/pTP0IXBBD9xmG51fCQykCYWFgCw0QDVb79NpgHesFiPQDKxake/z9WXuAA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

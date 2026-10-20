@@ -1509,6 +1509,153 @@ async function loadKeys() {
 }
 
 // openKeyBindModal 修改既有密钥的账号范围。
+// openOnboardModal 一键接入（v0.31.69，需求 P3）。
+//
+// 为什么是"下载一个脚本"而不是"服务端直接写"：浏览器不能写本地文件，
+// 而用户端 agent 已在 v0.31.53 整体下线（`/api/agent/poll` 对普通用户回 410）。
+// 一次性脚本是唯一"不需要常驻进程、也不需要给它任意路径写权限"的做法。
+//
+// 弹窗要回答的四件事（缺一个用户就会问支持）：
+//   1. 会写哪个文件（路径）；
+//   2. 改坏了怎么回去（自动备份 .wb2api.bak）；
+//   3. 写完怎么验证（WorkBuddy 模型选择里出现该名字）；
+//   4. 不想跑脚本怎么办（复制 JSON，手动合并）。
+async function openOnboardModal(k) {
+  let caps = { targets: [] };
+  try { caps = await api('/api/onboard/caps'); } catch (e) { /* 老后端：给最小可用集 */ }
+  const targets = (caps.targets && caps.targets.length) ? caps.targets : [
+    { id: 'workbuddy', label: 'WorkBuddy', desc: '写入 ~/.workbuddy/models.json' },
+    { id: 'ccswitch', label: 'CC Switch', desc: '写入 ~/.claude/settings.json 的 env' },
+  ];
+
+  // 平台：脚本形态由**用户**的机器决定，不是服务端。
+  const isWin = /Win/i.test(navigator.platform || navigator.userAgent || '');
+  let picked = targets[0].id;
+
+  const m = openModal('一键接入 · ' + (k.name || '未命名'),
+    '把「本站地址 + 这把 Key + 一个模型」写进客户端配置。会先备份原文件，再按 id 合并（不会追加重复条目）。');
+
+  // 目标选择：用项目里既有的 segmented 控件（不是自造 chip —— 自造就要自己维护
+  // 选中态样式，而 .chip 的选中类是 .active 不是 .on，写错时"能点但看不出选了谁"）。
+  const segBox = el('div');
+  segBox.style.marginBottom = '10px';
+  m.body.appendChild(segBox);
+  const renderSeg = () => {
+    segBox.textContent = '';
+    segBox.appendChild(segmented(
+      targets.map((t) => ({ value: t.id, label: t.label })),
+      picked,
+      (v) => { picked = v; renderSeg(); }));
+    const cur = targets.find((t) => t.id === picked);
+    if (cur && cur.desc) segBox.appendChild(el('div', 'muted', cur.desc));
+  };
+  renderSeg();
+
+  // 模型名（带候选）
+  const row = el('div', 'row');
+  row.style.gap = '8px';
+  row.style.alignItems = 'center';
+  const inp = el('input');
+  inp.placeholder = '模型名，如 glm-5.3';
+  inp.style.flex = '1';
+  inp.setAttribute('list', 'onboardModelList');
+  const dl = el('datalist');
+  dl.id = 'onboardModelList';
+  row.appendChild(inp);
+  row.appendChild(dl);
+  m.body.appendChild(row);
+  // 候选列表：拉不到就让用户手填（不能因为模型目录接口失败而让整个功能不可用）。
+  api('/api/models').then((r) => {
+    for (const id of (r.models || [])) {
+      const o = el('option');
+      o.value = id;
+      dl.appendChild(o);
+    }
+  }).catch(() => {});
+
+  const hint = el('div', 'muted');
+  hint.style.fontSize = '12px';
+  hint.style.marginTop = '6px';
+  hint.textContent = isWin
+    ? '将生成 Windows 脚本（.bat）：双击运行，完成后自删。'
+    : '将生成 macOS/Linux 脚本（.sh）：需要 python3 处理 JSON（不会用 sed 硬改，那会写坏配置）。';
+  m.body.appendChild(hint);
+
+  const result = el('div');
+  result.style.marginTop = '12px';
+  m.body.appendChild(result);
+
+  const ops = el('div', 'row');
+  ops.style.marginTop = '12px';
+  const gen = el('button', '', '生成接入包');
+  const cancel = el('button', 'ghost', '关闭');
+  cancel.onclick = m.close;
+  ops.appendChild(gen);
+  ops.appendChild(cancel);
+  m.body.appendChild(ops);
+
+  gen.onclick = async () => {
+    const model = inp.value.trim();
+    if (!model) { toast('先填一个模型名（可在「可用模型」里复制）', 'err'); return; }
+    gen.disabled = true;
+    gen.textContent = '生成中…';
+    try {
+      const d = await post(`/api/keys/${k.id}/onboard`, {
+        target: picked, model: model, os: isWin ? 'windows' : 'unix',
+      });
+      result.textContent = '';
+      // ① 主路径：下载脚本
+      const box = el('div', 'card');
+      box.style.background = 'var(--bg-soft, rgba(0,0,0,.02))';
+      const dl2 = el('button', '', '下载 ' + d.filename);
+      dl2.onclick = () => { downloadText(d.script, d.filename); toast('已下载，双击运行即可', 'ok'); };
+      box.appendChild(dl2);
+      box.appendChild(el('div', 'muted',
+        '地址 ' + d.base_url + ' · 模型 ' + d.model + ' · Key ' + (d.key_masked || '')));
+      box.appendChild(el('div', 'muted',
+        '文件里含明文 Key：运行完脚本会自删；若手动保存了副本，用完请删除。'));
+      result.appendChild(box);
+
+      // ② 兜底：手动配置（不进脚本的人）
+      const det = el('details');
+      det.style.marginTop = '10px';
+      const sum = el('summary', 'muted', '不运行脚本？复制 JSON 手动合并');
+      sum.style.cursor = 'pointer';
+      sum.style.fontSize = '12px';
+      det.appendChild(sum);
+      const man = d.manual || {};
+      if (man.path) det.appendChild(el('div', 'muted', '落点：' + man.path));
+      if (man.note) det.appendChild(el('div', 'muted', man.note));
+      const ta = el('textarea');
+      ta.value = man.json || '';
+      ta.readOnly = true;
+      ta.rows = 8;
+      ta.style.width = '100%';
+      ta.style.marginTop = '6px';
+      ta.style.fontFamily = 'monospace';
+      ta.style.fontSize = '12px';
+      det.appendChild(ta);
+      const cp = el('button', 'ghost', '复制 JSON');
+      cp.onclick = async () => {
+        if (await writeClipboard(ta.value)) toast('已复制', 'ok');
+        else toast('复制失败，请手动选择', 'err');
+      };
+      det.appendChild(cp);
+      result.appendChild(det);
+
+      // ③ 怎么验证
+      result.appendChild(el('div', 'muted',
+        picked === 'workbuddy'
+          ? '验证：打开 WorkBuddy 的模型选择，应看到「' + (d.manual && d.manual.model ? d.manual.model : d.model) + '」。看不到时先看备份文件是否生成（说明脚本没跑到写入那步）。'
+          : '验证：重启 Claude Code 后 /status 应显示新的 base_url。若 CC Switch 处于 routing 模式，需在它内部再选一次供应商。'));
+      gen.textContent = '重新生成';
+    } catch (e) {
+      toast(e.message, 'err');
+      gen.textContent = '生成接入包';
+    } finally { gen.disabled = false; }
+  };
+}
+
 function openKeyBindModal(k) {
   const sel = new Set(k.account_uids || []);
   const m = openModal('账号范围 · ' + (k.name || '未命名'), '勾选该密钥可用的代挂账号，保存后立即生效。');
@@ -1624,6 +1771,15 @@ function renderKeyCards() {
     if (host) {
       const bind = iconBtn({ icon: 'list', label: '账号范围', onClick: () => openKeyBindModal(k) });
       btnRow.appendChild(bind);
+    }
+    // 一键接入（v0.31.69，需求 P3）：把这把 Key 写进 WorkBuddy / CC Switch 的配置。
+    // 只对可用且能回显的 Key 显示 —— 停用的 Key 接进去只会得到 401，
+    // 用户会以为是"接入失败"，那是更糟的体验。
+    if (active && canReveal) {
+      btnRow.appendChild(iconBtn({
+        icon: 'external', label: '接入', title: '一键写入 WorkBuddy / CC Switch 配置',
+        onClick: () => openOnboardModal(k),
+      }));
     }
     body.appendChild(btnRow);
     card.appendChild(body);

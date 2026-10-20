@@ -120,9 +120,16 @@ def main():
     base = "http://127.0.0.1:%d" % port
     db = os.path.join(tmp, "data", "webapp.db")
     # -no-tasks：冒烟不该触发签到/保活这类出站任务（既慢又可能真的打到上游）。
-    # -secret none：跳过密钥文件，避免在 CI 上随机生成文件干扰断言。
     # -key：给一个固定管理密钥，保证可重复。
-    cmd = [exe, "-addr", "127.0.0.1:%d" % port, "-db", db, "-secret", "none",
+    #
+    # ⚠️ `-secret` 用**临时目录里的密钥文件**，不用 `none`（v0.31.69 改）：
+    # 禁用加密时 Key 没有密文 → `/api/keys` 的 `revealable` 恒为 false →
+    # 「查看 / 复制 / 一键接入」这三个按钮**根本不会渲染**。用 `none` 冒烟会
+    # "通过"，但整条"取回明文"的链路一次都没被走过（真浏览器 E2E 就是这么发现的：
+    # 它点了「接入」，而卡片上并没有那颗按钮）。
+    # 文件放在 tmp 里，首次启动会自动生成，不污染仓库、也不跨进程复用。
+    secret = os.path.join(tmp, "data", "secret.key")
+    cmd = [exe, "-addr", "127.0.0.1:%d" % port, "-db", db, "-secret", secret,
            "-no-tasks", "-key", "smoke-admin-key"]
     out_path = os.path.join(tmp, "run.log")
     out = open(out_path, "wb")

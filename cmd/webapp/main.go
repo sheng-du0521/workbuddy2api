@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.68"
+const version = "0.31.69"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1597,6 +1597,10 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/keys", a.userGuard(a.handleCreateKey))
 	// 显式取回完整密钥（v0.17.8）：列表只回掩码，明文单独一次、本人限定。
 	mux.HandleFunc("GET /api/keys/{id}/reveal", a.userGuard(a.handleRevealKey))
+	// 一键接入（v0.31.69，需求 P3）：生成把 key+地址+模型写进客户端的一次性脚本。
+	// 与 reveal 同一纪律：归属校验下推 SQL（跨用户 404）、不写日志、错误笼统。
+	mux.HandleFunc("POST /api/keys/{id}/onboard", a.userGuard(a.handleKeyOnboard))
+	mux.HandleFunc("GET /api/onboard/caps", a.userGuard(a.handleOnboardCaps))
 	mux.HandleFunc("DELETE /api/keys/{id}", a.userGuard(a.handleDeleteKey))
 	mux.HandleFunc("POST /api/keys/{id}/disable", a.userGuard(a.handleToggleKey(false)))
 	mux.HandleFunc("POST /api/keys/{id}/enable", a.userGuard(a.handleToggleKey(true)))

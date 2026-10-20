@@ -94,6 +94,46 @@ try {
     { timeout: 15000 });
   console.log('生成密钥并在页面展示明文 ✓');
 
+  // ③b 一键接入（v0.31.69，需求 P3）：点开弹窗 → 生成 → 看到下载按钮。
+  //
+  // 只验到"生成成功、能下载"这一步，**不点下载**：
+  //   · 无头浏览器点下载会在临时目录留一个含明文 key 的文件；
+  //   · 真正的"脚本能不能写对文件"由 Go 用例真跑 .bat 覆盖（那层更可靠）。
+  // 这里要抓的是 JS 层的断链：按钮没绑、弹窗打不开、接口路径写错、渲染抛异常。
+  // 先把「已生成 N 把密钥」弹窗关掉：它的遮罩盖住整页，不关就点不到卡片上的按钮
+  // （实测表现为 locator 一直等不到可点击元素，而元素其实一直在）。
+  if (await page.locator('.modal-mask').count()) {
+    await page.locator('.modal-mask .modal-x').first().click();
+    await page.waitForSelector('.modal-mask', { state: 'detached', timeout: 5000 });
+  }
+  // ⚠️ 不能用 getByRole('button', {name:'接入'})：左侧导航里有「接入说明」，
+  // 名字是**子串匹配**，会先命中它（实测点了导航，弹窗永远不出现）。
+  // 限定在密钥卡（.ecard）里找，那里只有我们加的那颗按钮。
+  try {
+    await page.locator('.ecard button', { hasText: '接入' }).first().click();
+  } catch (e) {
+    // 失败时把卡片里的按钮文本打出来 —— 只报 "locator 超时" 等于没说，
+    // 到底是"按钮没渲染"还是"文本不一样"必须能一眼区分。
+    const dump = await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('.ecard'));
+      return cards.map((c, i) => 'card' + i + ': ' +
+        Array.from(c.querySelectorAll('button')).map((b) => JSON.stringify(b.innerText)).join(' | ')).join('\n');
+    });
+    console.log('调试 · 密钥卡内的按钮：\n' + dump);
+    throw e;
+  }
+  await page.waitForSelector('.modal input[list="onboardModelList"]', { timeout: 10000 });
+  await page.fill('.modal input[list="onboardModelList"]', 'glm-5.3');
+  await page.getByRole('button', { name: '生成接入包' }).click();
+  await page.waitForFunction(
+    () => /下载 wb2api-onboard-\w+\.(bat|sh)/.test(document.body.innerText), null,
+    { timeout: 15000 });
+  // 手动兜底必须同时给出来（不给的话"不想跑脚本"的人就没有第二条路）。
+  if (!(await page.evaluate(() => document.body.innerText.includes('复制 JSON')))) {
+    fail('一键接入弹窗缺少「复制 JSON」兜底');
+  }
+  console.log('一键接入弹窗可用（生成脚本 + 手动兜底）✓');
+
   // ④ 顺手确认面板不是"渲染成空白"：主容器有可见文本
   const nav = await page.evaluate(() => document.body.innerText.trim().length);
   if (nav < 200) fail('控制台正文只有 ' + nav + ' 个字符（疑似渲染失败）');
@@ -114,7 +154,7 @@ try {
   if (errors.length > fatal.length) {
     console.log('（忽略 ' + (errors.length - fatal.length) + ' 条预期内探测：登录前 /api/auth/me 401）');
   }
-  console.log('E2E OK：注册 → 控制台 → 生成密钥（真浏览器，无 console/page 错误）');
+  console.log('E2E OK：注册 → 控制台 → 生成密钥 → 一键接入（真浏览器，无 console/page 错误）');
 } finally {
   await browser.close();
 }
