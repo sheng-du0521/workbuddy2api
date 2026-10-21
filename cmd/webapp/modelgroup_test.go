@@ -42,7 +42,7 @@ func TestApplyGroupExpansionRewritesPayload(t *testing.T) {
 	withModelsCache(t, []string{"glm-5.3"})
 
 	payload := map[string]any{"model": "wb-group-work", "messages": []any{}}
-	real, ok := px.applyGroupExpansion(payload, "wb-group-work", &APIKey{})
+	real, gmodels, ok := px.applyGroupExpansion(payload, "wb-group-work", &APIKey{})
 	if !ok {
 		t.Fatal("wb-group-work 应被展开")
 	}
@@ -52,10 +52,16 @@ func TestApplyGroupExpansionRewritesPayload(t *testing.T) {
 	if payload["model"] != real {
 		t.Errorf("payload[model] = %v，期望被改写成 %q（否则上游收到的是组名）", payload["model"], real)
 	}
+	// v0.31.96：展开要返回**一组**候选（首个是首选，其余给 relay 在失败时轮换）。
+	// 这里号池只有一个模型，所以只断言"首个 == 选中的那个"；多成员场景由
+	// TestExpandGroupModelOnlyGroupNames 覆盖（那里断言 2 个）。
+	if len(gmodels) == 0 || gmodels[0] != real {
+		t.Errorf("展开候选 = %v，期望首个为 %q", gmodels, real)
+	}
 
 	// 普通模型名：payload 一个字节都不该动。
 	p2 := map[string]any{"model": "glm-5.3"}
-	if _, ok := px.applyGroupExpansion(p2, "glm-5.3", &APIKey{}); ok {
+	if _, _, ok := px.applyGroupExpansion(p2, "glm-5.3", &APIKey{}); ok {
 		t.Error("普通模型名不该被展开")
 	}
 	if p2["model"] != "glm-5.3" {
@@ -73,7 +79,7 @@ func TestExpandGroupModelOnlyGroupNames(t *testing.T) {
 	withModelsCache(t, []string{"glm-5.3"})
 
 	for _, name := range []string{"glm-5.3", "wb-group-", "wb-groub-work", "claude-sonnet-4-5"} {
-		if _, _, ok := px.expandGroupModel(name, &APIKey{}); ok {
+		if _, _, ok := px.expandGroupModels(name, &APIKey{}); ok {
 			t.Errorf("%q 不该被当成模型组展开", name)
 		}
 	}
@@ -88,15 +94,23 @@ func TestExpandGroupModelWork(t *testing.T) {
 	defer store.Close()
 	withModelsCache(t, []string{"glm-5.3", "deepseek-v4-flash"})
 
-	real, label, ok := px.expandGroupModel("wb-group-work", &APIKey{})
+	models, label, ok := px.expandGroupModels("wb-group-work", &APIKey{})
 	if !ok {
 		t.Fatal("wb-group-work 应被识别为组名")
 	}
 	if label != "号池官组" {
 		t.Errorf("label = %q，期望 号池官组", label)
 	}
-	if real != "glm-5.3" && real != "deepseek-v4-flash" {
-		t.Errorf("展开结果 %q 不在号池目录里", real)
+	// v0.31.96：返回的是**整组候选**（首个为首选），所以断言"集合 == 目录"而不是"等于某一个"。
+	if len(models) != 2 {
+		t.Fatalf("展开候选 = %v，期望 2 个（整个号池目录）", models)
+	}
+	seen := map[string]bool{}
+	for _, m := range models {
+		seen[m] = true
+	}
+	if !seen["glm-5.3"] || !seen["deepseek-v4-flash"] {
+		t.Errorf("展开候选 %v 不在号池目录里", models)
 	}
 }
 

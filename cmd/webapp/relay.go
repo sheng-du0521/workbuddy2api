@@ -41,9 +41,19 @@ import (
 )
 
 const (
-	// relayMaxAttempts 一次请求最多试几条通道。
+	// relayMaxAttempts 一次请求最多试几条通道（**单个模型**内）。
 	// 与号池的 maxAttempts 同一个理由：试遍全表会把一次客户端请求放大成 N 次出站。
 	relayMaxAttempts = 3
+
+	// relayTotalAttempts 一次请求的**总**上游尝试上限（含组内成员轮换）。
+	//
+	// 为什么需要上限：组名请求会按成员逐个试（见 serveRelay 的组轮换），
+	// 一个 20 模型的组不该把一次客户端请求放大成 20 次出站。
+	// 6 = 够覆盖"名字最小那几个恰好限流、真能用的在后面"的常见形态。
+	relayTotalAttempts = 6
+
+	// relayGroupModels 一次请求最多试组内几个成员。
+	relayGroupModels = 6
 
 	// relayChatPath OpenAI 兼容对话端点（相对 base_url）。
 	relayChatPath = "/chat/completions"
@@ -95,82 +105,112 @@ func (p *Proxy) serveRelay(w http.ResponseWriter, r *http.Request, payload map[s
 		return false, false
 	}
 
-	ratio, ratioSrc := p.ratioForRelay(model)
 	var lastErr string
 	// upstreamStatus 最后一次**上游 HTTP 状态码**（0 = 没拿到响应，网络错误/超时）。
 	// 全失败时它是"该回什么状态、该怎么解释"的唯一依据（v0.31.95）。
 	upstreamStatus := 0
 	tried := 0
-	for _, v := range cands {
-		if tried >= relayMaxAttempts {
+
+	// 组内成员轮换（v0.31.96）：用组名请求时，**按成员逐个试**，一个被上游拒绝就换下一个。
+	//
+	// 为什么必须有：组是"这一组里随便挑一个能跑的"，而上游可用性是**按模型**的。
+	// 2026-10-21 现场：同一通道里 gpt-5.6 系列全 429、gpt-6 系列 200，
+	// 而旧的展开只挑名字最小的 gpt-5.6 → 用组名永远失败，手填 gpt-6-astra 却正常。
+	// 只挑一个不重试，等于把"组"退化成了"别名"。
+	//
+	// 非组名请求（groupModelsFrom 为 nil）走的就是"单成员"，行为与从前完全一致。
+	models := groupModelsFrom(r)
+	if len(models) == 0 {
+		models = []string{model}
+	}
+	_ = cands // 首个模型的候选在上面已查过（用来决定"该不该走通道"），循环内统一重查
+
+outer:
+	for mi, m := range models {
+		if mi >= relayGroupModels {
 			break
 		}
-		tried++
-		resp, reqErr := p.relayRequest(r.Context(), payload, v, wantStream)
-		if reqErr != nil {
-			lastErr = v.UpstreamName + "：" + reqErr.Error()
+		if m != model {
+			model = m
+			payload["model"] = m // 出站体是从 payload 重新编码的，必须一起改
+		}
+		mcands, err := p.store.relayCandidates(m)
+		if err != nil || len(mcands) == 0 {
 			continue
 		}
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+		// 倍率按**实际模型**取（组内不同成员可能配了不同倍率）。
+		ratio, ratioSrc := p.ratioForRelay(m)
+		for _, v := range mcands {
+			if tried >= relayTotalAttempts {
+				break outer
+			}
+			tried++
+			resp, reqErr := p.relayRequest(r.Context(), payload, v, wantStream)
+			if reqErr != nil {
+				lastErr = v.UpstreamName + "：" + reqErr.Error()
+				continue
+			}
+			if resp.StatusCode >= 400 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+				resp.Body.Close()
+				upstreamStatus = resp.StatusCode
+				lastErr = fmt.Sprintf("%s 返回 %d：%s", v.UpstreamName, resp.StatusCode,
+					truncateStr(strings.TrimSpace(string(body)), 200))
+				// 4xx 也不在这里判"这条通道坏了"：401 是 key 错（要人修配置），
+				// 429 是限流（换下一条/下一个成员都是合理的）—— 都不该改任何持久状态。
+				continue
+			}
+
+			// 响应头透出实际服务的通道（与 X-Wb-Account 同语义）：
+			// 排障时"这次是谁在答"必须一眼可见，否则号池/通道两条链路分不清。
+			w.Header().Set("X-Wb-Upstream", v.UpstreamName)
+			var ui usageInfo
+			var ferr error
+			if wantStream {
+				ui, _, ferr = streamSSEHint(w, resp, nil)
+			} else {
+				ui, ferr = relayForwardJSON(w, resp)
+			}
 			resp.Body.Close()
-			upstreamStatus = resp.StatusCode
-			lastErr = fmt.Sprintf("%s 返回 %d：%s", v.UpstreamName, resp.StatusCode,
-				truncateStr(strings.TrimSpace(string(body)), 200))
-			// 4xx 也不在这里判"这条通道坏了"：401 是 key 错（要人修配置），
-			// 429 是限流（换下一条是合理的）—— 都不该改任何持久状态。
-			continue
-		}
 
-		// 响应头透出实际服务的通道（与 X-Wb-Account 同语义）：
-		// 排障时"这次是谁在答"必须一眼可见，否则号池/通道两条链路分不清。
-		w.Header().Set("X-Wb-Upstream", v.UpstreamName)
-		var ui usageInfo
-		var ferr error
-		if wantStream {
-			ui, _, ferr = streamSSEHint(w, resp, nil)
-		} else {
-			ui, ferr = relayForwardJSON(w, resp)
-		}
-		resp.Body.Close()
+			if ferr != nil {
+				log.Printf("WARN: [relay] upstream stream interrupted channel=%s model=%s: %v",
+					v.UpstreamName, model, ferr)
+				// 与号池同口径：中断也要留一条流水（0 费），否则"执行到一半断了"查不到。
+				p.settleUsageScoped(u, key, model, "", usageInfo{LatencyMS: time.Since(start).Milliseconds()},
+					resv, "interrupted", "relay stream interrupted: "+ferr.Error(), stickyHash, tried, billing.ScopeRelay)
+				return true, false
+			}
 
-		if ferr != nil {
-			log.Printf("WARN: [relay] upstream stream interrupted channel=%s model=%s: %v",
-				v.UpstreamName, model, ferr)
-			// 与号池同口径：中断也要留一条流水（0 费），否则"执行到一半断了"查不到。
-			p.settleUsageScoped(u, key, model, "", usageInfo{LatencyMS: time.Since(start).Milliseconds()},
-				resv, "interrupted", "relay stream interrupted: "+ferr.Error(), stickyHash, tried, billing.ScopeRelay)
-			return true, false
-		}
+			// 折算积分：通道按 token 计价，平台内部一律用"积分"这一个单位。
+			// 这样结算公式、流水字段、倍率语义都与号池完全一致（不需要第二套账）。
+			tokens := ui.Total()
+			ui.Credit = float64(tokens) / 1000.0 * v.CreditPer1k
+			ui.HasCredit = true // 这是**我们自己折算**的，不是上游回报；见下方注释
+			ui.LatencyMS = time.Since(start).Milliseconds()
 
-		// 折算积分：通道按 token 计价，平台内部一律用"积分"这一个单位。
-		// 这样结算公式、流水字段、倍率语义都与号池完全一致（不需要第二套账）。
-		tokens := ui.Total()
-		ui.Credit = float64(tokens) / 1000.0 * v.CreditPer1k
-		ui.HasCredit = true // 这是**我们自己折算**的，不是上游回报；见下方注释
-		ui.LatencyMS = time.Since(start).Milliseconds()
-
-		status := "ok"
-		errMsg := ""
-		if tokens == 0 {
-			// 上游没回报 usage → 无法计费。**不能**按"估算"扣钱：通道的估算没有基准
-			// （对方单价是按 token 的，而 token 数正是缺的那个）。记流水留痕、收 0 费、
-			// 打 WARN 让人去查（多数是没支持 stream_options.include_usage）。
-			status = "no_usage"
-			errMsg = "upstream did not return usage; charged 0"
-			log.Printf("WARN: [relay] 上游未返回 usage（本次 0 费）channel=%s model=%s；"+
-				"检查该中转站是否支持 stream_options.include_usage", v.UpstreamName, model)
+			status := "ok"
+			errMsg := ""
+			if tokens == 0 {
+				// 上游没回报 usage → 无法计费。**不能**按"估算"扣钱：通道的估算没有基准
+				// （对方单价是按 token 的，而 token 数正是缺的那个）。记流水留痕、收 0 费、
+				// 打 WARN 让人去查（多数是没支持 stream_options.include_usage）。
+				status = "no_usage"
+				errMsg = "upstream did not return usage; charged 0"
+				log.Printf("WARN: [relay] 上游未返回 usage（本次 0 费）channel=%s model=%s；"+
+					"检查该中转站是否支持 stream_options.include_usage", v.UpstreamName, model)
+			}
+			ok, charged := p.settleUsageScoped(u, key, model, "", ui, resv, status, errMsg,
+				stickyHash, tried, billing.ScopeRelay)
+			log.Printf("INFO: [relay] channel=%s model=%s→%s tokens=%d credit=%.4f ratio=%.3f(%s) charged=%.4f点",
+				v.UpstreamName, model, v.RemoteModel, tokens, ui.Credit, ratio, ratioSrc, MicroToPoint(charged))
+			p.noteLive(r, liveEvent{
+				At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: true,
+				Tokens: tokens, Charged: MicroToPoint(charged),
+				Status: http.StatusOK, ElapsedMS: time.Since(start).Milliseconds(),
+			})
+			return true, ok
 		}
-		ok, charged := p.settleUsageScoped(u, key, model, "", ui, resv, status, errMsg,
-			stickyHash, tried, billing.ScopeRelay)
-		log.Printf("INFO: [relay] channel=%s model=%s→%s tokens=%d credit=%.4f ratio=%.3f(%s) charged=%.4f点",
-			v.UpstreamName, model, v.RemoteModel, tokens, ui.Credit, ratio, ratioSrc, MicroToPoint(charged))
-		p.noteLive(r, liveEvent{
-			At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: true,
-			Tokens: tokens, Charged: MicroToPoint(charged),
-			Status: http.StatusOK, ElapsedMS: time.Since(start).Milliseconds(),
-		})
-		return true, ok
 	}
 
 	// 全部通道都失败：按**最后一次上游状态码**给出可诊断的结论（v0.31.95）。

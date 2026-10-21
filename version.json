@@ -1,20 +1,20 @@
 {
-  "version": "0.31.95",
+  "version": "0.31.96",
   "min_supported": "0.24.0",
-  "notes": "v0.31.95：通道组请求失败时不再一律甩 502「检查通道配置」。\n\n## 现场（本次实测，用生产两条通道的配置在临时实例里跑）\n\n用户端切到通道组后发一次对话请求：\n\n- `ch1`（codex官组原生，5 个 gpt-* 模型）→ **502**，gateway_hint 说\n  \"all channels failed; check the channel config (base_url / api_key / model mapping)\"\n- `ch2`（image-2.5，3 个 gpt-image-* 模型）→ 同样 502\n\n直接拿通道的 key 打上游才发现真相完全不是\"配置错\"：\n\n| 通道 | 上游真实回答 | 含义 |\n|---|---|---|\n| ch1 `gpt-5.6` | 429 `Upstream rate limit exceeded` | 上游限流 |\n| ch1 `gpt-5.6-sol` | 503 `Service temporarily unavailable` | 上游抖动 |\n| ch2 `gpt-image-2.5*` | 400 `This model is not supported on the Chat Completions endpoint` | 图像模型，对话端点本来就不支持 |\n\n也就是说：组展开、通道分发、鉴权、到达上游 **这条链是通的**；错的是网关把\n\"上游限流 / 模型不支持该端点\"统统说成\"你自己的配置错了\"—— 用户会去反复核对\nbase_url 与 key，方向完全错。\n\n## 改动\n\n`cmd/webapp/relay.go`：新增 `relayFailureVerdict(upstreamStatus)`，全失败时按\n**最后一次上游状态码**决定回什么、说什么（并设置 `X-Wb-Fail-Kind`）：\n\n| 上游状态 | 回给客户端 | fail-kind | 文案要点 |\n|---|---|---|---|\n| 401/403 | 502 | `relay_auth` | 通道 key 无效/无权限，是**通道侧**配置问题 |\n| 429 | **429** | `relay_rate_limited` | 限流，你不用改任何东西，稍后重试 |\n| 其它 4xx | **透传该 4xx** | `relay_rejected` | 上游拒绝（典型：图像模型走 chat、或 remote 名映射不对） |\n| 5xx | 502 | `relay_unavailable` | 上游暂时不可用 |\n| 无响应 | 502 | `relay_unreachable` | 连不上/超时，查 base_url 与出网 |\n\n关键点：429 与 4xx 必须**透传状态码**——SDK 对 429 会退避重试，对 4xx 不重试；\n一律 502 会让客户端做出错误决策。\n\n## 验证\n\n- 新增 `TestRelayFailureVerdict`（8 组状态映射）、`TestRelayAllChannelsFailRateLimited`\n  （429 透传 + fail-kind）、`TestRelayAllChannelsFailModelUnsupported`（400 透传 +\n  文案点明 `/chat/completions`）；原 `TestRelayAllChannelsFail`（500 → 502）保持。\n- 真机复跑（`scripts/channel_group_probe.py`，用生产通道配置的临时实例）：\n  ch1 → `429 relay_rate_limited`、ch2 → `400 relay_rejected`，\n  组名在 `/v1/models` 里正确、切组 200。\n\n## 结论（给运维）\n\n两条通道的**链路都正常**，问题在上游侧：\n- ch1 当前被上游限流（429/503 交替），换时段重试或降低该通道优先级；\n- ch2 是图像模型，**不能用于对话**（`/chat/completions` 不支持），这是上游能力边界，\n  不是配置错；要验它需要走图像端点（本网关目前只转发对话）。",
-  "released_at": 1792580040,
+  "notes": "v0.31.96：组名请求现在会在**组内换成员重试**（这是\"手填能用、组名不能用\"的根因）。\n\n## 现场（2026-10-21 实测）\n\n同一条通道 `codex官组原生` 里，模型可用性是**按模型**分裂的：\n\n- `gpt-5.6` / `gpt-5.6-sol` / `gpt-5.6-terra` → 429/503（上游账号池限流）\n- `gpt-6-astra` / `gpt-6-sol` → **200 正常**\n\n而组名 `wb-group-ch1` 的展开逻辑只挑**一个**成员（按名字排序第一个 = `gpt-5.6`），\n且失败后**不换人**。于是：\n\n- 手填 `gpt-6-astra` → 能用 ✅\n- 用组名 `wb-group-ch1` → 永远撞在 `gpt-5.6` 上 → 永远 429 ❌\n\n用户说的\"我直接 openai 接入 codex 组内模型可以用的\"，指的就是前者。\n\"组\"被实现成了一个**别名**，而不是\"一组可互换的模型\"。\n\n## 改动\n\n1. `modelgroup.go`：`expandGroupModel` → `expandGroupModels`，返回**整组候选**（首个仍是原首选，\n   其余按组内顺序跟在后面）。\n2. `applyGroupExpansion` 把候选挂到请求上下文（`ctxGroupModelsKey`），不改 serveRelay 的 11 个参数。\n3. `relay.go`：`serveRelay` 外层加\"成员轮换\" —— 一个成员被上游拒绝就换下一个，\n   并且：\n   - 出站 `payload[\"model\"]` 跟着改成实际成员（否则上游收到旧名）；\n   - 倍率按**实际模型**取（组内不同成员可能配了不同倍率）；\n   - 流水 / 台账 / `X-Wb-Upstream` 都记实际服务的那个模型；\n   - 上限：单模型最多 3 条通道、组内最多 6 个成员、一次请求总上游尝试 6 次\n     （不让一次客户端请求被放大成 N 次出站）；\n   - 失败仍按上游状态码分类（v0.31.95 的 `relay_*`）。\n\n非组名请求（具体模型名）走的是\"单成员\"，行为与从前**完全一致**。\n\n## 验证\n\n- 新增 `TestRelayGroupRetriesNextMember`：同一通道两成员，首个 429、次个 200 →\n  整体 200、响应来自第二个成员、**流水 model = 实际模型**（不是组名/首个成员）。\n- `TestApplyGroupExpansionRewritesPayload` 补\"返回整组候选\"的断言；\n  `TestExpandGroupModelOnlyGroupNames` 改为断言整组（2 个）。\n- 真机（临时实例 + 生产通道配置）：`wb-group-ch1` → **200，首句 \"pong\"**；\n  `/v1/models` 列出组名 + 成员；切组 200。\n\n## 边界\n\n- 组内轮换会多打几次上游（失败很轻，429 不计费），但一次请求最多 6 次。\n- 图像模型（`gpt-image-*`）仍不能走对话端点，那条组会稳定 400 `relay_rejected`（上游能力边界）。",
+  "released_at": 1792586841,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.95/webapp.exe",
-      "sha256": "b341b364896a8203361f5018e9b82730db9abcee6e78f069de7e91e0c49c6476",
-      "size": 16097280
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.96/webapp.exe",
+      "sha256": "77732532469a86ad146fd0087417e3d973a7d373929e2907181d062d18876560",
+      "size": 16100352
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "NUy+pdSFCaWmevON35itlfitce14pVQR5NBtZS3eUja8zbgTAVwsGWF/SS+WkHwgVoq1FMfumTaImuwoc2xbAQ==",
+  "signature": "RKBUbruEWbH/DCaBw8YTvh2VGbwxcYgyjG755mQrp2t7CApyA8+EIV4oqUJ7GTHc5rPew1EcO3ZudJduvaeBDQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

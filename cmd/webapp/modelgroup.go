@@ -30,7 +30,9 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -268,49 +270,97 @@ func (p *Proxy) allChannelGroups() []modelGroupInfo {
 //
 // k 参与展开（v0.31.82）：自挂官组的成员取决于**这把 Key 绑了哪些账号**，
 // 同一份 payload 在不同 Key 下会展开出不同模型 —— 所以 Key 必须一路传进来。
-func (p *Proxy) applyGroupExpansion(payload map[string]any, model string, k *APIKey) (string, bool) {
-	real, label, ok := p.expandGroupModel(model, k)
+func (p *Proxy) applyGroupExpansion(payload map[string]any, model string, k *APIKey) (string, []string, bool) {
+	models, label, ok := p.expandGroupModels(model, k)
 	if !ok {
-		return model, false
+		return model, nil, false
 	}
-	log.Printf("INFO: [group] %q → %q（%s）", model, real, label)
-	payload["model"] = real
-	return real, true
+	log.Printf("INFO: [group] %q → %q（%s，同组备选 %d 个）", model, models[0], label, len(models)-1)
+	payload["model"] = models[0]
+	return models[0], models, true
 }
 
-// expandGroupModel 把虚拟组名展开成一个**真实模型名**。
+// ctxGroupModelsKey 本次请求"组展开出来的候选模型"（首个已写进 payload）。
 //
-// 选谁（确定性优先，不做随机/轮询）：
+// 为什么用 context 而不是改 serveRelay 的签名：签名已经 11 个参数，再加一个
+// "可能与请求无关、只在组名场景有值"的切片，会让每个调用点都要想一遍。
+// 挂在请求上语义也更准 —— 它本来就是**这一次请求**的上下文。
+type ctxGroupModelsKey struct{}
+
+// withGroupModels 把组候选挂到请求上（只挂一次，后续 relay 读取）。
+func withGroupModels(r *http.Request, models []string) *http.Request {
+	if len(models) < 2 {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), ctxGroupModelsKey{}, models))
+}
+
+// groupModelsFrom 取本次请求的组候选（没有就返回 nil = 不是组名请求）。
+func groupModelsFrom(r *http.Request) []string {
+	if r == nil {
+		return nil
+	}
+	if v, ok := r.Context().Value(ctxGroupModelsKey{}).([]string); ok {
+		return v
+	}
+	return nil
+}
+
+// expandGroupModels 把虚拟组名展开成**一组**真实模型名（首个是首选，其余是备选）。
+//
+// 为什么返回一组而不是一个（v0.31.96）：组的意义是"这一组里随便挑一个能跑的"，
+// 而上游的可用性是**按模型**的。2026-10-21 的真实现场：同一条通道里
+// gpt-5.6/5.6-sol/5.6-terra 全部 429、gpt-6-astra/gpt-6-sol 正常 200，
+// 而展开固定挑名字最小的 gpt-5.6 —— 于是"用组名永远失败，手填 gpt-6-astra 却能用"。
+// 只挑一个的写法把"组"退化成了"别名"，用户看到的就是"组不能用"。
+//
+// 首选顺序（确定性优先，不做随机/轮询）：
 //  1. 组内第一个"号池认识且有可用账号"的成员；
 //  2. 否则组内第一个"有可用通道"的成员；
 //  3. 都没有 → 仍返回第一个成员，让下游按它正常失败（503/404 的文案由既有链路给，
 //     不在这里自造 —— 否则同一个"没号可用"会有两套错误消息）。
 //
+// 备选（后面的元素）按组内原顺序排列，由 relay 在首个失败时逐个重试。
+//
 // ok=false 表示这不是组名（调用方保持原值，零影响）。
-func (p *Proxy) expandGroupModel(model string, k *APIKey) (real, label string, ok bool) {
+func (p *Proxy) expandGroupModels(model string, k *APIKey) (models []string, label string, ok bool) {
 	gid, hasCut := strings.CutPrefix(strings.TrimSpace(model), groupModelPrefix)
 	if !hasCut {
-		return "", "", false
+		return nil, "", false
 	}
 	members, label, ok := p.groupMembersFor(gid, k)
 	if !ok || len(members) == 0 {
 		// 组不存在 / 成员为 0：不展开，让它按"未知模型"走 ——
 		// 客户端填错组名时，报"模型不存在"比报 500 更有指向。
-		return "", "", false
+		return nil, "", false
 	}
-	// 自挂官组的成员已经按"这把 Key 的账号能不能服务"筛过一遍，
-	// 这里再按可用性挑第一个（号池里第一个能跑的就是它的最优解）。
+	// 首选：号池里第一个能跑的成员（自挂官组的成员已按"这把 Key 的账号"筛过）。
+	first := ""
 	for _, m := range members {
 		if known, decided := p.poolKnowsModel(m); decided && known {
 			if len(p.pool.AvailableUIDsForModel(m)) > 0 {
-				return m, label, true
+				first = m
+				break
 			}
 		}
 	}
-	for _, m := range members {
-		if cands, err := p.store.relayCandidates(m); err == nil && len(cands) > 0 {
-			return m, label, true
+	if first == "" {
+		for _, m := range members {
+			if cands, err := p.store.relayCandidates(m); err == nil && len(cands) > 0 {
+				first = m
+				break
+			}
 		}
 	}
-	return members[0], label, true
+	if first == "" {
+		first = members[0]
+	}
+	out := make([]string, 0, len(members))
+	out = append(out, first)
+	for _, m := range members {
+		if m != first {
+			out = append(out, m)
+		}
+	}
+	return out, label, true
 }

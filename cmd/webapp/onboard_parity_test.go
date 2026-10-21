@@ -156,13 +156,13 @@ func TestOnboardParity(t *testing.T) {
 			// "有成员 ⇔ 能展开"：两类都走 expandGroupModel 同一实现，
 			// 不存在"一种有成员也不展开、另一种没成员却硬展开"。
 			hostMembers := px.hostGroupMembers(f.host)
-			_, _, okHost := px.expandGroupModel(groupVirtualModel(groupHostID), f.host)
+			_, _, okHost := px.expandGroupModels(groupVirtualModel(groupHostID), f.host)
 			if (len(hostMembers) > 0) != okHost {
 				t.Errorf("自挂官组：成员 %d 个，展开=%v —— 两者必须一致（有成员才能展开）",
 					len(hostMembers), okHost)
 			}
 			poolMembers, _, _ := px.groupMembersFor(groupWorkID, nil)
-			_, _, okWork := px.expandGroupModel(groupVirtualModel(groupWorkID), &APIKey{})
+			_, _, okWork := px.expandGroupModels(groupVirtualModel(groupWorkID), &APIKey{})
 			if (len(poolMembers) > 0) != okWork {
 				t.Errorf("号池官组：成员 %d 个，展开=%v —— 两者必须一致", len(poolMembers), okWork)
 			}

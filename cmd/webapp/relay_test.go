@@ -437,6 +437,103 @@ func TestRelayAllChannelsFailModelUnsupported(t *testing.T) {
 	}
 }
 
+// fakeRelayPerModel 一个**按模型区分状态**的假中转站：status[model] >= 400 就失败。
+//
+// 为什么需要它：组内轮换的正确性必须用"第一个真失败、第二个真成功"来证明，
+// 单一状态的 fakeRelay 只能测出"全失败"。
+func fakeRelayPerModel(t *testing.T, status map[string]int) (*httptest.Server, *int32) {
+	t.Helper()
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/models"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []map[string]any{}})
+		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+			atomic.AddInt32(&hits, 1)
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			m, _ := body["model"].(string)
+			if code := status[m]; code >= 400 {
+				w.WriteHeader(code)
+				fmt.Fprintf(w, `{"error":{"message":"boom %s"}}`, m)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "cmpl-" + m, "object": "chat.completion", "model": m,
+				"choices": []any{map[string]any{
+					"index": 0, "message": map[string]any{"role": "assistant", "content": "hello from " + m},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	return srv, &hits
+}
+
+// seedChannelWithModels 一条通道 + 多个模型映射（组内轮换要"同一条通道的多个成员"）。
+func seedChannelWithModels(t *testing.T, store *Store, name, baseURL string, models ...string) int64 {
+	t.Helper()
+	now := time.Now().Unix()
+	res, err := store.db.Exec(`INSERT INTO upstreams
+		(name, kind, base_url, api_key, enabled, priority, note, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`, name, "openai", baseURL, "sk-relay-test", 1, 10, "", now, now)
+	if err != nil {
+		t.Fatalf("插入通道：%v", err)
+	}
+	uid, _ := res.LastInsertId()
+	for _, m := range models {
+		if _, err := store.db.Exec(`INSERT INTO upstream_models
+			(upstream_id, model, remote_model, credit_per_1k, enabled, created_at, updated_at)
+			VALUES (?,?,?,?,?,?,?)`, uid, m, "", 1.0, 1, now, now); err != nil {
+			t.Fatalf("插入模型 %s：%v", m, err)
+		}
+	}
+	return uid
+}
+
+// TestRelayGroupRetriesNextMember 组名请求：首个成员失败时**自动换下一个成员**。
+//
+// 这是 2026-10-21 现场的直接回归：同一条通道里 gpt-5.6 系列全部 429、
+// gpt-6 系列 200，而旧的展开只挑名字最小的 gpt-5.6 且不重试 ——
+// 用户"用组名永远失败，手填 gpt-6-astra 却正常"。组必须能在成员之间换。
+func TestRelayGroupRetriesNextMember(t *testing.T) {
+	store, _, _, srv := newRelayChatApp(t, false)
+	defer store.Close()
+	defer srv.Close()
+
+	up, hits := fakeRelayPerModel(t, map[string]int{"bad-model": 429})
+	defer up.Close()
+	uid := seedChannelWithModels(t, store, "grp-relay", up.URL, "bad-model", "good-model")
+	// 号池目录**非空**但都不含这两个 → decided=true 且 known=false → 走通道。
+	// （目录为空时 poolKnowsModel 返回 decided=false，会按号池处理，见 serveRelay 开头。）
+	seedPoolModels([]string{"pool-known-model"})
+
+	body := fmt.Sprintf(`{"model":"wb-group-ch%d","messages":[{"role":"user","content":"hi"}]}`, uid)
+	resp, out := chatOnce(t, srv, body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("组内应换到可用成员后成功，得 %d：%s", resp.StatusCode, out)
+	}
+	if !strings.Contains(out, "hello from good-model") {
+		t.Fatalf("应由第二个成员应答，响应体：%s", out)
+	}
+	if n := atomic.LoadInt32(hits); n != 2 {
+		t.Fatalf("应各打一次（首个 429 + 备选成功），实际 %d 次", n)
+	}
+	// 计费与流水必须落在**实际服务**的那个模型上，不能记成组名/首个成员。
+	var model string
+	if err := store.db.QueryRow(`SELECT model FROM usage_logs ORDER BY id DESC LIMIT 1`).Scan(&model); err != nil {
+		t.Fatalf("查流水：%v", err)
+	}
+	if model != "good-model" {
+		t.Fatalf("流水 model = %q，期望 good-model（真实服务的那个）", model)
+	}
+}
+
 // R4：停用通道 → 模型立刻从号池清单外消失（relayModelIDs 为空）。
 //
 // 「面板说关了、实际还能看见」是本项目反复踩过的形态（缓存没作废）。

@@ -1603,8 +1603,11 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if real, ok := p.applyGroupExpansion(payload, model, apiKeyFrom(r)); ok {
+	if real, groupModels, ok := p.applyGroupExpansion(payload, model, apiKeyFrom(r)); ok {
 		model = real
+		// 同组备选（v0.31.96）：挂到请求上，relay 在首个成员失败时逐个重试。
+		// 组=「这一组里随便挑一个能跑的」，只挑一个就退化成了"别名"（见 expandGroupModels 注释）。
+		r = withGroupModels(r, groupModels)
 	}
 	// 模型名归一化（v0.31.2）：去空白 / 剥 realm 前缀 / 按已知清单折回规范写法。
 	//
