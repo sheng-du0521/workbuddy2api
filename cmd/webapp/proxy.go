@@ -1656,6 +1656,21 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 生图模型不能走对话端点（v0.31.98）：**零出站、零扣费**，并说清这是能力边界。
+	//
+	// 2026-10-21 现场：通道里挂着 gpt-image-2.5 系列（生图模型），有人拿它发对话，
+	// 上游回 400，网关回 relay_rejected —— 文案里那句"可能是图像模型"埋在一长串英文里，
+	// 用户读到的是"网关/配置有问题"。这里在**我们自己这一层**就拦下来说清楚：
+	// 该用哪个端点、这次有没有花钱。
+	//
+	// 位置：归一化与生效分组校验之后（此时 model 已是最终真名；组名也不会走到这里 ——
+	// 组展开已把生图成员剔除，见 chatCapableModels）。
+	if IsImageModel(model) {
+		w.Header().Set("X-Wb-Fail-Kind", imageModelCode)
+		log.Printf("INFO: [proxy] 拒绝生图模型走对话端点 model=%s（零出站、零扣费）", model)
+		writeOpenAIErrorHint(w, http.StatusBadRequest, imageModelMsg, imageModelHint)
+		return
+	}
 	// 归一化之后仍不在已知清单里 → 记一条 WARN（同名一次）。
 	// 这正是"客户端模型名配置错"的直接症状：每次调用都会拿到上游 400/11102，
 	// 而我们回 404 —— 没有这条日志时，运维要在台账、上游原文与客户端配置之间来回对账。

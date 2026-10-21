@@ -694,6 +694,13 @@ type probeCheck struct {
 	Error  string `json:"error,omitempty"`
 	// RemoteModel 该模型映射到上游的真实名字（空 = 同名）。
 	RemoteModel string `json:"remote_model,omitempty"`
+	// Kind 模型类别（v0.31.98）：空 = 对话模型，"image" = 生图模型。
+	Kind string `json:"kind,omitempty"`
+	// Skipped 本次没做对话探活（生图模型走图像端点，用对话探只会得到必然的 400）。
+	//
+	// 不探不等于"不可用"：把它标成 ✗ 会让人以为通道坏了 —— 而真相是它本来就不服务对话。
+	Skipped bool   `json:"skipped,omitempty"`
+	Note    string `json:"note,omitempty"`
 }
 
 // probeUpstreamDeep 对每个模型真发一次**极小对话**，确认它此刻能被调用。
@@ -706,6 +713,14 @@ func probeUpstreamDeep(ctx context.Context, u Upstream, models []UpstreamModel) 
 	var wg sync.WaitGroup
 	for i, m := range models {
 		out[i] = probeCheck{Model: m.Model, RemoteModel: m.RemoteModel}
+		// 生图模型不探对话（v0.31.98）：它不服务 /chat/completions，
+		// 拿对话去探只会得到 400，然后被显示成"不可调用"—— 结论是错的。
+		if IsImageModel(m.Model) || IsImageModel(m.RemoteModel) {
+			out[i].Kind = "image"
+			out[i].Skipped = true
+			out[i].Note = "生图模型：只服务图像端点，未做对话探活（对话调用会被网关直接拒绝）"
+			continue
+		}
 		remote := strings.TrimSpace(m.RemoteModel)
 		if remote == "" {
 			remote = m.Model
@@ -1070,13 +1085,23 @@ func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 		dctx, dcancel := context.WithTimeout(r.Context(), budget)
 		checks = probeUpstreamDeep(dctx, *target, models)
 		dcancel()
-		okN := 0
+		okN, probed, imgN := 0, 0, 0
 		for _, c := range checks {
+			if c.Skipped {
+				imgN++
+				continue
+			}
+			probed++
 			if c.OK {
 				okN++
 			}
 		}
-		msg += fmt.Sprintf("；逐个调用验证 %d/%d 可调用", okN, len(checks))
+		if probed > 0 {
+			msg += fmt.Sprintf("；逐个调用验证 %d/%d 可调用", okN, probed)
+		}
+		if imgN > 0 {
+			msg += fmt.Sprintf("；另有 %d 个生图模型（只服务图像端点，未做对话探活）", imgN)
+		}
 	}
 
 	// 探活结果落库：后台列表要能显示"上次探活什么时候、结果如何"，

@@ -422,10 +422,13 @@ func TestRelayAllChannelsFailModelUnsupported(t *testing.T) {
 
 	up, _ := fakeRelay(t, 0, 0, 400, false)
 	defer up.Close()
-	seedRelay(t, store, up.URL, "image-only-model", 1.0, true)
+	// ⚠️ 名字里**不能**带 image 之类标记（v0.31.98）：那种名字会在网关本地就被判成
+	// 生图模型并回 400 image_model_on_chat_endpoint，这条用例要验的是
+	// "上游 4xx 原样透传"，所以用一个普通名字。
+	seedRelay(t, store, up.URL, "chat-rejected-model", 1.0, true)
 	seedPoolModels([]string{"pool-known-model"})
 
-	resp, body := chatOnce(t, srv, `{"model":"image-only-model","messages":[{"role":"user","content":"hi"}]}`)
+	resp, body := chatOnce(t, srv, `{"model":"chat-rejected-model","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("上游 400 应透传 400（不是 502），得 %d：%s", resp.StatusCode, body)
 	}

@@ -66,19 +66,30 @@ const FX = {
     upstreams: [{
       id: 7, name: '测试通道', base_url: 'https://api.example.com/v1', key_masked: 'sk-***',
       enabled: true, priority: 100, last_probe_at: 0, last_probe_ok: false, last_probe_msg: '',
-      upstream_ratio: 0.224, models: [],
+      upstream_ratio: 0.224,
+      // v0.31.98：通道卡上生图模型要打「生图」标（解释它为什么不在对话清单里）。
+      // ⚠️ 名字不能与探活桩的 ids 重名：重名会让探活把它们判成"已在映射里"，
+      // 从而只渲染一行的输入框（可导入数也跟着变），断言会连带失败。
+      models: [
+        { model: 'card-chat-model', remote_model: '', credit_per_1k: 0.1, billing_ratio: 0, billing_scope: 'relay' },
+        { model: 'gpt-image-card', remote_model: '', credit_per_1k: 0, billing_ratio: 0, billing_scope: 'relay' },
+      ],
     }],
     pool_models: {}, affected_keys: {},
   },
   // v0.31.97：探活带"逐个可调用性"与建议单价（官方倍率 × 上游倍率）。
   '/api/admin/upstreams/probe': {
-    ok: true, count: 2, models: ['m-one', 'm-two'],
+    // v0.31.98：第三个是生图模型 —— 探活**没做对话探活**（skipped），界面上要显示
+    // 「生图」而不是「不可调用」，否则会让人以为通道坏了。
+    ok: true, count: 3, models: ['m-one', 'm-two', 'gpt-image-2.5'],
     upstream_ratio: 0.224,
     checks: [
       { model: 'm-one', ok: true, status: 200 },
       { model: 'm-two', ok: false, status: 404, error: 'Model "m-two" is not supported by any configured account' },
+      { model: 'gpt-image-2.5', kind: 'image', skipped: true, ok: false,
+        note: '生图模型：只服务图像端点，未做对话探活（对话调用会被网关直接拒绝）' },
     ],
-    suggest_credit: { 'm-one': 0.1165, 'm-two': 0.1165 },
+    suggest_credit: { 'm-one': 0.1165, 'm-two': 0.1165, 'gpt-image-2.5': 0.1165 },
   },
   '/api/admin/anthropic-config': { default_model: '', known_models: [] },
   '/api/admin/accounts': {
@@ -1767,7 +1778,7 @@ function run(pageFile, meOverride, plan) {
       has: [['.modal-mask', 1], ['.modal-mask .modal-head', 1],
         ['.modal-mask input[placeholder*="上游名"]', 2],
         ['.modal-mask input[type="number"]', 4]],
-      textIn: [['.modal-mask', '识别到 2 个模型'], ['.modal-mask', 'm-one'],
+      textIn: [['.modal-mask', '识别到 3 个模型'], ['.modal-mask', 'm-one'],
         ['.modal-mask', '导入勾选的模型'],
         // v0.31.97：深度探活结论（一个可调用、一个不可调用）+ 上游倍率 + 加价入口
         ['.modal-mask', '可调用'], ['.modal-mask', '不可调用'],
@@ -1777,7 +1788,9 @@ function run(pageFile, meOverride, plan) {
       },
     // 隔一个 stage（约 700ms）再看一眼：弹窗还在才算"不会闪现消失"。
     { has: [['.modal-mask', 1]],
-      textIn: [['.modal-mask', 'm-two'], ['.modal-mask', '可导入 2 个']] },
+      textIn: [['.modal-mask', 'm-two'], ['.modal-mask', '可导入 3 个'],
+        // 生图模型必须带「生图」标（不是「不可调用」——它没做对话探活）
+        ['.modal-mask', '生图']] },
     // 冷静期本身也要可验证：否则"遮罩点一下不关"很可能被后来的人改成"永远不关"。
     // ① 刚打开就点遮罩 → 必须**不关**（这就是"连点/双击第二下"的场景）；
     { run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })",

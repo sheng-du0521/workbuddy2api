@@ -1090,6 +1090,22 @@ function legend(items) {
 }
 
 // cfgRow 配置行（左文案 + 右控件）。
+// IMAGE_MODEL_MARKERS 生图模型的名字特征（v0.31.98，与后端 modelkind.go 同一份口径）。
+//
+// 只用于**界面提示**（打标签 / 说明为什么它不在对话清单里），不参与任何路由判断：
+// 真正的拦截在后端（ServeChat 400 + 组展开剔除）。前端判断只是为了让人早点看见。
+const IMAGE_MODEL_MARKERS = [
+  'image', 'dall-e', 'dalle', 'imagen', 'flux', 'stable-diffusion', 'sdxl',
+  'midjourney', 'kolors', 'seedream', 'seededit', 'recraft', 'ideogram',
+  'cogview', 'wanx', 'nano-banana', 'grok-image',
+];
+
+function isImageModel(id) {
+  const s = String(id || '').toLowerCase();
+  if (!s) return false;
+  return IMAGE_MODEL_MARKERS.some((m) => s.indexOf(m) >= 0);
+}
+
 function cfgRow(title, hint, ctl) {
   const row = el('div', 'cfg-row');
   const txt = el('div', 'cfg-txt');

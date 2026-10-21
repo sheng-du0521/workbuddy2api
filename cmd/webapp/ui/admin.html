@@ -8365,7 +8365,15 @@ function channelCard(up, poolModels, affected) {
       row.appendChild(nm);
       // 深度探活的单项结论：不可调用的**默认不勾**（用户手动点进去才导入）。
       const ck = chk.get(id);
-      if (ck && !ck.ok) {
+      // 生图模型（v0.31.98）：它不服务 /chat/completions，所以**没做对话探活**。
+      // 标成"不可调用"是错的（会让人以为通道坏了），标成「生图」才说明白：
+      // 这条映射本身有效，只是入口是图像端点。
+      if ((ck && ck.skipped) || isImageModel(id)) {
+        const im = el('span', 'tag', '生图');
+        im.title = (ck && ck.note)
+          || '生图模型：只服务图像端点。它不会出现在对话模型清单里，用对话接口请求会被直接拒绝（零扣费）';
+        row.appendChild(im);
+      } else if (ck && !ck.ok) {
         cb.checked = false;
         const bad = el('span', 'tag err', '不可调用');
         bad.title = '深度探活失败（' + (ck.status || '无响应') + '）：'
@@ -8654,7 +8662,16 @@ function channelCard(up, poolModels, affected) {
   }
   for (const m of models) {
     const r = el('div', 'code-gen-row');
-    r.appendChild(el('span', 'mono', m.model));
+    const nameCell = el('span', 'mono', m.model);
+    // 生图模型（v0.31.98）：标出来，省得运维反复问"为什么这个模型不在对话清单里"。
+    if (isImageModel(m.model) || isImageModel(m.remote_model)) {
+      const im = el('span', 'tag', '生图');
+      im.style.marginLeft = '6px';
+      im.title = '生图模型：只服务图像端点。不参与对话（不会出现在 /v1/models 与通道分组里），'
+        + '用对话接口请求会被网关直接拒绝且不扣费';
+      nameCell.appendChild(im);
+    }
+    r.appendChild(nameCell);
     r.appendChild(el('span', 'mono muted', m.remote_model || '（同名）'));
     r.appendChild(el('span', 'mono', String(m.credit_per_1k)));
     // 计费倍率（v0.31.88）：左边「每 1k 积分」是**我方成本**，这一列是**用户按几倍收**。

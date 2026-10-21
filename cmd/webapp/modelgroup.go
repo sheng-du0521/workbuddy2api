@@ -173,10 +173,23 @@ func (p *Proxy) userGroups(k *APIKey) []modelGroupInfo {
 	if p == nil || k == nil {
 		return nil
 	}
+	// ⚠️ 对话面只列**能对话**的成员（v0.31.98）：
+	// 生图模型（gpt-image-* 等）挂在这里，用户选了必然被上游 400 —— 那是
+	// "我们给了它一个用不了的名字"，不是用户选错。过滤后成员为 0 的组**不列**
+	// （只挂生图模型的通道因此不再作为对话分组出现），与"空组不列"同一口径。
 	if k.Kind == KeyKindHost {
 		ms, label, ok := p.groupMembersFor(groupHostID, k)
 		if !ok {
 			return nil
+		}
+		// 只过滤**非空**的成员表：代挂 Key 还没绑定账号时成员本来就是 0，
+		// 那个 0 不是"全被生图模型占了"，不能因此把自挂官组藏掉（否则用户
+		// 生成一把代挂 Key 后连组名都看不见，又回到"选不到组"的老问题）。
+		if len(ms) > 0 {
+			ms = chatCapableModels(ms)
+			if len(ms) == 0 {
+				return nil
+			}
 		}
 		return []modelGroupInfo{{
 			ID: groupHostID, Model: groupVirtualModel(groupHostID),
@@ -188,6 +201,14 @@ func (p *Proxy) userGroups(k *APIKey) []modelGroupInfo {
 		ms, label, ok := p.groupMembersFor(gid, k)
 		if !ok {
 			continue // 组已删 / 通道已停用：不列（与 groupSelectable 的口径一致）
+		}
+		// 同上：只有"原本有成员、过滤后没了"才判定为不可用对话分组。
+		// 原本就空（通道刚建、还没加映射）交给上层既有口径（成员 0 由调用方处理）。
+		if len(ms) > 0 {
+			ms = chatCapableModels(ms)
+			if len(ms) == 0 {
+				continue // 只剩生图模型 = 这条通道不能对话，不是一个可用的对话分组
+			}
 		}
 		out = append(out, modelGroupInfo{
 			ID: gid, Model: groupVirtualModel(gid),
@@ -332,6 +353,13 @@ func (p *Proxy) expandGroupModels(model string, k *APIKey) (models []string, lab
 	if !ok || len(members) == 0 {
 		// 组不存在 / 成员为 0：不展开，让它按"未知模型"走 ——
 		// 客户端填错组名时，报"模型不存在"比报 500 更有指向。
+		return nil, "", false
+	}
+	// 对话面只展开**能对话**的成员（v0.31.98）：组里混着生图模型时，
+	// 旧行为会把 gpt-image-* 也当候选 → 轮到它必 400，而错误文案说的是
+	// "上游拒绝"，看起来像网关坏了。生图模型的入口是图像端点，不是组名。
+	members = chatCapableModels(members)
+	if len(members) == 0 {
 		return nil, "", false
 	}
 	// 首选：号池里第一个能跑的成员（自挂官组的成员已按"这把 Key 的账号"筛过）。
