@@ -1,20 +1,20 @@
 {
-  "version": "0.31.85",
+  "version": "0.31.86",
   "min_supported": "0.24.0",
-  "notes": "v0.31.85：一键接入改为「批量接入整组模型」。\n\n① 行为变化：以前只写 1 条（组名或一个模型名），现在把该组里被选中的模型全部接进去 —— 一次点「接入」、跑一次脚本，客户端里直接出现 N 个 WorkBuddy2API · <模型> 条目。\n\n② 什么时候批量（一条硬规则）：后台「work官组」选配勾了 N 个 → 批量接这 N 个（上限 20，超出截取并说明）；没勾（不限制）→ 仍是单条写组名。没勾时不批量是刻意的：那时成员是整份模型目录（几十个），全写进去会让客户端模型选择器变成一锅粥。\n\n③ 逐条执行 + 逐条结果 + 汇总：脚本终端输出 `[1/3] ok glm-5.3` / `[2/3] FAIL xxx：原因` / `接入完成：成功 2 / 3，失败 1` + 失败明细 + 配置文件路径与总数。三条纪律：单个失败不中断其余（每条独立 try/catch，失败只记进 $fail 并继续）；**写盘只做一次**（逐条写会在中途失败时留下半截配置，而\"成功 3/5\"与实际文件就对不上）；有失败非 0 退出且脚本保留（可看明细、修完重跑）。\n\n④ 接口：POST /api/keys/{id}/onboard 新增 batch（缺省 true，显式 false 时只接那一个）；响应新增 models[]/count/batch/truncated，model 保留为清单首项（兼容旧前端）；手动兜底的 JSON 也变成数组（一次复制 N 条，不再逐条粘贴）。\n\n⑤ 测试：TestOnboardBatchPowerShell（3 条 entry、foreach、[序号/总数]、汇总、失败明细、exit 1、每条独立 try/catch、WriteAllText 只出现一次）、TestOnboardBatchShell（WB2API_ENTRIES、逐条循环、sys.exit(1)、json.dump 只一次）、TestOnboardBatchModels（去重保序/空成员/超 20 条截断）、TestBatchModelsFromOnlyWhenRestricted（没配不批量/配了才批量/成员空不批量）、**TestOnboardBatchRunReal**（真跑 .bat：第 2 条故意空 id → 断言 [2/3] FAIL 后 [3/3] ok 仍执行、汇总成功 2/3、退出码非 0、配置文件 1 原有 + 2 成功 = 3 条、失败那条没进文件、备份存在）。\n\n⑥ 为什么必须有真跑用例：批量逻辑在脚本里，字符串断言只能证明\"写了循环\"，只有真跑才能证明\"第一条失败后第二条还写\"。\n\n边界：上限 20 条；批量只对 WorkBuddy 生效（CC Switch 写 settings.json 的 env，一个 base_url + 一个 token，没有多条模型的概念）；服务端只给\"计划清单\"不给\"执行结果\"（脚本跑在用户机器上，伪造结果比不给更糟）；单条坏数据不会导致整组回滚。",
-  "released_at": 1792558964,
+  "notes": "v0.31.86：CC Switch 也批量接入（两个目标同一套行为）。\n\n① 用户诉求：CC Switch 也要「一键把整组选配的模型全部接进去」，逐条执行、逐条结果、单个失败不中断、最后汇总。上一版只在 WorkBuddy 做了批量，理由是「CC Switch 的 env 只有一个模型槽」——那句话对了一半，结论错了。\n\n② 落地方式（为什么不是简单复制 WorkBuddy 的做法）：settings.json 的 env 是「一槽一模型」，但 Claude Code 认五个槽位：ANTHROPIC_MODEL（默认）、ANTHROPIC_DEFAULT_SONNET_MODEL / _OPUS_ / _HAIKU_（/model sonnet|opus|haiku 的落点）、ANTHROPIC_SMALL_FAST_MODEL（后台快任务）。所以前 5 个模型逐个占槽位，第 6 个起仍算成功——Claude Code 支持 /model <任意模型名>，请求把名字原样透传，平台按名选号。脚本把它记进 ~/.claude/wb2api-models.json 并在汇总里写明「用 /model 直接指定」，不假装它占了槽位。\n\n③ 三条纪律沿用 WorkBuddy 版：每条独立 try/catch（失败只记录并继续）；写盘只做一次（配置 + 清单各一次，逐条写会留半截配置）；有失败非 0 退出且保留脚本（能看原文、修完重跑）。备份、读回校验（base_url 必须匹配）、保留原有 permissions/其它 env 键全部保留；仍然不动 CC Switch 自己的 providers 表（第三方 SSOT，它自己会写）。\n\n④ 批量条件与 WorkBuddy 完全一致：只有后台「work官组」勾了选配（Restricted）才批量；没勾仍是单条组名（否则会把整份模型目录几十个全写进去）。这是行为一致，不是目标特例。\n\n⑤ 手动兜底同步：manual 的 JSON 也给 5 个槽位，超出部分单列 extra_models，note 说清槽位与 /model 用法——手动路径不能比脚本少。\n\n验证（两条真跑是重点，脚本逻辑只在真跑里才成立）：\n- TestOnboardCCSwitchBatchRunReal 真跑 .bat（隔离 USERPROFILE，预置含 permissions 与 KEEP_ME 的 settings.json）：第 2 条空 id → [2/3] FAIL 后 [3/3] ok 仍执行；汇总「成功 2 / 3，失败 1」；退出码非 0；ANTHROPIC_MODEL=m-one、ANTHROPIC_DEFAULT_SONNET_MODEL=m-three（失败项不占槽）；KEEP_ME 与 permissions 原样保留；备份含 old-model；清单 2 条且槽位一致。\n- TestOnboardCCSwitchBatchRunRealShell 真跑 .sh（bash + python3 wrapper + 隔离 HOME）：同上断言。\n- 字符串层：PowerShell 版 WriteAllText 恰好 2 次；sh 版 json.dump(cfg) 恰好 1 次；两者都有 foreach/[i/N]/汇总/失败明细/非 0 退出。\n- 全量 go test 通过（首次跑 internal/scheduler 的 TestCheckinAllRefreshBeforeExpiry 偶发失败，单跑与整包重跑均通过，属既有 flaky，与本改动无关）。\n\n顺带一处输出改进：.bat 的 powershell 行显式加 -OutputFormat Text。注意 stderr 的 \"#< CLIXML\" 是 PowerShell 在管道/文件重定向下写信息流的固有行为，双击运行（真控制台）不会出现——这个开关消不掉它，注释里已写明，免得下一个人以为没生效。\n\n边界：槽位只有 5 个（这是 Claude Code 的键决定的，不是我方限制）；第 6 个起的模型「接入成功」的含义是\"能用 /model <名字> 直接指定\"，不是\"出现在某个选择器里\"；批量只对配了选配的组生效；执行结果只有用户终端可见，服务端不给也不伪造。",
+  "released_at": 1792560068,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.85/webapp.exe",
-      "sha256": "f5f263247e16bd25656f6eec7a2879539064d1dfdb01f2c9e093099cf9ac11fc",
-      "size": 16011776
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.86/webapp.exe",
+      "sha256": "0461e50031868dd2d655f560aa5c268156bc360e76db7ce40979dccf41ddfd40",
+      "size": 16021504
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "hgkJ1KeDHY69EJLeRcnjjIU7j7JE7NUcKIvGeezpqFfTAg/+16Rrbjory1tn+yxSrKqrn385lc7Uz2BLTqkBBQ==",
+  "signature": "FqvvnUaotbacXm4rQkJq2KyGUB4uno6MV26aFQ01ZMdVIadt7QnQlfyoj3el5y0nudUjjXM2tYzfw2sF6ImHCg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

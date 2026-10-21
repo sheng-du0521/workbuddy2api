@@ -195,7 +195,11 @@ func buildOnboardScript(p onboardPlan, goos string) (filename, content string) {
 			// 某个字节处，实测报 `'ey，运行后请删除。' is not recognized`。
 			// 中文提示交给 PowerShell（那时代码页已是 65001）。
 			"rem This file contains a PLAINTEXT API key. Delete it after running.",
-			"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + enc,
+			// `-OutputFormat Text`：显式声明 stdout 为纯文本（部分宿主默认会把对象
+			// 序列化成 XML）。注意 stderr 里那条 `#< CLIXML` 是 PowerShell 在被
+			// 管道/文件重定向时写信息流的固有行为 —— 双击运行（真控制台）不会出现，
+			// 所以它不是缺陷，也别指望这个开关能消掉它。
+			"powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand " + enc,
 			"set RC=%ERRORLEVEL%",
 			"echo.",
 			"if not \"%RC%\"==\"0\" echo [FAILED] exit %RC% - see the message above.",
@@ -320,20 +324,68 @@ func buildPowerShellOnboard(p onboardPlan) string {
 	}, "\n")
 }
 
-// buildPowerShellCCSwitch CC Switch / Claude Code 目标（v0.31.70）。
+// ccSwitchSlots Claude Code 认的模型槽位（顺序即分配顺序）。
 //
-// 写的是 `~/.claude/settings.json` 的 `env` 两个键。**为什么不写 cc-switch.db**：
+// 为什么是这五个：`ANTHROPIC_MODEL` 是主模型；`ANTHROPIC_DEFAULT_SONNET_MODEL`
+// / `_OPUS_` / `_HAIKU_` 是 Claude Code 里 `/model sonnet|opus|haiku` 的别名落点；
+// `ANTHROPIC_SMALL_FAST_MODEL` 是后台快任务。批量接入按这个顺序占位，
+// 用户重启后在 `/model` 里就能逐个切到它们。
+//
+// 超出五个的模型**不占槽位，但仍算接入成功**：Claude Code 支持
+// `/model <任意模型名>`，请求会把该名字原样透传（我们按名选号）。
+// 这一点必须在汇总里显式写出来，不能含糊成"全都配好了"。
+var ccSwitchSlots = []string{
+	"ANTHROPIC_MODEL",
+	"ANTHROPIC_DEFAULT_SONNET_MODEL",
+	"ANTHROPIC_DEFAULT_OPUS_MODEL",
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+	"ANTHROPIC_SMALL_FAST_MODEL",
+}
+
+// ccSwitchSlotOf 第 i 个模型落在哪个槽位（越界返回 ""）。
+func ccSwitchSlotOf(i int) string {
+	if i < 0 || i >= len(ccSwitchSlots) {
+		return ""
+	}
+	return ccSwitchSlots[i]
+}
+
+// ccSwitchManifestName 我们自己的接入清单文件名（落在 ~/.claude/）。
+//
+// 刻意**不写** CC Switch 的 providers 表：那是它的第三方 SSOT（schema 由它自己
+// 迁移，它也会写）。清单只是给人看/给脚本重跑对照，写坏了不影响任何客户端。
+const ccSwitchManifestName = "wb2api-models.json"
+
+// ccSwitchEntries 本次要写进 env 的模型条目（批量优先，否则单条）。
+func ccSwitchEntries(p onboardPlan) []map[string]any {
+	models := onboardEntryModels(p)
+	out := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		out = append(out, map[string]any{"id": m})
+	}
+	return out
+}
+
+// buildPowerShellCCSwitch CC Switch / Claude Code 目标（v0.31.70，v0.31.86 批量）。
+//
+// 写的是 `~/.claude/settings.json` 的 `env`。**为什么不写 cc-switch.db**：
 // 那张表是 CC Switch 自己的 SSOT（第三方 schema，它自己也会写），直接改它
 // 既可能被覆盖、也可能破坏它的迁移；而 settings.json 是 Claude Code 认的格式，
 // CC Switch 在 direct 模式下本身就是写这份文件。
 //
-// 与 WorkBuddy 版的差别只有三处：路径、要合并的是**对象字段**而不是数组、
-// 以及必须保留 settings.json 里其它键（permissions / hooks …）——
-// 所以用 ConvertFrom-Json → 改 env → ConvertTo-Json 整体回写，而不是拼字符串。
+// 批量的语义与 WorkBuddy 不同，必须说清：
+//   - env 里"一个模型一个槽"最多五个（见 ccSwitchSlots），所以前五个占槽位；
+//   - 其余模型仍逐个"接入"（校验 + 记进清单）—— 在 Claude Code 里用
+//     `/model <名字>` 直接指定即可，不需要占槽位；
+//   - 逐条 try/catch：单个失败只记进 $fail 并继续，**绝不中断**后面的模型；
+//   - settings.json 只在全部跑完后**写一次**（逐条写会在中途失败时留下半截配置）。
 func buildPowerShellCCSwitch(p onboardPlan) string {
+	blob, _ := json.Marshal(ccSwitchEntries(p))
+	slotList := "'" + strings.Join(ccSwitchSlots, "', '") + "'"
 	return strings.Join([]string{
 		"$ErrorActionPreference = 'Stop'",
 		"$path = Join-Path $env:USERPROFILE '.claude\\settings.json'",
+		"$manifest = Join-Path $env:USERPROFILE '.claude\\" + ccSwitchManifestName + "'",
 		"$dir = Split-Path -Parent $path",
 		"if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
 		"$cfg = $null",
@@ -352,14 +404,66 @@ func buildPowerShellCCSwitch(p onboardPlan) string {
 		"}",
 		"$cfg.env | Add-Member -NotePropertyName ANTHROPIC_BASE_URL -NotePropertyValue " + psQuote(p.Origin) + " -Force",
 		"$cfg.env | Add-Member -NotePropertyName ANTHROPIC_AUTH_TOKEN -NotePropertyValue " + psQuote(p.APIKey) + " -Force",
-		"$json = $cfg | ConvertTo-Json -Depth 20",
-		"[IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))",
-		// 读回校验：既要能解析，也要能读出新值（写没写进去必须当场知道）。
-		"$check = [IO.File]::ReadAllText($path) | ConvertFrom-Json",
-		"if ($check.env.ANTHROPIC_BASE_URL -ne " + psQuote(p.Origin) + ") { throw '写入后校验失败：base_url 不匹配' }",
-		"Write-Host ('已写入 ' + $path)",
-		"Write-Host ('  ANTHROPIC_BASE_URL = ' + $check.env.ANTHROPIC_BASE_URL)",
-		"Write-Host '接入完成：重启 Claude Code 生效。若 CC Switch 处于 routing 模式，请在它内部再选一次供应商。'",
+		// 再设一次 base_url/token 之后才处理模型：即使模型条全部失败，
+		// 一个能用的 base+token 配置也已经落盘（不会是"什么都没写"）。
+		"$slots = @(" + slotList + ")",
+		"$entriesRaw = " + psQuote(string(blob)),
+		// @(... | ConvertFrom-Json) 在 PS 5.1 里会再包一层（v0.31.80 踩过），
+		// 所以先赋值、再用 @() 统一成数组。
+		"$parsed = $entriesRaw | ConvertFrom-Json",
+		"$list = @($parsed)",
+		"$ok = @()",
+		"$fail = @()",
+		"$plan = @()",
+		"$i = 0",
+		"foreach ($e in $list) {",
+		"  $i = $i + 1",
+		"  $mid = ''",
+		"  try {",
+		"    $mid = [string]$e.id",
+		"    if ([string]::IsNullOrWhiteSpace($mid)) { throw '条目缺少 id' }",
+		"    foreach ($p0 in $plan) { if ($p0.model -eq $mid) { throw '同一次接入里出现重复模型' } }",
+		"    $slot = ''",
+		"    if ($plan.Count -lt $slots.Count) { $slot = $slots[$plan.Count] }",
+		"    if ($slot -ne '') { $cfg.env | Add-Member -NotePropertyName $slot -NotePropertyValue $mid -Force }",
+		"    $plan += (New-Object psobject -Property @{ model = $mid; slot = $slot })",
+		"    $ok += $mid",
+		"    $where = if ($slot -ne '') { '-> ' + $slot } else { '(槽位已满，Claude Code 里用 /model ' + $mid + ' 直接指定)' }",
+		"    Write-Host ('[' + $i + '/' + $list.Count + '] ok   ' + $mid + ' ' + $where)",
+		"  } catch {",
+		"    $who = if ($mid) { $mid } else { '(第 ' + $i + ' 条)' }",
+		"    $fail += ($who + '：' + $_.Exception.Message)",
+		"    Write-Host ('[' + $i + '/' + $list.Count + '] FAIL ' + $fail[-1])",
+		"  }",
+		"}",
+		"if ($ok.Count -gt 0) {",
+		"  $json = $cfg | ConvertTo-Json -Depth 20",
+		"  [IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))",
+		"  $check = [IO.File]::ReadAllText($path) | ConvertFrom-Json",
+		"  if ($check.env.ANTHROPIC_BASE_URL -ne " + psQuote(p.Origin) + ") { throw '写入后校验失败：base_url 不匹配' }",
+		"  $mf = $plan | ConvertTo-Json -Depth 10",
+		"  if ($plan.Count -eq 1) { $mf = '[' + ($plan[0] | ConvertTo-Json -Depth 10) + ']' }",
+		"  [IO.File]::WriteAllText($manifest, $mf, (New-Object Text.UTF8Encoding($false)))",
+		"  Write-Host '===================='",
+		"  Write-Host ('接入完成：成功 ' + $ok.Count + ' / ' + $list.Count + '，失败 ' + $fail.Count)",
+		"  if ($fail.Count -gt 0) {",
+		"    Write-Host '失败明细：'",
+		"    foreach ($f in $fail) { Write-Host ('  - ' + $f) }",
+		"  }",
+		"  Write-Host ('  ANTHROPIC_BASE_URL = ' + $check.env.ANTHROPIC_BASE_URL)",
+		"  Write-Host '模型槽位（重启 Claude Code 后 /model 可用）：'",
+		"  foreach ($p1 in $plan) {",
+		"    $line = '  ' + $p1.model",
+		"    if ($p1.slot -ne '') { $line = $line + ' -> ' + $p1.slot } else { $line = $line + ' -> /model 直接指定' }",
+		"    Write-Host $line",
+		"  }",
+		"  Write-Host ('清单文件：' + $manifest)",
+		"} else {",
+		"  Write-Host '===================='",
+		"  Write-Host ('接入完成：成功 0 / ' + $list.Count + '，全部失败（原配置未改动）')",
+		"  foreach ($f in $fail) { Write-Host ('  - ' + $f) }",
+		"}",
+		"if ($fail.Count -gt 0) { exit 1 }",
 		"exit 0",
 	}, "\n")
 }
@@ -399,15 +503,64 @@ if target == "ccswitch":
     env["ANTHROPIC_BASE_URL"] = os.environ["WB2API_BASE_URL"]
     env["ANTHROPIC_AUTH_TOKEN"] = os.environ["WB2API_API_KEY"]
     cfg["env"] = env
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    check = json.load(open(path, encoding="utf-8"))
-    got = (check.get("env") or {}).get("ANTHROPIC_BASE_URL")
-    if got != os.environ["WB2API_BASE_URL"]:
-        sys.exit("写入后校验失败：base_url 不匹配")
-    print("已写入 " + path)
-    print("  ANTHROPIC_BASE_URL = " + got)
+    slots = ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+             "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+             "ANTHROPIC_SMALL_FAST_MODEL"]
+    manifest = os.path.join(home, ".claude", "wb2api-models.json")
+    try:
+        entries = json.loads(os.environ.get("WB2API_ENTRIES") or "[]")
+    except Exception:
+        entries = []
+    if not isinstance(entries, list) or not entries:
+        entries = [json.loads(os.environ["WB2API_ENTRY"])]
+    ok, fail, plan = [], [], []
+    for i, entry in enumerate(entries, 1):
+        mid = ""
+        try:
+            mid = str((entry or {}).get("id") or "")
+            if not mid:
+                raise ValueError("条目缺少 id")
+            if any(x["model"] == mid for x in plan):
+                raise ValueError("同一次接入里出现重复模型")
+            slot = slots[len(plan)] if len(plan) < len(slots) else ""
+            if slot:
+                env[slot] = mid
+            plan.append({"model": mid, "slot": slot})
+            ok.append(mid)
+            where = ("-> " + slot) if slot else ("(槽位已满，Claude Code 里用 /model %s 直接指定)" % mid)
+            print("[%d/%d] ok   %s %s" % (i, len(entries), mid, where))
+        except Exception as ex:
+            fail.append("%s：%s" % (mid or ("(第 %d 条)" % i), ex))
+            print("[%d/%d] FAIL %s" % (i, len(entries), fail[-1]))
+    if ok:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        check = json.load(open(path, encoding="utf-8"))
+        got = (check.get("env") or {}).get("ANTHROPIC_BASE_URL")
+        if got != os.environ["WB2API_BASE_URL"]:
+            sys.exit("写入后校验失败：base_url 不匹配")
+        with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(plan, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        print("=" * 20)
+        print("接入完成：成功 %d / %d，失败 %d" % (len(ok), len(entries), len(fail)))
+        if fail:
+            print("失败明细：")
+            for f1 in fail:
+                print("  - " + f1)
+        print("  ANTHROPIC_BASE_URL = " + got)
+        print("模型槽位（重启 Claude Code 后 /model 可用）：")
+        for x in plan:
+            print("  " + x["model"] + (" -> " + x["slot"] if x["slot"] else " -> /model 直接指定"))
+        print("清单文件：" + manifest)
+    else:
+        print("=" * 20)
+        print("接入完成：成功 0 / %d，全部失败（原配置未改动）" % len(entries))
+        for f1 in fail:
+            print("  - " + f1)
+    if fail:
+        sys.exit(1)
 else:
     # v0.31.85：批量。entries 是数组；旧调用方只给单条 WB2API_ENTRY 也能跑。
     try:
@@ -607,16 +760,21 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		Model:   model,
 		Name:    "WorkBuddy2API · " + model,
 	}
-	// 批量接入（v0.31.85）：把**这一组里被选中的全部模型**一次接进去。
+	// 批量接入（v0.31.85，v0.31.86 扩到 CC Switch）：把**这一组里被选中的
+	// 全部模型**一次接进去，两个目标同一套规则 —— "能接几个模型"不该看目标，
+	// 用户看到的应当是同一个行为。
 	//
-	// 只在 WorkBuddy 目标下批量：CC Switch 写的是 settings.json 的 env（一个 base_url +
-	// 一个 token，模型由客户端自己挑），没有"多条模型"这个概念。
+	// 两个目标的落地方式不同（**这是实现细节，不是产品差异**）：
+	//   WorkBuddy  → models.json 数组，一个模型一条，天然无上限；
+	//   CC Switch  → settings.json 的 env，前五个模型占槽位
+	//                （MODEL / SONNET / OPUS / HAIKU / SMALL_FAST），
+	//                其余模型仍接入成功，在 `/model <名字>` 里直接可用。
 	//
 	// ⚠️ 只有**配了选配**（Restricted）才批量：没配选配时成员是整份模型目录（几十个），
 	// 一键全写进客户端会让模型选择器变成一锅粥。那种情况下退回单条（组名），
 	// 也就是"让平台替我挑一个"—— 这才是"未选配"该有的样子。
 	batchTruncated := 0
-	if batch && target == onboardTargetWorkBuddy {
+	if batch {
 		if m, truncated := batchModelsFrom(a.buildOnboardPlan(k)); len(m) > 0 {
 			plan.Models = m
 			plan.Model = m[0]
@@ -683,17 +841,40 @@ func onboardManual(p onboardPlan) map[string]any {
 		// CC Switch 自己有一张 providers 表（SQLite，第三方 SSOT），直接改它有风险：
 		// schema 会变、它自己也会写。这里给的是 Claude Code 认的 settings.json 形态，
 		// 也就是 CC Switch 切到 direct 模式时用的那种配置。
-		blob, _ := json.MarshalIndent(map[string]any{
-			"env": map[string]any{
-				"ANTHROPIC_BASE_URL":   p.Origin,
-				"ANTHROPIC_AUTH_TOKEN": p.APIKey,
-			},
-		}, "", "  ")
+		//
+		// 批量时和脚本**同一套槽位**（前五个模型占 MODEL/SONNET/OPUS/HAIKU/SMALL_FAST），
+		// 超出五个的写在 models 字段里让人自己 `/model <名字>` —— 手动路径不能比脚本少。
+		models := onboardEntryModels(p)
+		env := map[string]any{
+			"ANTHROPIC_BASE_URL":   p.Origin,
+			"ANTHROPIC_AUTH_TOKEN": p.APIKey,
+		}
+		extra := make([]string, 0, len(models))
+		for i, m := range models {
+			if slot := ccSwitchSlotOf(i); slot != "" {
+				env[slot] = m
+				continue
+			}
+			extra = append(extra, m)
+		}
+		blob, _ := json.MarshalIndent(map[string]any{"env": env}, "", "  ")
 		out["path"] = `%USERPROFILE%\.claude\settings.json（macOS/Linux: ~/.claude/settings.json）`
-		out["note"] = "把 env 这两个键合并进现有 settings.json（ANTHROPIC_BASE_URL 填**不带 /v1** 的地址：" +
-			"客户端自己拼 /v1/messages）。若 CC Switch 处于 routing 模式，需在它内部再选一次供应商 —— " +
-			"否则它会在下次切换时覆盖这里。"
+		out["note"] = "把 env 合并进现有 settings.json（ANTHROPIC_BASE_URL 填**不带 /v1** 的地址：" +
+			"客户端自己拼 /v1/messages）。共接入 " + itoa(len(models)) + " 个模型：前 " +
+			itoa(minInt(len(models), len(ccSwitchSlots))) + " 个占槽位（/model 里按别名切换）" +
+			func() string {
+				if len(extra) == 0 {
+					return "。"
+				}
+				return "，其余 " + itoa(len(extra)) + " 个用 /model <名字> 直接指定。"
+			}() +
+			"若 CC Switch 处于 routing 模式，需在它内部再选一次供应商 —— 否则它会在下次切换时覆盖这里。"
 		out["json"] = string(blob)
+		out["models"] = models
+		out["count"] = len(models)
+		if len(extra) > 0 {
+			out["extra_models"] = extra
+		}
 	}
 	return out
 }
