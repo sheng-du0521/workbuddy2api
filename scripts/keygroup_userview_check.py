@@ -130,7 +130,7 @@ def main():
             print(open(log_path, "rb").read()[-2000:].decode("utf-8", "replace"))
             sys.exit("服务没起来")
 
-        ch_id = seed_channel(db, "userview-relay", ["relay-only-model"])
+        ch_id = seed_channel(db, "userview-relay", ["relay-only-model", "relay-second"])
 
         user = "uv_%d" % int(time.time())
         pw = "Userview_pw_2026"
@@ -207,11 +207,42 @@ def main():
 
             code, body = req("GET", base + "/api/onboard/options?key_id=%d" % key_id)
             plan2 = json.loads(body) if code == 200 else {}
-            print("   onboard(已切组) -> %d  group_name=%s  models=%s" %
-                  (code, plan2.get("group_name"), (plan2.get("models") or [])[:4]))
+            print("   onboard(已切组) -> %d  group_name=%s  batch=%s  count=%s" %
+                  (code, plan2.get("group_name"), plan2.get("batch"), plan2.get("count")))
             if plan2.get("group_name") != vmodel:
                 fails.append("切组后接入组名应为 %s，得到 %r（切组对一键接入无效）"
                              % (vmodel, plan2.get("group_name")))
+            if not plan2.get("batch"):
+                fails.append("通道组的接入应是批量（batch=false 只会接进去一个组名）")
+
+            # ⑥ 生成接入包：必须把这组的模型**全部**写进去（v0.31.93）
+            code, body = req("POST", base + "/api/keys/%d/onboard" % key_id,
+                             {"target": "workbuddy", "os": "windows"})
+            pkg = json.loads(body) if code == 200 else {}
+            got = pkg.get("models") or []
+            print("⑥ onboard 生成 -> %d  count=%s  models=%s" %
+                  (code, pkg.get("count"), got))
+            want = {"relay-only-model", "relay-second"}
+            if code != 200:
+                fails.append("生成接入包失败：%d" % code)
+            elif set(got) != want:
+                fails.append("接入包模型清单 = %s，期望该通道选用的全部 %s"
+                             % (sorted(got), sorted(want)))
+            elif not (pkg.get("script") or "").strip():
+                fails.append("接入包没有脚本正文")
+
+            # ⑦ CC Switch 同一套规则（"能接几个"不该看目标）
+            code, body = req("POST", base + "/api/keys/%d/onboard" % key_id,
+                             {"target": "ccswitch", "os": "unix"})
+            pkg2 = json.loads(body) if code == 200 else {}
+            got2 = pkg2.get("models") or []
+            print("⑦ onboard(ccswitch) -> %d  count=%s  models=%s" %
+                  (code, pkg2.get("count"), got2))
+            if code != 200:
+                fails.append("CC Switch 接入包生成失败：%d" % code)
+            elif set(got2) != want:
+                fails.append("CC Switch 接入包清单 = %s，期望 %s（两个目标口径应一致）"
+                             % (sorted(got2), sorted(want)))
 
         if fails:
             for f in fails:

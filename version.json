@@ -1,20 +1,20 @@
 {
-  "version": "0.31.92",
+  "version": "0.31.93",
   "min_supported": "0.24.0",
-  "notes": "v0.31.92：修「生成密钥后依然无法选用通道组」—— 用户面的组改成**一个口径**。\n\n## 根因（三处落点，同一个病根：两套口径）\n\n上一批（v0.31.90）给用户开了「切换分组」，但只改了**切换弹窗**那一处\n（selectableGroupIDs 含通道组）。用户可见的「组」还有另外两个出口，\n它们仍在用旧口径（v0.31.82 的 visibleGroups：只回 work / host）：\n\n① `/api/keys/{id}/models` 的 groups → 控制台「测试对话」下拉、\n   「一键接入」弹窗的组标签。于是**能切到 ch1，但下拉里没有 wb-group-ch1 这一项**。\n\n② `/v1/models` 的定制判据还是 `active_group 非空 || group_scope 非空`。\n   v0.31.90 把 group_scope 改成\"空 = 默认开放\"之后，管理员不再逐 Key 授权 →\n   新生成的 Key 两个字段都是空 → **永远走全局缓存原文**，客户端模型选择器里\n   连 wb-group-work 都没有，更别说通道组。这就是\"生成密钥后\"这个前提的由来。\n\n③ `/api/onboard/options`（一键接入）的组名恒为 wb-group-work / wb-group-host，\n   **不看 active_group**。用户切到通道组之后再接入，写进客户端的还是号池官组 ——\n   切组对一键接入完全无效。\n\n另有一个体验陷阱：控制台「生成密钥」的默认类型写死 `host`（代挂自用）。\n一个代挂账号都没有的人点一下生成，拿到的 Key 既没有可跑模型（自挂组成员取决于\n绑定账号），也没有「切换分组」按钮 —— 同样会表现为\"选不了通道组\"。\n\n## 改动\n\n- 新增 `Proxy.userGroups(k)` 作为**用户面唯一口径**：\n  代挂 Key → 自挂官组；池计费 Key → 号池官组 + 该 Key **可切换**的通道组。\n  内部直接复用 `selectableGroupIDs`，所以\"列出来的\"与\"切得动的\"永远同一批，\n  不可能再出现\"列表里有、点了 403\"。\n- **删除 `visibleGroups`**：它没写错，但留着一定会被再次误用 —— 本次故障就是它。\n- `/api/keys/{id}/models` 与 `/v1/models` 都改用 `userGroups`；\n  `/v1/models` 的定制判据换成 `keyNeedsGroupCatalog`（生效分组非空 / 池 Key 且有\n  通道组可选）。**没有通道组的部署保持逐字节不变**（v0.31.76 的承诺仍然守）。\n- 一键接入尊重 `active_group`：切到通道组后，接入包写 wb-group-ch<N>，\n  候选 = 该组成员，且不套用后台给官组配的选配名单（那份名单只对官组有意义）。\n- 控制台默认密钥类型改为\"有代挂账号才默认代挂自用，否则号池计费\"。\n\n## 验证\n\n- 新增 `cmd/webapp/keygroup_userview_test.go` 六条：userGroups 含通道组 /\n  代挂 Key 只有 host / 模型清单里出现 wb-group-ch<N> / 新 Key（两字段全空）的\n  /v1/models 也列出通道组名 / 没有通道组的部署不定制 / 切到通道组后接入包写该组名。\n- 改写 `TestVisibleGroupsByKeyKind` → `TestUserGroupsByKeyKindAndWhitelist`\n  （旧用例锁的正是被推翻的\"通道组不可见\"口径），并保留白名单收窄的断言。\n- uitest 新增：密钥页「切换分组」弹窗必须列出通道组与它的倍率；测试对话下拉必须\n  出现 wb-group-ch1。\n- go test ./...、jscheck、uitest、preflight 全链绿。\n\n## 边界\n\n- 代挂自用 Key 的 /v1/models 仍不按 Key 定制（它的模型面取决于绑定账号，\n  用全局目录冒充会让人选到跑不了的模型），组名由接入脚本直接写入客户端。\n- 通道组的候选不套用「work官组选配」——那份名单是给号池/自挂两类官组配的。",
-  "released_at": 1792574764,
+  "notes": "v0.31.93：一键接入按「当前分组」批量接入它选用的全部模型。\n\n反馈：接入分组的对应后台选用的模型都批量接入。\n\n## 旧行为\n\n`batchModelsFrom` 的判据是 `Restricted`（后台「一键接入选配」配了才批量）。而通道组的\n\"选用模型\"在通道自己的映射表里、不在那份选配 KV 里 —— v0.31.92 又把通道组的\nconfigured 显式置 false，于是**通道组永远走单条**：点接入只得到一个 `wb-group-ch1`，\n后台为该通道启用的那批模型一个都没进去。\n\n## 现在（口径写进 plan.Batch，只有一处）\n\n| 当前分组 | 是否批量 | 清单来源 |\n|---|---|---|\n| 通道组 `ch<N>` | **总是批量** | 该通道 enabled 的模型映射（= 后台为该通道选用的那批） |\n| 号池官组 + 配了选配 | 批量 | 后台「号池官组选配」∩ 该 Key 能跑的 |\n| 号池官组 + 没配选配 | 单条（组名） | 成员是整份号池目录（几十个），全写进客户端会让模型选择器没法用 |\n| 自挂官组 | 同上（看选配） | 绑定账号能满足的模型 |\n\n配套：\n- `workGroupPlan` 新增 `Batch`，`batchModelsFrom` 只认它（不再自己判 Restricted）。\n- `/api/onboard/options` 多回 `batch` / `count`：接入弹窗在任何点击之前就写明\n  「将批量接入该分组的 N 个模型（… 在后台选用的全部）—— 不只写一个组名」。\n- 上限仍是 20，超出会截断并在生成结果里提示（先缩小选配范围）。\n\n## 验证\n\n- 单测：`TestOnboardBatchForChannelGroup`（通道组 Batch=true、清单=该通道两个模型）、\n  `TestOnboardBatchForOfficialGroupNeedsAllowList`（官组没选配不批量、配了才批量且清单是交集）。\n- uitest：接入弹窗出现「将批量接入该分组的 2 个模型」+ 分组名。\n- 真机（`scripts/keygroup_userview_check.py`，临时实例 + 直插通道）：\n  `onboard(已切组) batch=True count=2`；WorkBuddy 接入包 `models=[relay-only-model, relay-second]`；\n  CC Switch 接入包同一清单（\"能接几个\"不看目标）。\n\n## 边界\n\n- 官组没配选配时仍只接一个组名 —— 这不是漏改：官组成员是整份号池目录，\n  批量会把几十个模型塞进客户端。要批量就先在后台「选配」里勾出那批。\n- 未改通道组的成员计算、计费与选号链路。",
+  "released_at": 1792576078,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.92/webapp.exe",
-      "sha256": "9098382e72b9ce46a673ecb85962d3590c0eff0e21ca013e91fa5b6df5f0b04a",
-      "size": 16093184
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.93/webapp.exe",
+      "sha256": "8bf258d2829f973d63b07913c4d7d62bb229da5a9a82bce9eca319416cbf98af",
+      "size": 16094208
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "Ftjg6joE5CG4SxxGUPocaNRpEOiV3jyhwBAI8cpCCcIdvvR5EhOilHuo3D8fdSSWkZND5eC4CF+ls41az7NzDA==",
+  "signature": "g4vh3pg4pJLsIhv4Y1en4dh6zPrp+MqkP86RzfAPAwIBpbcQQ+/3u6VphWGFOqZyCKVytvK3umUAf0U4DkFyBQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

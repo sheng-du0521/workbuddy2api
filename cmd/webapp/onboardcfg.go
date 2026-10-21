@@ -52,6 +52,10 @@ type onboardOptionsResp struct {
 	// 前端据此显示「work官组 · 号池官组」而不是自己拼字符串（口径只能有一处）。
 	GroupName  string `json:"group_name"`
 	GroupLabel string `json:"group_label"`
+	// Batch / Count（v0.31.93）：接入时会不会整组批量写进去、一共几个。
+	// 前端据这句话告诉用户"点生成会接哪几个"，省掉"我以为是整组、结果只接了一个"的来回。
+	Batch bool `json:"batch"`
+	Count int  `json:"count"`
 }
 
 // allModelIDs 平台可见的全部模型名（号池目录 ∪ 通道映射，去重排序）。
@@ -124,7 +128,14 @@ type workGroupPlan struct {
 	Members    []string // 具体模型候选（不含组名）
 	Default    string
 	Restricted bool
-	Note       string
+	// Batch 这次接入是不是"整组接进去"（v0.31.93）。
+	//
+	//   · 官组：配了后台选配才批量 —— 没配时成员是整份号池目录（几十个），
+	//     一键全写进客户端会让模型选择器变成一锅粥；
+	//   · 通道组：**总是批量** —— 它在后台启用的模型就是运营亲手选的那批，
+	//     数量本来就可控，没有理由只接一个名字进去。
+	Batch bool
+	Note  string
 }
 
 // planKey 两类官组的差异**只有这几个参数**，其余全部由 buildOnboardPlan 统一处理。
@@ -191,6 +202,10 @@ func (a *app) buildOnboardPlan(k *APIKey) workGroupPlan {
 		}
 	}
 	plan.Members = models
+	// 批量口径（v0.31.93）：见 workGroupPlan.Batch 的注释。
+	// 通道组（!official）恒批量：它的成员就是"后台为该通道启用的模型"，
+	// 用户点接入时期望的是把这批都写进去，而不是只写一个组名。
+	plan.Batch = configured || !official
 
 	// ③ 默认值：配置优先；没配就用本组虚拟名。
 	// defKV 为空（= 生效分组是通道组）时不读 KV：那条 KV 描述的是号池官组的默认。
@@ -247,6 +262,8 @@ func (a *app) handleOnboardOptions(w http.ResponseWriter, r *http.Request) {
 		Note:       plan.Note,
 		GroupName:  plan.GroupName,
 		GroupLabel: plan.GroupLabel,
+		Batch:      plan.Batch,
+		Count:      len(plan.Members),
 	})
 }
 

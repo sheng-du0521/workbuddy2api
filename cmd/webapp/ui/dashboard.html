@@ -1827,6 +1827,16 @@ async function openOnboardModal(k) {
       tip.style.marginTop = '4px';
       row.appendChild(tip);
     }
+    // 批量口径（v0.31.93）：把"点生成到底会接几个"提前说清楚。
+    // 通道组之所以要讲：它接的不是一个组名，而是后台为该通道启用的**那一批模型**；
+    // 不讲的话用户会以为"我选了组，结果只接进去一个名字"。
+    if (r.batch && r.count > 1) {
+      const bt = el('div', 'muted',
+        '将批量接入该分组的 ' + r.count + ' 个模型（' + (r.group_label || '')
+        + ' 在后台选用的全部）—— 不只写一个组名');
+      bt.style.cssText = 'font-size:12px;margin-top:4px;color:var(--accent, #4A6CF7);';
+      row.appendChild(bt);
+    }
     if (!list.length && !r.default_model) {
       inp.placeholder = (k.kind === 'host')
         ? '手填你自己账号能跑的模型名（代挂 Key 不能用组名）'

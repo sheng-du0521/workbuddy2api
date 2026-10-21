@@ -182,22 +182,28 @@ func TestOnboardBatchResponse(t *testing.T) {
 	}
 }
 
-// TestBatchModelsFromOnlyWhenRestricted 只有配了选配才批量。
+// TestBatchModelsFromByBatchFlag 批量判据只看 plan.Batch（v0.31.93）。
 //
-// 没配选配时成员是整份模型目录（几十个），一键全写进客户端会让模型选择器变成一锅粥；
-// 那种情况必须退回单条（组名）。
-func TestBatchModelsFromOnlyWhenRestricted(t *testing.T) {
-	// 未配选配 → 不批量
-	if m, _ := batchModelsFrom(workGroupPlan{Restricted: false, Members: []string{"a", "b", "c"}}); len(m) != 0 {
-		t.Errorf("未配选配时不该批量，得到 %v", m)
+// 这个判据此前是 Restricted（"后台选配配了没有"），而通道组的"选用模型"在通道
+// 自己的映射表里、不在那份选配 KV 里 —— 于是通道组永远走单条，用户点接入只得到
+// 一个组名。现在由 buildOnboardPlan 一处算出 Batch，这里只认它。
+func TestBatchModelsFromByBatchFlag(t *testing.T) {
+	// 官组未配选配 → 不批量：成员是整份号池目录（几十个），全写进去会让选择器变成一锅粥
+	if m, _ := batchModelsFrom(workGroupPlan{Batch: false, Members: []string{"a", "b", "c"}}); len(m) != 0 {
+		t.Errorf("Batch=false 时不该批量，得到 %v", m)
 	}
-	// 配了选配 → 批量
-	m, _ := batchModelsFrom(workGroupPlan{Restricted: true, Members: []string{"a", "b", "c"}})
+	// 官组配了选配 → 批量
+	m, _ := batchModelsFrom(workGroupPlan{Batch: true, Restricted: true, Members: []string{"a", "b", "c"}})
 	if len(m) != 3 {
 		t.Errorf("配了选配应批量接入 3 个，得到 %v", m)
 	}
-	// 配了但成员为空（一个都跑不了）→ 不批量，交给单条兜底
-	if m, _ := batchModelsFrom(workGroupPlan{Restricted: true}); len(m) != 0 {
+	// 通道组：Batch=true 且 Restricted=false → 同样批量（本版的核心改动）
+	m, _ = batchModelsFrom(workGroupPlan{Batch: true, Members: []string{"x", "y"}})
+	if len(m) != 2 {
+		t.Errorf("通道组应批量接入 2 个，得到 %v", m)
+	}
+	// 成员为空（这一组一个模型都没有）→ 不批量，交给单条兜底（写组名）
+	if m, _ := batchModelsFrom(workGroupPlan{Batch: true}); len(m) != 0 {
 		t.Errorf("成员为空时不该批量，得到 %v", m)
 	}
 }

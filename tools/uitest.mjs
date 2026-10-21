@@ -577,6 +577,13 @@ const FX = {
       { id: 'ch1', model: 'wb-group-ch1', label: '通道 · 中转A', kind: 'channel', members: 2 },
     ],
   },
+  // 一键接入选配（v0.31.93）：通道组要走**批量**，count 就是该组选用的模型数。
+  '/api/onboard/options': {
+    models: ['wb-group-ch1', 'relay-a', 'relay-b'],
+    default_model: 'wb-group-ch1', kind: 'pool', restricted: false,
+    group_name: 'wb-group-ch1', group_label: '通道 · 中转A',
+    batch: true, count: 2,
+  },
   // 分组切换弹窗（v0.31.88）：pool Key 才 editable，选项里必须有通道组。
   '/api/keys/1/group-options': {
     kind: 'pool', active_group: '', editable: true, global_ratio: 1,
@@ -1800,6 +1807,14 @@ function run(pageFile, meOverride, plan) {
         // 通道组的倍率区间要显示出来（决定"切过去贵不贵"）
         ['.modal-mask', '×1.5']] },
     { clickText: [['.modal-mask button', '关闭']], absent: ['.modal-mask'] },
+    // v0.31.93：接入弹窗必须提前讲清"会接几个"。通道组接的不是一个组名，
+    // 而是后台为该通道选用的那一批模型 —— 不讲用户就会以为"我选了组，只接进去一个名字"。
+    { nav: 'keys',
+      run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })",
+        "(function () { var b = Array.prototype.find.call(document.querySelectorAll('#keyCards button'),"
+        + " function (x) { return (x.title || '').indexOf('一键写入') >= 0; }); if (b) b.click(); })()"],
+      has: [['.modal-mask', 1]],
+      textIn: [['.modal-mask', '将批量接入该分组的 2 个模型'], ['.modal-mask', '通道 · 中转A']] },
     // v0.31.91：下拉里必须出现通道组名（wb-group-ch1）—— 用户在控制台
     // 能切到通道组，模型选择器里就得能选到它，否则"切了也白切"。
     { nav: 'test', counts: [['testKey', 2], ['testModelSel', 4]],

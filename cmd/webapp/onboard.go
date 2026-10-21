@@ -69,12 +69,19 @@ type onboardPlan struct {
 // 超限时截取前 N 个，并在响应里说明（前端会显示"已截取"）。
 const onboardBatchLimit = 20
 
-// batchModelsFrom 批量模式下的清单：**只有配了选配才批量**。
+// batchModelsFrom 批量模式下的清单（v0.31.93 改判据：看 plan.Batch）。
 //
-// 没配选配时成员是整份模型目录（几十个），一键全写进客户端会让模型选择器变成一锅粥；
-// 那种情况退回单条（组名），也就是"让平台替我挑一个"。
+// 口径由 buildOnboardPlan 决定，这里只负责"要不要批量 + 限长"：
+//
+//	官组 + 配了选配 → 批量（成员就是后台勾选的那批）
+//	官组 + 没配选配 → 单条（组名）：成员是整份号池目录，几十个会把客户端塞爆
+//	通道组          → 批量（成员就是后台为该通道启用的那批模型）
+//
+// 为什么通道组不再要求"配了选配"：后台选配（onboard_models）是给两类官组配的，
+// 通道组的"选用模型"本来就在通道自己的映射表里。上一版把它当成"没选配"，
+// 结果用户点接入只得到一个组名 —— 与他"把这批模型都接进去"的预期不符。
 func batchModelsFrom(pl workGroupPlan) (models []string, truncated int) {
-	if !pl.Restricted {
+	if !pl.Batch {
 		return nil, 0
 	}
 	return onboardBatchModels(pl.Members)
@@ -770,9 +777,9 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 	//                （MODEL / SONNET / OPUS / HAIKU / SMALL_FAST），
 	//                其余模型仍接入成功，在 `/model <名字>` 里直接可用。
 	//
-	// ⚠️ 只有**配了选配**（Restricted）才批量：没配选配时成员是整份模型目录（几十个），
-	// 一键全写进客户端会让模型选择器变成一锅粥。那种情况下退回单条（组名），
-	// 也就是"让平台替我挑一个"—— 这才是"未选配"该有的样子。
+	// ⚠️ 要不要批量由 plan.Batch 决定（v0.31.93）：官组只在配了选配时批量；
+	// 通道组**总是批量**（它后台启用的那几个模型就是用户要接的清单）。
+	// 没配选配的官组仍退回单条（组名），也就是"让平台替我挑一个"。
 	batchTruncated := 0
 	if batch {
 		if m, truncated := batchModelsFrom(a.buildOnboardPlan(k)); len(m) > 0 {

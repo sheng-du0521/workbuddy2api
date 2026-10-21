@@ -193,6 +193,64 @@ func TestModelsCatalogUnchangedWithoutChannelGroup(t *testing.T) {
 	}
 }
 
+// TestOnboardBatchForChannelGroup 通道组的接入必须**批量**（v0.31.93）。
+//
+// 用户口径：「接入分组的对应后台选用的模型都批量接入」——
+// 对通道组来说，"后台选用的模型"就是该通道 enabled 的映射；
+// 上一版把它当成"没配选配"，结果点接入只得到一个组名。
+func TestOnboardBatchForChannelGroup(t *testing.T) {
+	f := newGroupFixture(t)
+	f.addChannelModel(t, "relay-a")
+	f.addChannelModel(t, "relay-b")
+	ch := "ch" + itoa(int(f.chID))
+	if _, err := f.store.SetAPIKeyActiveGroup(f.user.ID, f.key.ID, ch); err != nil {
+		t.Fatalf("SetAPIKeyActiveGroup: %v", err)
+	}
+	plan := f.a.buildOnboardPlan(f.reloadKey(t))
+	if !plan.Batch {
+		t.Fatal("通道组的接入必须是批量（plan.Batch=false 会让用户只接进去一个组名）")
+	}
+	models, truncated := batchModelsFrom(plan)
+	if truncated != 0 {
+		t.Errorf("2 个模型不该被截断，truncated=%d", truncated)
+	}
+	if len(models) != 2 || !hasModel(models, "relay-a") || !hasModel(models, "relay-b") {
+		t.Fatalf("批量清单 = %v，期望该通道的两个模型", models)
+	}
+}
+
+// TestOnboardBatchForOfficialGroupNeedsAllowList 官组没配选配时仍走单条（组名）。
+//
+// 这不是"没改干净"：官组的成员是**整份号池目录**（几十个），
+// 一键全写进客户端会让模型选择器变成一锅粥；通道组的成员是运营手选的那批，才该批量。
+func TestOnboardBatchForOfficialGroupNeedsAllowList(t *testing.T) {
+	f := newGroupFixture(t)
+	// withModelsCache 只设了 ids/at，没设 payload → modelsCacheFresh() 为 false，
+	// allModelIDs() 会去"刷新"（单测里必失败）并把 ids 覆盖成内置兜底清单。
+	// 这里显式给一份可解析的缓存体，让选配过滤看到真实目录。
+	setModelCatalogPayload("glm-5.3")
+	plan := f.a.buildOnboardPlan(f.reloadKey(t))
+	if plan.Batch {
+		t.Fatal("没配选配的号池官组不该批量")
+	}
+	if m, _ := batchModelsFrom(plan); len(m) != 0 {
+		t.Fatalf("没配选配的号池官组 batchModelsFrom 应为空，得到 %v", m)
+	}
+
+	// 配了选配 → 批量，且清单就是后台勾选的那批 ∩ 该 Key 能跑的。
+	if err := f.store.SetKV(kvOnboardModels, "glm-5.3"); err != nil {
+		t.Fatalf("SetKV: %v", err)
+	}
+	plan = f.a.buildOnboardPlan(f.reloadKey(t))
+	if !plan.Batch || !plan.Restricted {
+		t.Fatalf("配了选配应 Batch+Restricted，得到 batch=%v restricted=%v", plan.Batch, plan.Restricted)
+	}
+	models, _ := batchModelsFrom(plan)
+	if len(models) != 1 || models[0] != "glm-5.3" {
+		t.Fatalf("批量清单 = %v，期望 [glm-5.3]", models)
+	}
+}
+
 // TestOnboardPlanWritesActiveChannelGroup 切到通道组后，一键接入必须写这个组名。
 func TestOnboardPlanWritesActiveChannelGroup(t *testing.T) {
 	f := newGroupFixture(t)
