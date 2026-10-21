@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -20,12 +21,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,6 +58,13 @@ type Upstream struct {
 	LastProbeAt  int64  `json:"last_probe_at"`
 	LastProbeOK  bool   `json:"last_probe_ok"`
 	LastProbeMsg string `json:"last_probe_msg,omitempty"`
+
+	// UpstreamRatio 上游自己声明的计费倍率（v0.31.97，Sub2API `effective_rate_multiplier`）。
+	//
+	// 为什么要落库：以前只在探活的提示文案里出现一次，刷新就没了 —— 而它正是
+	// "我方成本 = 官方价 × 上游倍率"里最关键的那一项，导入定价必须用到。
+	// 0 = 没读到（非 Sub2API 站点，或该端点不可用），不参与任何计算。
+	UpstreamRatio float64 `json:"upstream_ratio"`
 
 	Models []UpstreamModel `json:"models,omitempty"`
 
@@ -127,6 +137,7 @@ const migrationUpstreams = `CREATE TABLE IF NOT EXISTS upstreams (
 	last_probe_at  INTEGER NOT NULL DEFAULT 0,
 	last_probe_ok  INTEGER NOT NULL DEFAULT 0,
 	last_probe_msg TEXT NOT NULL DEFAULT '',
+	upstream_ratio REAL NOT NULL DEFAULT 0,
 	created_at  INTEGER NOT NULL DEFAULT 0,
 	updated_at  INTEGER NOT NULL DEFAULT 0
 )`
@@ -156,6 +167,13 @@ func (s *Store) migrateUpstreams() error {
 		if _, err := s.db.Exec(st); err != nil {
 			return fmt.Errorf("migrate upstreams: %w", err)
 		}
+	}
+	// 上游倍率列（v0.31.97）：老库没有，补上；新库由 migrationUpstreams 直接建。
+	// ⚠️ 必须放在建表**之后**：ensureColumn 会 `PRAGMA table_info` 查列，
+	// 表还不存在时直接报 "no such table: upstreams"（第一次部署就起不来）。
+	if err := s.ensureColumn("upstreams", "upstream_ratio",
+		"upstream_ratio REAL NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate upstreams.upstream_ratio: %w", err)
 	}
 	return nil
 }
@@ -228,7 +246,7 @@ func maskUpstreamKey(k string) string {
 // 路由用 relayCandidates（只挑要用的字段）。
 func (s *Store) ListUpstreams() ([]Upstream, error) {
 	rows, err := s.db.Query(`SELECT id, name, kind, base_url, api_key, enabled, priority, note,
-		last_probe_at, last_probe_ok, last_probe_msg, created_at, updated_at
+		last_probe_at, last_probe_ok, last_probe_msg, upstream_ratio, created_at, updated_at
 		FROM upstreams ORDER BY priority, id`)
 	if err != nil {
 		return nil, err
@@ -240,7 +258,7 @@ func (s *Store) ListUpstreams() ([]Upstream, error) {
 		var en, ok int
 		var key string
 		if err := rows.Scan(&u.ID, &u.Name, &u.Kind, &u.BaseURL, &key, &en, &u.Priority, &u.Note,
-			&u.LastProbeAt, &ok, &u.LastProbeMsg, &u.CreatedAt, &u.UpdatedAt); err != nil {
+			&u.LastProbeAt, &ok, &u.LastProbeMsg, &u.UpstreamRatio, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		u.APIKey, u.KeyMasked, u.Enabled, u.LastProbeOK = key, maskUpstreamKey(key), en != 0, ok != 0
@@ -420,6 +438,18 @@ func (s *Store) SetUpstreamProbe(id int64, ok bool, msg string) error {
 	}
 	_, err := s.db.Exec(`UPDATE upstreams SET last_probe_at=?, last_probe_ok=?, last_probe_msg=? WHERE id=?`,
 		time.Now().Unix(), o, msg, id)
+	return err
+}
+
+// SetUpstreamRatio 落库上游倍率（v0.31.97）。
+//
+// 只在**读到**时写：读不到（非 Sub2API 站点）不该把上一次的值清成 0 ——
+// 那会让"这条通道到底多少钱"从已知重新变成未知，凭空丢掉定价依据。
+func (s *Store) SetUpstreamRatio(id int64, ratio float64) error {
+	if ratio <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE upstreams SET upstream_ratio=? WHERE id=?`, ratio, id)
 	return err
 }
 
@@ -651,6 +681,97 @@ func probeUpstream(ctx context.Context, u Upstream) ([]string, error) {
 	return ids, nil
 }
 
+// probeCheck 一个模型的**可调用性**检查结果（深度探活）。
+//
+// 为什么要它：`GET /models` 只是"上游声称自己有这些名字"，不等于"这些名字能调通"。
+// 2026-10-21 的真实现场：上游列出 `gpt-6-sol`，而人工填进去的 `gpt-6.1-sol`
+// 在上游是 404（Model "gpt-6.1-sol" is not supported ...）—— 只探 /models 的探活
+// 对这类错误**完全无感**，要等用户发请求才炸。
+type probeCheck struct {
+	Model  string `json:"model"`
+	OK     bool   `json:"ok"`
+	Status int    `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
+	// RemoteModel 该模型映射到上游的真实名字（空 = 同名）。
+	RemoteModel string `json:"remote_model,omitempty"`
+}
+
+// probeUpstreamDeep 对每个模型真发一次**极小对话**，确认它此刻能被调用。
+//
+// 成本：每个模型 max_tokens=1（大约几十个 token），并发 3；总耗时受 ctx 控制。
+// 失败原因原样带回（上游的 404/400 文案比我们编的准）。
+func probeUpstreamDeep(ctx context.Context, u Upstream, models []UpstreamModel) []probeCheck {
+	out := make([]probeCheck, len(models))
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, m := range models {
+		out[i] = probeCheck{Model: m.Model, RemoteModel: m.RemoteModel}
+		remote := strings.TrimSpace(m.RemoteModel)
+		if remote == "" {
+			remote = m.Model
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, remote string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			body, _ := json.Marshal(map[string]any{
+				"model": remote, "max_tokens": 1, "stream": false,
+				"messages": []map[string]any{{"role": "user", "content": "ping"}},
+			})
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+				strings.TrimRight(u.BaseURL, "/")+relayChatPath, bytes.NewReader(body))
+			if err != nil {
+				out[i].Error = err.Error()
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+u.APIKey)
+			req.Header.Set("Content-Type", "application/json")
+			cli := &http.Client{Timeout: 25 * time.Second}
+			resp, derr := cli.Do(req)
+			if derr != nil {
+				out[i].Error = truncateStr(derr.Error(), 160)
+				return
+			}
+			defer resp.Body.Close()
+			blob, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+			out[i].Status = resp.StatusCode
+			if resp.StatusCode >= 400 {
+				out[i].Error = truncateStr(strings.TrimSpace(string(blob)), 200)
+				return
+			}
+			out[i].OK = true
+		}(i, remote)
+	}
+	wg.Wait()
+	return out
+}
+
+// suggestCreditPer1k 建议单价：官方倍率 × 上游倍率（v0.31.97）。
+//
+// 口径与假设（必须写在界面上，不能只说一个数字）：
+//   - 官方 credits 形如 "x0.52"（上游模型目录里的原文），取出数值 0.52；
+//   - 上游倍率 = Sub2API 的 effective_rate_multiplier（例如 0.224）；
+//   - 于是"我方成本"≈ 0.52 × 0.224 = 0.1165 积分/1k token（按 1 credit = 1 积分换算）。
+//
+// 这只是**建议值**：两边的单位关系由部署方决定，运营可以在导入弹窗里改。
+// 任意一项缺失就返回 0（= 不填，保持"暂不计费"），绝不编一个看起来像真的数。
+func suggestCreditPer1k(officialCredits string, upstreamRatio float64) float64 {
+	if upstreamRatio <= 0 {
+		return 0
+	}
+	s := strings.TrimSpace(officialCredits)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "x"), "X")
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return math.Round(v*upstreamRatio*10000) / 10000
+}
+
 // probeUpstreamBilling 尽力读取上游的计费倍率。
 //
 // **为什么是"尽力而为"**：这是 Sub2API 的私有端点 `GET /v1/sub2api/billing`
@@ -876,6 +997,8 @@ func (a *app) handleAdminUpstreamToggle(w http.ResponseWriter, r *http.Request) 
 func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID int64 `json:"id"`
+		// Deep 逐个模型真发一次极小对话，确认"能被调用"而不只是"上游说它有"（v0.31.97）。
+		Deep bool `json:"deep"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id 不能为空"})
@@ -897,9 +1020,12 @@ func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "通道不存在"})
 		return
 	}
+	// 三个动作各用**独立**的超时预算（v0.31.97 修）：
+	// 以前共用一个 15s ctx —— /models 慢一点就把 billing 与深度探活的额度吃完，
+	// 表现为"探活成功、但既没读到倍率、所有模型都 deadline"（本机实测踩到）。
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
 	ids, perr := probeUpstream(ctx, *target)
+	cancel()
 	msg := ""
 	billNote := ""
 	if perr != nil {
@@ -908,11 +1034,51 @@ func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 		msg = fmt.Sprintf("可用模型 %d 个", len(ids))
 		// 探活成功后再顺手读上游倍率（失败静默）：对非 sub2 站点这一项不存在，
 		// 不能让它影响"通道是否可用"的结论。
-		if _, note, ok := probeUpstreamBilling(ctx, target.BaseURL, target.APIKey); ok {
+		bctx, bcancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ratio, note, ok := probeUpstreamBilling(bctx, target.BaseURL, target.APIKey)
+		bcancel()
+		if ok {
 			billNote = note
 			msg += "；" + note
+			target.UpstreamRatio = ratio
+			// 落库（v0.31.97）：它是"我方成本 = 官方价 × 上游倍率"里最关键的一项，
+			// 只写进提示文案的话，刷新页面就再也拿不到了。
+			if err := a.store.SetUpstreamRatio(req.ID, ratio); err != nil {
+				log.Printf("WARN: [relay] 保存上游倍率失败：%v", err)
+			}
 		}
 	}
+
+	// 深度探活（v0.31.97）：`/models` 只说明"上游声称有这个名字"，
+	// 不说明它此刻能被调用 —— 2026-10-21 实测：上游列出 gpt-6-sol，
+	// 而人工填的 gpt-6.1-sol 在上游直接 404。只探 /models 的探活对这类错误无感。
+	var checks []probeCheck
+	if perr == nil && req.Deep {
+		models := target.Models
+		if len(models) == 0 {
+			// 还没导入任何映射：就把 /models 列出的名字当成"待验证清单"。
+			for _, id := range ids {
+				models = append(models, UpstreamModel{Model: id})
+			}
+		}
+		// 预算按模型数算：每个模型一次极小请求，并发 3 → 大约 n/3 轮；
+		// 留足余量，上限 120s（深度探活是"点名要准"，不该因为预算小就误报失败）。
+		budget := time.Duration(20+5*len(models)) * time.Second
+		if budget > 120*time.Second {
+			budget = 120 * time.Second
+		}
+		dctx, dcancel := context.WithTimeout(r.Context(), budget)
+		checks = probeUpstreamDeep(dctx, *target, models)
+		dcancel()
+		okN := 0
+		for _, c := range checks {
+			if c.OK {
+				okN++
+			}
+		}
+		msg += fmt.Sprintf("；逐个调用验证 %d/%d 可调用", okN, len(checks))
+	}
+
 	// 探活结果落库：后台列表要能显示"上次探活什么时候、结果如何"，
 	// 否则运维每次都要手动点一遍才知道通道还活着。
 	if err := a.store.SetUpstreamProbe(req.ID, perr == nil, msg); err != nil {
@@ -922,8 +1088,27 @@ func (a *app) handleAdminUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": perr.Error()})
 		return
 	}
+	// 建议单价（v0.31.97）：官方倍率 × 上游倍率。只给"两项都有依据"的模型，
+	// 缺失就整条不出现 —— 界面上宁可空着让人填，也不要给一个看起来像真的数。
+	suggest := map[string]float64{}
+	if target.UpstreamRatio > 0 {
+		if ratios, rerr := a.store.ListModelRatios(); rerr == nil {
+			off := make(map[string]string, len(ratios))
+			for _, mr := range ratios {
+				off[mr.Model] = mr.OfficialCredits
+			}
+			for _, id := range ids {
+				if v := suggestCreditPer1k(off[id], target.UpstreamRatio); v > 0 {
+					suggest[id] = v
+				}
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "models": ids, "count": len(ids), "billing_note": billNote,
+		"upstream_ratio": target.UpstreamRatio,
+		"checks":         checks,
+		"suggest_credit": suggest,
 	})
 }
 

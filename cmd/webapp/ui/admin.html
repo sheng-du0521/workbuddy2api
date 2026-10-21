@@ -8305,8 +8305,13 @@ function channelCard(up, poolModels, affected) {
   // 新建通道时焦点在表单，面板长在另一张卡的下半截，根本不会被注意到；
   // 页面上一堆通道卡时，也分不清"这块是谁的探活结果"。
   // 弹窗是唯一不会被错过的位置，而且能把"勾选 → 填单价 → 导入"收在一屏里。
-  const showProbeImport = (ids, cur) => {
+  const showProbeImport = (ids, cur, extra) => {
     const U = cur || up; // 优先用刚刷新后的通道（映射可能已变），退回点击时的快照
+    // 深度探活结果（v0.31.97）：checks = 每个模型"此刻能不能真的调通"，
+    // suggest = 建议单价（官方倍率 × 上游倍率）。
+    const EX = extra || {};
+    const chk = new Map((EX.checks || []).map((c) => [c.model, c]));
+    const sug = EX.suggest || {};
     if (!ids.length) {
       const msg = '探活成功，但上游没有返回任何模型（检查该 key 是否有模型列表权限）';
       say(msg);
@@ -8327,8 +8332,11 @@ function channelCard(up, poolModels, affected) {
     const m = openModal('识别到 ' + ids.length + ' 个模型 · ' + (U.name || ''),
       '勾选要接入的模型，填好单价与倍率后一次导入。已在映射里的 '
       + (ids.length - fresh.length) + ' 个不会被覆盖。'
-      + '单价 0 = 暂不计费；倍率留空 = 跟随全局（不是免费）。',
-      { maxWidth: '860px' });
+      + '单价 0 = 暂不计费；倍率留空 = 跟随全局（不是免费）。'
+      + (EX.upstreamRatio > 0
+        ? ' ｜ 上游倍率 ' + EX.upstreamRatio + '（Sub2API），单价建议 = 官方倍率 × 上游倍率，可直接改。'
+        : ''),
+      { maxWidth: '900px' });
 
     if (!fresh.length) {
       m.body.appendChild(el('div', 'hintbar',
@@ -8355,6 +8363,18 @@ function channelCard(up, poolModels, affected) {
       const nm = el('span', 'mono', id);
       nm.style.cssText = 'min-width:160px;flex:1;' + (isNew ? '' : 'opacity:.55;');
       row.appendChild(nm);
+      // 深度探活的单项结论：不可调用的**默认不勾**（用户手动点进去才导入）。
+      const ck = chk.get(id);
+      if (ck && !ck.ok) {
+        cb.checked = false;
+        const bad = el('span', 'tag err', '不可调用');
+        bad.title = '深度探活失败（' + (ck.status || '无响应') + '）：'
+          + (ck.error || '上游没有返回内容')
+          + '。仍可手动勾选导入，但请求大概率同样失败。';
+        row.appendChild(bad);
+      } else if (ck && ck.ok) {
+        row.appendChild(el('span', 'tag ok', '可调用'));
+      }
       if (!isNew) {
         const tag = el('span', 'tag', '已有');
         tag.title = '已有映射不会被覆盖：人工调过的单价必须保住（要改价请在通道卡那张表里改）';
@@ -8368,10 +8388,15 @@ function channelCard(up, poolModels, affected) {
         const cp = el('input');
         cp.type = 'number';
         cp.min = '0';
-        cp.step = '0.1';
-        cp.value = '0';
-        cp.title = '每 1k token 折算多少积分（我方成本）；0 = 暂不计费，可后补';
-        cp.style.width = '88px';
+        cp.step = '0.0001';
+        // 建议单价（v0.31.97）：官方倍率 × 上游倍率。没有依据就留 0，不编数字。
+        const sv = Number(sug[id] || 0);
+        cp.value = sv > 0 ? String(sv) : '0';
+        cp.title = sv > 0
+          ? ('建议单价 ' + sv + ' 积分/1k = 官方倍率 × 上游倍率（' + EX.upstreamRatio
+             + '）；这是估算，可按你的积分口径改')
+          : '每 1k token 折算多少积分（我方成本）；0 = 暂不计费，可后补';
+        cp.style.width = '96px';
         row.appendChild(cp);
         const br = el('input');
         br.type = 'number';
@@ -8411,6 +8436,42 @@ function channelCard(up, poolModels, affected) {
     tools.appendChild(bulk);
     tools.appendChild(bBulk);
     m.body.appendChild(tools);
+
+    // 加价（v0.31.97）：运营真正想要的是「在上游成本上加 X%」，而不是心算倍数。
+    // 倍率语义 = 成本倍数：加价 30% → 1.3。这里只把百分比换算成倍率填进去，
+    // 填完仍可逐行改（每行的倍率框才是真正的定价值）。
+    const mkRow = el('div', 'row');
+    mkRow.style.cssText = 'gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap;';
+    mkRow.appendChild(el('span', 'muted', '在上游成本上加价'));
+    const mk = el('input');
+    mk.type = 'number';
+    mk.min = '0';
+    mk.step = '1';
+    mk.placeholder = '如 30';
+    mk.style.width = '76px';
+    mk.title = '填 30 = 加价 30%：用户价 = 成本 x 1.3（倍率框会变成 1.3）';
+    mkRow.appendChild(mk);
+    mkRow.appendChild(el('span', 'muted', '%'));
+    const bMk = el('button', 'ghost', '应用到全部');
+    bMk.style.padding = '2px 8px';
+    const mkHint = el('div', 'muted');
+    mkHint.style.fontSize = '12px';
+    bMk.onclick = () => {
+      const v = Number(mk.value);
+      if (mk.value === '' || !isFinite(v) || v < 0) {
+        mkHint.style.color = '#c0392b';
+        mkHint.textContent = '加价请填 >=0 的数字（0 = 不加价，即倍率 1）';
+        return;
+      }
+      const r = Math.round((1 + v / 100) * 10000) / 10000;
+      for (const x of rows) x.br.value = String(r);
+      mkHint.style.color = '#2e7d32';
+      mkHint.textContent = '已把 ' + rows.length + ' 个模型的倍率设为 x' + r
+        + '：用户价 = 成本 x ' + r + '（即加价 ' + v + '%）';
+    };
+    mkRow.appendChild(bMk);
+    mkRow.appendChild(mkHint);
+    m.body.appendChild(mkRow);
 
     const foot = el('div', 'row');
     foot.style.cssText = 'gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;';
@@ -8492,7 +8553,10 @@ function channelCard(up, poolModels, affected) {
     let r = null;
     let err = '';
     try {
-      r = await post('/api/admin/upstreams/probe', { id: up.id });
+      // 深度探活（v0.31.97）：逐个模型真发一次 1-token 对话。
+      // 只探 /models 看不出「列了但调不通」（实测：上游有 gpt-6-sol，
+      // 人工填的 gpt-6.1-sol 直接 404）。每模型 1 个 token，值得。
+      r = await post('/api/admin/upstreams/probe', { id: up.id, deep: true });
     } catch (e) {
       err = e.message || '请求失败';
     } finally {
@@ -8507,12 +8571,18 @@ function channelCard(up, poolModels, affected) {
     try { d = await loadChannels(); } catch (e) { /* 刷新失败不影响弹窗 */ }
     const U = ((d && d.upstreams) || []).find((x) => x.id === up.id) || up;
     if (r && r.ok) {
+      const badN = (r.checks || []).filter((c) => !c.ok).length;
       say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '')
+        + (badN ? '；其中 ' + badN + ' 个调不通（见弹窗）' : '')
         + '（弹窗里勾选导入）');
       // 弹窗渲染异常不能被吞掉：吞掉就只剩"一个空遮罩闪一下"，
       // 正是这条反馈的观感。异常要 toast 出来，让人知道是渲染问题而不是探活问题。
-      try { showProbeImport(r.models || [], U); }
-      catch (e) { toast('打开模型列表失败：' + e.message, 'err'); }
+      try {
+        showProbeImport(r.models || [], U, {
+          checks: r.checks || [], suggest: r.suggest_credit || {},
+          upstreamRatio: Number(r.upstream_ratio) || 0,
+        });
+      } catch (e) { toast('打开模型列表失败：' + e.message, 'err'); }
       return;
     }
     // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
@@ -8559,8 +8629,12 @@ function channelCard(up, poolModels, affected) {
     window.__probePending = null;
     // v0.31.91：异常不能静默 —— 静默的结果就是一个空遮罩 + 一句没人看的 hint，
     // 与"弹窗闪一下就没了"完全同观感。
-    try { showProbeImport(pend.models || [], up); }
-    catch (e) { toast('打开模型列表失败：' + e.message, 'err'); }
+    try {
+      showProbeImport(pend.models || [], up, {
+        checks: pend.checks || [], suggest: pend.suggest || {},
+        upstreamRatio: Number(pend.upstreamRatio) || 0,
+      });
+    } catch (e) { toast('打开模型列表失败：' + e.message, 'err'); }
   }
 
   // ---- 模型映射 ----
@@ -8817,9 +8891,12 @@ function showChannelForm(up) {
       if (!editing && savedID) {
         if (hint) hint.textContent = '已新增「' + name + '」，正在识别可用模型…';
         try {
-          const r = await post('/api/admin/upstreams/probe', { id: savedID });
+          const r = await post('/api/admin/upstreams/probe', { id: savedID, deep: true });
           if (r.ok) {
-            window.__probePending = { id: savedID, models: r.models || [] };
+            window.__probePending = {
+              id: savedID, models: r.models || [], checks: r.checks || [],
+              suggest: r.suggest_credit || {}, upstreamRatio: Number(r.upstream_ratio) || 0,
+            };
             if (hint) hint.textContent = '已新增「' + name + '」：识别到 ' + r.count +
               ' 个模型，取消勾选不要的、填好单价后一次导入';
           } else if (hint) {

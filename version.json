@@ -1,20 +1,20 @@
 {
-  "version": "0.31.96",
+  "version": "0.31.97",
   "min_supported": "0.24.0",
-  "notes": "v0.31.96：组名请求现在会在**组内换成员重试**（这是\"手填能用、组名不能用\"的根因）。\n\n## 现场（2026-10-21 实测）\n\n同一条通道 `codex官组原生` 里，模型可用性是**按模型**分裂的：\n\n- `gpt-5.6` / `gpt-5.6-sol` / `gpt-5.6-terra` → 429/503（上游账号池限流）\n- `gpt-6-astra` / `gpt-6-sol` → **200 正常**\n\n而组名 `wb-group-ch1` 的展开逻辑只挑**一个**成员（按名字排序第一个 = `gpt-5.6`），\n且失败后**不换人**。于是：\n\n- 手填 `gpt-6-astra` → 能用 ✅\n- 用组名 `wb-group-ch1` → 永远撞在 `gpt-5.6` 上 → 永远 429 ❌\n\n用户说的\"我直接 openai 接入 codex 组内模型可以用的\"，指的就是前者。\n\"组\"被实现成了一个**别名**，而不是\"一组可互换的模型\"。\n\n## 改动\n\n1. `modelgroup.go`：`expandGroupModel` → `expandGroupModels`，返回**整组候选**（首个仍是原首选，\n   其余按组内顺序跟在后面）。\n2. `applyGroupExpansion` 把候选挂到请求上下文（`ctxGroupModelsKey`），不改 serveRelay 的 11 个参数。\n3. `relay.go`：`serveRelay` 外层加\"成员轮换\" —— 一个成员被上游拒绝就换下一个，\n   并且：\n   - 出站 `payload[\"model\"]` 跟着改成实际成员（否则上游收到旧名）；\n   - 倍率按**实际模型**取（组内不同成员可能配了不同倍率）；\n   - 流水 / 台账 / `X-Wb-Upstream` 都记实际服务的那个模型；\n   - 上限：单模型最多 3 条通道、组内最多 6 个成员、一次请求总上游尝试 6 次\n     （不让一次客户端请求被放大成 N 次出站）；\n   - 失败仍按上游状态码分类（v0.31.95 的 `relay_*`）。\n\n非组名请求（具体模型名）走的是\"单成员\"，行为与从前**完全一致**。\n\n## 验证\n\n- 新增 `TestRelayGroupRetriesNextMember`：同一通道两成员，首个 429、次个 200 →\n  整体 200、响应来自第二个成员、**流水 model = 实际模型**（不是组名/首个成员）。\n- `TestApplyGroupExpansionRewritesPayload` 补\"返回整组候选\"的断言；\n  `TestExpandGroupModelOnlyGroupNames` 改为断言整组（2 个）。\n- 真机（临时实例 + 生产通道配置）：`wb-group-ch1` → **200，首句 \"pong\"**；\n  `/v1/models` 列出组名 + 成员；切组 200。\n\n## 边界\n\n- 组内轮换会多打几次上游（失败很轻，429 不计费），但一次请求最多 6 次。\n- 图像模型（`gpt-image-*`）仍不能走对话端点，那条组会稳定 400 `relay_rejected`（上游能力边界）。",
-  "released_at": 1792586841,
+  "notes": "v0.31.97：通道探活补两处遗漏 —— 逐个模型验证可调用 + 上游倍率落库；导入支持按上游成本加价。\n\n## 一、探活原来只问「上游声称有哪些模型」\n\n`GET /models` 只说明\"上游自称有这些名字\"，**不说明它们此刻能调通**。\n\n2026-10-21 实测（生产通道，同一 key）：\n\n| 模型 | 上游回答 |\n|---|---|\n| `gpt-6-sol` | 200 |\n| `gpt-6.1-sol` | **404** `Model \"gpt-6.1-sol\" is not supported by any configured account` |\n| `gpt-6-astra` | 200 |\n| `gpt-6-astra-1.1` | 404 |\n\n也就是说：库里的映射名与上游真实名字差一个字符，旧探活**完全无感**，要等用户发请求才炸。\n（顺带纠正一处误判：上游 `/models` 确实有 `gpt-6-sol`，`gpt-6.1-sol` 才是无效名。）\n\n**现在**：探活带 `deep: true`，对每个模型（按映射后的上游名）真发一次 `max_tokens=1`\n的极小对话，并发 3，返回逐条 `{model, ok, status, error}`；不可调用的默认**不勾选**导入，\n弹窗里标红并显示上游原文。真机验证（生产通道）：\n\n```\n== codex官组原生  ratio=0.224\n   gpt-6-astra   OK\n== image-2.5      ratio=1\n   gpt-image-2.5 / -flare / -sunburst   FAIL  This model is not supported on the Chat Completions endpoint\n```\n\n## 二、上游倍率以前只活在提示文案里\n\n`probeUpstreamBilling` 早就读得到 Sub2API 的 `effective_rate_multiplier`（实测 0.224），\n但只拼进了一条消息，**刷新页面就没了** —— 而它正是定价唯一的外部依据。\n\n**现在**：落库到 `upstreams.upstream_ratio`（新增列，老库自动补），通道卡常驻显示\n「上游倍率 0.224」。\n\n## 三、单价建议 + 在上游成本上加价\n\n上游只给一个**全局**倍率，没有 per-model 单价。所以：\n\n- **建议单价** = 官方倍率（`model_ratios.official_credits`，如 `x0.52`）× 上游倍率（0.224）\n  → 0.52 × 0.224 = 0.1165 积分/1k。导入弹窗里预填这个值，可改；\n  没有官方口径的模型（第三方私有模型）**留 0**，不编数字。\n- **加价**：导入弹窗新增「在上游成本上加价 N%」→ 一键把倍率设为 `1 + N/100`\n  （填 30 → 倍率 1.3）。倍率语义就是成本倍数：`用户价 = 成本 × 倍率`。\n  填完仍可逐行改（每行的倍率框才是真正的定价值）。\n\n同时修掉一个超时预算 bug：以前 `/models`、billing、深度探活**共用一个 15s ctx**，\n`/models` 稍慢就把后面两个的额度吃光（表现为\"探活成功但读不到倍率、所有模型都 deadline\"）；\n现在三段各自独立预算（15s / 10s / 按模型数 20+5n，上限 120s）。\n\n## 验证\n\n- 单测：`TestProbeUpstreamDeepDetectsBrokenModel`（404 的模型必须被点名）、\n  `TestProbeUpstreamDeepUsesRemoteModel`（有映射按映射名探）、\n  `TestSuggestCreditPer1k`（7 组边界）、`TestStoreUpstreamRatioRoundTrip`（落库读回 + 传 0 不覆盖）。\n- uitest：探活弹窗出现「可调用 / 不可调用 / 上游倍率 0.224 / 在上游成本上加价」。\n- 真机（生产通道配置，临时实例）：见上表。\n\n## 边界\n\n- 深度探活会对每个模型**真实消耗 1 个 token**（可忽略，但不是零）。\n- 「建议单价」按 1 官方 credit = 1 积分换算 —— 这是部署方自己的口径，弹窗里标了\"估算，可改\"。\n- 图像模型（`gpt-image-*`）走对话端点必然 400：探活现在会直接把它标成不可调用，这是能力边界。",
+  "released_at": 1792587706,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.96/webapp.exe",
-      "sha256": "77732532469a86ad146fd0087417e3d973a7d373929e2907181d062d18876560",
-      "size": 16100352
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.97/webapp.exe",
+      "sha256": "5bc4a160ad52894cbabbf0e8c9e7e15e927fa9d535748ae733f64491ffd3a819",
+      "size": 16117248
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "RKBUbruEWbH/DCaBw8YTvh2VGbwxcYgyjG755mQrp2t7CApyA8+EIV4oqUJ7GTHc5rPew1EcO3ZudJduvaeBDQ==",
+  "signature": "IkvAPqxo/EtK6AgDj8BLBFce+3OQ7dcamofRaJxWK0OIcBFLdLRpAdJnZDV3XKXmBeWTEzSQngifOt6rXi8BCw==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

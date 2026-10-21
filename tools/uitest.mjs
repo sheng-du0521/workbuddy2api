@@ -66,11 +66,20 @@ const FX = {
     upstreams: [{
       id: 7, name: '测试通道', base_url: 'https://api.example.com/v1', key_masked: 'sk-***',
       enabled: true, priority: 100, last_probe_at: 0, last_probe_ok: false, last_probe_msg: '',
-      models: [],
+      upstream_ratio: 0.224, models: [],
     }],
     pool_models: {}, affected_keys: {},
   },
-  '/api/admin/upstreams/probe': { ok: true, count: 2, models: ['m-one', 'm-two'] },
+  // v0.31.97：探活带"逐个可调用性"与建议单价（官方倍率 × 上游倍率）。
+  '/api/admin/upstreams/probe': {
+    ok: true, count: 2, models: ['m-one', 'm-two'],
+    upstream_ratio: 0.224,
+    checks: [
+      { model: 'm-one', ok: true, status: 200 },
+      { model: 'm-two', ok: false, status: 404, error: 'Model "m-two" is not supported by any configured account' },
+    ],
+    suggest_credit: { 'm-one': 0.1165, 'm-two': 0.1165 },
+  },
   '/api/admin/anthropic-config': { default_model: '', known_models: [] },
   '/api/admin/accounts': {
     accounts: [
@@ -1759,7 +1768,10 @@ function run(pageFile, meOverride, plan) {
         ['.modal-mask input[placeholder*="上游名"]', 2],
         ['.modal-mask input[type="number"]', 4]],
       textIn: [['.modal-mask', '识别到 2 个模型'], ['.modal-mask', 'm-one'],
-        ['.modal-mask', '导入勾选的模型']],
+        ['.modal-mask', '导入勾选的模型'],
+        // v0.31.97：深度探活结论（一个可调用、一个不可调用）+ 上游倍率 + 加价入口
+        ['.modal-mask', '可调用'], ['.modal-mask', '不可调用'],
+        ['.modal-mask', '上游倍率 0.224'], ['.modal-mask', '在上游成本上加价']],
       // 每行的三个输入框必须真的渲染出来（"上游名"是 placeholder，不在 textContent 里，
       // 所以要用属性选择器断言，不能拿 textIn 查 —— 那样永远失败）。
       },

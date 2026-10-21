@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.96"
+const version = "0.31.97"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
