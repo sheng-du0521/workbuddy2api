@@ -41,7 +41,7 @@
       <button class="nav-item" data-nav="report" data-on="loadReport" data-title="用量报表" data-sub="实时态势 + 按日 / 按模型分解"><span class="ico">📊</span>用量报表</button>
       <div class="nav-group">系统</div>
       <button class="nav-item" data-nav="announce" data-on="loadAnnounce" data-title="公告" data-sub="发布 / 编辑 / 启停 / 删除站内公告"><span class="ico">📣</span>公告<span class="badge hidden" id="annBadge">0</span></button>
-      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="计费、反代防封、预扣、限流告警"><span class="ico">⚙</span>设置<span class="badge hidden" id="updBadge">1</span></button>
+      <button class="nav-item" data-nav="settings" data-on="loadSettings" data-title="设置" data-sub="计费、反代防封、预扣、限流告警"><span class="ico">⚙</span>设置</button>
       <button class="nav-item" data-nav="test" data-title="调试对话" data-sub="用管理密钥直连上游，不走用户计费"><span class="ico">⌘</span>调试对话</button>
     </nav>
     <div class="sidebar-foot">
@@ -1465,47 +1465,12 @@
       </div>
 
       <div class="card">
-        <h2>关于 · 版本更新提醒</h2>
+        <h2>关于 · 版本更新</h2>
         <div class="sub" style="margin:0 0 12px;">
-          本功能<b>只提醒，不自动更新</b>。检查在后台异步进行（启动 25 秒后一次，之后每 12 小时一次），
-          结果缓存 12 小时 —— 打开页面<b>不会</b>因为"查更新"而变慢；缓存新鲜时完全不出站。
-          <br>检查失败<b>静默</b>：离线、DNS 失败、被代理拦、被 CDN 限流，一律不影响主功能，
-          只会在这里标出来。不自动替换 exe 的原因：Windows 上运行中的 exe 无法覆盖，
-          且更新通道是供应链攻击最肥的目标，只提醒就不存在这个攻击面。
+          自 v0.31.101 起，<b>本程序不再从任何远端下载或替换二进制</b>：项目已停止对外发布，
+          更新只走「本机部署」（备份 → 替换文件 → 重启 → 核对 sha256）。
+          原来的「检查更新 / 下载产物 / 应用更新」入口已移除，旧页面缓存调接口会收到 <b>410</b>。
         </div>
-        <div class="setting-grid">
-          <div class="setting-card">
-            <label>开启版本检查</label>
-            <label class="muted" style="display:flex;gap:6px;align-items:center;margin-top:6px;">
-              <input type="checkbox" id="setUpdateCheck"> <span>允许本程序向下面的地址出站查询</span>
-            </label>
-            <div class="hint">内网 / 私有化部署应当<b>关掉</b>：隔离网络里这个请求既无用又多一个外联点。</div>
-          </div>
-          <div class="setting-card">
-            <label>自动下载新版本产物</label>
-            <label class="muted" style="display:flex;gap:6px;align-items:center;margin-top:6px;">
-              <input type="checkbox" id="setUpdateAuto"> <span>发现新版本时自动下载到本地并校验</span>
-            </label>
-            <div class="hint">下载的产物只<b>落盘为 <code>*.new</code> 并校验 SHA-256</b>，
-              <b>不会自动替换正在运行的程序</b>—— 替换要停服务，交由人在维护窗口执行
-              （卡片会给出一条命令）。关掉则只在面板里显示下载链接。</div>
-          </div>
-          <div class="setting-card">
-            <label>更新清单地址（version.json）</label>
-            <input type="text" id="setUpdateManifest" placeholder="https://raw.githubusercontent.com/用户/仓库/main/version.json">
-            <div class="hint">静态 JSON，字段：<code>version</code> / <code>min_supported</code> /
-              <code>notes</code> / <code>url</code> / <code>assets[]</code>。只接受 <b>http(s)</b>。</div>
-          </div>
-        </div>
-        <div class="row" style="margin-top:14px;">
-          <button id="btnSaveUpdate">保存</button>
-          <button class="ghost" id="btnCheckUpdate">立即检查</button>
-          <button class="ghost" id="btnApplyUpdate" style="display:none;"
-            title="生成替换脚本并给出操作步骤（不会自动替换、不会自动重启）">应用更新</button>
-          <button class="ghost" id="btnSkipUpdate" style="display:none;">跳过此版本</button>
-          <span id="updateCfgHint" class="muted"></span>
-        </div>
-        <div id="updateStatus" style="margin-top:12px;"></div>
       </div>
 
       <div class="card">
@@ -4681,9 +4646,6 @@ async function loadSettings() {
     // 设备风控凭证（v0.25.1）：**只回显状态，不回显明文**。
     if ($('setDeviceTokenFile')) $('setDeviceTokenFile').value = d.device_token_file || '';
     // 版本更新提醒（v0.26.0）：清单地址是配置项（原样回显）；状态另拉一次（走缓存，不出站）。
-    if ($('setUpdateCheck')) $('setUpdateCheck').checked = d.update_check_enabled !== false;
-    if ($('setUpdateManifest')) $('setUpdateManifest').value = d.update_manifest_url || '';
-    loadUpdateStatus(false);
     loadLedgerCheck(false);
     loadDataUsage(false);
     // 调价历史（v0.27.0）：与倍率输入框同屏，改完保存能立刻看到"刚刚这一次"进去了。
@@ -5833,130 +5795,6 @@ async function loadDataUsage(prune) {
   }
 }
 
-async function loadUpdateStatus(force) {
-  const box = $('updateStatus');
-  if (!box) return;
-  box.textContent = '';
-  box.appendChild(el('div', 'muted', force ? '检查中…' : '读取中…'));
-  let d;
-  try { d = await api('/api/admin/update-status' + (force ? '?force=1' : '')); }
-  catch (e) { d = { current: '', error: e.message, enabled: true }; }
-  renderUpdateStatus(d);
-}
-
-// renderUpdateStatus 全部用 el() 构造，**不用 innerHTML**。
-// latest / notes / release_url 都来自**外部清单文件**（远端可控），
-// 以 HTML 形式插进 DOM 就是把更新通道变成 XSS 通道。
-function renderUpdateStatus(d) {
-  const box = $('updateStatus');
-  if (!box) return;
-  box.textContent = '';
-  const skip = $('btnSkipUpdate');
-  if (skip) skip.style.display = 'none';
-  // 导航徽标：有更新时在「设置」上点一个红点 —— 否则提示只存在于一个
-  // 默认收在「设置 → 关于」里的卡片中，等于没有提醒。
-  setUpdateBadge(!!(d && d.has_update));
-
-  const head = el('div', 'row');
-  head.style.gap = '10px';
-  head.appendChild(el('span', 'muted', '当前 ' + (d.current || '—')));
-  if (d.latest) head.appendChild(el('span', 'muted', '最新 ' + d.latest));
-  if (d.checked_at) head.appendChild(el('span', 'muted', fmtClock(d.checked_at) + ' 检查'));
-  box.appendChild(head);
-  // 生效地址与实际命中地址分开显示：多候选回退时两者不同（raw 走不通时命中的是
-  // API / CDN 镜像），排障时要能一眼看出"它到底从哪拿到清单的"。
-  if (d.manifest_url) {
-    box.appendChild(el('div', 'muted',
-      '更新源 ' + d.manifest_url + (d.manifest_used && d.manifest_used !== d.manifest_url
-        ? '（实际命中 ' + d.manifest_used + '）' : '')));
-  }
-  // 清单验签（v0.31.60，审查 F07）：签名是"这份清单有没有被改过"的唯一证据。
-  // 不显示的话，面板上"有新版本"与"有人投毒了清单"长得一模一样。
-  // 老后端不下发这两个字段，因此这里是"有才渲染"，不会多出一行空话。
-  if (d.verified) {
-    box.appendChild(el('div', 'muted', '清单签名 已校验（key ' + (d.signed_by || '—') + '）'));
-  } else if (d.verify_note) {
-    box.appendChild(el('div', 'muted', '清单签名 ' + d.verify_note));
-  } else if (d.latest) {
-    box.appendChild(el('div', 'credit-err', '清单签名 未校验（本二进制无内置公钥或清单未签名）'));
-  }
-
-  if (d.enabled === false) { box.appendChild(el('div', 'muted', '版本检查已关闭。')); return; }
-  if (d.error && !d.latest) { box.appendChild(el('div', 'credit-err', '检查未成功：' + d.error)); return; }
-
-  if (d.has_update) {
-    const label = { major: '重大更新', minor: '功能更新', patch: '修复更新' }[d.severity] || '有可用更新';
-    box.appendChild(el('div', '', label + '：' + d.latest));
-    if (d.too_old) {
-      box.appendChild(el('div', 'credit-err',
-        '当前版本低于清单声明的最低支持版本 ' + (d.min_supported || '') + '，建议尽快升级。'));
-    }
-    // 版本说明（更新日志）：按行拆开渲染，而不是把整段塞进一个 muted div。
-    // 清单里的 notes 是多行条目（"① … ② …"或逐条换行），整段渲染会变成
-    // 一大坨、看不出有几条改动。逐行渲染才能被"扫读"。
-    if (d.notes) {
-      const nb = el('div', 'upd-notes');
-      for (const line of String(d.notes).split(/\r?\n/)) {
-        const tx = line.trim();
-        if (!tx) continue;
-        nb.appendChild(el('div', 'upd-line', tx));
-      }
-      box.appendChild(nb);
-    }
-    // 产物状态（v0.26.7）：none / downloading / done / failed 四态各有明确文案。
-    // 刻意不用"准备中"这类模糊措辞：运维需要知道"还差什么才能更新"。
-    const dl = d.download;
-    if (dl && dl.state && dl.state !== 'none') {
-      const dbox = el('div', 'upd-dl');
-      if (dl.state === 'downloading') {
-        dbox.appendChild(el('span', 'muted',
-          '正在下载 ' + (dl.version || d.latest || '') + ' 的产物…'
-          + (dl.size ? '（约 ' + fmtBytes(dl.size) + '）' : '')));
-      } else if (dl.state === 'done') {
-        const t = el('span', 'tag ok', '产物已就绪 ' + (dl.version || ''));
-        t.title = '已下载并校验通过（' + (dl.file || '') + '）';
-        dbox.appendChild(t);
-        dbox.appendChild(el('span', 'muted',
-          fmtBytes(dl.got_size || dl.size || 0) + ' · SHA-256 校验通过'));
-      } else if (dl.state === 'failed') {
-        dbox.appendChild(el('span', 'credit-err', '产物下载失败：' + (dl.error || '未知原因')));
-      }
-      if (dl.state === 'done' && dl.apply_hint) {
-        // 操作指引**原样展示**而不是做成按钮自动执行 —— 最后一步必须由人确认
-        // （正在运行的 exe 无法被覆盖，且清单与二进制同源、无法自证）。
-        dbox.appendChild(el('div', 'upd-hint', dl.apply_hint));
-      }
-      box.appendChild(dbox);
-    }
-    const links = el('div', 'row');
-    links.style.gap = '10px';
-    if (d.release_url) links.appendChild(extLink(d.release_url, '打开发布页'));
-    if (d.asset && d.asset.url) links.appendChild(extLink(d.asset.url, '下载本平台产物'));
-    if (links.childNodes.length) box.appendChild(links);
-    if (d.asset && d.asset.sha256) box.appendChild(el('div', 'muted', 'SHA-256 ' + d.asset.sha256));
-    // 「应用更新」只在下好产物时出现。
-    const ap = $('btnApplyUpdate');
-    if (ap) ap.style.display = (dl && dl.state === 'done') ? '' : 'none';
-    if (skip) { skip.style.display = ''; skip.textContent = '跳过 ' + d.latest; }
-  } else {
-    box.appendChild(el('div', 'muted', '已是最新版本。'));
-    const ap = $('btnApplyUpdate');
-    if (ap) ap.style.display = 'none';
-  }
-  if (d.stale) box.appendChild(el('div', 'muted', '离线：显示的是上次成功检查的结果。'));
-  if (d.error && d.latest) box.appendChild(el('div', 'muted', '本次检查未成功：' + d.error));
-}
-
-// setUpdateBadge 设置导航上的更新徽标（true=显示）。
-function setUpdateBadge(on) {
-  const b = $('updBadge');
-  if (!b) return;
-  b.classList.toggle('hidden', !on);
-  if (on) b.textContent = '新';
-}
-
-// extLink 外链一律 noopener，且**只接受 http(s)** ——
-// 清单是外部内容，不能让它塞进 javascript: 之类伪协议。
 function extLink(href, text) {
   const a = el('a', '', text);
   a.href = /^https?:\/\//i.test(href) ? href : '#';
@@ -5964,51 +5802,6 @@ function extLink(href, text) {
   a.rel = 'noopener noreferrer';
   return a;
 }
-
-if ($('btnCheckUpdate')) $('btnCheckUpdate').onclick = () => loadUpdateStatus(true);
-if ($('btnLedgerCheck')) $('btnLedgerCheck').onclick = () => loadLedgerCheck(true);
-if ($('btnChNew')) $('btnChNew').onclick = () => showChannelForm(null);
-if ($('btnAnthSave')) $('btnAnthSave').onclick = saveAnthropicCfg;
-if ($('btnDataUsage')) $('btnDataUsage').onclick = () => loadDataUsage(false);
-if ($('btnPruneLogs')) $('btnPruneLogs').onclick = () => {
-  // 删数据不可逆：必须让人显式确认，且说明"按当前保留策略"而不是"全删"。
-  if (!confirm('按当前保留策略（usage_log_retention_days，默认 180 天）删除过期用量流水？\n此操作不可撤销。')) return;
-  loadDataUsage(true);
-};
-// 「应用更新」：只生成替换脚本 + 回操作指引，**不自动替换、不自动重启**。
-// 打开一个可复制的对话框而不是直接执行 —— 执行意味着停服务，必须由人决定时机。
-if ($('btnApplyUpdate')) $('btnApplyUpdate').onclick = async () => {
-  try {
-    const d = await post('/api/admin/update-apply', {});
-    await confirmDialog({
-      title: '更新产物已就绪',
-      message: '请按以下步骤应用（程序不会自动替换自己）：' + String.fromCharCode(10, 10)
-        + (d.apply_hint || ''),
-      confirmText: '知道了',
-      hideCancel: true,
-    });
-  } catch (e) { toast('应用更新失败：' + e.message, 'err'); }
-};
-if ($('btnSaveUpdate')) $('btnSaveUpdate').onclick = async () => {
-  try {
-    await post('/api/admin/settings', {
-      update_check_enabled: !!($('setUpdateCheck') && $('setUpdateCheck').checked),
-      update_auto_download: !!($('setUpdateAuto') && $('setUpdateAuto').checked),
-      update_manifest_url: $('setUpdateManifest').value.trim(),
-    });
-    toast('版本更新设置已保存', 'ok');
-    loadSettings();
-  } catch (e) { toast(e.message, 'err'); }
-};
-if ($('btnSkipUpdate')) $('btnSkipUpdate').onclick = async () => {
-  const v = ($('btnSkipUpdate').textContent || '').replace('跳过', '').trim();
-  if (!v) return;
-  try {
-    await post('/api/admin/update-skip', { version: v });
-    toast('已跳过 ' + v + '（下一个版本仍会提醒）', 'ok');
-    loadUpdateStatus(false);
-  } catch (e) { toast(e.message, 'err'); }
-};
 
 $('btnSaveHost').onclick = async () => {
   try {
@@ -10696,9 +10489,7 @@ window.paletteSources = (window.paletteSources || []).concat([
   mountUiShell(); // v0.26.6：命令面板（⌘K）+ 全局快捷键 + 侧边栏过滤
   setupNav(document.body); // 初始页的实时轮询由 onNavChange 钩子按需启动
 
-  // 版本更新提醒（v0.26.5 恢复）：进后台就查一次，让「设置」上的徽标立即可见 ——
-  // 走缓存、缓存新鲜时不出站，所以这一步不会拖慢任何东西（见 updatecheck.go）。
-  loadUpdateStatus(false);
+  // 版本更新提醒已下线（v0.31.101）：启动时不再查更新（接口回 410、后台循环不启动）。
 })();
 </script>
 </body>

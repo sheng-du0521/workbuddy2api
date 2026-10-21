@@ -478,6 +478,11 @@ func TestOrderUpdateCandidates(t *testing.T) {
 // 出站被替换成必定失败的 transport，因此本用例**不发任何真实请求**：
 // 断言的是"它确实去试了默认地址 + 全部失败时给出可读原因 + 不谎报有更新"。
 func TestCheckUpdateUsesDefaultManifestURLAndReportsFailure(t *testing.T) {
+	// 自更新已下线（v0.31.101）：这条用例验的是「检查更新」这条链路，
+	// 而它现在不可达（路由 410 + 不启动后台循环 + updateCheckEnabled 恒 false）。
+	// 保留代码与用例而不是删掉：万一将来重新启用，这里是现成的验收；
+	// 现在就跳过，避免"删了之后没人知道原来验过什么"。
+	t.Skip("自更新已下线（v0.31.101）：checkUpdate 不再可达")
 	old := selfupdate.HTTPClient
 	selfupdate.HTTPClient = &http.Client{
 		Timeout:   time.Second,
@@ -536,6 +541,11 @@ func TestCheckUpdateDisabled(t *testing.T) {
 //  2. 出站失败时**保留上一次的好结果**，只标 error ——
 //     否则"暂时网络不通"看起来像"项目已停止维护"。
 func TestCheckUpdateCacheAndSilentFailure(t *testing.T) {
+	// 自更新已下线（v0.31.101）：这条用例验的是「检查更新」这条链路，
+	// 而它现在不可达（路由 410 + 不启动后台循环 + updateCheckEnabled 恒 false）。
+	// 保留代码与用例而不是删掉：万一将来重新启用，这里是现成的验收；
+	// 现在就跳过，避免"删了之后没人知道原来验过什么"。
+	t.Skip("自更新已下线（v0.31.101）：checkUpdate 不再可达")
 	withTestClient(t)
 	a := newUpdateTestApp(t)
 
@@ -634,6 +644,11 @@ func TestUpdateExitCode(t *testing.T) {
 //  3. 错误信息可读（运维要能区分"网络问题"与"清单不可信"）；
 //  4. 不触发下载（attachDownload 依赖 HasUpdate/Asset，前两条已保证，这里显式断言一次）。
 func TestCheckUpdateRejectsUnsignedManifest(t *testing.T) {
+	// 自更新已下线（v0.31.101）：这条用例验的是「检查更新」这条链路，
+	// 而它现在不可达（路由 410 + 不启动后台循环 + updateCheckEnabled 恒 false）。
+	// 保留代码与用例而不是删掉：万一将来重新启用，这里是现成的验收；
+	// 现在就跳过，避免"删了之后没人知道原来验过什么"。
+	t.Skip("自更新已下线（v0.31.101）：checkUpdate 不再可达")
 	withTestClient(t)
 	a := newUpdateTestApp(t)
 
@@ -663,5 +678,35 @@ func TestCheckUpdateRejectsUnsignedManifest(t *testing.T) {
 	}
 	if st.Download != nil && st.Download.State == "downloading" {
 		t.Fatal("未签名清单不得触发下载")
+	}
+}
+
+// TestSelfUpdateRemoved 自更新已下线（v0.31.101）：
+//
+//	① 即使有人把 KV 打开（update_check_enabled=1），也必须返回 false ——
+//	   编译期常量优先于设置项，避免"一次误操作就恢复外联"；
+//	② 旧接口必须回 410 + 明确 code，而不是 404（404 会被当成路由写错）。
+func TestSelfUpdateRemoved(t *testing.T) {
+	store, _, a := newTestApp(t)
+	// Windows 上不关库会让 TempDir 清理失败（报"文件被占用"），测试会红在一个跟断言无关的地方。
+	defer store.Close()
+	if err := a.store.SetKV(kvUpdateEnabled, "1"); err != nil {
+		t.Fatalf("SetKV: %v", err)
+	}
+	if a.updateCheckEnabled() {
+		t.Fatal("自更新已下线：updateCheckEnabled 必须恒为 false（KV 打开也不能出站）")
+	}
+
+	rec := httptest.NewRecorder()
+	a.handleUpdateRemoved(rec, httptest.NewRequest(http.MethodGet, "/api/admin/update-status", nil))
+	if rec.Code != http.StatusGone {
+		t.Fatalf("已下线接口应回 410，得 %d：%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是 JSON：%v", err)
+	}
+	if body["code"] != "self_update_removed" {
+		t.Fatalf("code = %v，期望 self_update_removed", body["code"])
 	}
 }

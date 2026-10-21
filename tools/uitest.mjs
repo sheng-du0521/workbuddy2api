@@ -1452,7 +1452,7 @@ function run(pageFile, meOverride, plan) {
         // v0.26.1：两个默认关闭的开关（R6 降档 / R4 样本回流）
         ['#setPickSink', 1], ['#setFpSamples', 1],
         // v0.26.5：样本面板的跨页入口 + 实时条数；更新提醒的导航徽标容器
-        ['#btnFpGo', 1], ['#fpCfgCount', 1], ['#updBadge', 1],
+        ['#btnFpGo', 1], ['#fpCfgCount', 1],
         // v0.29.0：提现审核方式（下拉 2 项）+ 免审额度上限
         ['#setWithdrawMode', 1], ['#setWithdrawMode option', 2],
         ['#setWithdrawAutoMax', 1], ['#wdModeHint', 1],
@@ -1640,23 +1640,13 @@ function run(pageFile, meOverride, plan) {
         ['#multHistBox', '未发出公告'],
         ['#multHistBox', '建议手工在「公告」页补一条']] },
 
-    // v0.26.7：更新检测与自动下载面板。
+    // v0.31.101：自更新已下线 —— 面板里**不得再出现任何**更新入口/下载链接。
+    // 反过来钉住"删干净了"：漏掉一个按钮，用户就会点到一个必然 410 的入口。
     { nav: 'settings',
-      has: [['#setUpdateAuto', 1], ['#btnApplyUpdate', 1],
-        ['#updateStatus .upd-notes', 1],
-        // 简介按行渲染：给的是 3 行 notes，就必须渲染成 3 个 .upd-line
-        // （整段塞一个 div 会让"有几条改动"看不出来）。
-        ['#updateStatus .upd-line', 3],
-        // 产物已就绪：徽标 + 应用按钮可见
-        ['#updateStatus .tag', 1], ['#updateStatus .upd-dl', 1],
-        ['#updateStatus .upd-hint', 1]],
-      textIn: [['#updateStatus', '功能更新'], ['#updateStatus', '0.26.7'],
-        ['#updateStatus', '① 补齐耗时与缓存观测'],
-        ['#updateStatus', '产物已就绪'],
-        ['#updateStatus', 'SHA-256 校验通过'],
-        ['#updateStatus', 'apply-update.bat']],
-      // 已就绪时应用按钮应可见（display 不为 none —— 由 display 断言覆盖）
-      display: [['#btnApplyUpdate', true]] },
+      absent: ['#updateStatus', '#setUpdateCheck', '#setUpdateAuto', '#setUpdateManifest',
+        '#btnCheckUpdate', '#btnApplyUpdate', '#btnSkipUpdate', '#updBadge'],
+      // 原位保留一句说明（解释为什么没有更新功能了），免得运维以为是版本坏了。
+      textIn: [['main.main', '更新只走「本机部署」']] },
 
     // ================================================================
     // v0.26.6 · 共享 UI 套件（对照 workbuddy-manager 的交互调研结论）

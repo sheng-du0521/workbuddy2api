@@ -133,9 +133,35 @@ var (
 // 清单库的能力 —— 库只管"怎么取一份清单"，要不要串行化由使用方决定。
 var updateFetchMu sync.Mutex
 
+// selfUpdateRemoved 自更新已下线（v0.31.101）。
+//
+// 项目已停止对外发布：没有新版本可下、没有新产物可发，继续保留「检查更新 / 下载产物 /
+// 应用更新」只会有两个后果 —— ① 每次检查都指向一个 404；② 更新通道是供应链攻击最肥的
+// 目标，留着就等于留一条没人维护的下载入口。所以整条链路（入口 / 接口 / 后台循环）一起下线。
+//
+// 这是**编译期常量**而不是设置项：设置项可以被一次误操作打开（KV 改成 "1" 就会出站），
+// 而我们要的是「任何人、任何配置都不可能再触发」。
+const selfUpdateRemoved = true
+
 func (a *app) updateCheckEnabled() bool {
+	if selfUpdateRemoved {
+		return false
+	}
 	v, _ := a.store.GetKV(kvUpdateEnabled)
 	return strings.TrimSpace(v) != "0"
+}
+
+// handleUpdateRemoved 已下线接口的统一出口（410 Gone）。
+//
+// 为什么不直接删路由（那样会 404）：410 能说清「这东西存在过、被有意移除」，
+// 而 404 会让人以为是路由写错/版本不对，白查一轮。旧页面缓存、旧脚本都会打到这里。
+func (a *app) handleUpdateRemoved(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusGone, map[string]any{
+		"error": "self-update has been removed",
+		"code":  "self_update_removed",
+		"hint": "本项目已停止对外发布：不再从任何远端下载或替换二进制；" +
+			"更新只走本机部署（备份 → 替换文件 → 重启 → 核对 sha256）",
+	})
 }
 
 // updateManifestURL 生效的清单地址：显式配置优先，未配置时回落默认（见

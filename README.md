@@ -685,7 +685,6 @@ curl http://127.0.0.1:8780/v1/chat/completions \
 | 法律声明与边界 | [`NOTICE`](NOTICE) |
 | 开源协议 | [`LICENSE`](LICENSE) |
 | 一键部署脚本 | [`deploy/`](deploy)（Windows 双击 / Linux `install.sh`） |
-| 版本清单（供更新提醒） | [`version.json`](version.json) |
 | Web 版使用说明（含各版本变更 / 验证 / 诚实边界） | 随发布包分发（`Web应用使用说明.md`） |
 
 ---

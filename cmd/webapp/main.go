@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.100"
+const version = "0.31.101"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -451,7 +451,9 @@ func main() {
 
 	// 版本更新提醒（v0.26.0）：启动后延迟一次 + 之后每 12 小时一次。
 	// 失败静默、只读缓存，绝不碰账号与出站主链路（详见 updatecheck.go）。
-	go a.updateLoop(probeCtx)
+	// 自更新已下线（v0.31.101）：不再启动任何「查更新」的后台循环，
+	// 保证「不配置也绝不会出站」（开关可以被误开，没启动的循环不能）。
+	_ = a.updateLoop // 保留函数以备审阅，但不调度
 	// 模型倍率自动同步（v0.31.51，需求一）：启动后补跑 + 之后每小时检查是否满 20 小时。
 	go a.modelRatioLoop(probeCtx)
 	// 账目对账（v0.31.62）：启动 90s 后一次 + 每 6 小时一次。只读 SELECT，
@@ -1944,13 +1946,13 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/plugins/{id}/claim",
 		a.adminGuard(func(w http.ResponseWriter, r *http.Request) { a.handlePluginClaim(w, r, true) }))
 
-	// 版本更新提醒（v0.26.0）：读状态 + 跳过某版本。**只提醒，不自动更新**。
-	mux.HandleFunc("GET /api/admin/update-status", a.adminGuard(a.handleAdminUpdateStatus))
-	mux.HandleFunc("POST /api/admin/update-skip", a.adminGuard(a.handleAdminUpdateSkip))
-	// 「应用更新」（v0.26.7）：生成替换脚本并回操作指引。**不自动替换、不自动重启**
-	// —— 正在运行的 exe 无法被覆盖，任何自动替换都要靠外部进程在退出后动手，
-	// 等于一次无人值守的重启；且清单与二进制同源、无法自证，最后一步必须由人确认。
-	mux.HandleFunc("POST /api/admin/update-apply", a.adminGuard(a.handleAdminUpdateApply))
+	// 版本更新：**已下线**（v0.31.101）。
+	// 三个入口统一回 410（而不是删路由变 404）：旧页面缓存与旧脚本会打到这里，
+	// 410 能说明「被有意移除」，不会让人误判成路由写错。
+	// 对应地：后台循环不再启动（见下方 updateLoop 调用点）、面板卡片已移除。
+	mux.HandleFunc("GET /api/admin/update-status", a.adminGuard(a.handleUpdateRemoved))
+	mux.HandleFunc("POST /api/admin/update-skip", a.adminGuard(a.handleUpdateRemoved))
+	mux.HandleFunc("POST /api/admin/update-apply", a.adminGuard(a.handleUpdateRemoved))
 
 	// 站内公告管理（v0.17.8）：创建 / 编辑 / 启停 / 删除。
 	mux.HandleFunc("GET /api/admin/announcements", a.adminGuard(a.handleAdminListAnnouncements))
