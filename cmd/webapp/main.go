@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.83"
+const version = "0.31.84"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -2030,6 +2030,15 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /admin/accounts/{uid}/revive", a.compatGuard(a.handleCompatAccountRevive))
 	mux.HandleFunc("POST /admin/tasks/{name}/run", a.compatGuard(a.handleCompatTaskRun))
 	mux.HandleFunc("POST /v1/chat/completions", a.liveCapture(a.apiKeyGuard(a.proxy.ServeChat)))
+	// POST /v1 别名（v0.31.84）：WorkBuddy 的 useCustomProtocol 会把 models.json 里的
+	// url 当作**完整端点**原样发送；老脚本里写的是 base（`…/v1`），于是它直接
+	// POST 到 `/v1` —— 客户端表现为 `internal error 404`。
+	//
+	// 这里挂一条同义路由，让"base 写法"与"完整端点写法"都能通：
+	//   · 老脚本（已分发出去的）不用重跑；
+	//   · 用户手改配置时填 base 也不会 404。
+	// 鉴权与 body 上限与正式路由完全一致（同一个 handler 链），不是放宽权限。
+	mux.HandleFunc("POST /v1", a.liveCapture(a.apiKeyGuard(a.proxy.ServeChat)))
 
 	// Anthropic Messages 兼容（v0.31.70）：CC Switch / Claude Code 请求 /v1/messages。
 	// 只做协议转换，转发/计费/风控全部复用 ServeChat（见 anthropic.go 的文件头）。

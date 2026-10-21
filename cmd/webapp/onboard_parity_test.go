@@ -282,8 +282,40 @@ func TestOnboardScriptParity(t *testing.T) {
 	if !strings.Contains(psH, `"id": "wb-group-host"`) {
 		t.Error("代挂 Key 的脚本里 model 不是 wb-group-host")
 	}
+	// url 必须是**完整端点**（v0.31.84）：useCustomProtocol=true 时客户端原样发送，
+	// 写成 base 会让 WorkBuddy 直接 POST 到 /v1 → internal error 404。
+	for name, ps := range map[string]string{"池 Key": psP, "代挂 Key": psH} {
+		if !strings.Contains(ps, "/v1/chat/completions") {
+			t.Errorf("%s 的脚本 url 不是完整端点（缺 /v1/chat/completions）", name)
+		}
+	}
 	if strings.Contains(psP, "wb-group-host") || strings.Contains(psH, "wb-group-work") {
 		t.Error("脚本里串了对方的组名 —— 默认值没有按 Key 类型分流")
+	}
+}
+
+// TestPostV1AliasRegistered POST /v1 必须与 /v1/chat/completions 同一条链路。
+//
+// 为什么需要这条别名（v0.31.84）：WorkBuddy 的 useCustomProtocol 把 models.json 里的
+// url 当完整端点原样发送；老接入脚本写的是 base（`…/v1`），于是它 POST 到 `/v1`，
+// 表现为 `internal error 404`。别名让"老脚本"不用重跑也能立刻恢复。
+func TestPostV1AliasRegistered(t *testing.T) {
+	store, _, mux, _ := newAuthzApp(t)
+	defer store.Close()
+
+	for _, path := range []string{"/v1", "/v1/chat/completions"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"x"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code == http.StatusNotFound {
+			t.Errorf("%s 未注册（客户端会看到 internal error 404）", path)
+			continue
+		}
+		// 两条路由必须**同样要求鉴权**：别名不是放宽权限的后门。
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s 无 Key 时应 401，得到 %d —— 别名与正式路由的鉴权不一致", path, rec.Code)
+		}
 	}
 }
 

@@ -1,20 +1,20 @@
 {
-  "version": "0.31.83",
+  "version": "0.31.84",
   "min_supported": "0.24.0",
-  "notes": "v0.31.83：两类官组的一致性契约 + 接入自动用默认模型。\n\n① 不传模型也能接入：「默认模型」此前只活在弹窗里，接口收到空 model 会回 400 bad_model。现在 POST /api/keys/{id}/onboard 不传 model 或传空串时，服务端用「work官组」的默认模型补上 —— 池计费 Key → wb-group-work，代挂自用 Key → wb-group-host。脚本与第三方调用方不填模型也能接出正确配置，且一定是对应类型的组名。前端也不再因输入框为空就拦（后端兜底更可靠）。\n\n② 一致性由结构保证：把两类官组的计算收敛到一个结构 workGroupPlan + 一段 buildOnboardPlan，差异只有三个参数（组 id、显示名、默认值 KV），其余全部共用 —— 默认值（同一个 pickDefault）、鉴权（同一个 userGuard + 同一条 SQL 归属条件 + 同一条停用判断）、调用参数（同一个 handleKeyOnboard 与脚本模板）、可用性判断（同一个 expandGroupModel，有成员才展开）、异常处理（同一个 groupKindMismatch）。\n\n③ 关键重构 groupKindMismatch：此前 ServeChat 与 handleKeyOnboard 各写了一套「组名与 Key 类型不匹配」的判断，码还不一样（host_key_cannot_use_group vs host_key_cannot_use_pool_group）。现在只有一处定义、两边都调它 —— 「生成脚本时说不行、发请求却说行」这种自相矛盾不会再有。\n\n④ 新增一致性测试：TestOnboardParity（表驱动跑两类 Key，覆盖默认值非空且等于自己组名 / 候选第一项是组名且不重复 / 本人 200·跨用户 404·停用 403 / 成员为空则不展开 / kind 正确）；TestOnboardScriptParity（不传 model 时两类各拿到自己组名；生成的 .bat 行数相同、解码后的 PowerShell 都含 apiKey/useCustomProtocol/vendor、不串用对方组名）；TestGroupKindMismatchSymmetric（两方向都拒且 hint 非空、正确搭配与 ch<N> 历史名不误拦、onboard 的 code 与纯函数一致）。\n\n⑤ 测试里的坑：.bat 正文是 base64 编码的 PowerShell，直接在原文搜 apiKey 搜不到（第一版断言全红）。补了 decodePSFromBat：取 -EncodedCommand → base64 → UTF-16LE 再断言。\n\n验证：全量 go test + jscheck + uitest + preflight 通过。\n\n边界：默认模型不是「一定能跑」—— wb-group-work / wb-group-host 是「在能跑的账号里挑一个」，挑不到仍会失败，失败信息由既有链路给；接口层默认只兜「没传」这一种，显式传错名字仍按用户传的来（不静默替换，否则用户会以为写对了）。",
-  "released_at": 1792555013,
+  "notes": "v0.31.84：修 WorkBuddy「internal error 404」。\n\n① 现象与证据：WorkBuddy 接入后任意模型都报 internal error 404。生产日志是 `[route] 404 POST /v1 ua=\"WorkBuddy/5.8.3 …\"` —— 它请求的是 POST /v1，不是 /v1/chat/completions。\n\n② 根因：接入脚本往 models.json 写的 url 是 base（…/v1），而 useCustomProtocol=true 的语义是「按我给的这个地址原样发」——客户端不会再拼 /chat/completions，于是 POST 到 /v1，我们没这条路由 → 404，被 WorkBuddy 包成 internal error 404。v0.31.69 当时按「url 是 base」写，那次是猜的，这次有实证。\n\n③ 修法两处缺一不可：① 脚本 url 改完整端点（…/v1/chat/completions），对以后接入的人；② 加 POST /v1 别名路由，与正式路由同一条 handler 链（同样鉴权、同样 body 上限），对已经接入的人 —— 已分发出去的脚本不会自动更新，只改脚本他们永远好不了；只加别名则每个人配置里都留着一个语义含糊的 base 地址。\n\n④ 验证：端到端（本地实例+真 Key）POST /v1 无 Key → 401（路由存在、鉴权生效，此前 404）、有 Key → 503（进业务层）、/v1/chat/completions → 503（与别名一致）。单测 TestPostV1AliasRegistered（两条路由都不能 404 且都必须 401）+ TestOnboardScriptParity 增加断言（脚本 url 必须含 /v1/chat/completions）。\n\n⑤ 给已接入用户：**不用重跑脚本**，POST /v1 别名已兜住旧 url；想让配置语义正确就重新点一次「接入」。\n\n边界：别名只对 POST 生效（GET /v1 仍 404，聊天只有 POST 不存在歧义）；/v1/models 不受影响；别名不改变任何计费/选号逻辑，进的是同一个 ServeChat。",
+  "released_at": 1792558102,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.83/webapp.exe",
-      "sha256": "b01dc083f26ab4db2ccfa9d0ba45a7fc04a5fc58b4f406fe264d05be65b389a4",
-      "size": 16000512
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.84/webapp.exe",
+      "sha256": "edb36f6d44b7973f22e9615ca1497b3047ed201eff2b6a7fe4acf9cdc1b1ee80",
+      "size": 16001024
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "4VSQiIBpXjhUhw8fBGvICo2AcRO70/IHDfHDOGdHSF6OweJflpZ+YK2sevyFeSpZOLkONOg5kiIeX1q10LBZCw==",
+  "signature": "Ts46CiCnykBPlWI5dXeylS1YjlrpPpBghOodl8kMOuVp7iAkMSD+9dPeZPqkoddi+lFWtBlAQZ9vzl0huLKKBQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

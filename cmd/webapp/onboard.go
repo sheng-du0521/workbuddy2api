@@ -83,17 +83,23 @@ func sanitizeModelName(s string) (string, bool) {
 	return s, true
 }
 
-// onboardJSON 生成要合并进客户端的那一条（WorkBuddy 的 models.json 元素）。
+// onboardWorkBuddyEntry 生成要合并进客户端的那一条（WorkBuddy 的 models.json 元素）。
 //
 // 字段是**实测**出来的（2026-10-20 本机只读探测）：顶层数组，每条含
 // id/name/vendor/url/apiKey/useCustomProtocol/reasoning/maxXXXTokens。
 // 这里只写我们真正确定的字段 —— 多写一个猜的字段，客户端可能整条不认。
+//
+// ⚠️ url 必须是**完整端点**（v0.31.84 实证修正）：
+// useCustomProtocol=true 的语义是"按我给的这个地址原样发请求"，客户端**不会**再拼
+// `/chat/completions`。此前这里写的是 base（`…/v1`），于是 WorkBuddy 直接 POST 到
+// `/v1`，我们没这个路由 → 客户端报 `internal error 404`。
+// 现场日志：`[route] 404 POST /v1 ua="WorkBuddy/5.8.3 …"`。
 func onboardWorkBuddyEntry(p onboardPlan) map[string]any {
 	return map[string]any{
 		"id":                p.Model,
 		"name":              p.Name,
 		"vendor":            "custom",
-		"url":               p.BaseURL,
+		"url":               p.BaseURL + "/chat/completions",
 		"apiKey":            p.APIKey,
 		"useCustomProtocol": true,
 	}
