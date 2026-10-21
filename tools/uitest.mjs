@@ -59,6 +59,19 @@ const FX = {
     ],
     observed_models: 2,
   },
+  // v0.31.91：第三方通道页。探活弹窗的回归用例需要"一条通道 + 一次成功的探活"。
+  // 顺序敏感：fixtureFor 按 key 长度降序做前缀匹配，所以 /probe 必须自成一条，
+  // 否则探活请求会被 /api/admin/upstreams 的列表体命中（r.ok undefined → 不弹窗）。
+  '/api/admin/upstreams': {
+    upstreams: [{
+      id: 7, name: '测试通道', base_url: 'https://api.example.com/v1', key_masked: 'sk-***',
+      enabled: true, priority: 100, last_probe_at: 0, last_probe_ok: false, last_probe_msg: '',
+      models: [],
+    }],
+    pool_models: {}, affected_keys: {},
+  },
+  '/api/admin/upstreams/probe': { ok: true, count: 2, models: ['m-one', 'm-two'] },
+  '/api/admin/anthropic-config': { default_model: '', known_models: [] },
   '/api/admin/accounts': {
     accounts: [
       {
@@ -1689,6 +1702,42 @@ function run(pageFile, meOverride, plan) {
       textIn: [['.load-banner', '实时态势已连续'], ['.load-banner', '重试']] },
     { nav: 'overview', press: [[null, 'Escape']],
       has: [['.load-banner', 1]] },
+    // v0.31.91：第三方通道「探活」的候选导入弹窗必须**稳定存在**。
+    // 回归的反馈是「点探活，弹窗闪现消失」。三个可能成因各钉一条：
+    //   ① 弹窗出现的同时背后的通道列表被 loadChannels() 清空重建（顺序反了）；
+    //   ② 遮罩"点一下即关"没有冷静期，连点/双击的第二下正好落在刚出现的遮罩上；
+    //   ③ 弹窗内容渲染异常被吞掉 → 只剩一个空遮罩。
+    // 这里先清掉前面用例可能留下的弹窗，避免"残留遮罩"让断言假通过。
+    { nav: 'channels',
+      run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })"],
+      counts: [['chList', 1]],
+      // 必须用 absent：has 的语义是 >=n，写 has:[sel,0] 永远通过（见文件头注释）。
+      absent: ['.modal-mask'],
+      textIn: [['#chList', '测试通道']] },
+    { clickText: [['#chList button', '探活']],
+      has: [['.modal-mask', 1], ['.modal-mask .modal-head', 1],
+        ['.modal-mask input[placeholder*="上游名"]', 2],
+        ['.modal-mask input[type="number"]', 4]],
+      textIn: [['.modal-mask', '识别到 2 个模型'], ['.modal-mask', 'm-one'],
+        ['.modal-mask', '导入勾选的模型']],
+      // 每行的三个输入框必须真的渲染出来（"上游名"是 placeholder，不在 textContent 里，
+      // 所以要用属性选择器断言，不能拿 textIn 查 —— 那样永远失败）。
+      },
+    // 隔一个 stage（约 700ms）再看一眼：弹窗还在才算"不会闪现消失"。
+    { has: [['.modal-mask', 1]],
+      textIn: [['.modal-mask', 'm-two'], ['.modal-mask', '可导入 2 个']] },
+    // 冷静期本身也要可验证：否则"遮罩点一下不关"很可能被后来的人改成"永远不关"。
+    // ① 刚打开就点遮罩 → 必须**不关**（这就是"连点/双击第二下"的场景）；
+    { run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })",
+      "(function () { openModal('冷静期', '', {});"
+      + " document.querySelector('.modal-mask').dispatchEvent(new MouseEvent('click', { bubbles: true })); })()"],
+      has: [['.modal-mask', 1]] },
+    // ② 冷静期内再点一次也不该关（stage 间隔只有 ~260ms，仍在 350ms 冷静期内）。
+    { has: [['.modal-mask', 1]] },
+    // ③ 累计已过冷静期（~520ms）再点遮罩 → 必须关闭（证明"能关"，不是变成关不掉）。
+    { run: ["document.querySelector('.modal-mask').dispatchEvent(new MouseEvent('click', { bubbles: true }))"],
+      absent: ['.modal-mask'] },
+
   ];
   const dashPlan = [
     { nav: 'overview', counts: [['ovChart', 1], ['ovToday', 4], ['ovFeed', 1], ['ovModels', 1]],
@@ -1787,7 +1836,6 @@ function run(pageFile, meOverride, plan) {
     { click: ['#btnTheme'], has: [['html[data-theme="dark"]', 1]], textIn: [['#btnTheme', '浅色']] },
     { click: ['#btnTheme'], has: [['html[data-theme="light"]', 1]], textIn: [['#btnTheme', '深色']] },
     { nav: 'docs', texts: [['baseUrl', '/v1']] },
-
   ];
   const a = await run('admin.html', { id: 1, username: 'admin', is_admin: true }, adminPlan);
   const b = await run('dashboard.html', { id: 2, username: 'tester', is_admin: false, daily_limit: 100, daily_used: 12.5, monthly_limit: 1000, monthly_used: 800 }, dashPlan);

@@ -8243,16 +8243,19 @@ async function loadChannels() {
   if (!box) return;
   let d;
   try { d = await api('/api/admin/upstreams'); }
-  catch (e) { box.textContent = ''; box.appendChild(el('div', 'credit-err', '读取失败：' + e.message)); return; }
+  catch (e) { box.textContent = ''; box.appendChild(el('div', 'credit-err', '读取失败：' + e.message)); return null; }
   box.textContent = '';
   const list = (d && d.upstreams) || [];
   const poolModels = (d && d.pool_models) || {};
   if (!list.length) {
     box.appendChild(el('div', 'hintbar',
       '还没有配置通道。点「新增通道」填 base_url 与 API Key，然后用「探活」确认可用，再添加模型映射。'));
-    return;
+    return d;
   }
   for (const up of list) box.appendChild(channelCard(up, poolModels, (d && d.affected_keys) || {}));
+  // 返回本次读到的数据（v0.31.91）：探活流程要"先刷新列表、再弹窗"，
+  // 弹窗里的"已在映射里"必须按**刚刷新的**映射判断，不能用点击那一刻的旧快照。
+  return d;
 }
 
 // channelCard 一条通道（含模型映射表）。
@@ -8302,16 +8305,26 @@ function channelCard(up, poolModels, affected) {
   // 新建通道时焦点在表单，面板长在另一张卡的下半截，根本不会被注意到；
   // 页面上一堆通道卡时，也分不清"这块是谁的探活结果"。
   // 弹窗是唯一不会被错过的位置，而且能把"勾选 → 填单价 → 导入"收在一屏里。
-  const showProbeImport = (ids) => {
+  const showProbeImport = (ids, cur) => {
+    const U = cur || up; // 优先用刚刷新后的通道（映射可能已变），退回点击时的快照
     if (!ids.length) {
-      say('探活成功，但上游没有返回任何模型（检查该 key 是否有模型列表权限）');
+      const msg = '探活成功，但上游没有返回任何模型（检查该 key 是否有模型列表权限）';
+      say(msg);
+      // 空结果也要有个"看得见的东西"（v0.31.91）：只写页首那行提示时，
+      // 通道卡在下半页的运营看不到任何反馈，与"弹窗闪一下就没了"无法区分。
+      const m0 = openModal('探活通过 · ' + (U.name || '') + ' · 0 个模型', '', { maxWidth: '520px' });
+      m0.body.appendChild(el('div', 'muted', msg));
+      const c0 = el('button', 'ghost', '关闭');
+      c0.style.marginTop = '10px';
+      c0.onclick = () => m0.close();
+      m0.body.appendChild(c0);
       return;
     }
-    const have = new Set((up.models || []).map((x) => x.model));
+    const have = new Set((U.models || []).map((x) => x.model));
     const fresh = ids.filter((id) => !have.has(id));
     // 加宽到 860px：每行是「勾选 + 模型名 + 上游名 + 单价 + 倍率」，
     // 440px 下会折成三行、看不出哪个框填什么（第一版就是这个毛病）。
-    const m = openModal('识别到 ' + ids.length + ' 个模型 · ' + (up.name || ''),
+    const m = openModal('识别到 ' + ids.length + ' 个模型 · ' + (U.name || ''),
       '勾选要接入的模型，填好单价与倍率后一次导入。已在映射里的 '
       + (ids.length - fresh.length) + ' 个不会被覆盖。'
       + '单价 0 = 暂不计费；倍率留空 = 跟随全局（不是免费）。',
@@ -8416,7 +8429,7 @@ function channelCard(up, poolModels, affected) {
       bGo.disabled = true;
       bGo.textContent = '导入中…';
       try {
-        const out = await post('/api/admin/upstreams/models/import', { id: up.id, models: models });
+        const out = await post('/api/admin/upstreams/models/import', { id: U.id, models: models });
         const bits = ['新增 ' + (out.added || []).length];
         if ((out.skipped || []).length) bits.push('已存在跳过 ' + out.skipped.length);
         if ((out.ratios_added || []).length) bits.push('入模型列表 ' + out.ratios_added.length);
@@ -8443,25 +8456,69 @@ function channelCard(up, poolModels, affected) {
     m.body.appendChild(hint2);
   };
 
+  // probeFailDialog 探活失败弹窗（v0.31.91）。
+  //
+  // 从前失败只写页首那行 #chHint。通道卡排在页面下半部分时，那行字在视口外，
+  // 运营看到的现象是"点了探活什么都没发生" —— 与"弹窗闪了一下就没了"根本分不清。
+  // 失败原因必须出现在**点击位置附近**，并且给一个原地重试的按钮。
+  const probeFailDialog = (U, msg) => {
+    const m = openModal('探活失败 · ' + (U.name || ''),
+      '没有改动任何配置（探活失败不会顺手停用通道）。检查地址、API Key '
+      + '与上游是否允许列模型后可直接重试。', { maxWidth: '560px' });
+    const p = el('div', 'mono');
+    p.style.cssText = 'white-space:pre-wrap;word-break:break-all;font-size:12px;'
+      + 'background:var(--bg-soft, rgba(0,0,0,.03));border-radius:8px;padding:8px 10px;';
+    p.textContent = msg || '（上游没有给出原因）';
+    m.body.appendChild(p);
+    const foot = el('div', 'row');
+    foot.style.cssText = 'gap:8px;margin-top:10px;';
+    const retry = el('button', '', '重试探活');
+    retry.onclick = () => { m.close(); bProbe.onclick(); };
+    const c = el('button', 'ghost', '关闭');
+    c.onclick = () => m.close();
+    foot.appendChild(retry);
+    foot.appendChild(c);
+    m.body.appendChild(foot);
+  };
+
   const bProbe = el('button', 'ghost', '探活');
   bProbe.title = '服务端 GET {base_url}/models：验证地址、key 与可用模型；'
     + '成功后弹窗列出全部模型，勾选即可导入（可填单价与倍率）。不消耗对方额度';
   bProbe.onclick = async () => {
+    if (bProbe.disabled) return; // 连点只跑一次（连点也是"弹窗闪现"的经典成因）
     bProbe.disabled = true;
+    bProbe.textContent = '探活中…';
     say('探活中…');
+    let r = null;
+    let err = '';
     try {
-      const r = await post('/api/admin/upstreams/probe', { id: up.id });
-      if (r.ok) {
-        say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '')
-          + '（在下方勾选导入）');
-        showProbeImport(r.models || []);
-      } else {
-        // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
-        say('探活失败：' + r.error);
-      }
-      loadChannels();
-    } catch (e) { say('探活失败：' + e.message); }
-    finally { bProbe.disabled = false; }
+      r = await post('/api/admin/upstreams/probe', { id: up.id });
+    } catch (e) {
+      err = e.message || '请求失败';
+    } finally {
+      bProbe.disabled = false;
+      bProbe.textContent = '探活';
+    }
+    // 顺序很关键（v0.31.91）：**先刷新列表、再弹窗**。
+    // 反过来的话，弹窗出现的同时背后的通道列表被 loadChannels() 整体清空重建 ——
+    // 视觉上就是"页面抖一下"，运营正在弹窗里勾选时列表还在变。
+    // 刷新放前面之后，弹窗一出现，这一页就静止了。
+    let d = null;
+    try { d = await loadChannels(); } catch (e) { /* 刷新失败不影响弹窗 */ }
+    const U = ((d && d.upstreams) || []).find((x) => x.id === up.id) || up;
+    if (r && r.ok) {
+      say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '')
+        + '（弹窗里勾选导入）');
+      // 弹窗渲染异常不能被吞掉：吞掉就只剩"一个空遮罩闪一下"，
+      // 正是这条反馈的观感。异常要 toast 出来，让人知道是渲染问题而不是探活问题。
+      try { showProbeImport(r.models || [], U); }
+      catch (e) { toast('打开模型列表失败：' + e.message, 'err'); }
+      return;
+    }
+    // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
+    const msg = (r && r.error) || err || '未知错误';
+    say('探活失败：' + msg);
+    probeFailDialog(U, msg);
   };
   ops.appendChild(bProbe);
 
@@ -8500,7 +8557,10 @@ function channelCard(up, poolModels, affected) {
   if (window.__probePending && window.__probePending.id === up.id) {
     const pend = window.__probePending;
     window.__probePending = null;
-    showProbeImport(pend.models || []);
+    // v0.31.91：异常不能静默 —— 静默的结果就是一个空遮罩 + 一句没人看的 hint，
+    // 与"弹窗闪一下就没了"完全同观感。
+    try { showProbeImport(pend.models || [], up); }
+    catch (e) { toast('打开模型列表失败：' + e.message, 'err'); }
   }
 
   // ---- 模型映射 ----

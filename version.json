@@ -1,20 +1,20 @@
 {
-  "version": "0.31.90",
+  "version": "0.31.91",
   "min_supported": "0.24.0",
-  "notes": "v0.31.90：通道探活结果改成弹窗；通道组默认对用户可选。\n\n用户反馈两条，根因都在\"可达性\"而不是逻辑本身。\n\n① 「第三方通道接入后不可以进行模型检测选用导入」→ 探活候选面板改成**弹窗**。v0.31.88 把它渲染在通道卡下半部分：新建通道时焦点在表单、面板长在另一张卡的下半截，页面上一堆卡片时也分不清是谁的结果 —— 实际基本不会被看到。而且弹窗样式固定 max-width 440px，每行「勾选 + 模型名 + 上游名 + 单价 + 倍率」会折成三行，看不出哪个框填什么。现在：点探活（或新建通道保存后自动探活）直接弹窗，宽度 860px（openModal 新增可选 maxWidth，不传仍是 440px，旧弹窗零影响）；顶部写明「可导入 N 个，另有 M 个已在映射里（置灰）」；导入失败留在弹窗内可原地重试，不必重走一遍探活。\n\n② 「用户控制台密钥以及接入只有号池组没有通道自建的组」→ 通道组**默认可选**。原语义把 group_scope 当白名单且默认空 = 一个都没有，每建一条通道都要管理员逐个授权，而授权入口还曾被撤掉，结果通道组对用户完全不可见，切换功能等于只有 work 一个选项。现在改为「默认开放 + 可选白名单」：scope 空 = 不限制（全部 enabled 通道组都能看到并切换）；scope 非空 = 只有列出的这些（后台「组」勾选即收窄）。group-options 与切换校验共用 groupSelectable 一个判据；密钥卡分组标签显示通道人话名（通道 · relay-a）而不是 ch3；/v1/models 仍只在 active_group 非空时列该组，不给每个通道组都塞组名条目（避免客户端列表膨胀）。\n\n验证：新增 TestKeyGroupChannelGroupDefaultOpen（不授权也能切到通道组、切后只剩该组模型）与 TestKeyGroupWhitelistExcludesChannelGroup（白名单非空时未列出的组不可选）；TestKeyGroupOptionsListsChoices 改为断言默认列出「不限制 + work + 通道组」；TestKeyGroupSetValidation 的四条拒绝路径（400 代挂 / 403 白名单外 / 409 空组 / 404 不存在）与 TestKeyGroupRevokedImmediatelyInactive（移出白名单后立刻失效）按新语义重写并通过。全量 go test + jscheck + uitest（含 auth-trace）+ preflight 全链绿。\n\n边界：/v1/models 的组名条目仍只给 work（避免客户端模型列表膨胀），切到通道组后该组模型与组名才会出现在目录里；\"默认开放\"意味着任何号池 Key 都能切到任何 enabled 通道组 —— 要限制特定用户，在后台「组」里勾选即变白名单；本次未改计费链路。",
-  "released_at": 1792571751,
+  "notes": "v0.31.91：第三方通道「探活」的候选导入弹窗不会再\"闪现消失\"。\n\n反馈：点「探活」，识别到模型的弹窗出现一下就没了。\n\n诚实边界先说清楚：本机用 jsdom + 真浏览器（Edge，1400×900）都复现不出来 —— 单击、双击、探活 0ms 与 800ms 延迟三种时序下，2500ms 采样里弹窗一直稳定存在。所以这次没有\"确证根因\"，而是把三条能产生这个观感的路径一起收紧：\n\n① 弹窗出现时，背后的通道列表还在重建（顺序反了）\n旧：先弹窗、再 loadChannels()。弹窗一出现，背后的卡片列表就被整体清空重建 —— 页面抖一下；运营正在弹窗里勾选时，列表还在变。\n新：先 await loadChannels()，再弹窗。弹窗一出现这一页就静止。弹窗里\"已在映射里\"的判断也改用刚刷新的映射，不再用点击瞬间的旧快照。\n\n② 遮罩\"点一下即关\"没有冷静期（最像\"闪现即消失\"的成因）\n探活要等上游几秒，人会在原地反复点那颗按钮；若请求恰好在两次点击之间返回，弹窗就出现在鼠标正下方，紧跟着那一次点击落在刚出现的遮罩上 —— 等于自己把它点掉。\n新：bindMaskDismiss() 统一给遮罩点击加 350ms 冷静期（openModal 与积分包弹窗共用同一实现）；探活按钮在等待期间显示\"探活中…\"并忽略连点。冷静期对手动关窗无感，但足以吃掉连点/双击的第二下与手势残影。\n\n③ 失败与空结果只写页首一行提示，等于\"什么都没发生\"\n通道卡排在页面下半部分时，那行 #chHint 在视口外，与\"弹窗闪一下没了\"根本分不清。\n新：探活失败改为弹窗显示上游原话 + 「重试探活」；成功但上游返回 0 个模型也弹窗说明。弹窗内容渲染异常改为 toast 显式报错，不再静默成一个空遮罩。\n\n测试：uitest 新增三组回归用例 —— 探活后弹窗存在、隔一个阶段（约 700ms）仍在；勾选/上游名/单价/倍率输入框真的渲染；遮罩在冷静期内点不关、过了冷静期能关（防止被后来的人改成\"永远关不掉\"）。jscheck / 全量 go test / preflight 全链绿。\n\n边界：本次未改探活的服务端逻辑（GET {base_url}/models 与写映射的语义一字未动），也没有改计费链路。",
+  "released_at": 1792573126,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.90/webapp.exe",
-      "sha256": "215e5d831f9fccf29635a7c34ef128716dee8f06c91bf56871374529afd4fcce",
-      "size": 16086528
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.91/webapp.exe",
+      "sha256": "27d943168521018cd7519d232f8318fccef47674d3ea97119bd1d9720c64c116",
+      "size": 16091136
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "4AWly1V8hss3dxXqmvWGtgz7U9XrFtL2WHQrYr4Yx5uqmxvRCo9urnYe5bBaqb3PUpF+AGAq1QoS4k/iFyUFCA==",
+  "signature": "ovRyDRf90WyHvRWcGb3uVsw0haNcBYZ7W2tqFs2vuUJbLSUJ7v5SazqNGDZ0UmBqgiNF90k/cQyDWv1rTJMZDQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

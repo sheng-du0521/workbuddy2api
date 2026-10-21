@@ -519,8 +519,8 @@ function creditModal(title, d, rows) {
   for (const r of rows) body.appendChild(creditPackRow(r));
   box.appendChild(body);
   mask.appendChild(box);
-  mask.onclick = (e) => { if (e.target === mask) mask.remove(); };
   document.body.appendChild(mask);
+  bindMaskDismiss(mask, () => mask.remove());
 }
 
 // creditRowsTotal 明细行的可用合计（排除已过期包）。
@@ -1021,6 +1021,23 @@ function copyBtn(getText, label, cls) {
 }
 
 // openModal 通用弹窗。返回 {mask, body, close}（点击遮罩 / × 关闭）。
+// bindMaskDismiss 绑定「点遮罩关闭」，并给刚出现的弹窗一段**冷静期**（v0.31.91）。
+//
+// 真实现场：探活/查积分这类操作要等一两秒，人往往在原地反复点那颗按钮；
+// 若请求恰好在两次点击之间返回，弹窗就出现在鼠标正下方 —— 紧跟着的那次点击
+// 落在**刚出现的遮罩**上，等于"自己把它点掉了"，看到的现象是"弹窗闪现即消失"。
+// 350ms 对手动点击无感（人不会在看清内容后 350ms 内去点遮罩），
+// 但足以吃掉连点/双击的第二下与手势残影。
+function bindMaskDismiss(mask, closeFn, delay) {
+  const openedAt = Date.now();
+  const guard = (delay == null) ? 350 : delay;
+  mask.onclick = (e) => {
+    if (e.target !== mask) return;
+    if (Date.now() - openedAt < guard) return;
+    closeFn();
+  };
+}
+
 function openModal(title, subtitle, opts) {
   const mask = el('div', 'modal-mask');
   const box = el('div', 'modal');
@@ -1038,8 +1055,8 @@ function openModal(title, subtitle, opts) {
   const body = el('div', 'modal-body');
   box.appendChild(body);
   mask.appendChild(box);
-  mask.onclick = (e) => { if (e.target === mask) closeFn(); };
   document.body.appendChild(mask);
+  bindMaskDismiss(mask, closeFn, (opts && opts.dismissDelay != null) ? opts.dismissDelay : 350);
   return { mask, body, close: closeFn };
 }
 
