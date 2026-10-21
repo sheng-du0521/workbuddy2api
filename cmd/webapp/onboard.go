@@ -135,7 +135,12 @@ func buildOnboardScript(p onboardPlan, goos string) (filename, content string) {
 			"set RC=%ERRORLEVEL%",
 			"echo.",
 			"if not \"%RC%\"==\"0\" echo [FAILED] exit %RC% - see the message above.",
-			"pause",
+			// pause 可跳过（v0.31.80）：双击运行时它当然要停住让人看结果，
+			// 但自动化/CI 里没人按键 —— 设 WB_NO_PAUSE=1 就直通。
+			"if not defined WB_NO_PAUSE pause",
+			// 自删只在**成功时**做（v0.31.80）：失败还删掉脚本，用户既看不到原文
+			// 也没法重试，只能回控制台重新生成一遍。失败时留着文件，并提示路径。
+			"if not \"%RC%\"==\"0\" (echo [KEPT] script left at %~f0 for retry & exit /b %RC%)",
 			// 自删：`del %~f0` 直接跟在后面会报 "The batch file cannot be found."
 			// （cmd 还持有文件句柄）。`(goto) 2>nul` 先让 cmd 跳出当前批处理、
 			// 释放句柄，删除才会成功。
@@ -200,8 +205,15 @@ func buildPowerShellOnboard(p onboardPlan) string {
 		"if ($null -eq $json -or $json.Trim().Length -eq 0) { throw '生成 JSON 失败' }",
 		"[IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))",
 		// 校验：读回来必须能解析，且能数出条目数（写坏了要当场发现，而不是让用户去猜）。
-		"$check = @([IO.File]::ReadAllText($path) | ConvertFrom-Json)",
-		"Write-Host ('已写入 ' + $path + '（当前共 ' + $check.Count + ' 个模型）')",
+		//
+		// ⚠️ 数量必须分两步算（v0.31.80 真机测出来的坑）：
+		// `@(<表达式> | ConvertFrom-Json)` 在 PS 5.1 里会把整个数组**再包一层**，
+		// $check.Count 永远是 1（实测：文件里 2 条，打印「当前共 1 个模型」）。
+		// 它不影响写入结果，但在"刚接入完"这个最紧张的时刻告诉用户"你的模型只剩 1 个"，
+		// 会让人以为原配置被覆盖了。先赋值、再按类型取长度才是对的。
+		"$check = [IO.File]::ReadAllText($path) | ConvertFrom-Json",
+		"$cnt = if ($check -is [array]) { $check.Length } else { 1 }",
+		"Write-Host ('已写入 ' + $path + '（当前共 ' + $cnt + ' 个模型）')",
 		// 拼接必须**整体加括号**：写成 `Write-Host 'a' + 'b'` 时 PowerShell 会把 `+`
 		// 当成第三个参数原样打印（实测输出 `「 + name + 」`，看起来像脚本没拼好）。
 		"Write-Host ('接入完成：打开 WorkBuddy 的模型选择即可看到「' + " + psQuote(p.Name) + " + '」。')",
@@ -315,6 +327,12 @@ else:
 	if p.Target == onboardTargetCCSwitch {
 		baseURL = p.Origin
 	}
+	// 收尾提示必须**按目标**给（v0.31.80 真机发现）：此前两句写死，
+	// ccswitch 用户会看到"打开 WorkBuddy 的模型选择"——去翻一个他根本没配的东西。
+	verifyHint := "  WorkBuddy：打开模型选择，应看到「" + p.Name + "」。"
+	if p.Target == onboardTargetCCSwitch {
+		verifyHint = "  重启 Claude Code 后 /status 应显示新的 base_url（" + baseURL + "）。"
+	}
 	return strings.Join([]string{
 		"#!/usr/bin/env bash",
 		"# WorkBuddy2API 一键接入脚本（" + p.Target + "）。本文件含明文 API Key，运行后请删除。",
@@ -331,7 +349,7 @@ else:
 		"python3 - <<'WB2API_PY'",
 		py + "WB2API_PY",
 		"echo '接入完成：'",
-		"echo '  WorkBuddy：模型选择里应出现「" + p.Name + "」；Claude Code：/status 应显示新的 base_url。'",
+		"echo " + shellQuote(verifyHint),
 		"rm -- \"$0\" 2>/dev/null || true",
 	}, "\n") + "\n"
 }

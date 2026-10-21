@@ -1,20 +1,20 @@
 {
-  "version": "0.31.79",
+  "version": "0.31.80",
   "min_supported": "0.24.0",
-  "notes": "v0.31.79：503 可定位 + 拒绝拼串模型名。\n\n① 查证结论：生产近 3 小时**没有 503**。6 小时 463 条流水里 461 ok + 2 interrupted，按 hard_credit / session_dead / 11140 / 11102 搜也是 0 条；号池 5 个在池号、46 个未入池。唯一异常是一条 404：客户端把 /v1/models 的整个清单用空格拼成一个字符串塞进 model（54 个名字、1KB），打了 2 个号各被 11102 拒、触发 rotateguard 才停。\n\n② 拒绝拼串模型名 → 400 零出站。判据用「词数 >= 3 或长度 > 128」，且**必须放在归一化之后**。第一版判据是「空格 >= 2」且放在归一化前，当场把带首尾空格的 [global:]GLM-5.3 误判成拼串回 400 —— 归一化用例立刻红。教训：漏判一条垃圾请求远好于误伤一个真实用户，所以判据改成 strings.Fields 的**词数**（连续/首尾空白都不算），检查点后移到归一化之后。\n\n③ 503 可定位：响应头新增 X-Wb-Fail-Kind（值来自 upstream.Classify 的分类名，同源不另起词），日志新增一行 kind + status + model + 上游原文（此前这条出口只写 message，日志里查不到）。报障时把这两个发来，就能判断是「号池真没号 / 积分耗尽 / 会话失效 / 上游 5xx」哪一类。\n\n验证：TestModelNameLooksLikeList（glm-5.3、claude-sonnet-4-5-20250929、wb-group-work、默认模型、glm 5.3、带首尾空格的 [global:]GLM-5.3、连续空白、128 字符边界都不判成清单；\"auto fast-model balanced-model deep-model\"、129 字符、54 个名字 join 判成清单）+ TestModelNameNormalization 回归；全量 go test + jscheck + uitest + preflight 通过。\n\n边界：拼串判据只在进入上游之前生效，不影响已归一化的名字；真实 503 仍原样返回（不改分类映射 —— 503 = 可重试的容量/上游问题，与 4xx 的分界由 upstream.Classify 决定），这次只让它可查；X-Wb-Fail-Kind 只在最终失败时出现。",
-  "released_at": 1792549935,
+  "notes": "v0.31.80：一键接入真机复验（发现并修了 4 个问题）。\n\n背景：一键接入的产物是脚本，只有真跑才知道能不能用。这次把 workbuddy 与 ccswitch 两个目标都在隔离 HOME 里真跑了一遍（不碰本机真实配置），复验脚本固化到 scripts/onboard_check.py。\n\n① 数量提示永远是 1（workbuddy）：文件里 2 条，脚本打印「当前共 1 个模型」。根因是 PowerShell 5.1 里 @(<表达式> | ConvertFrom-Json) 会把整个数组再包一层，.Count 恒为 1。它不影响写入结果，但在「刚接入完」这个最紧张的时刻告诉用户「你的模型只剩 1 个」，会让人以为原配置被覆盖了。修法：先赋值再按类型取长度（$check -is [array] → .Length）。\n\n② 失败时脚本把自己删了：$ErrorActionPreference='Stop' 一出错退出码非 0，然后照样执行自删 —— 用户既看不到原文也没法重试，只能回控制台重新生成。修法：只在成功时自删，失败保留并打印 [KEPT] script left at … for retry。\n\n③ CC Switch 的收尾提示写错目标：原来无论哪个目标都打印「WorkBuddy：模型选择里应出现…；Claude Code：/status…」，ccswitch 用户会去找一个自己根本没配的东西。现在按 target 给对应的一句话。\n\n④ .bat 的 pause 改成 if not defined WB_NO_PAUSE pause：双击运行照常停住看结果，自动化/CI 设 WB_NO_PAUSE=1 直通。\n\n复验覆盖（scripts/onboard_check.py）：workbuddy 成功（合并写入数组 / 同名替换不重复 / 其它条目保留 / url 与 apiKey / 备份等于原内容 / 自删 / 数量提示一致）、workbuddy 失败（非 0 退出 / [FAILED] / [KEPT] / 脚本仍在 / 坏配置没被覆盖 / 无 pause）、ccswitch（ANTHROPIC_BASE_URL 是 origin 不带 /v1 / AUTH_TOKEN / 既有 env 键保留 / 其它顶层字段保留 / 备份 / 自删）。三个场景全 PASS。\n\n边界：复验用本地临时实例 + 一次性 Key，不连生产、不写本机真实配置；ccswitch 只写 ~/.claude/settings.json 的 env，CC Switch 自己的 providers 表不动（那是它的第三方 SSOT）；脚本仍含明文 Key，运行后自删；复验脚本自身踩过「给 bash 传 Windows 反斜杠路径导致 rm -- \"$0\" 删不掉自己」的假失败，传参已一律转正斜杠。",
+  "released_at": 1792551560,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.79/webapp.exe",
-      "sha256": "39450e5d58d7dfbde850f5b8818c8d6333c526aafd6a9b4374952f3e3048cd5d",
-      "size": 15972864
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.80/webapp.exe",
+      "sha256": "b3e5781e9d0c430bf90dcc4d06799c25def64237c897375e37caf1a565a25623",
+      "size": 15973376
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "/HWHqEqbAJ8+BJpYfJrkLYjJleK2ALFazwH40RNN/exDK8PO7ulbmDxOr0u7AmdkaXqJCaSNHRI4QcrKNbh6Cg==",
+  "signature": "yekcF9UDBB39HzRC5CVWyTZ2YRus5Ia3i9SXs0+ueJrDKcraddJrVOEn3WH5KLAVUJOfxAMivCZPrsPFe5RQBw==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
