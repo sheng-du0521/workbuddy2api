@@ -1,20 +1,20 @@
 {
-  "version": "0.31.86",
+  "version": "0.31.87",
   "min_supported": "0.24.0",
-  "notes": "v0.31.86：CC Switch 也批量接入（两个目标同一套行为）。\n\n① 用户诉求：CC Switch 也要「一键把整组选配的模型全部接进去」，逐条执行、逐条结果、单个失败不中断、最后汇总。上一版只在 WorkBuddy 做了批量，理由是「CC Switch 的 env 只有一个模型槽」——那句话对了一半，结论错了。\n\n② 落地方式（为什么不是简单复制 WorkBuddy 的做法）：settings.json 的 env 是「一槽一模型」，但 Claude Code 认五个槽位：ANTHROPIC_MODEL（默认）、ANTHROPIC_DEFAULT_SONNET_MODEL / _OPUS_ / _HAIKU_（/model sonnet|opus|haiku 的落点）、ANTHROPIC_SMALL_FAST_MODEL（后台快任务）。所以前 5 个模型逐个占槽位，第 6 个起仍算成功——Claude Code 支持 /model <任意模型名>，请求把名字原样透传，平台按名选号。脚本把它记进 ~/.claude/wb2api-models.json 并在汇总里写明「用 /model 直接指定」，不假装它占了槽位。\n\n③ 三条纪律沿用 WorkBuddy 版：每条独立 try/catch（失败只记录并继续）；写盘只做一次（配置 + 清单各一次，逐条写会留半截配置）；有失败非 0 退出且保留脚本（能看原文、修完重跑）。备份、读回校验（base_url 必须匹配）、保留原有 permissions/其它 env 键全部保留；仍然不动 CC Switch 自己的 providers 表（第三方 SSOT，它自己会写）。\n\n④ 批量条件与 WorkBuddy 完全一致：只有后台「work官组」勾了选配（Restricted）才批量；没勾仍是单条组名（否则会把整份模型目录几十个全写进去）。这是行为一致，不是目标特例。\n\n⑤ 手动兜底同步：manual 的 JSON 也给 5 个槽位，超出部分单列 extra_models，note 说清槽位与 /model 用法——手动路径不能比脚本少。\n\n验证（两条真跑是重点，脚本逻辑只在真跑里才成立）：\n- TestOnboardCCSwitchBatchRunReal 真跑 .bat（隔离 USERPROFILE，预置含 permissions 与 KEEP_ME 的 settings.json）：第 2 条空 id → [2/3] FAIL 后 [3/3] ok 仍执行；汇总「成功 2 / 3，失败 1」；退出码非 0；ANTHROPIC_MODEL=m-one、ANTHROPIC_DEFAULT_SONNET_MODEL=m-three（失败项不占槽）；KEEP_ME 与 permissions 原样保留；备份含 old-model；清单 2 条且槽位一致。\n- TestOnboardCCSwitchBatchRunRealShell 真跑 .sh（bash + python3 wrapper + 隔离 HOME）：同上断言。\n- 字符串层：PowerShell 版 WriteAllText 恰好 2 次；sh 版 json.dump(cfg) 恰好 1 次；两者都有 foreach/[i/N]/汇总/失败明细/非 0 退出。\n- 全量 go test 通过（首次跑 internal/scheduler 的 TestCheckinAllRefreshBeforeExpiry 偶发失败，单跑与整包重跑均通过，属既有 flaky，与本改动无关）。\n\n顺带一处输出改进：.bat 的 powershell 行显式加 -OutputFormat Text。注意 stderr 的 \"#< CLIXML\" 是 PowerShell 在管道/文件重定向下写信息流的固有行为，双击运行（真控制台）不会出现——这个开关消不掉它，注释里已写明，免得下一个人以为没生效。\n\n边界：槽位只有 5 个（这是 Claude Code 的键决定的，不是我方限制）；第 6 个起的模型「接入成功」的含义是\"能用 /model <名字> 直接指定\"，不是\"出现在某个选择器里\"；批量只对配了选配的组生效；执行结果只有用户终端可见，服务端不给也不伪造。",
-  "released_at": 1792560068,
+  "notes": "v0.31.87：验证连接验全部模型 + 按目标换协议；Anthropic 错误带「下一步」。\n\n① 前两版把批量接入做通了（WorkBuddy + CC Switch），但「验证连接」还停在单条 + 单一协议上，等于给了一个跑得比验证更快的功能。三个问题：\n- 只验 d.model（批量时是清单首项）→ 接了 8 个只覆盖 1 个；\n- 恒打 /v1/chat/completions → CC Switch/Claude Code 实际走 /v1/messages，验的是另一条链路；\n- 只回一行结论，失败项混在一起。\n\n② 现在按目标选协议（WorkBuddy=chat/completions，CC Switch=/v1/messages 带 anthropic-version），\n覆盖 d.models 全部模型，并发 3 个 worker，按钮上显示「验证中 4/8」，结果按原清单顺序还原。\n每个模型真实计费一次 max_tokens:1，界面在开始前就写明。请求没发出去（status 0）与服务端拒绝分开报\n—— 否则用户会去查余额，而问题是自己的网络。\n\n③ 顺带修掉一个更根的问题：/v1/messages 的错误路径一直在丢信息。anthropicAdapter.finish() 的错误分支\n只取 error.message，OpenAI 信封里的 gateway_hint 被丢掉；而且它直接写 a.out、从不 copyHeader，\n所以 X-Wb-Fail-Kind（v0.31.79 专为排障加的头）与 Retry-After 在 Anthropic 路径上从来没出去过。\n现在 hint 拼进 message（Anthropic 的 error 只有 type/message，多写字段会被 SDK 丢掉；而\"该去哪充值/\n为什么没号\"正是用户唯一的下一步），原文保留在前、hint 追加在后，两个头一并透传。\n\n验证：\n- TestAnthropicErrorCarriesHintAndHeaders（503/402 两条）：hint 进 message、上游原话保留、\n  X-Wb-Fail-Kind 与 Retry-After 透传、信封仍是 Anthropic 形状、Content-Type 正确。\n- TestAnthropicErrorWithoutHintUnchanged：没有 hint 时输出与旧版逐字一致（不为新功能改动普通错误）。\n- 真实例 + 真 Key（临时脚本，未入库）：/v1/messages 与 /v1/chat/completions 都返回 503\n  （路由在、鉴权过、body 解析过、进到选号），结论一致；且 /v1/messages 的 message 里已带\n  「no healthy account available in pool; check /status or retry later」。这条是本版改前端协议的前提：\n  若 /v1/messages 在鉴权过+余额够时返回 404/400，换协议就是错的。\n- 全量 go test 通过；preflight 全链（gofmt/vet/前端/jscheck/uitest/冒烟/双平台构建）通过。\n\n边界：验证只证明「这一刻该模型能通」——冷却/限流/上游波动仍可能下一次拒绝；每个模型会真实计费一次\n（max_tokens:1），批量 20 个就是 20 次；并发 3 是为等待时间，不是限流规避。",
+  "released_at": 1792563634,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.86/webapp.exe",
-      "sha256": "0461e50031868dd2d655f560aa5c268156bc360e76db7ce40979dccf41ddfd40",
-      "size": 16021504
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.87/webapp.exe",
+      "sha256": "1da3a275adc1055e62a880717d93250a7452862a7a818542533b650ca3503133",
+      "size": 16025600
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "FqvvnUaotbacXm4rQkJq2KyGUB4uno6MV26aFQ01ZMdVIadt7QnQlfyoj3el5y0nudUjjXM2tYzfw2sF6ImHCg==",
+  "signature": "bEZ34D+pfRF2qgzE3+ppATuSjR17K0ahgqeAhoMgViUCoNfM9LfDQF+IJR3kdQ0gI98A1FbBeMN8jMjI7CoDCg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

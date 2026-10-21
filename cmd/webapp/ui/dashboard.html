@@ -1764,51 +1764,111 @@ async function openOnboardModal(k) {
       box.appendChild(el('div', 'muted',
         '文件里含明文 Key：运行完脚本会自删；若手动保存了副本，用完请删除。'));
 
-      // 「验证连接」（v0.31.75）：脚本跑完 ≠ 接上了。
-      // 用这把 Key 发一次最小请求（max_tokens:1），把"成功"变成有证据的结论；
-      // 失败按状态码给下一步，而不是让用户自己开客户端试。
+      // 「验证连接」（v0.31.75；v0.31.87 批量 + 按目标换协议）
+      //
+      // 两件事必须对，否则这个按钮等于装饰：
+      //   ① **协议要对** —— CC Switch / Claude Code 走 `/v1/messages`（Anthropic），
+      //      拿 `/v1/chat/completions` 去验是另一条链路，结论不能代表客户端会走的路；
+      //   ② **覆盖要对** —— 批量接入了 N 个模型，只验第一个等于没验。
+      //
+      // 代价：每个模型真实计费一次（max_tokens:1）。所以并发 3、按完成数报进度，
+      // 不做 20 个串行（那要等半分钟，用户会以为卡死）。
       const vRow = el('div', 'row');
-      vRow.style.cssText = 'gap:8px;margin-top:8px;align-items:center;';
+      vRow.style.cssText = 'gap:8px;margin-top:8px;align-items:flex-start;flex-wrap:wrap;';
       const bVerify = el('button', 'ghost', '验证连接');
-      const vLine = el('span', 'muted', '');
-      vLine.style.fontSize = '12px';
+      const vLine = el('div', 'muted', '');
+      vLine.style.cssText = 'font-size:12px;white-space:pre-wrap;line-height:1.6;';
       bVerify.onclick = async () => {
+        let models = (d.models || []).filter(Boolean);
+        if (!models.length && d.model) models = [d.model];
+        if (!models.length) { toast('没有可验证的模型', 'err'); return; }
+        const isCC = picked === 'ccswitch';
+        const url = isCC ? '/v1/messages' : '/v1/chat/completions';
+        const protoName = isCC ? 'Anthropic /v1/messages' : 'OpenAI /v1/chat/completions';
+
         bVerify.disabled = true;
-        bVerify.textContent = '验证中…';
         vLine.style.color = '';
-        vLine.textContent = '';
+        vLine.textContent = '准备验证 ' + models.length + ' 个模型（每个会真实计费一次 max_tokens:1）…';
+
+        let key = '';
         try {
+          // 明文 Key 只在这一刻取一次，发完即弃（与测试对话页同一纪律）。
           const rv = await api('/api/keys/' + encodeURIComponent(k.id) + '/reveal');
-          if (!rv.key) throw new Error('这把密钥没有可回显的密文，请重新生成后再验证');
-          // 明文 Key 只在这一刻拿一次，发完即弃（与测试对话页同一纪律）。
-          const t0 = performance.now();
-          const res = await fetch('/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Authorization': 'Bearer ' + rv.key, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: d.model, stream: false, max_tokens: 1,
-              messages: [{ role: 'user', content: 'ping' }],
-            }),
-          });
-          const ms = Math.round(performance.now() - t0);
-          if (res.ok) {
-            vLine.style.color = '#2e7d32';
-            vLine.textContent = '✓ 通了：HTTP 200 · ' + ms + 'ms · 模型 ' + d.model;
-          } else {
-            const txt = await res.text();
-            vLine.style.color = '#c0392b';
-            if (res.status === 402) vLine.textContent = '✗ 余额不足（Key 有效，去充值后再试）· ' + ms + 'ms';
-            else if (res.status === 404) vLine.textContent = '✗ 模型名不对或不在该 Key 范围：' + txt.slice(0, 120);
-            else if (res.status === 401) vLine.textContent = '✗ Key 无效或已停用，重新生成一把';
-            else vLine.textContent = '✗ HTTP ' + res.status + '：' + txt.slice(0, 140);
-          }
+          key = rv.key || '';
+          if (!key) throw new Error('这把密钥没有可回显的密文，请重新生成后再验证');
         } catch (e) {
           vLine.style.color = '#c0392b';
-          vLine.textContent = '✗ 请求没发出去：' + (e.message || e);
-        } finally {
+          vLine.textContent = '✗ ' + (e.message || e);
           bVerify.disabled = false;
           bVerify.textContent = '验证连接';
+          return;
         }
+
+        const one = async (m) => {
+          const t0 = performance.now();
+          try {
+            const res = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'Authorization': 'Bearer ' + key,
+                'Content-Type': 'application/json',
+                'anthropic-version': '2023-06-01',
+              },
+              body: JSON.stringify({
+                model: m, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }],
+              }),
+            });
+            const ms = Math.round(performance.now() - t0);
+            if (res.ok) return { model: m, ok: true, ms: ms };
+            const txt = (await res.text()).slice(0, 160);
+            return { model: m, ok: false, ms: ms, status: res.status, text: txt };
+          } catch (e) {
+            // 请求根本没发出去（断网/被拦）—— 与"服务端拒绝"必须分开报，
+            // 否则用户会去查余额，而真正的原因是自己的网络。
+            return { model: m, ok: false, ms: 0, status: 0, text: (e.message || String(e)) };
+          }
+        };
+
+        const results = [];
+        let next = 0;
+        let done = 0;
+        const worker = async () => {
+          while (next < models.length) {
+            const m = models[next++];
+            results.push(await one(m));
+            done += 1;
+            bVerify.textContent = '验证中 ' + done + '/' + models.length;
+          }
+        };
+        await Promise.all([worker(), worker(), worker()]);
+        // 并发完成顺序不定，按原清单顺序摆回去（用户是按那个顺序核对的）。
+        results.sort((a, b) => models.indexOf(a.model) - models.indexOf(b.model));
+
+        const okList = results.filter((r) => r.ok);
+        const badList = results.filter((r) => !r.ok);
+        const lines = [];
+        if (!badList.length) {
+          const lat = okList.map((r) => r.ms);
+          lines.push('✓ 全部可用：' + okList.length + '/' + models.length + ' · ' + protoName
+            + ' · ' + Math.min.apply(null, lat) + '~' + Math.max.apply(null, lat) + 'ms');
+        } else {
+          lines.push((okList.length ? '△ ' : '✗ ') + okList.length + '/' + models.length
+            + ' 可用 · ' + protoName);
+          for (const r of badList) {
+            let why;
+            if (r.status === 402) why = '余额不足（Key 有效，充值后再试）';
+            else if (r.status === 404) why = '模型名不对或不在该 Key 的范围';
+            else if (r.status === 401) why = 'Key 无效或已停用';
+            else if (r.status === 429) why = '上游限流，稍等再试';
+            else if (r.status === 0) why = '请求没发出去：' + r.text;
+            else why = 'HTTP ' + r.status + '：' + r.text;
+            lines.push('  - ' + r.model + '：' + why);
+          }
+        }
+        vLine.style.color = badList.length ? '#c0392b' : '#2e7d32';
+        vLine.textContent = lines.join('\n');
+        bVerify.disabled = false;
+        bVerify.textContent = '重新验证';
       };
       vRow.appendChild(bVerify);
       vRow.appendChild(vLine);

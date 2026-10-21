@@ -152,7 +152,19 @@ func (a *app) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 // 形状与 OpenAI 不同（`{"type":"error","error":{"type","message"}}`），
 // 客户端的 SDK 会按 type 分支处理；回 OpenAI 格式会被当成"未知响应"。
 func writeAnthropicError(w http.ResponseWriter, status int, etype, msg string) {
+	writeAnthropicErrorHint(w, status, etype, msg, "")
+}
+
+// writeAnthropicErrorHint 带 gateway_hint 的错误信封（v0.31.87）。
+//
+// **hint 拼进 message，不做独立字段**：Anthropic 的 error 对象只有 type/message，
+// 多写的字段会被 SDK 丢掉 —— 而"该去哪充值 / 为什么没有号"正是用户唯一的下一步。
+// 丢掉它，503 就退化成"服务挂了"，402 就退化成"失败了"。
+func writeAnthropicErrorHint(w http.ResponseWriter, status int, etype, msg, hint string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if hint != "" {
+		msg = msg + "\n" + hint
+	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"type":  "error",
@@ -528,9 +540,11 @@ func (a *anthropicAdapter) finish() {
 		if a.status >= 400 {
 			// OpenAI 错误 → Anthropic 错误（客户端按 type 分支处理）
 			msg := "upstream error"
+			hint := ""
 			var e struct {
 				Error struct {
-					Message string `json:"message"`
+					Message     string `json:"message"`
+					GatewayHint string `json:"gateway_hint"`
 				} `json:"error"`
 				Message string `json:"message"`
 			}
@@ -540,8 +554,13 @@ func (a *anthropicAdapter) finish() {
 				} else if e.Message != "" {
 					msg = e.Message
 				}
+				hint = e.Error.GatewayHint
 			}
-			writeAnthropicError(a.out, a.status, anthropicErrType(a.status), msg)
+			// 头必须先透传（v0.31.87）：`X-Wb-Fail-Kind` 是排障时唯一能带出去的分类
+			// 线索，`Retry-After` 是客户端决定"等多久"的依据。此前这条错误分支直接
+			// 写 a.out、从不 copyHeader，两个头在 Anthropic 路径上一直是丢的。
+			copyHeader(a.out.Header(), a.hdr)
+			writeAnthropicErrorHint(a.out, a.status, anthropicErrType(a.status), msg, hint)
 			return
 		}
 		out, err := openAIToAnthropicMessage(body, a.model)

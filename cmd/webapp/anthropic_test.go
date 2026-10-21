@@ -395,3 +395,95 @@ func TestAnthropicDefaultModelMapping(t *testing.T) {
 		t.Fatalf("空模型名不该映射，得 %q", got2)
 	}
 }
+
+// TestAnthropicErrorCarriesHintAndHeaders 错误路径必须带上「下一步」与排障头（v0.31.87）。
+//
+// 两件此前在 Anthropic 路径上一直是丢的：
+//
+//	① OpenAI 信封里的 `gateway_hint`（该去哪充值 / 为什么没号）—— Anthropic 的
+//	   error 对象只有 type/message，不拼进 message 就等于没给；
+//	② `X-Wb-Fail-Kind` / `Retry-After` —— 这条错误分支只写 a.out，从不 copyHeader。
+func TestAnthropicErrorCarriesHintAndHeaders(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		orig   string // 上游原话：必须原样保留（排障第一步就是看它）
+		want   string // gateway_hint：必须跟在后头
+	}{
+		{
+			name:   "503 无可用账号",
+			status: http.StatusServiceUnavailable,
+			body:   `{"error":{"code":503,"message":"upstream unavailable: no available account","gateway_hint":"no healthy account available in pool; retry later"}}`,
+			orig:   "upstream unavailable: no available account",
+			want:   "no healthy account available in pool",
+		},
+		{
+			name:   "402 余额耗尽",
+			status: http.StatusPaymentRequired,
+			body:   `{"error":{"code":402,"message":"insufficient balance","gateway_hint":"redeem a code in the console"}}`,
+			orig:   "insufficient balance",
+			want:   "redeem a code in the console",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			ad := newAnthropicAdapter(rec, "glm-5.3", false)
+			ad.Header().Set("X-Wb-Fail-Kind", "hard_credit")
+			ad.Header().Set("Retry-After", "7")
+			ad.WriteHeader(c.status)
+			if _, err := ad.Write([]byte(c.body)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			ad.finish()
+
+			if rec.Code != c.status {
+				t.Errorf("状态码 = %d，期望 %d", rec.Code, c.status)
+			}
+			got := rec.Body.String()
+			// 信封形状必须是 Anthropic 的（OpenAI 格式会被 SDK 当未知响应）。
+			if !strings.Contains(got, `"type":"error"`) || !strings.Contains(got, `"message"`) {
+				t.Errorf("不是 Anthropic 错误信封：%s", got)
+			}
+			// 原文必须保留：hint 是**追加**，不是替换。
+			if !strings.Contains(got, c.orig) {
+				t.Errorf("上游原话被改写（%q 不见了）：%s", c.orig, got)
+			}
+			if !strings.Contains(got, c.want) {
+				t.Errorf("message 里没有 gateway_hint（%q）：%s", c.want, got)
+			}
+			if h := rec.Header().Get("X-Wb-Fail-Kind"); h != "hard_credit" {
+				t.Errorf("X-Wb-Fail-Kind = %q，期望 hard_credit（排障全靠它）", h)
+			}
+			if h := rec.Header().Get("Retry-After"); h != "7" {
+				t.Errorf("Retry-After = %q，期望 7（客户端据此决定等多久）", h)
+			}
+			if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+				t.Errorf("Content-Type = %q，期望 application/json", ct)
+			}
+		})
+	}
+}
+
+// TestAnthropicErrorWithoutHintUnchanged 没有 hint 时信封与旧版逐字一致。
+//
+// 这条防的是"为了带 hint 把普通错误的输出改了" —— 客户端可能拿旧输出做匹配。
+func TestAnthropicErrorWithoutHintUnchanged(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeAnthropicError(rec, http.StatusBadRequest, "invalid_request_error", "bad thing")
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("不是合法 JSON：%v", err)
+	}
+	if got["type"] != "error" {
+		t.Errorf("type = %v", got["type"])
+	}
+	e, _ := got["error"].(map[string]any)
+	if e["type"] != "invalid_request_error" || e["message"] != "bad thing" {
+		t.Errorf("错误体被改变了：%v", e)
+	}
+	if strings.Contains(rec.Body.String(), "\\n") {
+		t.Errorf("没有 hint 时不该多出换行：%s", rec.Body.String())
+	}
+}
