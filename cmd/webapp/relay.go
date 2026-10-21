@@ -30,9 +30,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -148,6 +150,17 @@ outer:
 			resp, reqErr := p.relayRequest(r.Context(), payload, v, wantStream)
 			if reqErr != nil {
 				lastErr = v.UpstreamName + "：" + reqErr.Error()
+				// 超时 ≠ 没发出去（v0.31.99）：请求可能**已经完整送达并被上游受理**，
+				// 只是没在时限内答复。这时换下一条通道 = 让上游再做一遍（重复计费）。
+				// 连不上（dial 失败）才安全重试，两者必须分开。
+				if requestMaybeProcessed(reqErr) {
+					// 用 504 表达"已受理但超时未答"：下面的 relayFailureVerdict 会把它
+					// 归到 relay_timeout，并明确告诉客户端"网关没有重试、别自己猛点"。
+					upstreamStatus = http.StatusGatewayTimeout
+					log.Printf("WARN: [relay] 上游请求超时（可能已受理），停止重试 model=%s channel=%s：%v",
+						model, v.UpstreamName, reqErr)
+					break outer
+				}
 				continue
 			}
 			if resp.StatusCode >= 400 {
@@ -156,8 +169,19 @@ outer:
 				upstreamStatus = resp.StatusCode
 				lastErr = fmt.Sprintf("%s 返回 %d：%s", v.UpstreamName, resp.StatusCode,
 					truncateStr(strings.TrimSpace(string(body)), 200))
-				// 4xx 也不在这里判"这条通道坏了"：401 是 key 错（要人修配置），
-				// 429 是限流（换下一条/下一个成员都是合理的）—— 都不该改任何持久状态。
+				// 继续怎么试，由状态码决定（v0.31.99，见 retryVerdictFor 的注释）：
+				//   · 504/524 → 停：上游已受理但没在超时内答复，重试等于让上游再干一遍
+				//   · 400/404/422… → 这个模型在这条链路上跑不通，换通道没用，换组内下一个成员
+				//   · 401/403/408/409/429/5xx → 换下一条通道（另一条通道的 key 可能是好的）
+				// 无论哪种都**不改任何持久状态**：401 是配置问题、429 是限流，都不该顺手停用。
+				switch retryVerdictFor(resp.StatusCode) {
+				case retryNone:
+					log.Printf("WARN: [relay] 上游 %d 属「已受理/不可重试」类，停止重试 model=%s channel=%s",
+						resp.StatusCode, model, v.UpstreamName)
+					break outer
+				case retryNextModel:
+					continue outer
+				}
 				continue
 			}
 
@@ -233,6 +257,76 @@ outer:
 	return true, false
 }
 
+// requestMaybeProcessed 这次出站失败是否**可能已被上游受理**（v0.31.99）。
+//
+// 只有超时才可能是"发出去了、对方在算、我们不等了"：此时重试 = 让上游把同一件事
+// 再做一遍（视频/生图生成两份、对话重复计费）。连接失败（dial 不通 / DNS 失败）
+// 则确定没送达，可以安全换通道。
+//
+// 判据只用标准库已有的两类：context 超时 与 net.Error.Timeout()。
+// 不按错误字符串匹配 —— 那是"看起来对、换语言就废"的做法。
+func requestMaybeProcessed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
+
+// retryVerdict 上游返回 >=400 时"还要不要试"的三种结论。
+type retryVerdict int
+
+const (
+	// retryNextChannel 换下一条通道（同一个模型）。
+	retryNextChannel retryVerdict = iota
+	// retryNextModel 这个模型在这条链路上跑不通，换通道没用，但组内别的成员也许行。
+	retryNextModel
+	// retryNone 整体停止：再试只会重复花钱或注定同样失败。
+	retryNone
+)
+
+// retryVerdictFor 按上游状态码决定继续策略（v0.31.99）。
+//
+// # 为什么必须有这一层
+//
+// v0.31.96 起一次请求会跨"组内成员 × 每成员的通道"轮换，最多 6 次出站。
+// 之前对**所有** >=400 都是 `continue` —— 等价于"任何失败都再试一次"。两个后果：
+//
+//  1. **504 / 524 会重复扣上游**：这两个码来自 CDN/网关（Cloudflare 的 524 尤其典型），
+//     语义是"上游收到请求了，只是在超时时间内没算完"。这时重试 = 让上游把同一件事
+//     再做一遍：视频/生图会生成两份，对话会重复计费。new-api 也把这两个码列为
+//     "永不重试"。
+//  2. **400/404 会白试一整圈**：模型本身不支持该端点（典型是"生图模型走对话"，
+//     虽然 v0.31.98 已本地拦下，但上游还有别的形态）或远端名映射错了 —— 换几条通道
+//     都是同一个 400，最后才把真实原因报给用户，白等好几秒。这类失败只该换**成员**。
+//
+// 401/403 刻意归到"换通道"：key 是**通道级**的，另一条通道的 key 可能是好的；
+// 而 429 换通道是常规降级。这三类都不改持久状态（停用/冷却），只影响本次请求。
+func retryVerdictFor(code int) retryVerdict {
+	switch {
+	case code == http.StatusGatewayTimeout || code == 524:
+		// 524 是非标准码（Cloudflare: A Timeout Occurred），Go 里没有常量。
+		return retryNone
+	case code == http.StatusTooManyRequests, code == http.StatusRequestTimeout,
+		code == http.StatusConflict:
+		return retryNextChannel
+	case code == http.StatusUnauthorized, code == http.StatusForbidden:
+		return retryNextChannel
+	case code >= 500:
+		return retryNextChannel
+	case code >= 400:
+		// 400 / 404 / 405 / 422 …：请求本身跑不通，换通道无用
+		return retryNextModel
+	}
+	return retryNextChannel
+}
+
 // relayFailureVerdict 通道全失败时该回什么状态、给什么解释（纯函数，便于单测）。
 //
 // 输入只有"最后一次拿到的上游 HTTP 状态码"（0 = 没拿到响应）。三类失败必须分开说：
@@ -255,6 +349,14 @@ func relayFailureVerdict(upstreamStatus int) (status int, kind, hint string) {
 		return upstreamStatus, "relay_rejected",
 			"the upstream rejected this request (not a gateway failure): typically the model is not " +
 				"served on /chat/completions (e.g. an image model) or its remote name mapping is wrong"
+	case upstreamStatus == http.StatusGatewayTimeout || upstreamStatus == 524:
+		// 504/524 与"连不上"必须分开说：上游**已经收到**请求（可能已经生成/计费），
+		// 只是没在超时内答复。这时让客户端"重试"是危险的（会重复扣费），
+		// 该做的是去查上游任务状态/延长超时。
+		return http.StatusBadGateway, "relay_timeout",
+			"the upstream accepted the request but did not answer before the timeout (504/524): " +
+				"it may already be processed and billed, so this gateway does NOT retry it; " +
+				"check the channel's task status before retrying, or raise that channel's timeout"
 	case upstreamStatus == 0:
 		return http.StatusBadGateway, "relay_unreachable",
 			"cannot reach the upstream (timeout / network): check the channel base_url and the " +

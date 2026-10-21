@@ -301,6 +301,20 @@ const FX = {
         host_count: 2, host_groups: [{ group: '主力', count: 1 }, { group: '备用', count: 1 }], host_earned: 12.5 },
     ],
   },
+  // v0.31.100：后台「组」授权弹窗里新增了滚动限额输入（5h/1d/7d）。
+  // 没有这个桩，openKeyGroups 会在第一行 catch 里退出 —— 那段界面从未被执行过。
+  '/api/admin/users/2/keys': {
+    keys: [{
+      id: 11, name: 'tester-key', masked: 'sk-wb…', kind: 'pool', status: 'active',
+      group_scope: 'ch1', rl_5h: 2, rl_1d: 20, rl_7d: 100,
+      windows: [
+        { label: '5 小时', limit: 2, used: 1.25 },
+        { label: '1 天', limit: 20, used: 9 },
+        { label: '7 天', limit: 100, used: 66 },
+      ],
+    }],
+    groups: [{ id: 'ch1', label: '通道 · 中转A', members: 2 }],
+  },
   // v0.27.0：人工余额调整的返回。必须回显 before/after —— 界面靠它显示
   // "已从 X 调整为 Y"（只提示"已调整"无法让人确认到底改成了多少）。
   '/api/admin/users/1/balance': { id: 1, balance: 300, before: 100, after: 300, delta: 200 },
@@ -1712,6 +1726,22 @@ function run(pageFile, meOverride, plan) {
     // 余额调整必须真的走通（v0.27.0）。旧实现依赖原生 prompt：被浏览器弹窗策略
     // 拦截时它**不显示界面且返回 null**，调用方按"取消"处理 —— 用户看到的就是
     // "点了没反应、没有任何报错"。这条用例钉住"填了值就一定发得出去"。
+    // v0.31.100：滚动限额必须在授权弹窗里可见（否则管理员根本不知道有这个开关）。
+    // 同时断言"已用"跟着显示 —— 只给输入框不给已用量，等于让人盲填。
+    // 必须点 **tester 那张卡**上的「组」：clickText 只点第一个匹配，
+    // 而第一张卡是 admin（它没有 keys 桩，点了会在 catch 里退出，弹窗根本不出现）。
+    { nav: 'users',
+      run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })",
+        "(function () {var cards = document.querySelectorAll('#userCards .ecard');"
+        + "for (var i = 0; i < cards.length; i++) {"
+        + " if (cards[i].textContent.indexOf('tester') < 0) continue;"
+        + " var bs = cards[i].querySelectorAll('footer button');"
+        + " for (var j = 0; j < bs.length; j++) {"
+        + "  if (bs[j].textContent.trim() === '组') { bs[j].click(); return; } } } })()"],
+      has: [['.modal', 1], ['.modal input[type=number]', 3]],
+      textIn: [['.modal', '滚动限额（积分，0 = 不限）'], ['.modal', '5 小时'],
+        ['.modal', '已用 1.25'], ['.modal', '已用 66']] },
+    { run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })"] },
     { nav: 'users', prompt: { delta: '200', reason: '回归验证' },
       clickText: [['#userCards .ecard footer button', '加余额']] },
     { has: [['.toast-card', 1]],

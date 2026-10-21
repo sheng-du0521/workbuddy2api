@@ -12,10 +12,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // handleAdminUserKeys GET /api/admin/users/{id}/keys
@@ -45,6 +48,12 @@ func (a *app) handleAdminUserKeys(w http.ResponseWriter, r *http.Request) {
 			"kind":        k.Kind,
 			"status":      k.Status,
 			"group_scope": k.GroupScope,
+			// 滚动窗口（v0.31.100）：限额（积分，0=不限）+ 当前三个窗口的已用量。
+			// 不把 used 一起给的话，管理员填限额只能靠猜 —— 而"该填多少"正是他要判断的事。
+			"rl_5h":   k.RL5h,
+			"rl_1d":   k.RL1d,
+			"rl_7d":   k.RL7d,
+			"windows": a.store.WindowUsageForAdmin(k, time.Now().Unix()),
 			// allowed_groups：这把 Key **可以**被授权哪些组。
 			// 代挂 Key 只有 work —— 它只用本人账号，接通道组等于用平台的钱给个人用。
 			"allowed_groups": a.allowedGroupsFor(k),
@@ -87,6 +96,47 @@ func (a *app) allowedGroupsFor(k *APIKey) []string {
 		}
 	}
 	return out
+}
+
+// handleAdminSetKeyLimits POST /api/admin/keys/{id}/limits {h5,d1,d7}
+//
+// 设置某把 Key 的 5h / 1d / 7d 滚动消费上限（单位：积分，0 = 不限）。
+//
+// 为什么是管理员接口而不是用户自助：限额是**防滥用**手段，和"授权哪些组"同一性质 ——
+// 让用户自己调上限等于没有上限（真被刷的人第一件事就是去调高它）。
+func (a *app) handleAdminSetKeyLimits(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "非法 key id"})
+		return
+	}
+	var req struct {
+		H5 float64 `json:"h5"`
+		D1 float64 `json:"d1"`
+		D7 float64 `json:"d7"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json: " + err.Error()})
+		return
+	}
+	// 上界 1e6 积分：够大且能挡住"把 NaN/Inf 写进库"这类输入（它们会让比较永远为 false，
+	// 限额静默失效 —— 比报错危险得多）。
+	for _, v := range []float64{req.H5, req.D1, req.D7} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1e6 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "限额必须是 0–1000000 之间的数字（0 = 不限）"})
+			return
+		}
+	}
+	if err := a.store.SetKeyRateLimits(id, req.H5, req.D1, req.D7); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "key 不存在"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rl_5h": req.H5, "rl_1d": req.D1, "rl_7d": req.D7})
 }
 
 // handleAdminSetKeyGroups POST /api/admin/keys/{id}/groups  {group_scope:"ch3,ch4"}

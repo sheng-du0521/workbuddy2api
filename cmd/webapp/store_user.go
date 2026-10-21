@@ -170,8 +170,19 @@ type APIKey struct {
 	// 非空时它对**可用模型**是硬约束（不在该组的模型直接 404），
 	// 否则"切换分组"只是换了个标签，计费口径根本没变。
 	ActiveGroup string
-	LastUsedAt  int64
-	CreatedAt   int64
+
+	// 滚动消费窗口（v0.31.100）：5 小时 / 1 天 / 7 天内允许消耗的**积分**，0 = 不限。
+	//
+	// 为什么需要：余额只管"总量"，一把 Key 被脚本刷起来，10 分钟就能烧完整月额度，
+	// 事后只能人工停用。上游（Sub2API）的 Key 默认带 5h/1d/7d 三窗口正是这个原因。
+	// 单位取"积分"而不是微点：管理员填的是人话（如 5 积分/5 小时），
+	// 换算统一在 keywindows.go 里做，别让两个地方各算一遍。
+	RL5h float64
+	RL1d float64
+	RL7d float64
+
+	LastUsedAt int64
+	CreatedAt  int64
 }
 
 // HostEarning 一笔「代挂账号在池中为号主赚到」的收益流水（对账用）。
@@ -277,6 +288,9 @@ func (s *Store) migrateUsers() error {
 			host_group   TEXT NOT NULL DEFAULT '',
 			account_uids TEXT NOT NULL DEFAULT '',
 			last_used_at INTEGER NOT NULL DEFAULT 0,
+			rl_5h        REAL NOT NULL DEFAULT 0,
+			rl_1d        REAL NOT NULL DEFAULT 0,
+			rl_7d        REAL NOT NULL DEFAULT 0,
 			created_at   INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)`,
@@ -404,6 +418,22 @@ func (s *Store) migrateUsers() error {
 		if err := s.ensureColumn("users", c.col, c.ddl); err != nil {
 			return fmt.Errorf("migrate users column %s: %w", c.col, err)
 		}
+	}
+	// api_keys 的滚动窗口列（v0.31.100）：老库补三列，默认 0 = 不限。
+	// 与 usage_logs.key_id 的联合索引一起加 —— 没有索引时每次请求都要全表扫，
+	// 而这查询**在热路径上**（鉴权中间件），慢一次就是每个请求都慢。
+	for _, c := range []struct{ col, ddl string }{
+		{"rl_5h", "rl_5h REAL NOT NULL DEFAULT 0"},
+		{"rl_1d", "rl_1d REAL NOT NULL DEFAULT 0"},
+		{"rl_7d", "rl_7d REAL NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn("api_keys", c.col, c.ddl); err != nil {
+			return fmt.Errorf("migrate api_keys column %s: %w", c.col, err)
+		}
+	}
+	if _, err := s.db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_logs(key_id, created_at DESC)`); err != nil {
+		return fmt.Errorf("migrate usage_logs key index: %w", err)
 	}
 	// usage_logs 的 scope 增量列（v0.10.0 三类账单）。
 	if err := s.ensureColumn("usage_logs", "scope", "scope TEXT NOT NULL DEFAULT 'pool'"); err != nil {
@@ -1462,13 +1492,13 @@ func (s *Store) CreateAPIKey(userID int64, name, keyHash, keyEnc, prefix, kind, 
 		Kind: kind, HostGroup: hostGroup, AccountUIDs: accountUIDs, CreatedAt: now}, nil
 }
 
-const keyCols = `id, user_id, name, key_hash, key_enc, key_prefix, status, last_used_at, kind, host_group, account_uids, group_scope, active_group, created_at`
+const keyCols = `id, user_id, name, key_hash, key_enc, key_prefix, status, last_used_at, kind, host_group, account_uids, group_scope, active_group, rl_5h, rl_1d, rl_7d, created_at`
 
 func scanAPIKey(row interface{ Scan(dest ...any) error }) (*APIKey, error) {
 	var k APIKey
 	err := row.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.KeyEnc,
 		&k.KeyPrefix, &k.Status, &k.LastUsedAt, &k.Kind, &k.HostGroup, &k.AccountUIDs,
-		&k.GroupScope, &k.ActiveGroup, &k.CreatedAt)
+		&k.GroupScope, &k.ActiveGroup, &k.RL5h, &k.RL1d, &k.RL7d, &k.CreatedAt)
 	if err != nil {
 		return nil, err
 	}

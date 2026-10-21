@@ -163,7 +163,12 @@ def main():
         print("  若这是 CI 从 tag 重建，属于工具链差异 —— 以发布后的联网校验为准。")
         print("  要把它当闸门：python3 scripts/preflight.py --expect-manifest")
 
-    print("\nPREFLIGHT OK：可以发布（下一步：push2 → release → verify_release 全项）")
+    # 2026-10-22 起停止 GitHub 同步：这里不再引导 push2/release。
+    # 保留"可以发布"的判断（构建/测试/清单仍是绿的），但明确说明**发布动作已停用**，
+    # 否则后来人会照着提示去点 push2，然后被闸门拦下 —— 白折腾一次还要重新判断。
+    print("\nPREFLIGHT OK：构建、测试、清单三关都过（产物可用）")
+    print("⚠ 但 GitHub 同步已停止（仓库根 .github-sync-disabled）：push2 / release / _retag 均会 exit 2，")
+    print("  不要再走向上发布；需要上线只做本机部署（备份 → scp → restart → 核对 sha256）。")
 
 
 if __name__ == "__main__":

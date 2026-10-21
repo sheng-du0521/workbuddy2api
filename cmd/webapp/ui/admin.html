@@ -5526,7 +5526,40 @@ async function openKeyGroups(u) {
       grid.appendChild(lab);
     }
     card.appendChild(grid);
-    rows.push({ k: k, grid });
+
+    // 滚动限额（v0.31.100）：余额只管总量，管不住"十分钟烧完"。
+    // 三个窗口并排 + 显示当前已用 —— 不给已用量，管理员只能靠猜该填多少。
+    const lim = el('div', 'row');
+    lim.style.cssText = 'gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap;';
+    lim.appendChild(el('span', 'muted', '滚动限额（积分，0 = 不限）'));
+    const winMap = new Map((k.windows || []).map((w) => [w.label, w]));
+    const mkInput = () => {
+      const inp = el('input');
+      inp.type = 'number';
+      inp.min = '0';
+      inp.step = '0.1';
+      inp.style.width = '78px';
+      return inp;
+    };
+    const i5 = mkInput(); i5.value = String(k.rl_5h || 0);
+    const i1 = mkInput(); i1.value = String(k.rl_1d || 0);
+    const i7 = mkInput(); i7.value = String(k.rl_7d || 0);
+    for (const [lab, inp] of [['5 小时', i5], ['1 天', i1], ['7 天', i7]]) {
+      const w = winMap.get(lab);
+      inp.title = w
+        ? ('最近 ' + lab + ' 已实扣 ' + Number(w.used || 0).toFixed(2) + ' 积分'
+          + (w.limit > 0 ? ('，上限 ' + w.limit) : '，当前不限'))
+        : '';
+      const cell = el('span', 'muted');
+      cell.style.cssText = 'display:inline-flex;align-items:center;gap:4px;font-size:12px;';
+      cell.appendChild(el('span', null, lab));
+      cell.appendChild(inp);
+      if (w) cell.appendChild(el('span', 'mono muted', '已用 ' + Number(w.used || 0).toFixed(2)));
+      lim.appendChild(cell);
+    }
+    card.appendChild(lim);
+
+    rows.push({ k: k, grid, i5, i1, i7 });
     m.body.appendChild(card);
   }
 
@@ -5545,7 +5578,12 @@ async function openKeyGroups(u) {
       try {
         const res = await post('/api/admin/keys/' + encodeURIComponent(r.k.id) + '/groups',
           { group_scope: scope });
-        bits.push((r.k.name || r.k.id) + ' → ' + (res.group_scope || '（无）'));
+        // 限额与授权一起保存（同一屏两件事，分两次点会让人漏掉一件）。
+        const lim = await post('/api/admin/keys/' + encodeURIComponent(r.k.id) + '/limits', {
+          h5: Number(r.i5.value || 0), d1: Number(r.i1.value || 0), d7: Number(r.i7.value || 0),
+        });
+        bits.push((r.k.name || r.k.id) + ' → ' + (res.group_scope || '（无）')
+          + '｜限额 ' + (lim.rl_5h || 0) + '/' + (lim.rl_1d || 0) + '/' + (lim.rl_7d || 0));
         if ((res.dropped || []).length) bits.push('已丢弃 ' + res.dropped.join(','));
       } catch (e) {
         bad.push((r.k.name || r.k.id) + '：' + e.message);

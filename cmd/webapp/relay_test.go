@@ -5,9 +5,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -497,6 +500,149 @@ func seedChannelWithModels(t *testing.T, store *Store, name, baseURL string, mod
 		}
 	}
 	return uid
+}
+
+// timeoutNetErr 一个 net.Error 的最小实现（只用于验证"超时"判定）。
+type timeoutNetErr struct{}
+
+func (timeoutNetErr) Error() string   { return "i/o timeout" }
+func (timeoutNetErr) Timeout() bool   { return true }
+func (timeoutNetErr) Temporary() bool { return true }
+
+// TestRequestMaybeProcessed 区分"可能已受理"与"确定没发出去"（v0.31.99）。
+//
+// 这条判据直接决定会不会重复花钱：判宽了会把可安全重试的连接失败也停掉（可用性下降），
+// 判窄了会把"上游已在算"的超时当成没送达去重试（重复计费）。
+func TestRequestMaybeProcessed(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"context 超时", context.DeadlineExceeded, true},
+		{"包装后的 context 超时", fmt.Errorf("post: %w", context.DeadlineExceeded), true},
+		{"net 超时", &net.OpError{Op: "read", Net: "tcp", Err: timeoutNetErr{}}, true},
+		{"连接被拒", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}, false},
+		{"普通错误", errors.New("bad handshake"), false},
+	}
+	for _, c := range cases {
+		if got := requestMaybeProcessed(c.err); got != c.want {
+			t.Errorf("%s：requestMaybeProcessed = %v，期望 %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRetryVerdictFor 状态码 → 继续策略（v0.31.99）。
+//
+// 这张表就是"钱"：504/524 若判成可重试，一次客户端请求会让上游生成两份/计费两次。
+func TestRetryVerdictFor(t *testing.T) {
+	cases := []struct {
+		code int
+		want retryVerdict
+	}{
+		{504, retryNone},        // 上游已受理、超时未答（Cloudflare 524 同义）
+		{524, retryNone},        // 非标准码，Go 无常量
+		{429, retryNextChannel}, // 限流：换通道是常规降级
+		{408, retryNextChannel},
+		{409, retryNextChannel},
+		{401, retryNextChannel}, // key 是通道级的，另一条可能好
+		{403, retryNextChannel},
+		{500, retryNextChannel},
+		{502, retryNextChannel},
+		{503, retryNextChannel},
+		{400, retryNextModel}, // 请求本身跑不通，换通道无用
+		{404, retryNextModel},
+		{405, retryNextModel},
+		{422, retryNextModel},
+	}
+	for _, c := range cases {
+		if got := retryVerdictFor(c.code); got != c.want {
+			t.Errorf("retryVerdictFor(%d) = %v，期望 %v", c.code, got, c.want)
+		}
+	}
+}
+
+// TestRelayGatewayTimeoutNotRetried 上游 504 → **只打一次**，并把"别重试"写进错误。
+//
+// 现场依据：Cloudflare 524 / 网关 504 的语义是"上游收到请求但没在超时内算完"。
+// 这时重试 = 让上游把同一件事再做一遍（视频/生图会生成两份、对话会重复计费）。
+func TestRelayGatewayTimeoutNotRetried(t *testing.T) {
+	store, _, _, srv := newRelayChatApp(t, false)
+	defer store.Close()
+	defer srv.Close()
+
+	up, hits := fakeRelayPerModel(t, map[string]int{"slow-model": 504})
+	defer up.Close()
+	seedRelay(t, store, up.URL, "slow-model", 1.0, true)
+	seedPoolModels([]string{"pool-known-model"})
+
+	resp, body := chatOnce(t, srv, `{"model":"slow-model","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("上游 504 应回 502（不是透传，SDK 会对 504 自动重试），得 %d：%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Wb-Fail-Kind"); got != "relay_timeout" {
+		t.Fatalf("X-Wb-Fail-Kind = %q，期望 relay_timeout", got)
+	}
+	if !strings.Contains(body, "does NOT retry") {
+		t.Fatalf("错误里应说明网关不会重试（否则用户会自己再点一次）：%s", body)
+	}
+	if n := atomic.LoadInt32(hits); n != 1 {
+		t.Fatalf("504 不该重试，实际打了 %d 次上游", n)
+	}
+}
+
+// TestRelayGroupStopsOnGatewayTimeout 组内首个成员 504 → 不换下一个成员。
+//
+// 与 429 的差别就在这里：429 换成员是对的（限流是临时的），504 换成员是错的
+// （上游已经在算了，换一个成员就变成两笔生成/两份计费）。
+func TestRelayGroupStopsOnGatewayTimeout(t *testing.T) {
+	store, _, _, srv := newRelayChatApp(t, false)
+	defer store.Close()
+	defer srv.Close()
+
+	// 名字要保证"会 504 的那个"排在组内首位：组展开按名字排序，且优先挑"能跑"的成员。
+	// 这里用 aaa-/zzz- 前缀固定顺序，否则一旦 fast-b 排前面，这条用例测的就不是 504 了
+	// （第一版就踩了：fast-b 字典序在前，直接 200 通过）。
+	up, hits := fakeRelayPerModel(t, map[string]int{"aaa-slow": 504})
+	defer up.Close()
+	uid := seedChannelWithModels(t, store, "grp-timeout", up.URL, "aaa-slow", "zzz-fast")
+	seedPoolModels([]string{"pool-known-model"})
+
+	body := fmt.Sprintf(`{"model":"wb-group-ch%d","messages":[{"role":"user","content":"hi"}]}`, uid)
+	resp, out := chatOnce(t, srv, body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("组内 504 应回 502，得 %d：%s", resp.StatusCode, out)
+	}
+	if n := atomic.LoadInt32(hits); n != 1 {
+		t.Fatalf("504 之后不该再试同组其他成员，实际打了 %d 次", n)
+	}
+}
+
+// TestRelayGroupRetriesNextMemberOnBadRequest 组内成员 400 → 换下一个成员（不是整体放弃）。
+//
+// 400 是"这个模型在这条链路上跑不通"，与通道无关；组的价值正是"这批里挑一个能跑的"。
+func TestRelayGroupRetriesNextMemberOnBadRequest(t *testing.T) {
+	store, _, _, srv := newRelayChatApp(t, false)
+	defer store.Close()
+	defer srv.Close()
+
+	up, hits := fakeRelayPerModel(t, map[string]int{"bad-c": 400})
+	defer up.Close()
+	uid := seedChannelWithModels(t, store, "grp-badreq", up.URL, "bad-c", "good-d")
+	seedPoolModels([]string{"pool-known-model"})
+
+	body := fmt.Sprintf(`{"model":"wb-group-ch%d","messages":[{"role":"user","content":"hi"}]}`, uid)
+	resp, out := chatOnce(t, srv, body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("组内 400 应换成员后成功，得 %d：%s", resp.StatusCode, out)
+	}
+	if !strings.Contains(out, "hello from good-d") {
+		t.Fatalf("应由第二个成员应答：%s", out)
+	}
+	if n := atomic.LoadInt32(hits); n != 2 {
+		t.Fatalf("应各打一次（400 + 成功），实际 %d 次", n)
+	}
 }
 
 // TestRelayGroupRetriesNextMember 组名请求：首个成员失败时**自动换下一个成员**。

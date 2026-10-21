@@ -310,6 +310,25 @@ func (a *app) apiKeyGuardOpt(next http.HandlerFunc, requireBalance bool) http.Ha
 		// 因此跳过余额与消费闸（仍保留用户状态与限流校验）。
 		// requireBalance=false 的接口（如 /v1/models）同样跳过。
 		if requireBalance && key.Kind != KeyKindHost {
+			// 滚动窗口（v0.31.100）：余额只管总量，管不住"十分钟烧完"。
+			// 放在余额检查**之前**：额度已经超了还去查余额，只会给出误导性的原因。
+			// 统计失败时**放行**（记录 WARN）：宁可少拦一次，也不要因为统计故障
+			// 把整站请求全拒掉 —— 这是"防滥用"而不是"计费前置条件"。
+			if wu, retry, exceeded, werr := a.store.checkKeyWindows(key, time.Now().Unix()); werr != nil {
+				log.Printf("WARN: [keywindow] 统计失败（本次放行）key=%d：%v", key.ID, werr)
+			} else if exceeded {
+				// 429 而不是 402：这不是"没钱"，是"花太快"，语义上属于限流，SDK 会退避重试。
+				w.Header().Set("Retry-After", strconv.Itoa(int(retry)))
+				w.Header().Set("X-Wb-Fail-Kind", "key_window_exceeded")
+				writeOpenAIErrorHint(w, http.StatusTooManyRequests,
+					fmt.Sprintf("api key rate limit exceeded (%s window)", wu.W.Label),
+					fmt.Sprintf("key_window_exceeded: this key has used %.3f of its %.3f credit limit "+
+						"in the last %s; the window is rolling, so retry in about %d seconds. "+
+						"Nothing was sent upstream and nothing was charged; "+
+						"ask an admin to raise the limit or use another key",
+						billing.MicroToPoint(wu.UsedMicro), wu.W.Limit, wu.W.Label, retry))
+				return
+			}
 			if u.BalanceMicro <= 0 {
 				// 余额耗尽：硬拦截。允许上一笔把余额打成负数（在途请求不中断），
 				// 但负余额状态下不再放行新请求。
