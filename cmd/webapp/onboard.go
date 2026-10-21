@@ -390,14 +390,6 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	model, ok := sanitizeModelName(req.Model)
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "模型名不合法（不能为空、不能含引号/控制字符，长度 ≤120）",
-			"code":  "bad_model",
-		})
-		return
-	}
 	// 归属校验下推 SQL：跨用户查直接 404，不泄露存在性（与 reveal 同一纪律）。
 	k, err := a.store.GetAPIKey(u.ID, id)
 	if err != nil || k == nil {
@@ -411,26 +403,33 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// 「work官组」只有两类，且必须与 Key 类型匹配（v0.31.82）：
-	//   池计费 Key → wb-group-work（号池官组）
-	//   代挂 Key   → wb-group-host（自挂官组）
-	// 串了就在这里拒 —— 组名各自代表"从哪种账号里挑模型"，用错必然挑出跑不了的模型
-	// （v0.31.81 那个线上 404 就是"代挂 Key 用了号池组"）。
+	// 没传模型 = 用「work官组」的默认模型（v0.31.83）。
+	//
+	// 这是"默认会配置的模型"真正的落点：不只是弹窗替你填好，**接口层也认这个默认**。
+	// 调用方（脚本/第三方）不传 model 也能接入，且拿到的一定是这类 Key 的正确组名
+	// （号池官组 / 自挂官组），不会因为"没填"而失败或落到错误的组。
+	if strings.TrimSpace(req.Model) == "" {
+		if def := a.buildOnboardPlan(k).Default; def != "" {
+			req.Model = def
+		}
+	}
+	model, ok := sanitizeModelName(req.Model)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "模型名不合法（不能为空、不能含引号/控制字符，长度 ≤120）",
+			"code":  "bad_model",
+		})
+		return
+	}
+	// 「work官组」只有两类，且必须与 Key 类型匹配（v0.31.82）。
+	// 判定走 groupKindMismatch —— 与 ServeChat 那一处**共用同一个函数**（v0.31.83），
+	// 保证"能不能接入"和"能不能调用"用同一把尺子。
 	if strings.HasPrefix(strings.TrimSpace(model), groupModelPrefix) {
 		gid := strings.TrimPrefix(strings.TrimSpace(model), groupModelPrefix)
-		if k.Kind == KeyKindHost && gid == groupWorkID {
+		if code, msg, hint := groupKindMismatch(k.Kind, gid); code != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "代挂自用 Key 不能用号池官组（" + model + "）：那把 Key 只走你自己的账号，" +
-					"号池里的模型你的账号可能并没有。请用自挂官组 wb-group-host，或填一个具体模型名。",
-				"code": "host_key_cannot_use_pool_group",
-			})
-			return
-		}
-		if k.Kind != KeyKindHost && gid == groupHostID {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "池计费 Key 不能用自挂官组（" + model + "）：自挂官组是从你自己的账号里挑模型，" +
-					"池计费 Key 没有绑定账号。请用号池官组 wb-group-work。",
-				"code": "pool_key_cannot_use_host_group",
+				"error": msg + "（" + model + "）。" + hint,
+				"code":  code,
 			})
 			return
 		}

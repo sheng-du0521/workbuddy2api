@@ -1727,8 +1727,9 @@ async function openOnboardModal(k) {
   m.body.appendChild(ops);
 
   gen.onclick = async () => {
+    // 不因为"模型为空"就拦住（v0.31.83）：后端会用「work官组」的默认模型补上，
+    // 那条路才叫"自动按默认配置完成接入"。前端只在后端也拿不出默认时才需要用户动手。
     const model = inp.value.trim();
-    if (!model) { toast('先填一个模型名（可在「可用模型」里复制）', 'err'); return; }
     gen.disabled = true;
     gen.textContent = '生成中…';
     try {

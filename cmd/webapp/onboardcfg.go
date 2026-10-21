@@ -110,9 +110,97 @@ func (a *app) onboardAllowList(forHost bool) (allow []string, configured bool) {
 	return allow, true
 }
 
+// workGroupPlan 一次「work官组」接入的完整计划。
+//
+// v0.31.83：两类官组（号池 / 自挂）**共用这一个结构、共用一段计算**，
+// 差别只在 planKey() 给出的三个参数（组 id、候选基础、默认值 KV）。
+// 这么做是为了让"一致"成为结构性的，而不是靠两段代码各自小心：
+// 只要它们走同一个函数，默认值、候选顺序、组名位置、受限提示就不可能各写各的。
+type workGroupPlan struct {
+	IsHost     bool
+	GroupID    string
+	GroupName  string   // wb-group-work / wb-group-host
+	GroupLabel string   // 号池官组 / 自挂官组
+	Members    []string // 具体模型候选（不含组名）
+	Default    string
+	Restricted bool
+	Note       string
+}
+
+// planKey 两类官组的差异**只有这几个参数**，其余全部由 buildOnboardPlan 统一处理。
+func (a *app) planKey(isHost bool) (gid, label, defKV string) {
+	if isHost {
+		return groupHostID, "自挂官组", kvOnboardDefaultHost
+	}
+	return groupWorkID, "号池官组", kvOnboardDefaultPool
+}
+
+// buildOnboardPlan 算出接入计划（纯计算，不写响应）。
+//
+// 两条路径在以下五点上由同一段代码保证一致：
+//  1. 默认配置：配置优先 → 没配就用本组虚拟名（开箱即用）；
+//  2. 候选构成：本类"能跑什么" ∩ 后台选配，然后**组名固定排第一**；
+//  3. 可用性判断：全部来自 hostGroupMembers / keyModelIDs（与选号同源）；
+//  4. 鉴权：调用方（handler）用同一个 userGuard + 同一套归属校验；
+//  5. 异常/受限：同一套 note 文案结构（受限、空集、未绑定账号）。
+func (a *app) buildOnboardPlan(k *APIKey) workGroupPlan {
+	if k == nil {
+		return workGroupPlan{}
+	}
+	isHost := k.Kind == KeyKindHost
+	gid, label, defKV := a.planKey(isHost)
+	plan := workGroupPlan{
+		IsHost: isHost, GroupID: gid, GroupLabel: label,
+		GroupName: groupVirtualModel(gid),
+	}
+
+	// ① 候选基础：本类"能跑什么"（与选号同源的判据）。
+	base := a.keyModelIDs(k)
+	if isHost && a.proxy != nil {
+		if hm := a.proxy.hostGroupMembers(k); len(hm) > 0 {
+			base = hm
+		}
+	}
+	// ② 与后台选配取交集（选配为空 = 不限制）。
+	allow, configured := a.onboardAllowList(isHost)
+	plan.Restricted = configured
+	models := base
+	if configured {
+		models = intersectModels(base, allow)
+		plan.Note = "候选已按后台「work官组」选配过滤"
+		if len(models) == 0 {
+			plan.Note = "后台只放行了 " + strings.Join(allow, "、") +
+				"，但这把密钥一个都用不了 —— 直接手填模型名，或找管理员调整选配"
+		}
+	}
+	plan.Members = models
+
+	// ③ 默认值：配置优先；没配就用本组虚拟名。
+	def, _ := a.store.GetKV(defKV)
+	if strings.TrimSpace(def) == "" {
+		def = plan.GroupName
+	}
+	// 候选列表 = 组名 + 成员；组名固定排第一（它是"我不用挑"的入口）。
+	all := append([]string{plan.GroupName}, models...)
+	plan.Default = pickDefault(def, all)
+
+	// ④ 自挂官组的特有说明：没绑账号时我们确实不知道能跑什么。
+	if isHost && a.proxy != nil && len(a.proxy.hostGroupMembers(k)) == 0 {
+		plan.Note = "这把代挂 Key 没有绑定具体账号（或绑定的账号都不在池），平台无法判断它们能跑哪些模型；" +
+			"可以手填模型名，或在「API 密钥」里给它绑定账号后再试"
+	}
+	return plan
+}
+
+// candidates 组名在前、具体模型在后 —— 与弹窗候选顺序完全一致。
+func (p workGroupPlan) candidates() []string {
+	return append([]string{p.GroupName}, p.Members...)
+}
+
 // handleOnboardOptions GET /api/onboard/options?key_id=N
 //
 // 给一键接入弹窗用：候选模型 + 该类 Key 的默认模型。
+// 只负责"鉴权 → 取计划 → 序列化"，两类 Key 的计算全在 buildOnboardPlan 里。
 func (a *app) handleOnboardOptions(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
 	id, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("key_id")), 10, 64)
@@ -130,63 +218,16 @@ func (a *app) handleOnboardOptions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "该密钥已停用"})
 		return
 	}
-
-	// ① 这一类的候选基础：
-	//    池计费 Key → 平台模型目录（号池官组视角）
-	//    代挂 Key   → **它自己账号能满足的模型**（自挂官组视角）
-	// 这一区分是 v0.31.82 的核心：此前代挂 Key 也拿到整份号池目录，
-	// 于是"选得到、跑不了"，v0.31.81 的 404 就是这么来的。
-	isHost := k.Kind == KeyKindHost
-	base := a.keyModelIDs(k)
-	if isHost && a.proxy != nil {
-		if hm := a.proxy.hostGroupMembers(k); len(hm) > 0 {
-			base = hm
-		}
-	}
-	// ② 与后台选配取交集（选配为空 = 不限制）。
-	allow, configured := a.onboardAllowList(isHost)
-	models := base
-	note := ""
-	if configured {
-		models = intersectModels(base, allow)
-		note = "候选已按后台「work官组」选配过滤"
-		if len(models) == 0 {
-			note = "后台只放行了 " + strings.Join(allow, "、") +
-				"，但这把密钥一个都用不了 —— 直接手填模型名，或找管理员调整选配"
-		}
-	}
-	// ③ 组名永远排第一项：它是"我不用挑，你替我挑"的入口，也是默认值。
-	groupName := groupVirtualModel(groupWorkID)
-	groupLabel := "号池官组"
-	if isHost {
-		groupName = groupVirtualModel(groupHostID)
-		groupLabel = "自挂官组"
-	}
-	models = append([]string{groupName}, models...)
-
-	// ④ 默认值：配置优先；没配就用本类的组名（**开箱即用，不需要管理员先配**）。
-	def := ""
-	if isHost {
-		def, _ = a.store.GetKV(kvOnboardDefaultHost)
-		if strings.TrimSpace(def) == "" {
-			def = groupName // 自挂官组的默认：让平台在自己账号里挑
-		}
-	} else {
-		def, _ = a.store.GetKV(kvOnboardDefaultPool)
-		if strings.TrimSpace(def) == "" {
-			def = groupName
-		}
-	}
-	def = pickDefault(def, models)
-	resp := onboardOptionsResp{
-		Models: models, Default: def, Kind: k.Kind, Restricted: configured, Note: note,
-		GroupName: groupName, GroupLabel: groupLabel,
-	}
-	if isHost && a.proxy != nil && len(a.proxy.hostGroupMembers(k)) == 0 {
-		resp.Note = "这把代挂 Key 没有绑定具体账号（或绑定的账号都不在池），平台无法判断它们能跑哪些模型；" +
-			"可以手填模型名，或在「API 密钥」里给它绑定账号后再试"
-	}
-	writeJSON(w, http.StatusOK, resp)
+	plan := a.buildOnboardPlan(k)
+	writeJSON(w, http.StatusOK, onboardOptionsResp{
+		Models:     plan.candidates(),
+		Default:    plan.Default,
+		Kind:       k.Kind,
+		Restricted: plan.Restricted,
+		Note:       plan.Note,
+		GroupName:  plan.GroupName,
+		GroupLabel: plan.GroupLabel,
+	})
 }
 
 // hasModel 判断模型名是否在列表里。

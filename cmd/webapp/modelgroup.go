@@ -166,6 +166,28 @@ func (p *Proxy) visibleGroups(k *APIKey) []modelGroupInfo {
 	return out
 }
 
+// groupKindMismatch 判断「组名与 Key 类型不匹配」。
+//
+// ServeChat 与 handleKeyOnboard **共用这一个判定**（v0.31.83）：
+// 两处如果各写一套，迟早会出现"生成脚本时说不行、发请求却说行"这种自相矛盾。
+// 返回空串表示没有不匹配（未知组名 / ch<N> 历史组名放行，交给展开逻辑处理）。
+func groupKindMismatch(keyKind, gid string) (code, msg, hint string) {
+	switch {
+	case keyKind == KeyKindHost && gid == groupWorkID:
+		return "host_key_cannot_use_pool_group",
+			"代挂自用 Key 不能用号池官组",
+			"host-billed keys run only on your own accounts, so wb-group-work would pick a pool model " +
+				"your accounts do not have (upstream 404). Use wb-group-host (self-hosted group) or a " +
+				"concrete model name"
+	case keyKind != KeyKindHost && gid == groupHostID:
+		return "pool_key_cannot_use_host_group",
+			"池计费 Key 不能用自挂官组",
+			"wb-group-host picks a model from your own accounts, which only host-billed keys have. " +
+				"Use wb-group-work (pool group) or a concrete model name"
+	}
+	return "", "", ""
+}
+
 // allChannelGroups 所有 **enabled** 通道构成的组（不含 work）。
 //
 // v0.31.82 起**只给管理端内部使用**（例如排查"这条通道影响多少把 Key"），
