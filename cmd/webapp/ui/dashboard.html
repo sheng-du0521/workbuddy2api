@@ -1649,10 +1649,16 @@ async function openOnboardModal(k) {
   row.style.gap = '8px';
   row.style.alignItems = 'center';
   const inp = el('input');
-  // 默认填 work 官组的虚拟名（需求 4）：CC Switch / Claude Code 只认一个模型名，
-  // 填组名等于"用号池里此刻能跑的任意模型"，换模型不用改客户端配置。
-  inp.value = 'wb-group-work';
-  inp.placeholder = '模型名，或 wb-group-work（整个号池）';
+  // 默认值按 Key 类型给（v0.31.81）：代挂自用 Key **不能填组名** ——
+  // 组名展开的是平台号池的模型，而这把 Key 只在自己账号里选号，上游必然 404。
+  // 之前统一默认填 wb-group-work，代挂 Key 接入后就是"一直 404 / 流被中断"。
+  if (k.kind === 'host') {
+    inp.value = '';
+    inp.placeholder = '填你自己账号能跑的模型名（代挂 Key 不能用组名）';
+  } else {
+    inp.value = 'wb-group-work';
+    inp.placeholder = '模型名，或 wb-group-work（整个号池）';
+  }
   inp.style.flex = '1';
   inp.setAttribute('list', 'onboardModelList');
   const dl = el('datalist');
@@ -1660,16 +1666,31 @@ async function openOnboardModal(k) {
   row.appendChild(inp);
   row.appendChild(dl);
   m.body.appendChild(row);
-  // 候选列表：拉不到就让用户手填（不能因为模型目录接口失败而让整个功能不可用）。
-  // v0.31.74：改用**该密钥**的可用模型（与测试对话页、/v1/models 同源）——
-  // 用平台全集会让用户接上一个这把 Key 根本调不通的模型，接完才发现。
-  api('/api/keys/' + encodeURIComponent(k.id) + '/models').then((r) => {
-    for (const id of (r.models || [])) {
+  // 候选与**默认值**都来自服务端选配（v0.31.82）：运营在后台配"接入时给哪些模型"、
+  // 两类 Key 分别的默认值。前端不再硬编码 wb-group-work —— 那正是 v0.31.81 那个
+  // "代挂 Key 接入后一直 404" 的根因（组名对代挂 Key 无意义）。
+  api('/api/onboard/options?key_id=' + encodeURIComponent(k.id)).then((r) => {
+    const list = r.models || [];
+    dl.textContent = '';
+    for (const id of list) {
       const o = el('option');
       o.value = id;
       dl.appendChild(o);
     }
-    if (!(r.models || []).length && r.note) inp.placeholder = r.note;
+    // 默认值以服务端为准：它已经处理过"配置的默认值不在这把 Key 的候选里 → 回落第一项"。
+    if (r.default_model) inp.value = r.default_model;
+    if (r.note) {
+      inp.placeholder = r.note;
+      const tip = el('div', 'muted', r.note);
+      tip.style.fontSize = '12px';
+      tip.style.marginTop = '4px';
+      row.appendChild(tip);
+    }
+    if (!list.length && !r.default_model) {
+      inp.placeholder = (k.kind === 'host')
+        ? '手填你自己账号能跑的模型名（代挂 Key 不能用组名）'
+        : '手填模型名（平台暂无可用模型目录）';
+    }
   }).catch(() => {});
 
   const hint = el('div', 'muted');

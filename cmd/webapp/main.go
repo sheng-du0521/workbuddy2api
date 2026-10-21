@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.80"
+const version = "0.31.81"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1671,10 +1671,15 @@ func (a *app) routes() *http.ServeMux {
 	// 该 Key 的可用模型清单（v0.31.74）：测试对话页与一键接入共用这一个来源，
 	// 避免"下拉能选、发出去 404"（口径见 keymodels.go 头注释）。
 	mux.HandleFunc("GET /api/keys/{id}/models", a.userGuard(a.handleKeyModels))
+	// 一键接入的模型选配（v0.31.82）：运营配"接入时给哪些模型"，两类 Key 分别有默认值。
+	// 与 /api/keys/{id}/models 分开：那个是"实际能用什么"，这个是"接入时推荐填什么"。
+	mux.HandleFunc("GET /api/onboard/options", a.userGuard(a.handleOnboardOptions))
 	// 一键接入（v0.31.69，需求 P3）：生成把 key+地址+模型写进客户端的一次性脚本。
 	// 与 reveal 同一纪律：归属校验下推 SQL（跨用户 404）、不写日志、错误笼统。
 	mux.HandleFunc("POST /api/keys/{id}/onboard", a.userGuard(a.handleKeyOnboard))
 	mux.HandleFunc("GET /api/onboard/caps", a.userGuard(a.handleOnboardCaps))
+	mux.HandleFunc("GET /api/admin/onboard-config", a.adminGuard(a.handleAdminOnboardConfig))
+	mux.HandleFunc("POST /api/admin/onboard-config", a.adminGuard(a.handleAdminSetOnboardConfig))
 	mux.HandleFunc("DELETE /api/keys/{id}", a.userGuard(a.handleDeleteKey))
 	mux.HandleFunc("POST /api/keys/{id}/disable", a.userGuard(a.handleToggleKey(false)))
 	mux.HandleFunc("POST /api/keys/{id}/enable", a.userGuard(a.handleToggleKey(true)))

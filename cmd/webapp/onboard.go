@@ -411,6 +411,19 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// 代挂自用 Key 不能把**组名**写进配置（v0.31.81）。
+	//
+	// 组名（wb-group-*）展开出来的是平台号池的模型，而代挂 Key 只在自己的账号里选号 ——
+	// 号主没有那个模型，上游必然 11102/404，表现是"接入成功后一直 404 / 流被中断"。
+	// 在这里就拒绝，比让用户跑完脚本、打开客户端才发现要省一整轮排查。
+	if k.Kind == KeyKindHost && strings.HasPrefix(strings.TrimSpace(model), groupModelPrefix) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "代挂自用 Key 不能接入模型组（" + model + "）：组名对应平台号池的模型，" +
+				"而这把 Key 只走你自己的账号，上游会报「模型不存在」。请填一个你账号实际可用的模型名。",
+			"code": "host_key_cannot_use_group",
+		})
+		return
+	}
 	plain, derr := a.secret.Decrypt(k.KeyEnc)
 	if derr != nil || plain == "" {
 		writeJSON(w, http.StatusConflict, map[string]any{

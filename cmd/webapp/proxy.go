@@ -1588,6 +1588,21 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	//
 	// 展开必须放在归一化之前：归一化会把"不在已知清单里的名字"当作拼写差异处理，
 	// 而 `wb-group-work` 本来就不该出现在上游模型清单里。
+	//
+	// ⚠️ 代挂自用 Key（v0.31.81）**不许用组名**：组名展开出来的是**号池**的模型，
+	// 而代挂 Key 只在自己账号里选号 —— 号主没有那个模型，上游必然 11102/404。
+	// 现象是"一键接入后一直上游中断 + 404"，根因是接入弹窗把 `wb-group-work`
+	// 当成了所有 Key 的默认值（v0.31.76 引入）。这里直接拒，而不是展开成"碰运气"。
+	if strings.HasPrefix(strings.TrimSpace(model), groupModelPrefix) {
+		if k := apiKeyFrom(r); k != nil && k.Kind == KeyKindHost {
+			writeOpenAIErrorHint(w, http.StatusBadRequest,
+				"this key cannot use a model group",
+				"host-billed keys only run on your own accounts, so the pool group would pick a model "+
+					"your accounts do not have (upstream 404). Put a concrete model name instead — "+
+					"GET /v1/models lists the ones this key can see; no upstream account was used")
+			return
+		}
+	}
 	if real, ok := p.applyGroupExpansion(payload, model); ok {
 		model = real
 	}

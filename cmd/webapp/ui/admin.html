@@ -1752,6 +1752,21 @@
         <div id="chForm" style="display:none;"></div>
         <div id="chList">加载中…</div>
       </div>
+
+      <!-- 一键接入选配（v0.31.82）：决定用户点「接入」时能看到哪些模型、默认填哪个。
+           放在本页是因为它和"上游有什么模型"是同一个心智（都能看到号池优先/通道映射）。 -->
+      <div class="card" style="margin-top:14px;">
+        <div class="section-head">
+          <h2>一键接入选配</h2>
+          <span class="muted" style="font-size:12px;">只影响「接入」弹窗的候选与默认值，不影响 /v1/models 与实际可用性</span>
+        </div>
+        <div class="sub" style="margin:0 0 12px;">
+          不勾任何模型 = <b>不限制</b>（用户看到自己密钥的全量可用模型）。勾了就<b>取交集</b>：
+          只放行这几个，且仍受"这把 Key 自己能跑什么"约束。
+          <br>代挂自用的默认值<b>不能填组名</b>（组名对应号池模型，代挂 Key 会 404）。
+        </div>
+        <div id="onboardCfg">加载中…</div>
+      </div>
     </section>
 
     <section class="pane" data-pane="plugins" data-plugin-scope="admin">
@@ -8067,8 +8082,109 @@ async function saveAnthropicCfg() {
 //   1. 我配的 key 到底通不通？（探活按钮 → 服务端 GET /models，免费且不耗额度）
 //   2. 这个模型现在会走通道，还是会被号池抢走？（pool_models 命中就标「号池优先」）
 //   3. 改了之后什么时候生效？（停用/加模型会立刻作废模型缓存；计费倍率走快照，保存即生效）
+// loadOnboardCfg 一键接入选配（v0.31.82）。
+//
+// 只影响「接入」弹窗的候选与默认值 —— 不影响 /v1/models、不影响实际可用性。
+// 所以这里没有"保存即生效"的紧张感，失败也只提示、不阻塞通道页。
+async function loadOnboardCfg() {
+  const box = $('onboardCfg');
+  if (!box) return;
+  let d = null;
+  try { d = await api('/api/admin/onboard-config'); }
+  catch (e) { box.textContent = ''; box.appendChild(el('div', 'muted', '读取失败：' + e.message)); return; }
+  const all = (d && d.all) || [];
+  const picked = new Set((d && d.models) || []);
+  const raw = String((d && d.raw) || '');
+  // 配过但已下线的名字：必须显式提示，否则"我明明配了却不在列表里"没法自查。
+  const gone = raw.split(',').map((x) => x.trim()).filter((x) => x && !all.includes(x));
+  const configured = !!(d && d.configured);
+
+  box.textContent = '';
+  const head = el('div', 'row');
+  head.style.cssText = 'gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;';
+  const badge = el('span', 'tag ' + (configured ? 'accent' : ''), configured ? '已限制' : '不限制（全量）');
+  head.appendChild(badge);
+  const clear = el('button', 'ghost', '清空（恢复不限制）');
+  clear.style.padding = '2px 8px';
+  clear.onclick = () => { for (const cb of box.querySelectorAll('input[type=checkbox]')) cb.checked = false; };
+  head.appendChild(clear);
+  if (gone.length) {
+    const t = el('span', 'tag warn', '已下线：' + gone.join('、'));
+    t.title = '这些名字还在配置里，但平台当前模型目录里没有，已自动从候选剔除';
+    head.appendChild(t);
+  }
+  box.appendChild(head);
+
+  if (!all.length) {
+    box.appendChild(el('div', 'hintbar', '平台还没有可用模型目录（号池为空、也没有通道映射）。'));
+    return;
+  }
+  // 模型勾选区：两列 + 滚动。50+ 个模型铺满一屏会把下面的默认值顶走。
+  const grid = el('div');
+  grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;'
+    + 'max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px 10px;';
+  for (const m of all) {
+    const lab = el('label', 'muted', ' ' + m);
+    lab.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;';
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.value = m;
+    cb.checked = picked.has(m);
+    lab.prepend(cb);
+    grid.appendChild(lab);
+  }
+  box.appendChild(grid);
+
+  const row = el('div', 'row');
+  row.style.cssText = 'gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;';
+  const mkInput = (label, val, ph) => {
+    const wrap = el('div', 'row');
+    wrap.style.cssText = 'gap:6px;align-items:center;';
+    wrap.appendChild(el('span', 'muted', label));
+    const i = el('input');
+    i.value = val || '';
+    i.placeholder = ph;
+    i.className = 'mono';
+    i.style.width = '200px';
+    wrap.appendChild(i);
+    return { wrap, input: i };
+  };
+  const poolDef = mkInput('池计费默认', (d && d.default_pool) || '', '留空 = wb-group-work');
+  const hostDef = mkInput('代挂默认', (d && d.default_host) || '', '留空 = 让用户自己选');
+  row.appendChild(poolDef.wrap);
+  row.appendChild(hostDef.wrap);
+
+  const save = el('button', '', '保存选配');
+  const hint = el('span', 'muted', '');
+  hint.style.fontSize = '12px';
+  save.onclick = async () => {
+    const models = Array.from(box.querySelectorAll('input[type=checkbox]'))
+      .filter((c) => c.checked).map((c) => c.value);
+    save.disabled = true;
+    try {
+      const r = await post('/api/admin/onboard-config', {
+        models: models.join(','),
+        default_pool: poolDef.input.value.trim(),
+        default_host: hostDef.input.value.trim(),
+      });
+      hint.style.color = '#2e7d32';
+      hint.textContent = r.configured
+        ? '已保存：接入时只放行 ' + (r.models || []).length + ' 个模型'
+        : '已保存：恢复不限制（用户看到自己密钥的全量可用模型）';
+      loadOnboardCfg();
+    } catch (e) {
+      hint.style.color = '#c0392b';
+      hint.textContent = '保存失败：' + e.message;
+    } finally { save.disabled = false; }
+  };
+  row.appendChild(save);
+  row.appendChild(hint);
+  box.appendChild(row);
+}
+
 async function loadChannels() {
   loadAnthropicCfg(); // 同一页的另一块，各自失败互不影响
+  loadOnboardCfg();   // 一键接入选配（v0.31.82），同样独立失败
   const box = $('chList');
   if (!box) return;
   let d;
