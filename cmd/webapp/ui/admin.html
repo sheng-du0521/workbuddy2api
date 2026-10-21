@@ -8880,7 +8880,8 @@ async function loadModelRatios() {
       dr.appendChild(el('div', 'notice warn',
         '有 ' + drift.length + ' 个模型的官方口径与实收不一致（计费仍按实测执行）：'));
       const list = el('div', 'cfg-list');
-      for (const m of drift) list.appendChild(cfgRow(m.model, m.drift, ''));
+      // 第三参是「控件位」；这里没有控件，就别传（传 '' 会让提示位留下一个空盒子）。
+      for (const m of drift) list.appendChild(cfgRow(m.model, m.drift));
       dr.appendChild(list);
     }
   }
@@ -8969,8 +8970,11 @@ async function loadModelRatios() {
     if (!diffs.length) df.appendChild(el('div', 'muted', '（暂无变化记录）'));
     else for (const x of diffs.slice(0, 50)) {
       const kind = x.kind === 'free_switch' ? '免费状态' : (x.kind === 'credits_change' ? '倍率' : '新增模型');
+      // ⚠️ 第三参必须是**节点**：这里是「变化时间」，所以包一个文本 span。
+      // 直接传字符串曾导致 appendChild 抛 TypeError，把整个倍率页渲染中断
+      // （见 app.js cfgRow 的注释与 v0.31.94 修复）。
       df.appendChild(cfgRow(x.model, kind + '：' + (x.old || '—') + ' → ' + (x.new || '—'),
-        new Date(Number(x.created_at) * 1000).toLocaleString()));
+        el('span', 'muted', new Date(Number(x.created_at) * 1000).toLocaleString())));
     }
   }
 }

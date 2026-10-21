@@ -1,20 +1,20 @@
 {
-  "version": "0.31.93",
+  "version": "0.31.94",
   "min_supported": "0.24.0",
-  "notes": "v0.31.93：一键接入按「当前分组」批量接入它选用的全部模型。\n\n反馈：接入分组的对应后台选用的模型都批量接入。\n\n## 旧行为\n\n`batchModelsFrom` 的判据是 `Restricted`（后台「一键接入选配」配了才批量）。而通道组的\n\"选用模型\"在通道自己的映射表里、不在那份选配 KV 里 —— v0.31.92 又把通道组的\nconfigured 显式置 false，于是**通道组永远走单条**：点接入只得到一个 `wb-group-ch1`，\n后台为该通道启用的那批模型一个都没进去。\n\n## 现在（口径写进 plan.Batch，只有一处）\n\n| 当前分组 | 是否批量 | 清单来源 |\n|---|---|---|\n| 通道组 `ch<N>` | **总是批量** | 该通道 enabled 的模型映射（= 后台为该通道选用的那批） |\n| 号池官组 + 配了选配 | 批量 | 后台「号池官组选配」∩ 该 Key 能跑的 |\n| 号池官组 + 没配选配 | 单条（组名） | 成员是整份号池目录（几十个），全写进客户端会让模型选择器没法用 |\n| 自挂官组 | 同上（看选配） | 绑定账号能满足的模型 |\n\n配套：\n- `workGroupPlan` 新增 `Batch`，`batchModelsFrom` 只认它（不再自己判 Restricted）。\n- `/api/onboard/options` 多回 `batch` / `count`：接入弹窗在任何点击之前就写明\n  「将批量接入该分组的 N 个模型（… 在后台选用的全部）—— 不只写一个组名」。\n- 上限仍是 20，超出会截断并在生成结果里提示（先缩小选配范围）。\n\n## 验证\n\n- 单测：`TestOnboardBatchForChannelGroup`（通道组 Batch=true、清单=该通道两个模型）、\n  `TestOnboardBatchForOfficialGroupNeedsAllowList`（官组没选配不批量、配了才批量且清单是交集）。\n- uitest：接入弹窗出现「将批量接入该分组的 2 个模型」+ 分组名。\n- 真机（`scripts/keygroup_userview_check.py`，临时实例 + 直插通道）：\n  `onboard(已切组) batch=True count=2`；WorkBuddy 接入包 `models=[relay-only-model, relay-second]`；\n  CC Switch 接入包同一清单（\"能接几个\"不看目标）。\n\n## 边界\n\n- 官组没配选配时仍只接一个组名 —— 这不是漏改：官组成员是整份号池目录，\n  批量会把几十个模型塞进客户端。要批量就先在后台「选配」里勾出那批。\n- 未改通道组的成员计算、计费与选号链路。",
-  "released_at": 1792576078,
+  "notes": "v0.31.94：修倍率页「变化记录」的 TypeError（appendChild 收到非节点）。\n\n## 现场\n\n控制台报：\n  Failed to execute 'appendChild' on 'Node': parameter 1 is not of type 'Node'\n  at cfgRow (app.js) ← loadModelRatios (admin.html)\n\n用户看到的是**倍率页只画到一半就停**（后面的表格 / 变化记录区空白），控制台只有这一句，\n连\"哪个面板\"都不说。\n\n## 根因\n\n`cfgRow(title, hint, ctl)` 的第三参是「控件位」，只接受 DOM 节点。\n倍率页「变化记录」把**时间戳字符串**直接传了进去：\n\n    cfgRow(x.model, '倍率：1 → 2', new Date(...).toLocaleString())\n\n`c.appendChild('2026/10/21 18:00:00')` → TypeError。而这段代码在 `async function\nloadModelRatios()` 里，异常不是被捕获后提示，而是**中断整个函数的后续渲染** ——\n所以用户看到的不是\"变化记录坏了\"，而是\"倍率页坏了\"。\n\n顺带：`cfgRow(m.model, m.drift, '')`（口径矛盾列表）也在传空字符串，虽然 `''` 是 falsy\n不会抛错，但会在提示位留一个空盒子 —— 一并改成不传。\n\n## 修复\n\n1. `cmd/webapp/ui/app.js` `cfgRow`：第三参额外接受字符串/数字，渲染成只读 `<span>`。\n   不是纵容，是止损 —— 一处误用不该把整页画到一半就停下；纯文本放在\"控件位\"语义也说得通。\n2. `cmd/webapp/ui/admin.html` 变化记录：传 `el('span','muted', 时间)`（正确类型）；\n   口径矛盾列表改为不传第三参。\n\n## 为什么以前测试没抓到\n\nuitest 没有 `/api/admin/model-ratios` 的桩 → 接口返回 `{}` → `models` 为空 →\n`loadModelRatios` 在\"还没有同步数据\"处**提前 return**，「变化记录」那段永远执行不到。\n而 jsdom 里 async 未捕获异常不会让用例失败。\n\n现在补上非空桩（2 个模型 + 1 条 drift + 2 条 diffs）与断言：\n`#mrDiffs .cfg-row = 2`、`#mrDrift .cfg-row = 1`、两条变化文案、`共 2 个模型`。\n修复前这些断言会红（异常导致一行都渲染不出来）。\n\n## 验证\n\njscheck 0 错；uitest 全绿（新增 ratios 用例 7 条断言）；preflight --expect-manifest 全链绿。",
+  "released_at": 1792578739,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.93/webapp.exe",
-      "sha256": "8bf258d2829f973d63b07913c4d7d62bb229da5a9a82bce9eca319416cbf98af",
-      "size": 16094208
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.94/webapp.exe",
+      "sha256": "bb515ec94f1aa3aba257db3a9d580a0303e7b5cb0d637aa1f14395942bf691e0",
+      "size": 16095744
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "g4vh3pg4pJLsIhv4Y1en4dh6zPrp+MqkP86RzfAPAwIBpbcQQ+/3u6VphWGFOqZyCKVytvK3umUAf0U4DkFyBQ==",
+  "signature": "Kl6f7EN0wssS2tArtNIhkZQP21fM5hymngXrMXe0pEKlstdKCnBFmwAoZAaJhTh6PGzgGWcHsAhM19FfYH1mCg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

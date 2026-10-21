@@ -1097,7 +1097,21 @@ function cfgRow(title, hint, ctl) {
   if (hint) txt.appendChild(el('div', 'hint', hint));
   row.appendChild(txt);
   const c = el('div', 'cfg-ctl');
-  if (ctl) c.appendChild(ctl);
+  // ctl 正常是**控件节点**（开关 / 按钮 / 下拉）。
+  //
+  // v0.31.94：这里额外接受字符串/数字并渲染成只读文本 —— 不是纵容，是止损。
+  // 真实事故：倍率页「变化记录」把时间戳文本直接当第三参传进来，
+  // appendChild 收到字符串抛 TypeError；而它在一个 async 渲染函数里，
+  // 异常中断了后面整段渲染，用户只看到半页空白 + 控制台一句
+  // "parameter 1 is not of type 'Node'"（连哪个面板都不说）。
+  // 与其让一处误用把整页画到一半就停下，不如把纯文本按只读位渲染出来（语义也说得通）。
+  if (ctl) {
+    if (typeof ctl === 'string' || typeof ctl === 'number') {
+      c.appendChild(el('span', 'muted', String(ctl)));
+    } else {
+      c.appendChild(ctl);
+    }
+  }
   row.appendChild(c);
   return row;
 }

@@ -577,6 +577,23 @@ const FX = {
       { id: 'ch1', model: 'wb-group-ch1', label: '通道 · 中转A', kind: 'channel', members: 2 },
     ],
   },
+  // 模型倍率页（v0.31.94）：必须给**非空**数据，否则 loadModelRatios 会在
+  // "还没有同步数据" 处提前 return —— 「变化记录」那段（曾经的 TypeError 现场）
+  // 就永远跑不到，测试也永远绿。
+  '/api/admin/model-ratios': {
+    last_sync_at: now,
+    models: [
+      { model: 'glm-5.3', official_credits: 2, official_badge: 'x2', official_free: false,
+        measured_cost_1k: 1.2, billing_ratio: 0, drift: 'free_but_charged' },
+      { model: 'hy3-x', official_credits: 0, official_badge: '', official_free: true,
+        measured_cost_1k: 0, billing_ratio: 1.5, drift: '' },
+    ],
+    drift: [{ model: 'glm-5.3', drift: '官方标免费，实测扣点' }],
+    diffs: [
+      { model: 'glm-5.3', kind: 'credits_change', old: '1', new: '2', created_at: now },
+      { model: 'hy3-x', kind: 'free_switch', old: '收费', new: '免费', created_at: now - 60 },
+    ],
+  },
   // 一键接入选配（v0.31.93）：通道组要走**批量**，count 就是该组选用的模型数。
   '/api/onboard/options': {
     models: ['wb-group-ch1', 'relay-a', 'relay-b'],
@@ -1761,6 +1778,15 @@ function run(pageFile, meOverride, plan) {
     { run: ["document.querySelector('.modal-mask').dispatchEvent(new MouseEvent('click', { bubbles: true }))"],
       absent: ['.modal-mask'] },
 
+    // v0.31.94：倍率页「变化记录」曾把时间戳**字符串**当 cfgRow 的第三参，
+    // appendChild 收到非 Node → TypeError 把整页渲染中断。这里钉住两件事：
+    //   · 变化记录与口径矛盾都真的渲染出行；
+    //   · 文本位（时间）按只读 span 显示，不再靠"传什么类型都可能"。
+    { nav: 'ratios',
+      counts: [['mrTable', 3]],
+      has: [['#mrDiffs .cfg-row', 2], ['#mrDrift .cfg-row', 1]],
+      textIn: [['#mrDiffs', '倍率：1 → 2'], ['#mrDiffs', '免费状态：收费 → 免费'],
+        ['#mrDrift', '官方标免费，实测扣点'], ['#mrSummary', '共 2 个模型']] },
   ];
   const dashPlan = [
     { nav: 'overview', counts: [['ovChart', 1], ['ovToday', 4], ['ovFeed', 1], ['ovModels', 1]],
