@@ -53,6 +53,51 @@ type onboardPlan struct {
 	APIKey string
 	Model  string
 	Name   string // 展示名（WorkBuddy 的 name 字段）
+	// Models 批量接入的模型清单（v0.31.85）。
+	//
+	// 「一键接入」接入的是**这一组里被选中的全部模型**，不是其中一个。
+	// 清单由 buildOnboardPlan 的成员算出（后台选配 ∩ 这把 Key 能跑的），
+	// 单个模型的成败在**脚本里逐条记录**（脚本跑在用户机器上，服务端看不到过程）。
+	// 为空时退回单条（Model），即"只接一个模型/只接组名"的老行为。
+	Models []string
+}
+
+// onboardBatchLimit 一次批量接入的模型条数上限。
+//
+// 不是怕慢，是怕把用户的 models.json 塞成一份"模型大全"：没配选配时成员可能是
+// 整个号池目录（几十个），一键全写进去会让客户端模型选择器变得没法用。
+// 超限时截取前 N 个，并在响应里说明（前端会显示"已截取"）。
+const onboardBatchLimit = 20
+
+// batchModelsFrom 批量模式下的清单：**只有配了选配才批量**。
+//
+// 没配选配时成员是整份模型目录（几十个），一键全写进客户端会让模型选择器变成一锅粥；
+// 那种情况退回单条（组名），也就是"让平台替我挑一个"。
+func batchModelsFrom(pl workGroupPlan) (models []string, truncated int) {
+	if !pl.Restricted {
+		return nil, 0
+	}
+	return onboardBatchModels(pl.Members)
+}
+
+// onboardBatchModels 算出这次要批量接入的模型清单（去重、保序、限长）。
+//
+// members 为空（没配选配 / 这把 Key 一个都跑不了）→ 返回 nil，调用方退回单条模式。
+func onboardBatchModels(members []string) (models []string, truncated int) {
+	seen := map[string]bool{}
+	for _, m := range members {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		models = append(models, m)
+	}
+	if len(models) > onboardBatchLimit {
+		truncated = len(models) - onboardBatchLimit
+		models = models[:onboardBatchLimit]
+	}
+	return models, truncated
 }
 
 // onboardMaxModelLen 模型名的长度上限。
@@ -94,15 +139,28 @@ func sanitizeModelName(s string) (string, bool) {
 // `/chat/completions`。此前这里写的是 base（`…/v1`），于是 WorkBuddy 直接 POST 到
 // `/v1`，我们没这个路由 → 客户端报 `internal error 404`。
 // 现场日志：`[route] 404 POST /v1 ua="WorkBuddy/5.8.3 …"`。
-func onboardWorkBuddyEntry(p onboardPlan) map[string]any {
+func onboardWorkBuddyEntry(p onboardPlan, model string) map[string]any {
+	name := p.Name
+	if model != p.Model {
+		// 批量模式下每条用自己的模型名做展示名；单条模式保持 p.Name（可能与模型名不同）。
+		name = "WorkBuddy2API · " + model
+	}
 	return map[string]any{
-		"id":                p.Model,
-		"name":              p.Name,
+		"id":                model,
+		"name":              name,
 		"vendor":            "custom",
 		"url":               p.BaseURL + "/chat/completions",
 		"apiKey":            p.APIKey,
 		"useCustomProtocol": true,
 	}
+}
+
+// onboardEntryModels 本次要写的模型清单（批量优先，否则单条）。
+func onboardEntryModels(p onboardPlan) []string {
+	if len(p.Models) > 0 {
+		return p.Models
+	}
+	return []string{p.Model}
 }
 
 // buildOnboardScript 生成一次性接入脚本（Windows 用 .bat，其它平台用 .sh）。
@@ -180,15 +238,26 @@ func psQuote(s string) string {
 //  1. 文件不存在 → 建目录、写数组；
 //  2. 已存在 → **按 id 去重替换**（不是追加）—— 追加会让客户端里出现两个同名模型；
 //  3. 原文件先备份为 `models.json.wb2api.bak`，且写完后**读回来校验**（JSON 必须能解析）。
+//
+// v0.31.85 起支持**批量**：一次写入组内所有被选中的模型，且逐条报告结果。
+// 两条纪律：
+//   - **单个条目的失败不中断其余**（每个 entry 独立 try/catch）；
+//   - **写盘只做一次**（全部合并完再写）—— 逐条写会在中途失败时留下一份半截配置，
+//     而用户看到的"成功 3/5"与实际文件内容就对不上了。
 func buildPowerShellOnboard(p onboardPlan) string {
-	entry := onboardWorkBuddyEntry(p)
-	entryJSON, _ := json.MarshalIndent(entry, "", "  ")
-	// 用单引号字面量：JSON 里的双引号不需要转义，只有单引号要（psQuote 已处理）。
+	models := onboardEntryModels(p)
+	parts := make([]string, 0, len(models))
+	for _, m := range models {
+		entryJSON, _ := json.MarshalIndent(onboardWorkBuddyEntry(p, m), "", "  ")
+		// 用单引号字面量：JSON 里的双引号不需要转义，只有单引号要（psQuote 已处理）。
+		parts = append(parts, "  "+psQuote(string(entryJSON)))
+	}
+	entriesLiteral := "@(\n" + strings.Join(parts, ",\n") + "\n)"
+
 	return strings.Join([]string{
 		"$ErrorActionPreference = 'Stop'",
 		"$path = Join-Path $env:USERPROFILE '.workbuddy\\models.json'",
-		"$id = " + psQuote(p.Model),
-		"$entryJson = " + psQuote(string(entryJSON)),
+		"$entries = " + entriesLiteral,
 		"$dir = Split-Path -Parent $path",
 		"if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
 		"$list = @()",
@@ -201,28 +270,52 @@ func buildPowerShellOnboard(p onboardPlan) string {
 		"  Copy-Item -LiteralPath $path -Destination ($path + '.wb2api.bak') -Force",
 		"  Write-Host ('已备份原配置 -> ' + $path + '.wb2api.bak')",
 		"}",
-		"$entry = $entryJson | ConvertFrom-Json",
-		"$kept = @($list | Where-Object { $_.id -ne $id })",
-		"$kept += $entry",
+		"$okIds = @()",
+		"$fail = @()",
+		"$i = 0",
+		"foreach ($json in $entries) {",
+		"  $i++",
+		"  $who = '(第 ' + $i + ' 条)'",
+		"  try {",
+		"    $obj = $json | ConvertFrom-Json",
+		"    if ($null -eq $obj -or [string]::IsNullOrWhiteSpace($obj.id)) { throw '条目缺少 id' }",
+		"    $who = $obj.id",
+		"    $list = @($list | Where-Object { $_.id -ne $obj.id })",
+		"    $list += $obj",
+		"    $okIds += $obj.id",
+		"    Write-Host ('[' + $i + '/' + $entries.Count + '] ok   ' + $obj.id)",
+		"  } catch {",
+		"    $fail += ($who + '：' + $_.Exception.Message)",
+		"    Write-Host ('[' + $i + '/' + $entries.Count + '] FAIL ' + $who + '：' + $_.Exception.Message)",
+		"  }",
+		"}",
+		// 一次性写回：$list 已包含"原有 - 被替换的 + 本次成功的"。
+		"if ($okIds.Count -gt 0) {",
+		"  $kept = @($list)",
 		// ConvertTo-Json 对单元素数组会退化成对象 —— 客户端读到的就不是数组了。
-		// 用 @() 包一层再判断数量，是 PowerShell 里唯一可靠的写法。
-		"if ($kept.Count -eq 1) { $json = '[' + ($kept[0] | ConvertTo-Json -Depth 10) + ']' }",
-		"else { $json = $kept | ConvertTo-Json -Depth 10 }",
-		"if ($null -eq $json -or $json.Trim().Length -eq 0) { throw '生成 JSON 失败' }",
-		"[IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))",
+		"  if ($kept.Count -eq 1) { $json = '[' + ($kept[0] | ConvertTo-Json -Depth 10) + ']' }",
+		"  else { $json = $kept | ConvertTo-Json -Depth 10 }",
+		"  if ($null -eq $json -or $json.Trim().Length -eq 0) { throw '生成 JSON 失败' }",
+		"  [IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))",
+		"}",
 		// 校验：读回来必须能解析，且能数出条目数（写坏了要当场发现，而不是让用户去猜）。
 		//
 		// ⚠️ 数量必须分两步算（v0.31.80 真机测出来的坑）：
 		// `@(<表达式> | ConvertFrom-Json)` 在 PS 5.1 里会把整个数组**再包一层**，
 		// $check.Count 永远是 1（实测：文件里 2 条，打印「当前共 1 个模型」）。
-		// 它不影响写入结果，但在"刚接入完"这个最紧张的时刻告诉用户"你的模型只剩 1 个"，
-		// 会让人以为原配置被覆盖了。先赋值、再按类型取长度才是对的。
 		"$check = [IO.File]::ReadAllText($path) | ConvertFrom-Json",
 		"$cnt = if ($check -is [array]) { $check.Length } else { 1 }",
-		"Write-Host ('已写入 ' + $path + '（当前共 ' + $cnt + ' 个模型）')",
+		"Write-Host '===================='",
 		// 拼接必须**整体加括号**：写成 `Write-Host 'a' + 'b'` 时 PowerShell 会把 `+`
 		// 当成第三个参数原样打印（实测输出 `「 + name + 」`，看起来像脚本没拼好）。
-		"Write-Host ('接入完成：打开 WorkBuddy 的模型选择即可看到「' + " + psQuote(p.Name) + " + '」。')",
+		"Write-Host ('接入完成：成功 ' + $okIds.Count + ' / ' + $entries.Count + '，失败 ' + $fail.Count)",
+		"if ($fail.Count -gt 0) {",
+		"  Write-Host '失败明细：'",
+		"  foreach ($f in $fail) { Write-Host ('  - ' + $f) }",
+		"}",
+		"Write-Host ('配置文件：' + $path + '（当前共 ' + $cnt + ' 个模型）')",
+		"if ($okIds.Count -gt 0) { Write-Host ('打开 WorkBuddy 的模型选择即可看到 ' + $okIds.Count + ' 个「WorkBuddy2API」条目。') }",
+		"if ($fail.Count -gt 0) { exit 1 }",
 		"exit 0",
 	}, "\n")
 }
@@ -276,8 +369,9 @@ func buildPowerShellCCSwitch(p onboardPlan) string {
 // 不用 sed/awk 改 JSON：JSON 不是行式格式，"看起来改对了"的 sed 在遇到
 // 单行紧凑 JSON 或转义字符时会静默写坏文件 —— 而写坏的是用户的客户端配置。
 func buildShellOnboard(p onboardPlan) string {
-	entry := onboardWorkBuddyEntry(p)
-	entryJSON, _ := json.Marshal(entry)
+	entryModels := onboardEntryModels(p)
+	// 单条（兼容旧字段 WB2API_ENTRY：ccswitch 分支也只认一条 env）。
+	entryJSON, _ := json.Marshal(onboardWorkBuddyEntry(p, entryModels[0]))
 	// 两个目标共用一个 python 主体（按 WB2API_TARGET 分支）：
 	// 差别只有"写数组元素"与"合并对象字段"，而备份/校验/UTF-8 语义完全一样。
 	py := `import json, os, shutil, sys
@@ -315,19 +409,53 @@ if target == "ccswitch":
     print("已写入 " + path)
     print("  ANTHROPIC_BASE_URL = " + got)
 else:
-    entry = json.loads(os.environ["WB2API_ENTRY"])
+    # v0.31.85：批量。entries 是数组；旧调用方只给单条 WB2API_ENTRY 也能跑。
+    try:
+        entries = json.loads(os.environ.get("WB2API_ENTRIES") or "[]")
+    except Exception:
+        entries = []
+    if not isinstance(entries, list) or not entries:
+        entries = [json.loads(os.environ["WB2API_ENTRY"])]
     lst = []
     if isinstance(data, list):
         lst = data
     elif isinstance(data, dict):
         lst = [data]
-    lst = [x for x in lst if not (isinstance(x, dict) and x.get("id") == entry["id"])]
-    lst.append(entry)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(lst, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    check = json.load(open(path, encoding="utf-8"))
-    print("已写入 " + path + "（当前共 %d 个模型）" % len(check))
+    ok, fail = [], []
+    for i, entry in enumerate(entries, 1):
+        mid = (entry or {}).get("id") or ""
+        try:
+            if not mid:
+                raise ValueError("条目缺少 id")
+            # 按 id 去重替换：追加会让客户端里出现两个同名模型。
+            lst = [x for x in lst if not (isinstance(x, dict) and x.get("id") == mid)]
+            lst.append(entry)
+            ok.append(mid)
+            print("[%d/%d] ok   %s" % (i, len(entries), mid))
+        except Exception as ex:
+            fail.append("%s：%s" % (mid or ("(第 %d 条)" % i), ex))
+            print("[%d/%d] FAIL %s" % (i, len(entries), fail[-1]))
+    # 写盘只在最后做一次：逐条写会在中途失败时留下半截配置。
+    if ok:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(lst, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        check = json.load(open(path, encoding="utf-8"))
+        print("=" * 20)
+        print("接入完成：成功 %d / %d，失败 %d" % (len(ok), len(entries), len(fail)))
+        if fail:
+            print("失败明细：")
+            for f1 in fail:
+                print("  - " + f1)
+        print("配置文件：" + path + "（当前共 %d 个模型）" % len(check))
+        print("打开 WorkBuddy 的模型选择即可看到 %d 个「WorkBuddy2API」条目。" % len(ok))
+    else:
+        print("=" * 20)
+        print("接入完成：成功 0 / %d，全部失败（原配置未改动）" % len(entries))
+        for f1 in fail:
+            print("  - " + f1)
+    if fail:
+        sys.exit(1)
 `
 	baseURL := p.BaseURL
 	if p.Target == onboardTargetCCSwitch {
@@ -338,6 +466,18 @@ else:
 	verifyHint := "  WorkBuddy：打开模型选择，应看到「" + p.Name + "」。"
 	if p.Target == onboardTargetCCSwitch {
 		verifyHint = "  重启 Claude Code 后 /status 应显示新的 base_url（" + baseURL + "）。"
+	}
+	// 批量：把整组模型编成一个 JSON 数组传进去（单条仍保留 WB2API_ENTRY，兼容旧逻辑）。
+	var entryArr []json.RawMessage
+	for _, m := range entryModels {
+		b, _ := json.Marshal(onboardWorkBuddyEntry(p, m))
+		entryArr = append(entryArr, b)
+	}
+	entriesJSON := "[]"
+	if len(entryArr) > 0 {
+		if b, err := json.Marshal(entryArr); err == nil {
+			entriesJSON = string(b)
+		}
 	}
 	return strings.Join([]string{
 		"#!/usr/bin/env bash",
@@ -352,6 +492,7 @@ else:
 		"export WB2API_BASE_URL=" + shellQuote(baseURL),
 		"export WB2API_API_KEY=" + shellQuote(p.APIKey),
 		"export WB2API_ENTRY=" + shellQuote(string(entryJSON)),
+		"export WB2API_ENTRIES=" + shellQuote(entriesJSON),
 		"python3 - <<'WB2API_PY'",
 		py + "WB2API_PY",
 		"echo '接入完成：'",
@@ -384,6 +525,9 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		Target string `json:"target"`
 		Model  string `json:"model"`
 		OS     string `json:"os"` // 可选：windows / unix（默认按服务端平台猜，前端可以覆盖）
+		// Batch 批量接入（v0.31.85）：把整组被选中的模型一次接进去。缺省 true。
+		// 用指针是为了区分"没传"（=true，默认批量）与"显式 false"（只接一个）。
+		Batch *bool `json:"batch"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
@@ -395,6 +539,11 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 			"error": "不支持的接入目标", "code": "bad_target",
 		})
 		return
+	}
+	// 批量默认开启：这个功能的默认行为就是"把整组接进去"。
+	batch := true
+	if req.Batch != nil {
+		batch = *req.Batch
 	}
 	// 归属校验下推 SQL：跨用户查直接 404，不泄露存在性（与 reveal 同一纪律）。
 	k, err := a.store.GetAPIKey(u.ID, id)
@@ -458,6 +607,22 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		Model:   model,
 		Name:    "WorkBuddy2API · " + model,
 	}
+	// 批量接入（v0.31.85）：把**这一组里被选中的全部模型**一次接进去。
+	//
+	// 只在 WorkBuddy 目标下批量：CC Switch 写的是 settings.json 的 env（一个 base_url +
+	// 一个 token，模型由客户端自己挑），没有"多条模型"这个概念。
+	//
+	// ⚠️ 只有**配了选配**（Restricted）才批量：没配选配时成员是整份模型目录（几十个），
+	// 一键全写进客户端会让模型选择器变成一锅粥。那种情况下退回单条（组名），
+	// 也就是"让平台替我挑一个"—— 这才是"未选配"该有的样子。
+	batchTruncated := 0
+	if batch && target == onboardTargetWorkBuddy {
+		if m, truncated := batchModelsFrom(a.buildOnboardPlan(k)); len(m) > 0 {
+			plan.Models = m
+			plan.Model = m[0]
+			batchTruncated = truncated
+		}
+	}
 	// 客户端平台：不能只看服务端（服务端在 Linux 上跑，用户在 Windows 上用它）。
 	// 前端知道自己跑在哪，所以让它传；没传时按服务端平台给一个能跑的方向。
 	goos := strings.ToLower(strings.TrimSpace(req.OS))
@@ -466,11 +631,19 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 	}
 	filename, script := buildOnboardScript(plan, goos)
 
+	entryModels := onboardEntryModels(plan)
 	resp := map[string]any{
-		"target": target, "model": model, "base_url": plan.BaseURL,
+		"target": target, "model": plan.Model, "base_url": plan.BaseURL,
 		"filename": filename, "script": script,
 		"key_masked": maskSecret(plain),
 		"manual":     onboardManual(plan),
+		// 批量信息（v0.31.85）：前端据此显示"将接入 N 个模型"与清单。
+		// 真实成败由**脚本在用户机器上**逐条打印并汇总 —— 服务端看不到那个过程，
+		// 所以这里只给"计划接入的清单"，不伪造结果。
+		"models":    entryModels,
+		"count":     len(entryModels),
+		"batch":     len(plan.Models) > 1,
+		"truncated": batchTruncated,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -493,12 +666,19 @@ func onboardManual(p onboardPlan) map[string]any {
 	}
 	switch p.Target {
 	case onboardTargetWorkBuddy:
-		entry := onboardWorkBuddyEntry(p)
-		blob, _ := json.MarshalIndent(entry, "", "  ")
+		// 手动兜底同样给**批量**：一次复制一个数组进去，而不是让人逐条粘贴。
+		models := onboardEntryModels(p)
+		entries := make([]map[string]any, 0, len(models))
+		for _, m := range models {
+			entries = append(entries, onboardWorkBuddyEntry(p, m))
+		}
+		blob, _ := json.MarshalIndent(entries, "", "  ")
 		out["path"] = `%USERPROFILE%\.workbuddy\models.json` +
 			`（macOS/Linux: ~/.workbuddy/models.json）`
-		out["note"] = "顶层是数组：把这个对象追加进数组；已有同 id 的条目时**替换它**（不要留两条同名）。"
+		out["note"] = "顶层是数组：把下面这些对象合并进数组；已有同 id 的条目时**替换它**（不要留两条同名）。" +
+			"共 " + itoa(len(entries)) + " 条。"
 		out["json"] = string(blob)
+		out["count"] = len(entries)
 	case onboardTargetCCSwitch:
 		// CC Switch 自己有一张 providers 表（SQLite，第三方 SSOT），直接改它有风险：
 		// schema 会变、它自己也会写。这里给的是 Claude Code 认的 settings.json 形态，

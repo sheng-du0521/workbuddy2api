@@ -1740,11 +1740,24 @@ async function openOnboardModal(k) {
       // ① 主路径：下载脚本
       const box = el('div', 'card');
       box.style.background = 'var(--bg-soft, rgba(0,0,0,.02))';
-      const dl2 = el('button', '', '下载 ' + d.filename);
+      const dl2 = el('button', '', '下载 ' + d.filename
+        + ((d.count || 1) > 1 ? '（' + d.count + ' 个模型）' : ''));
       dl2.onclick = () => { downloadText(d.script, d.filename); toast('已下载，双击运行即可', 'ok'); };
       box.appendChild(dl2);
       box.appendChild(el('div', 'muted',
-        '地址 ' + d.base_url + ' · 模型 ' + d.model + ' · Key ' + (d.key_masked || '')));
+        '地址 ' + d.base_url + ' · 模型 ' + (d.model || '') + ' · Key ' + (d.key_masked || '')));
+      // 批量清单（v0.31.85）：一个一个列出来，让用户在运行前就能核对"要接哪些"。
+      if ((d.models || []).length > 1) {
+        const li = el('div', 'muted',
+          '将批量接入 ' + d.count + ' 个模型：' + d.models.join('、')
+          + (d.truncated ? ('（另有 ' + d.truncated + ' 个超出单次上限未包含，可用后台选配缩小范围）') : ''));
+        li.style.fontSize = '12px';
+        box.appendChild(li);
+        const tip = el('div', 'muted',
+          '脚本会逐个写入并在终端打印 [序号/总数] ok|FAIL；单个失败不影响其余，最后给出汇总与失败明细。');
+        tip.style.fontSize = '12px';
+        box.appendChild(tip);
+      }
       box.appendChild(el('div', 'muted',
         '文件里含明文 Key：运行完脚本会自删；若手动保存了副本，用完请删除。'));
 

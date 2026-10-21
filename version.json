@@ -1,20 +1,20 @@
 {
-  "version": "0.31.84",
+  "version": "0.31.85",
   "min_supported": "0.24.0",
-  "notes": "v0.31.84：修 WorkBuddy「internal error 404」。\n\n① 现象与证据：WorkBuddy 接入后任意模型都报 internal error 404。生产日志是 `[route] 404 POST /v1 ua=\"WorkBuddy/5.8.3 …\"` —— 它请求的是 POST /v1，不是 /v1/chat/completions。\n\n② 根因：接入脚本往 models.json 写的 url 是 base（…/v1），而 useCustomProtocol=true 的语义是「按我给的这个地址原样发」——客户端不会再拼 /chat/completions，于是 POST 到 /v1，我们没这条路由 → 404，被 WorkBuddy 包成 internal error 404。v0.31.69 当时按「url 是 base」写，那次是猜的，这次有实证。\n\n③ 修法两处缺一不可：① 脚本 url 改完整端点（…/v1/chat/completions），对以后接入的人；② 加 POST /v1 别名路由，与正式路由同一条 handler 链（同样鉴权、同样 body 上限），对已经接入的人 —— 已分发出去的脚本不会自动更新，只改脚本他们永远好不了；只加别名则每个人配置里都留着一个语义含糊的 base 地址。\n\n④ 验证：端到端（本地实例+真 Key）POST /v1 无 Key → 401（路由存在、鉴权生效，此前 404）、有 Key → 503（进业务层）、/v1/chat/completions → 503（与别名一致）。单测 TestPostV1AliasRegistered（两条路由都不能 404 且都必须 401）+ TestOnboardScriptParity 增加断言（脚本 url 必须含 /v1/chat/completions）。\n\n⑤ 给已接入用户：**不用重跑脚本**，POST /v1 别名已兜住旧 url；想让配置语义正确就重新点一次「接入」。\n\n边界：别名只对 POST 生效（GET /v1 仍 404，聊天只有 POST 不存在歧义）；/v1/models 不受影响；别名不改变任何计费/选号逻辑，进的是同一个 ServeChat。",
-  "released_at": 1792558102,
+  "notes": "v0.31.85：一键接入改为「批量接入整组模型」。\n\n① 行为变化：以前只写 1 条（组名或一个模型名），现在把该组里被选中的模型全部接进去 —— 一次点「接入」、跑一次脚本，客户端里直接出现 N 个 WorkBuddy2API · <模型> 条目。\n\n② 什么时候批量（一条硬规则）：后台「work官组」选配勾了 N 个 → 批量接这 N 个（上限 20，超出截取并说明）；没勾（不限制）→ 仍是单条写组名。没勾时不批量是刻意的：那时成员是整份模型目录（几十个），全写进去会让客户端模型选择器变成一锅粥。\n\n③ 逐条执行 + 逐条结果 + 汇总：脚本终端输出 `[1/3] ok glm-5.3` / `[2/3] FAIL xxx：原因` / `接入完成：成功 2 / 3，失败 1` + 失败明细 + 配置文件路径与总数。三条纪律：单个失败不中断其余（每条独立 try/catch，失败只记进 $fail 并继续）；**写盘只做一次**（逐条写会在中途失败时留下半截配置，而\"成功 3/5\"与实际文件就对不上）；有失败非 0 退出且脚本保留（可看明细、修完重跑）。\n\n④ 接口：POST /api/keys/{id}/onboard 新增 batch（缺省 true，显式 false 时只接那一个）；响应新增 models[]/count/batch/truncated，model 保留为清单首项（兼容旧前端）；手动兜底的 JSON 也变成数组（一次复制 N 条，不再逐条粘贴）。\n\n⑤ 测试：TestOnboardBatchPowerShell（3 条 entry、foreach、[序号/总数]、汇总、失败明细、exit 1、每条独立 try/catch、WriteAllText 只出现一次）、TestOnboardBatchShell（WB2API_ENTRIES、逐条循环、sys.exit(1)、json.dump 只一次）、TestOnboardBatchModels（去重保序/空成员/超 20 条截断）、TestBatchModelsFromOnlyWhenRestricted（没配不批量/配了才批量/成员空不批量）、**TestOnboardBatchRunReal**（真跑 .bat：第 2 条故意空 id → 断言 [2/3] FAIL 后 [3/3] ok 仍执行、汇总成功 2/3、退出码非 0、配置文件 1 原有 + 2 成功 = 3 条、失败那条没进文件、备份存在）。\n\n⑥ 为什么必须有真跑用例：批量逻辑在脚本里，字符串断言只能证明\"写了循环\"，只有真跑才能证明\"第一条失败后第二条还写\"。\n\n边界：上限 20 条；批量只对 WorkBuddy 生效（CC Switch 写 settings.json 的 env，一个 base_url + 一个 token，没有多条模型的概念）；服务端只给\"计划清单\"不给\"执行结果\"（脚本跑在用户机器上，伪造结果比不给更糟）；单条坏数据不会导致整组回滚。",
+  "released_at": 1792558964,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.84/webapp.exe",
-      "sha256": "edb36f6d44b7973f22e9615ca1497b3047ed201eff2b6a7fe4acf9cdc1b1ee80",
-      "size": 16001024
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.85/webapp.exe",
+      "sha256": "f5f263247e16bd25656f6eec7a2879539064d1dfdb01f2c9e093099cf9ac11fc",
+      "size": 16011776
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "Ts46CiCnykBPlWI5dXeylS1YjlrpPpBghOodl8kMOuVp7iAkMSD+9dPeZPqkoddi+lFWtBlAQZ9vzl0huLKKBQ==",
+  "signature": "hgkJ1KeDHY69EJLeRcnjjIU7j7JE7NUcKIvGeezpqFfTAg/+16Rrbjory1tn+yxSrKqrn385lc7Uz2BLTqkBBQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
