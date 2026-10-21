@@ -398,6 +398,9 @@ func (a *app) handleListKeys(w http.ResponseWriter, r *http.Request) {
 			// active_group（v0.31.88）：当前生效的模型组（"" = 不限制）。
 			// 前端要它才能显示"这把 Key 现在按哪组计费"以及切换后的选项高亮。
 			"active_group": k.ActiveGroup,
+			// active_group_label（v0.31.90）：前端要显示"分组 通道 · xxx"而不是 ch1。
+			// 算不出来（组已删/停用）时给空串，前端回落成裸 id。
+			"active_group_label": a.activeGroupLabel(k),
 			// stale_groups（v0.31.78）：scope 里**已经不存在**的组。
 			//
 			// 授权指向不存在的组是允许的（组被删/通道停用），但**必须让人看见** ——

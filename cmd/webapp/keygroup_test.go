@@ -85,6 +85,7 @@ func (f *groupFixture) reloadKey(t *testing.T) *APIKey {
 // TestKeyGroupSetValidation 四条拒绝路径的顺序与错误码。
 func TestKeyGroupSetValidation(t *testing.T) {
 	f := newGroupFixture(t)
+	chGroup := "ch" + itoa(int(f.chID))
 
 	// ① 代挂 Key：没有号池分组这回事。
 	hostKey, err := f.store.CreateAPIKey(f.user.ID, "h", "hash-h", "", "sk-wb-h", KeyKindHost, "", "")
@@ -96,14 +97,17 @@ func TestKeyGroupSetValidation(t *testing.T) {
 		t.Errorf("代挂 Key 应 400 + host_key_has_no_group，得到 %d %v", code, out)
 	}
 
-	// ② 未授权的通道组：403（不能因为"组存在"就放行）。
-	chGroup := "ch" + itoa(int(f.chID))
+	// ② **白名单模式**下不在名单里的组：403（不是 404 —— 不能让人以为组被删了）。
+	// v0.31.90 新语义：scope 为空 = 默认开放，非空 = 只有这些。
+	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, "ch999"); err != nil {
+		t.Fatalf("设白名单: %v", err)
+	}
 	code, out = f.setGroup(t, f.key.ID, chGroup)
 	if code != http.StatusForbidden || out["code"] != "group_not_granted" {
-		t.Errorf("未授权组应 403 + group_not_granted，得到 %d %v", code, out)
+		t.Errorf("白名单外的组应 403 + group_not_granted，得到 %d %v", code, out)
 	}
 
-	// ③ 授权了但组里没有模型：409（切过去每个请求都会失败）。
+	// ③ 白名单里有但组里没有模型：409（切过去每个请求都会失败）。
 	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, chGroup); err != nil {
 		t.Fatalf("授权: %v", err)
 	}
@@ -112,7 +116,7 @@ func TestKeyGroupSetValidation(t *testing.T) {
 		t.Errorf("空组应 409 + group_empty，得到 %d %v", code, out)
 	}
 
-	// ④ 授权了一个不存在的组：404。
+	// ④ 白名单里有一个不存在的组：404。
 	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, "ch999"); err != nil {
 		t.Fatalf("授权 ch999: %v", err)
 	}
@@ -122,7 +126,6 @@ func TestKeyGroupSetValidation(t *testing.T) {
 	}
 }
 
-// TestKeyGroupSwitchChangesModels 切换生效后，可用模型与目录立刻跟着变。
 func TestKeyGroupSwitchChangesModels(t *testing.T) {
 	f := newGroupFixture(t)
 	chGroup := "ch" + itoa(int(f.chID))
@@ -229,43 +232,36 @@ func TestKeyGroupSwitchKeepsMoney(t *testing.T) {
 // TestKeyGroupOptionsListsChoices 选项列表：不限制恒在，未授权的组不出现。
 func TestKeyGroupOptionsListsChoices(t *testing.T) {
 	f := newGroupFixture(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/keys/1/group-options", nil)
-	req.SetPathValue("id", itoa(int(f.key.ID)))
-	req = withUser(req, f.user)
-	rec := httptest.NewRecorder()
-	f.a.handleKeyGroupOptions(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("应 200，得到 %d", rec.Code)
+	chGroup := "ch" + itoa(int(f.chID))
+	call := func() keyGroupResp {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/keys/1/group-options", nil)
+		req.SetPathValue("id", itoa(int(f.key.ID)))
+		req = withUser(req, f.user)
+		rec := httptest.NewRecorder()
+		f.a.handleKeyGroupOptions(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("应 200，得到 %d", rec.Code)
+		}
+		var out keyGroupResp
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("解析: %v", err)
+		}
+		return out
 	}
-	var out keyGroupResp
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("解析: %v", err)
-	}
+
+	// ① 默认（scope 空 = 不限制）：不限制 + work + **通道组也在**（v0.31.90）。
+	// 这就是用户反馈的那条："控制台只有号池组，没有通道自建的组"。
+	out := call()
 	if !out.Editable {
 		t.Error("号池 Key 应允许切换")
 	}
-	// 未授权时只有两项：不限制 + work（work 恒可用）。
-	if len(out.Options) != 2 || out.Options[0].ID != "" || out.Options[1].ID != groupWorkID {
-		t.Errorf("未授权通道组时应是「不限制 + work」，得到 %+v", out.Options)
+	if len(out.Options) < 3 {
+		t.Fatalf("默认应列出 不限制 + work + 通道组，得到 %+v", out.Options)
 	}
-	if out.Options[0].Members == 0 {
-		t.Error("不限制的模型数不该是 0（号池至少有一个观测模型）")
+	if out.Options[0].ID != "" || out.Options[1].ID != groupWorkID {
+		t.Errorf("前两项应是不限制与 work，得到 %+v", out.Options)
 	}
-	if out.GlobalRatio <= 0 {
-		t.Errorf("global_ratio 应给出具体值（前端要显示「跟随全局 ×N」），得到 %v", out.GlobalRatio)
-	}
-
-	// 授权一个通道组后，它出现在选项里。
-	chGroup := "ch" + itoa(int(f.chID))
-	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, chGroup); err != nil {
-		t.Fatalf("授权: %v", err)
-	}
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/api/keys/1/group-options", nil)
-	req.SetPathValue("id", itoa(int(f.key.ID)))
-	req = withUser(req, f.user)
-	f.a.handleKeyGroupOptions(rec, req)
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	found := false
 	for _, o := range out.Options {
 		if o.ID == chGroup {
@@ -273,11 +269,24 @@ func TestKeyGroupOptionsListsChoices(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("已授权的通道组应出现在选项里，得到 %+v", out.Options)
+		t.Errorf("默认就该能选通道组（不必先授权），得到 %+v", out.Options)
+	}
+	if out.GlobalRatio <= 0 {
+		t.Errorf("global_ratio 应给出具体值（前端要显示「跟随全局 ×N」），得到 %v", out.GlobalRatio)
+	}
+
+	// ② 白名单模式：只列 work + 名单里的那个，其它通道组被排除。
+	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, chGroup); err != nil {
+		t.Fatalf("授权: %v", err)
+	}
+	out = call()
+	for _, o := range out.Options {
+		if o.ID != "" && o.ID != groupWorkID && o.ID != chGroup {
+			t.Errorf("白名单模式下不该出现 %q", o.ID)
+		}
 	}
 }
 
-// TestKeyGroupOptionsHostNotEditable 代挂 Key：不可切换，且给出原因。
 func TestKeyGroupOptionsHostNotEditable(t *testing.T) {
 	f := newGroupFixture(t)
 	hostKey, err := f.store.CreateAPIKey(f.user.ID, "h2", "hash-h2", "", "sk-wb-h2", KeyKindHost, "", "")
@@ -319,21 +328,21 @@ func TestKeyGroupRevokedImmediatelyInactive(t *testing.T) {
 	}
 	k := f.reloadKey(t)
 	if ms := f.px.activeGroupModels(k); ms == nil {
-		t.Fatal("授权有效时该组应生效")
+		t.Fatal("在白名单里时该组应生效")
 	}
 
-	// 管理员撤销授权：active_group 仍是 chN，但必须**立刻**不再约束/生效。
-	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, ""); err != nil {
-		t.Fatalf("撤销授权: %v", err)
+	// 管理员把它**移出白名单**（scope 换成别的组）：active_group 仍是 chN（用户的选择），
+	// 但必须**立刻**不再生效 —— 否则"撤销"等于没生效。
+	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, "ch999"); err != nil {
+		t.Fatalf("移出白名单: %v", err)
 	}
 	k = f.reloadKey(t)
 	if k.ActiveGroup != chGroup {
-		t.Fatalf("撤销授权不该改动 active_group（那是用户的选择）：%q", k.ActiveGroup)
+		t.Fatalf("改白名单不该改动 active_group：%q", k.ActiveGroup)
 	}
 	if ms := f.px.activeGroupModels(k); ms != nil {
-		t.Errorf("撤销授权后该组必须立刻失效（按不限制处理），得到 %v", ms)
+		t.Errorf("移出白名单后该组必须立刻失效（按不限制处理），得到 %v", ms)
 	}
-	// 界面口径也要一致：选项里不该再有它，且要提示"已失效"。
 	req := httptest.NewRequest(http.MethodGet, "/api/keys/1/group-options", nil)
 	req.SetPathValue("id", itoa(int(f.key.ID)))
 	req = withUser(req, f.user)
@@ -343,10 +352,54 @@ func TestKeyGroupRevokedImmediatelyInactive(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	for _, o := range out.Options {
 		if o.ID == chGroup {
-			t.Error("撤销授权后该组不该再出现在可选项里")
+			t.Error("移出白名单后该组不该再出现在可选项里")
 		}
 	}
 	if !strings.Contains(out.ActiveLabel, "已失效") {
 		t.Errorf("当前生效组失效时必须显式提示，得到 %q", out.ActiveLabel)
+	}
+}
+
+// TestKeyGroupChannelGroupDefaultOpen 通道组默认可选，不需要先授权（v0.31.90）。
+//
+// 这是用户反馈的核心："用户控制台密钥以及接入只有号池组，没有通道自建的组"。
+// 通道组与 work 一样是平台供给，默认就该能选；要限制时管理员才把它变成白名单。
+func TestKeyGroupChannelGroupDefaultOpen(t *testing.T) {
+	f := newGroupFixture(t)
+	chGroup := "ch" + itoa(int(f.chID))
+	if _, err := f.store.SaveUpstreamModel(&UpstreamModel{
+		UpstreamID: f.chID, Model: "gpt-open", RemoteModel: "gpt-open", CreditPer1k: 2, Enabled: true,
+	}); err != nil {
+		t.Fatalf("SaveUpstreamModel: %v", err)
+	}
+	// 没有调用任何 SetAPIKeyGroupsByID —— 直接切。
+	if code, out := f.setGroup(t, f.key.ID, chGroup); code != http.StatusOK {
+		t.Fatalf("未授权也应能切到通道组（默认开放），得到 %d %v", code, out)
+	}
+	k := f.reloadKey(t)
+	if k.ActiveGroup != chGroup {
+		t.Fatalf("active_group = %q，期望 %q", k.ActiveGroup, chGroup)
+	}
+	if got := f.a.keyModelIDs(k); len(got) != 1 || got[0] != "gpt-open" {
+		t.Errorf("切到通道组后可用模型 = %v，期望 [gpt-open]", got)
+	}
+	if !f.a.groupSelectable(k, chGroup) {
+		t.Error("默认开放时通道组应可选")
+	}
+}
+
+// TestKeyGroupWhitelistExcludesChannelGroup 白名单模式下，未列出的通道组不可选。
+func TestKeyGroupWhitelistExcludesChannelGroup(t *testing.T) {
+	f := newGroupFixture(t)
+	chGroup := "ch" + itoa(int(f.chID))
+	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, "ch999"); err != nil {
+		t.Fatalf("设白名单: %v", err)
+	}
+	k := f.reloadKey(t)
+	if f.a.groupSelectable(k, chGroup) {
+		t.Error("白名单非空时，未列出的通道组不该可选")
+	}
+	if !f.a.groupSelectable(k, groupWorkID) {
+		t.Error("work 恒可选")
 	}
 }

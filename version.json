@@ -1,20 +1,20 @@
 {
-  "version": "0.31.89",
+  "version": "0.31.90",
   "min_supported": "0.24.0",
-  "notes": "v0.31.89：恢复「分组授权」入口 + 撤销授权即时失效（v0.31.88 的收尾）。\n\n① 补上一处半开的门：v0.31.88 给用户加了「切换计费分组」，可切范围由管理员授权（group_scope）决定，而 v0.31.82 撤掉的「组」授权入口一直没回来——新用户只有「不限制 / work」两个选项，切换功能等于半开。现在后台用户卡恢复「组」按钮：每把 Key 一块、通道组逐个勾选；work 不出现在勾选项里（恒可用，勾了等于假装授予过）；代挂自用 Key 不给复选框、右侧直写「只能用 work 官组」；空组禁用并标「空组」。副标题明写「授权 ≠ 生效」——授权只是能选，真正生效哪个由用户自己切。\n\n② 修一个会让功能看起来\"不能用\"的接口问题：该接口的组清单原来用 visibleGroups，而它在 v0.31.82 被收窄成只给 work → 管理员永远只看到一个可勾项，会以为通道组不能授权。改为 work + 全部 enabled 通道组（附单测钉住）。\n\n③ 撤销授权必须立刻生效：activeGroupModels 原来只看\"组存不存在\"，不看\"有没有被授权\"。后果很具体——管理员撤销后界面显示「当前分组已失效」，请求却仍按那一组走。现在加授权校验，组不在 group_scope 里立即按「不限制」处理；并与 group-options 的「已失效」提示共用同一个 groupGranted 判据（不再各写一套）。active_group 字段本身不被撤销动作改写——那是用户的选择，撤销的是\"能不能用\"。\n\n④ 两个小修：/v1/models 在缓存未建立时可能返回 \"data\":null（部分 SDK 会直接抛错）→ 统一成 []；group-options 里 work 在 group_scope 含 work 时会重复出现 → 按 id 去重。\n\n验证：新增 TestAdminUserKeysListsAllGroups（组清单必须含 work 与 enabled 通道组 + 成员数）与 TestKeyGroupRevokedImmediatelyInactive（撤销后 active_group 不变但立刻不生效、选项消失、提示「已失效」）；v0.31.88 的 6 条分组用例全部仍通过；全量 go test + jscheck + uitest + preflight 全绿。顺带被 uitest 的 auth-trace 拦下一次误命名（把 rows 元素写成 r.key，被保守正则判成\"前端出现完整 key\"）——改名为 r.k，没有放宽那条检查。\n\n边界：授权只影响\"能选哪些\"，不影响已生效的 active_group（撤销后按不限制处理）；空组仍可被授权但用户切不过去（409），界面已禁用勾选；本次未改计费链路。",
-  "released_at": 1792570700,
+  "notes": "v0.31.90：通道探活结果改成弹窗；通道组默认对用户可选。\n\n用户反馈两条，根因都在\"可达性\"而不是逻辑本身。\n\n① 「第三方通道接入后不可以进行模型检测选用导入」→ 探活候选面板改成**弹窗**。v0.31.88 把它渲染在通道卡下半部分：新建通道时焦点在表单、面板长在另一张卡的下半截，页面上一堆卡片时也分不清是谁的结果 —— 实际基本不会被看到。而且弹窗样式固定 max-width 440px，每行「勾选 + 模型名 + 上游名 + 单价 + 倍率」会折成三行，看不出哪个框填什么。现在：点探活（或新建通道保存后自动探活）直接弹窗，宽度 860px（openModal 新增可选 maxWidth，不传仍是 440px，旧弹窗零影响）；顶部写明「可导入 N 个，另有 M 个已在映射里（置灰）」；导入失败留在弹窗内可原地重试，不必重走一遍探活。\n\n② 「用户控制台密钥以及接入只有号池组没有通道自建的组」→ 通道组**默认可选**。原语义把 group_scope 当白名单且默认空 = 一个都没有，每建一条通道都要管理员逐个授权，而授权入口还曾被撤掉，结果通道组对用户完全不可见，切换功能等于只有 work 一个选项。现在改为「默认开放 + 可选白名单」：scope 空 = 不限制（全部 enabled 通道组都能看到并切换）；scope 非空 = 只有列出的这些（后台「组」勾选即收窄）。group-options 与切换校验共用 groupSelectable 一个判据；密钥卡分组标签显示通道人话名（通道 · relay-a）而不是 ch3；/v1/models 仍只在 active_group 非空时列该组，不给每个通道组都塞组名条目（避免客户端列表膨胀）。\n\n验证：新增 TestKeyGroupChannelGroupDefaultOpen（不授权也能切到通道组、切后只剩该组模型）与 TestKeyGroupWhitelistExcludesChannelGroup（白名单非空时未列出的组不可选）；TestKeyGroupOptionsListsChoices 改为断言默认列出「不限制 + work + 通道组」；TestKeyGroupSetValidation 的四条拒绝路径（400 代挂 / 403 白名单外 / 409 空组 / 404 不存在）与 TestKeyGroupRevokedImmediatelyInactive（移出白名单后立刻失效）按新语义重写并通过。全量 go test + jscheck + uitest（含 auth-trace）+ preflight 全链绿。\n\n边界：/v1/models 的组名条目仍只给 work（避免客户端模型列表膨胀），切到通道组后该组模型与组名才会出现在目录里；\"默认开放\"意味着任何号池 Key 都能切到任何 enabled 通道组 —— 要限制特定用户，在后台「组」里勾选即变白名单；本次未改计费链路。",
+  "released_at": 1792571751,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.89/webapp.exe",
-      "sha256": "e8bb0e3c549b03d8dd735379497255a2be568877b8bb6f9cf0f20e6c191d8013",
-      "size": 16084480
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.90/webapp.exe",
+      "sha256": "215e5d831f9fccf29635a7c34ef128716dee8f06c91bf56871374529afd4fcce",
+      "size": 16086528
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "HkrQ+6cTUAZdW91s/KF1yMFMha7d1Cd6VXYRdpTX/tkSV0pb7W//Y0KHDis63g6rGJg46kH4MtIaqKPq4hl0Ag==",
+  "signature": "4AWly1V8hss3dxXqmvWGtgz7U9XrFtL2WHQrYr4Yx5uqmxvRCo9urnYe5bBaqb3PUpF+AGAq1QoS4k/iFyUFCA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

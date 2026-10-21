@@ -1021,9 +1021,12 @@ function copyBtn(getText, label, cls) {
 }
 
 // openModal 通用弹窗。返回 {mask, body, close}（点击遮罩 / × 关闭）。
-function openModal(title, subtitle) {
+function openModal(title, subtitle, opts) {
   const mask = el('div', 'modal-mask');
   const box = el('div', 'modal');
+  // opts.maxWidth：宽表格类弹窗（如"勾选模型导入"每行三个输入框）用 440px 会挤成一团，
+  // 由调用方声明需要的宽度；不传则沿用样式表里的 440px。
+  if (opts && opts.maxWidth) box.style.maxWidth = opts.maxWidth;
   const h = el('div', 'modal-head');
   h.appendChild(el('b', '', title));
   const close = el('button', 'modal-x', '×');

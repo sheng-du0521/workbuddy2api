@@ -1444,7 +1444,9 @@ function keyScopeLabel(k) {
   }
   // 生效分组（v0.31.88）：非空时它不是装饰标签，而是**计费口径** ——
   // 换组就是换一整套模型的价，所以必须写进最显眼的那一句。
-  if (k.active_group) return '号池计费 · 分组 ' + groupLabelOf(k.active_group) + ' · 按用量扣余额';
+  if (k.active_group) {
+    return '号池计费 · 分组 ' + (k.active_group_label || groupLabelOf(k.active_group)) + ' · 按用量扣余额';
+  }
   return '号池计费 · 按用量扣余额';
 }
 

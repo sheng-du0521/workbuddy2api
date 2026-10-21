@@ -8296,33 +8296,39 @@ function channelCard(up, poolModels, affected) {
   //
   // 为什么在这里而不是弹窗：运营要一边看候选一边对照已有映射（哪些会被覆盖、
   // 哪些是新增），弹窗会挡住那张表。面板直接长在通道卡里，导完即消失。
-  const probeBox = el('div');
-  const renderProbePanel = (ids) => {
-    probeBox.textContent = '';
-    if (!ids.length) return;
-    const have = new Set((up.models || []).map((m) => m.model));
+  // 探活结果弹窗（v0.31.90）——**必须是弹窗，不能长在卡片里**。
+  //
+  // v0.31.88 第一版把它渲染在通道卡下半部分，结果用户反馈"接入后不能检测选用导入"：
+  // 新建通道时焦点在表单，面板长在另一张卡的下半截，根本不会被注意到；
+  // 页面上一堆通道卡时，也分不清"这块是谁的探活结果"。
+  // 弹窗是唯一不会被错过的位置，而且能把"勾选 → 填单价 → 导入"收在一屏里。
+  const showProbeImport = (ids) => {
+    if (!ids.length) {
+      say('探活成功，但上游没有返回任何模型（检查该 key 是否有模型列表权限）');
+      return;
+    }
+    const have = new Set((up.models || []).map((x) => x.model));
     const fresh = ids.filter((id) => !have.has(id));
-
-    const box2 = el('div', 'card');
-    box2.style.cssText = 'margin-top:10px;background:var(--bg-soft, rgba(0,0,0,.02));';
-    const head = el('div', 'row');
-    head.style.cssText = 'justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;';
-    const t = el('div');
-    t.appendChild(el('b', null, '识别到 ' + ids.length + ' 个模型'));
-    t.appendChild(el('span', 'muted',
-      ' · 已在映射里 ' + (ids.length - fresh.length) + ' 个 · 可新增 ' + fresh.length + ' 个'));
-    head.appendChild(t);
-    box2.appendChild(head);
+    // 加宽到 860px：每行是「勾选 + 模型名 + 上游名 + 单价 + 倍率」，
+    // 440px 下会折成三行、看不出哪个框填什么（第一版就是这个毛病）。
+    const m = openModal('识别到 ' + ids.length + ' 个模型 · ' + (up.name || ''),
+      '勾选要接入的模型，填好单价与倍率后一次导入。已在映射里的 '
+      + (ids.length - fresh.length) + ' 个不会被覆盖。'
+      + '单价 0 = 暂不计费；倍率留空 = 跟随全局（不是免费）。',
+      { maxWidth: '860px' });
 
     if (!fresh.length) {
-      box2.appendChild(el('div', 'muted', '这条通道能服务的模型都已经在映射里，无需重复导入。'));
-      probeBox.appendChild(box2);
+      m.body.appendChild(el('div', 'hintbar',
+        '这条通道能服务的 ' + ids.length + ' 个模型都已经在映射里，无需重复导入。'));
+      const c = el('button', 'ghost', '关闭');
+      c.onclick = () => m.close();
+      m.body.appendChild(c);
       return;
     }
 
     const rows = [];
     const list = el('div');
-    list.style.cssText = 'max-height:260px;overflow:auto;margin-top:8px;border:1px solid var(--border);'
+    list.style.cssText = 'max-height:300px;overflow:auto;border:1px solid var(--border);'
       + 'border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:5px;';
     for (const id of ids) {
       const isNew = !have.has(id);
@@ -8334,17 +8340,17 @@ function channelCard(up, poolModels, affected) {
       cb.disabled = !isNew;
       row.appendChild(cb);
       const nm = el('span', 'mono', id);
-      nm.style.cssText = 'min-width:170px;flex:1;' + (isNew ? '' : 'opacity:.55;');
+      nm.style.cssText = 'min-width:160px;flex:1;' + (isNew ? '' : 'opacity:.55;');
       row.appendChild(nm);
       if (!isNew) {
         const tag = el('span', 'tag', '已有');
-        tag.title = '已有映射不会被覆盖：人工调过的单价必须保住（要改价请在下面那张表里改）';
+        tag.title = '已有映射不会被覆盖：人工调过的单价必须保住（要改价请在通道卡那张表里改）';
         row.appendChild(tag);
       } else {
         const rm = el('input');
         rm.placeholder = '上游名（空=同名）';
         rm.className = 'mono';
-        rm.style.width = '150px';
+        rm.style.width = '140px';
         row.appendChild(rm);
         const cp = el('input');
         cp.type = 'number';
@@ -8352,7 +8358,7 @@ function channelCard(up, poolModels, affected) {
         cp.step = '0.1';
         cp.value = '0';
         cp.title = '每 1k token 折算多少积分（我方成本）；0 = 暂不计费，可后补';
-        cp.style.width = '90px';
+        cp.style.width = '88px';
         row.appendChild(cp);
         const br = el('input');
         br.type = 'number';
@@ -8360,22 +8366,24 @@ function channelCard(up, poolModels, affected) {
         br.step = '0.1';
         br.placeholder = '倍率(空=全局)';
         br.title = '用户计费倍率；空或 0 = 跟随全局倍率（不是免费）';
-        br.style.width = '110px';
+        br.style.width = '108px';
         row.appendChild(br);
         rows.push({ id: id, cb: cb, rm: rm, cp: cp, br: br });
       }
       list.appendChild(row);
     }
-    box2.appendChild(list);
+    m.body.appendChild(list);
 
     const tools = el('div', 'row');
     tools.style.cssText = 'gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;';
+    tools.appendChild(el('span', 'muted',
+      '可导入 ' + fresh.length + ' 个，另有 ' + (ids.length - fresh.length) + ' 个已在映射里（置灰）'));
     const bAll = el('button', 'ghost', '全选');
     bAll.style.padding = '2px 8px';
-    bAll.onclick = () => { for (const r0 of rows) r0.cb.checked = true; };
+    bAll.onclick = () => { for (const x of rows) x.cb.checked = true; };
     const bNone = el('button', 'ghost', '全不选');
     bNone.style.padding = '2px 8px';
-    bNone.onclick = () => { for (const r0 of rows) r0.cb.checked = false; };
+    bNone.onclick = () => { for (const x of rows) x.cb.checked = false; };
     tools.appendChild(bAll);
     tools.appendChild(bNone);
     const bulk = el('input');
@@ -8383,25 +8391,27 @@ function channelCard(up, poolModels, affected) {
     bulk.min = '0';
     bulk.step = '0.1';
     bulk.placeholder = '单价批量填';
-    bulk.style.width = '110px';
+    bulk.style.width = '108px';
     const bBulk = el('button', 'ghost', '应用单价');
     bBulk.style.padding = '2px 8px';
-    bBulk.onclick = () => { for (const r0 of rows) r0.cp.value = bulk.value; };
+    bBulk.onclick = () => { for (const x of rows) x.cp.value = bulk.value; };
     tools.appendChild(bulk);
     tools.appendChild(bBulk);
-    box2.appendChild(tools);
+    m.body.appendChild(tools);
 
     const foot = el('div', 'row');
-    foot.style.cssText = 'gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap;';
+    foot.style.cssText = 'gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;';
     const bGo = el('button', '', '导入勾选的模型');
+    const hint2 = el('div', 'muted');
+    hint2.style.fontSize = '12px';
     bGo.onclick = async () => {
-      const picked = rows.filter((r0) => r0.cb.checked);
-      if (!picked.length) { say('先勾选要导入的模型'); return; }
-      const models = picked.map((r0) => ({
-        model: r0.id,
-        remote_model: r0.rm.value.trim(),
-        credit_per_1k: Number(r0.cp.value) || 0,
-        billing_ratio: r0.br.value === '' ? 0 : Number(r0.br.value),
+      const picked = rows.filter((x) => x.cb.checked);
+      if (!picked.length) { hint2.textContent = '先勾选要导入的模型'; return; }
+      const models = picked.map((x) => ({
+        model: x.id,
+        remote_model: x.rm.value.trim(),
+        credit_per_1k: Number(x.cp.value) || 0,
+        billing_ratio: x.br.value === '' ? 0 : Number(x.br.value),
       }));
       bGo.disabled = true;
       bGo.textContent = '导入中…';
@@ -8414,23 +8424,28 @@ function channelCard(up, poolModels, affected) {
         if ((out.invalid || []).length) bits.push('被拒 ' + out.invalid.length);
         say('导入完成：' + bits.join(' · ')
           + ((out.invalid || []).length ? '｜' + out.invalid.join('；') : ''));
-        probeBox.textContent = '';
+        m.close();
         loadChannels();
       } catch (e) {
-        say('导入失败：' + e.message);
+        // 失败留在弹窗里（不要只弹 toast）：用户勾了十几个模型被拒，
+        // 需要看到原因、改完直接重试，而不是从头再点一遍探活。
+        hint2.style.color = '#c0392b';
+        hint2.textContent = '✗ ' + e.message;
         bGo.disabled = false;
         bGo.textContent = '导入勾选的模型';
       }
     };
+    const bClose = el('button', 'ghost', '关闭');
+    bClose.onclick = () => m.close();
     foot.appendChild(bGo);
-    foot.appendChild(el('span', 'muted',
-      '未设置倍率 → 按全局倍率计费（不是免费）；已存在的映射不会被覆盖。'));
-    box2.appendChild(foot);
-    probeBox.appendChild(box2);
+    foot.appendChild(bClose);
+    m.body.appendChild(foot);
+    m.body.appendChild(hint2);
   };
 
   const bProbe = el('button', 'ghost', '探活');
-  bProbe.title = '服务端 GET {base_url}/models：验证地址、key 与可用模型；不消耗对方额度';
+  bProbe.title = '服务端 GET {base_url}/models：验证地址、key 与可用模型；'
+    + '成功后弹窗列出全部模型，勾选即可导入（可填单价与倍率）。不消耗对方额度';
   bProbe.onclick = async () => {
     bProbe.disabled = true;
     say('探活中…');
@@ -8439,7 +8454,7 @@ function channelCard(up, poolModels, affected) {
       if (r.ok) {
         say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '')
           + '（在下方勾选导入）');
-        renderProbePanel(r.models || []);
+        showProbeImport(r.models || []);
       } else {
         // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
         say('探活失败：' + r.error);
@@ -8479,13 +8494,13 @@ function channelCard(up, poolModels, affected) {
   };
   ops.appendChild(bDel);
   card.appendChild(ops);
-  card.appendChild(probeBox);
-  // 新增通道后自动探活的结果（v0.31.88）：由保存流程暂存，卡片一渲染就消费掉。
-  // 不这样做的话，运营得再点一次「探活」才看得到候选 —— "自动识别"就成了空话。
+  // 新增通道后自动探活的结果（v0.31.88 / v0.31.90 改弹窗）：由保存流程暂存，
+  // 卡片一渲染就消费掉并弹窗。不这样做的话，运营得再点一次「探活」才看得到候选 ——
+  // "自动识别"就成了空话；而弹窗保证不会被卡片下半截淹没。
   if (window.__probePending && window.__probePending.id === up.id) {
     const pend = window.__probePending;
     window.__probePending = null;
-    renderProbePanel(pend.models || []);
+    showProbeImport(pend.models || []);
   }
 
   // ---- 模型映射 ----

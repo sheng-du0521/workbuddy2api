@@ -128,7 +128,7 @@ func (a *app) handleKeyGroupOptions(w http.ResponseWriter, r *http.Request) {
 	// 授权了才出现（没授权的用户看不到，也就不存在越权选择）。
 	if a.proxy != nil {
 		seenG := map[string]bool{}
-		for _, gid := range append([]string{groupWorkID}, splitGroups(k.GroupScope)...) {
+		for _, gid := range a.proxy.selectableGroupIDs(k) {
 			if gid == "" || seenG[gid] {
 				continue
 			}
@@ -199,10 +199,10 @@ func (a *app) handleKeyGroupSet(w http.ResponseWriter, r *http.Request) {
 
 	group := strings.TrimSpace(req.Group)
 	if group != "" && group != groupWorkID {
-		// 授权检查：work 恒可用，通道组必须在 group_scope 里。
-		// 用 groupGranted 而不是就地遍历 —— 与 activeGroupModels 的失效判据必须是同一个，
+		// 可选性检查：work 恒可用；通道组要么默认开放，要么在管理员给的白名单里。
+		// 与 activeGroupModels 用**同一个** groupSelectable ——
 		// 否则会出现"能切过去、但切完立即算失效"这种自相矛盾。
-		if !groupGranted(k, group) {
+		if !a.groupSelectable(k, group) {
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error": "这个分组没有授权给你（需要管理员在后台授权后才会出现）",
 				"code":  "group_not_granted",
@@ -284,6 +284,14 @@ func (a *app) keyModelIDsUnrestricted(k *APIKey) []string {
 	return out
 }
 
+// groupSelectable app 侧入口（handler 用；判据仍在 Proxy 上，只此一份）。
+func (a *app) groupSelectable(k *APIKey, gid string) bool {
+	if a.proxy == nil {
+		return gid == "" || gid == groupWorkID
+	}
+	return a.proxy.groupSelectable(k, gid)
+}
+
 // activeGroupModels 该 Key 当前生效组限定的模型；nil = 不限制（走老逻辑）。
 //
 // **这是「切换分组」唯一的生效点**：目录、下拉、请求校验都从这里取，
@@ -301,10 +309,11 @@ func (p *Proxy) activeGroupModels(k *APIKey) []string {
 	if k == nil || k.ActiveGroup == "" {
 		return nil
 	}
-	// 授权撤销后必须**立刻**失效（v0.31.89）：groupMembersFor 只看"组存不存在"，
-	// 不看"这把 Key 有没有被授权" —— 少了这一句，管理员撤销授权等于没生效：
-	// 界面会显示「已失效」，请求却仍按那一组走。两个口径不一致比缺功能更糟。
-	if k.ActiveGroup != groupWorkID && !groupGranted(k, k.ActiveGroup) {
+	// 组不再可选时**立刻**失效（v0.31.89，v0.31.90 语义调整）：
+	// groupMembersFor 只看"组存不存在"，不看"这把 Key 还能不能选它" —— 少了这一句，
+	// 管理员把某个用户从白名单里去掉等于没生效：界面说「已失效」，请求却仍按那组走。
+	// 注意：scope 为空 = 不限制（默认开放），此时只看组是否存在，不构成"撤销"。
+	if !p.groupSelectable(k, k.ActiveGroup) {
 		return nil
 	}
 	ms, _, ok := p.groupMembersFor(k.ActiveGroup, k)
@@ -338,12 +347,57 @@ func modelInGroup(models []string, model string) bool {
 	return false
 }
 
-// groupGranted 该 Key 是否被授权使用某个通道组（work 恒可用，由调用方另行处理）。
-func groupGranted(k *APIKey, gid string) bool {
-	for _, g := range splitGroups(k.GroupScope) {
+// groupSelectable 该 Key 是否**能选**某个组（v0.31.90 语义调整）。
+//
+//	group_scope 为空  → **不限制**：全部 enabled 通道组都能选（与 work 一样是平台供给）
+//	group_scope 非空  → 白名单：只有列出的这些（管理员显式收窄）
+//
+// 为什么改：用户反馈「控制台只有号池组，没有通道自建的组」。原语义把 group_scope
+// 当白名单且默认空 = 什么都没有 —— 每建一条通道都要管理员逐个授权，而授权入口
+// 还曾经被撤掉，结果通道组对用户完全不可见，切换功能等于只有 work 一个选项。
+// 现在默认开放；要限制某些用户时，在后台「组」里勾选即变成白名单。
+func (p *Proxy) groupSelectable(k *APIKey, gid string) bool {
+	if gid == "" || gid == groupWorkID {
+		return true
+	}
+	if k == nil || p == nil {
+		return false
+	}
+	scope := splitGroups(k.GroupScope)
+	if len(scope) == 0 {
+		// 不限制：只要这个组此刻真的存在（通道 enabled + 有成员）
+		_, _, ok := p.groupMembersFor(gid, k)
+		return ok
+	}
+	for _, g := range scope {
 		if g == gid {
 			return true
 		}
 	}
 	return false
+}
+
+// selectableGroupIDs 该 Key 在控制台能看到/切换的组 id（work 恒在）。
+func (p *Proxy) selectableGroupIDs(k *APIKey) []string {
+	out := []string{groupWorkID}
+	if p == nil {
+		return out
+	}
+	for _, g := range p.allChannelGroups() {
+		if p.groupSelectable(k, g.ID) {
+			out = append(out, g.ID)
+		}
+	}
+	return out
+}
+
+// activeGroupLabel 当前生效组的人话名（组已删/停用返回空串）。
+func (a *app) activeGroupLabel(k *APIKey) string {
+	if k == nil || k.ActiveGroup == "" || a.proxy == nil {
+		return ""
+	}
+	if _, lb, ok := a.proxy.groupMembersFor(k.ActiveGroup, k); ok {
+		return lb
+	}
+	return ""
 }
