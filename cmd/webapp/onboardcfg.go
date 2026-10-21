@@ -370,6 +370,21 @@ func (a *app) keyModelIDs(k *APIKey) []string {
 	if k == nil {
 		return nil
 	}
+	// 生效分组（v0.31.88）：非空时它说了算。
+	// 这里不生效的话，接入候选/下拉会列出"切组后根本调不通"的模型，
+	// 用户接完才发现 —— 那正是 v0.31.81 那类 404 的老路。
+	if ms := a.activeGroupModels(k); ms != nil {
+		seen := map[string]bool{}
+		out := make([]string, 0, len(ms))
+		for _, m := range ms {
+			if m != "" && !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
 	if !modelsCacheFresh() {
 		a.refreshModelsCache()
 	}

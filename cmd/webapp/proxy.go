@@ -1639,6 +1639,20 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 			len(model), len(strings.Fields(model)), truncateStr(model, 160))
 		return
 	}
+	// 生效分组（v0.31.88）：非空时组外模型直接 404。
+	//
+	// 这是"切换分组 = 切换计费口径"的硬约束：不拦的话，用户切到 A 组却继续用
+	// B 组的模型，账单里就会出现"按 A 组口径收 B 组的量"，事后根本无法解释。
+	// 放在归一化与组展开之后 —— 校验的必须是**最终真名**，不是客户端的写法。
+	if k := apiKeyFrom(r); k != nil {
+		if ms := p.activeGroupModels(k); ms != nil && !modelInGroup(ms, model) {
+			writeOpenAIErrorHint(w, http.StatusNotFound, "model not available in the key's active group",
+				fmt.Sprintf("this key is pinned to group %q (%d models); GET /v1/models lists exactly "+
+					"what it can use, or switch the group in the console; no upstream account was used",
+					k.ActiveGroup, len(ms)))
+			return
+		}
+	}
 	// 归一化之后仍不在已知清单里 → 记一条 WARN（同名一次）。
 	// 这正是"客户端模型名配置错"的直接症状：每次调用都会拿到上游 400/11102，
 	// 而我们回 404 —— 没有这条日志时，运维要在台账、上游原文与客户端配置之间来回对账。

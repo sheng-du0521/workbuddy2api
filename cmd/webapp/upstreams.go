@@ -84,6 +84,14 @@ type UpstreamModel struct {
 	// 两者从配置界面都看不出来，只有摊开统计才看得见。
 	// 只在后台列表接口里填充；路由侧（relayCandidates）永远为 nil。
 	Recent *relayModelStat `json:"recent,omitempty"`
+
+	// BillingRatio / BillingScope **仅响应态、不落库**（v0.31.88）：
+	// 该模型在**用户计费**上生效的单模型倍率（存在 model_ratios，不在 upstream_models）。
+	// 在这里展开是为了让「通道 → 模型」这一屏能同时回答两个问题：
+	// "这条通道多少钱"（credit_per_1k）与"用户按几倍收"（billing_ratio）。
+	// 0 = 未设置，跟随全局倍率（**不是免费**）。
+	BillingRatio float64 `json:"billing_ratio"`
+	BillingScope string  `json:"billing_scope,omitempty"`
 }
 
 // relayModelStat 某模型近 N 天经通道的调用概况（只读统计，来自 usage_logs）。
@@ -748,6 +756,25 @@ func (a *app) handleAdminUpstreams(w http.ResponseWriter, r *http.Request) {
 			for j := range list[i].Models {
 				if st := stats[list[i].Models[j].Model]; st != nil {
 					list[i].Models[j].Recent = st
+				}
+			}
+		}
+	}
+
+	// 单模型计费倍率（v0.31.88）：把 model_ratios 的 billing_ratio 并进每个模型。
+	// 读失败同样只是"少一列数字"，不影响通道列表本身。
+	if ratios, rerr := a.store.ListModelRatios(); rerr != nil {
+		log.Printf("WARN: [relay] 读取模型倍率失败（通道列表照常返回）：%v", rerr)
+	} else {
+		bill := make(map[string]*modelRatio, len(ratios))
+		for _, r := range ratios {
+			bill[r.Model] = r
+		}
+		for i := range list {
+			for j := range list[i].Models {
+				if r := bill[list[i].Models[j].Model]; r != nil {
+					list[i].Models[j].BillingRatio = r.BillingRatio
+					list[i].Models[j].BillingScope = r.BillingScope
 				}
 			}
 		}

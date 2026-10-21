@@ -8169,6 +8169,143 @@ function channelCard(up, poolModels, affected) {
   const hint = $('chHint');
   const say = (msg) => { if (hint) hint.textContent = msg; };
 
+  // 探活候选面板（v0.31.88）——「接入后自动识别模型」的落地点。
+  //
+  // 为什么在这里而不是弹窗：运营要一边看候选一边对照已有映射（哪些会被覆盖、
+  // 哪些是新增），弹窗会挡住那张表。面板直接长在通道卡里，导完即消失。
+  const probeBox = el('div');
+  const renderProbePanel = (ids) => {
+    probeBox.textContent = '';
+    if (!ids.length) return;
+    const have = new Set((up.models || []).map((m) => m.model));
+    const fresh = ids.filter((id) => !have.has(id));
+
+    const box2 = el('div', 'card');
+    box2.style.cssText = 'margin-top:10px;background:var(--bg-soft, rgba(0,0,0,.02));';
+    const head = el('div', 'row');
+    head.style.cssText = 'justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;';
+    const t = el('div');
+    t.appendChild(el('b', null, '识别到 ' + ids.length + ' 个模型'));
+    t.appendChild(el('span', 'muted',
+      ' · 已在映射里 ' + (ids.length - fresh.length) + ' 个 · 可新增 ' + fresh.length + ' 个'));
+    head.appendChild(t);
+    box2.appendChild(head);
+
+    if (!fresh.length) {
+      box2.appendChild(el('div', 'muted', '这条通道能服务的模型都已经在映射里，无需重复导入。'));
+      probeBox.appendChild(box2);
+      return;
+    }
+
+    const rows = [];
+    const list = el('div');
+    list.style.cssText = 'max-height:260px;overflow:auto;margin-top:8px;border:1px solid var(--border);'
+      + 'border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:5px;';
+    for (const id of ids) {
+      const isNew = !have.has(id);
+      const row = el('div', 'row');
+      row.style.cssText = 'gap:8px;align-items:center;flex-wrap:wrap;';
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.checked = isNew;
+      cb.disabled = !isNew;
+      row.appendChild(cb);
+      const nm = el('span', 'mono', id);
+      nm.style.cssText = 'min-width:170px;flex:1;' + (isNew ? '' : 'opacity:.55;');
+      row.appendChild(nm);
+      if (!isNew) {
+        const tag = el('span', 'tag', '已有');
+        tag.title = '已有映射不会被覆盖：人工调过的单价必须保住（要改价请在下面那张表里改）';
+        row.appendChild(tag);
+      } else {
+        const rm = el('input');
+        rm.placeholder = '上游名（空=同名）';
+        rm.className = 'mono';
+        rm.style.width = '150px';
+        row.appendChild(rm);
+        const cp = el('input');
+        cp.type = 'number';
+        cp.min = '0';
+        cp.step = '0.1';
+        cp.value = '0';
+        cp.title = '每 1k token 折算多少积分（我方成本）；0 = 暂不计费，可后补';
+        cp.style.width = '90px';
+        row.appendChild(cp);
+        const br = el('input');
+        br.type = 'number';
+        br.min = '0';
+        br.step = '0.1';
+        br.placeholder = '倍率(空=全局)';
+        br.title = '用户计费倍率；空或 0 = 跟随全局倍率（不是免费）';
+        br.style.width = '110px';
+        row.appendChild(br);
+        rows.push({ id: id, cb: cb, rm: rm, cp: cp, br: br });
+      }
+      list.appendChild(row);
+    }
+    box2.appendChild(list);
+
+    const tools = el('div', 'row');
+    tools.style.cssText = 'gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;';
+    const bAll = el('button', 'ghost', '全选');
+    bAll.style.padding = '2px 8px';
+    bAll.onclick = () => { for (const r0 of rows) r0.cb.checked = true; };
+    const bNone = el('button', 'ghost', '全不选');
+    bNone.style.padding = '2px 8px';
+    bNone.onclick = () => { for (const r0 of rows) r0.cb.checked = false; };
+    tools.appendChild(bAll);
+    tools.appendChild(bNone);
+    const bulk = el('input');
+    bulk.type = 'number';
+    bulk.min = '0';
+    bulk.step = '0.1';
+    bulk.placeholder = '单价批量填';
+    bulk.style.width = '110px';
+    const bBulk = el('button', 'ghost', '应用单价');
+    bBulk.style.padding = '2px 8px';
+    bBulk.onclick = () => { for (const r0 of rows) r0.cp.value = bulk.value; };
+    tools.appendChild(bulk);
+    tools.appendChild(bBulk);
+    box2.appendChild(tools);
+
+    const foot = el('div', 'row');
+    foot.style.cssText = 'gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap;';
+    const bGo = el('button', '', '导入勾选的模型');
+    bGo.onclick = async () => {
+      const picked = rows.filter((r0) => r0.cb.checked);
+      if (!picked.length) { say('先勾选要导入的模型'); return; }
+      const models = picked.map((r0) => ({
+        model: r0.id,
+        remote_model: r0.rm.value.trim(),
+        credit_per_1k: Number(r0.cp.value) || 0,
+        billing_ratio: r0.br.value === '' ? 0 : Number(r0.br.value),
+      }));
+      bGo.disabled = true;
+      bGo.textContent = '导入中…';
+      try {
+        const out = await post('/api/admin/upstreams/models/import', { id: up.id, models: models });
+        const bits = ['新增 ' + (out.added || []).length];
+        if ((out.skipped || []).length) bits.push('已存在跳过 ' + out.skipped.length);
+        if ((out.ratios_added || []).length) bits.push('入模型列表 ' + out.ratios_added.length);
+        if ((out.ratios_set || []).length) bits.push('写倍率 ' + out.ratios_set.length);
+        if ((out.invalid || []).length) bits.push('被拒 ' + out.invalid.length);
+        say('导入完成：' + bits.join(' · ')
+          + ((out.invalid || []).length ? '｜' + out.invalid.join('；') : ''));
+        probeBox.textContent = '';
+        loadChannels();
+      } catch (e) {
+        say('导入失败：' + e.message);
+        bGo.disabled = false;
+        bGo.textContent = '导入勾选的模型';
+      }
+    };
+    foot.appendChild(bGo);
+    foot.appendChild(el('span', 'muted',
+      '未设置倍率 → 按全局倍率计费（不是免费）；已存在的映射不会被覆盖。'));
+    box2.appendChild(foot);
+    probeBox.appendChild(box2);
+  };
+
   const bProbe = el('button', 'ghost', '探活');
   bProbe.title = '服务端 GET {base_url}/models：验证地址、key 与可用模型；不消耗对方额度';
   bProbe.onclick = async () => {
@@ -8177,7 +8314,9 @@ function channelCard(up, poolModels, affected) {
     try {
       const r = await post('/api/admin/upstreams/probe', { id: up.id });
       if (r.ok) {
-        say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '') + '（可加到下方映射）');
+        say('探活通过：' + r.count + ' 个模型可用' + (r.billing_note ? '；' + r.billing_note : '')
+          + '（在下方勾选导入）');
+        renderProbePanel(r.models || []);
       } else {
         // 探活失败**不改任何配置**，只显示原因 —— 避免"探一下就顺手停用"。
         say('探活失败：' + r.error);
@@ -8217,12 +8356,20 @@ function channelCard(up, poolModels, affected) {
   };
   ops.appendChild(bDel);
   card.appendChild(ops);
+  card.appendChild(probeBox);
+  // 新增通道后自动探活的结果（v0.31.88）：由保存流程暂存，卡片一渲染就消费掉。
+  // 不这样做的话，运营得再点一次「探活」才看得到候选 —— "自动识别"就成了空话。
+  if (window.__probePending && window.__probePending.id === up.id) {
+    const pend = window.__probePending;
+    window.__probePending = null;
+    renderProbePanel(pend.models || []);
+  }
 
   // ---- 模型映射 ----
   const tbl = el('div');
   tbl.style.marginTop = '10px';
   const head2 = el('div', 'code-gen-row');
-  for (const t of ['模型（客户端请求的名字）', '上游模型名', '每 1k 积分', '近 7 天', '状态', '操作']) {
+  for (const t of ['模型（客户端请求的名字）', '上游模型名', '每 1k 积分', '计费倍率', '近 7 天', '状态', '操作']) {
     const c = el('span', 'muted', t);
     c.style.fontWeight = '600';
     head2.appendChild(c);
@@ -8238,6 +8385,36 @@ function channelCard(up, poolModels, affected) {
     r.appendChild(el('span', 'mono', m.model));
     r.appendChild(el('span', 'mono muted', m.remote_model || '（同名）'));
     r.appendChild(el('span', 'mono', String(m.credit_per_1k)));
+    // 计费倍率（v0.31.88）：左边「每 1k 积分」是**我方成本**，这一列是**用户按几倍收**。
+    // 两者混看会得出完全错误的毛利结论，所以并排放且各自可点。
+    // 0 = 未设置 → 跟随全局倍率（不是免费）—— 这一点必须写在提示里，
+    // 否则"空白"会被读成"这个模型不收费"。
+    const rateBtn = el('button', 'chip' + (m.billing_ratio > 0 ? '' : ' ghost'),
+      m.billing_ratio > 0 ? ('×' + m.billing_ratio) : '跟随全局');
+    rateBtn.style.padding = '2px 8px';
+    rateBtn.title = m.billing_ratio > 0
+      ? ('该模型经通道调用按 ' + m.billing_ratio + ' 倍计费（scope=' + (m.billing_scope || 'relay') + '）。点击修改。')
+      : '未设置单模型倍率 → 按全局倍率计费（不是免费）。点击可单独设置。';
+    rateBtn.onclick = async () => {
+      const ans = await promptDialog({
+        title: '计费倍率 · ' + m.model,
+        message: '0 = 不设置（跟随全局倍率，不是免费）。只影响该模型经通道的调用，'
+          + '不会改动号池同名模型的倍率（两者成本结构不同）。',
+        fields: [{ name: 'ratio', label: '倍率', value: String(m.billing_ratio || 0), placeholder: '例如 1.5' }],
+        confirmText: '保存',
+      });
+      if (ans === null) return;
+      const v = Number(ans.ratio);
+      if (!isFinite(v) || v < 0 || v > 100) { say('倍率必须在 0–100 之间'); return; }
+      try {
+        const out = await post('/api/admin/model-ratios/billing', {
+          model: m.model, billing_ratio: v, billing_scope: 'relay',
+        });
+        say('已保存「' + m.model + '」：生效 ×' + out.effective_ratio + '（来源 ' + out.source + '）');
+        loadChannels();
+      } catch (e) { say('保存倍率失败：' + e.message); }
+    };
+    r.appendChild(rateBtn);
     // 近 7 天通道调用（只读统计）：两个"以为在跑其实在亏"的现场靠这一列现形 ——
     // ① 一次都没有（被号池抢走 / 没人用）；② 走了但 0 费（上游没回 usage）。
     const st = m.recent;
@@ -8432,10 +8609,30 @@ function showChannelForm(up) {
         priority: Number(iPrio.value || 100), note: iNote.value.trim(), enabled: chk.checked,
       };
       if (editing) payload.id = up.id;
-      await post('/api/admin/upstreams/save', payload);
-      if (hint) hint.textContent = editing ? '已保存' : '已新增「' + name + '」，下一步点「探活」确认可用';
+      const saved = await post('/api/admin/upstreams/save', payload);
+      const savedID = (saved && saved.id) || 0;
       box.style.display = 'none';
       box.textContent = '';
+      // 新增通道 → 立刻探活并把候选面板准备好（v0.31.88）。
+      // 「接入后自动识别模型」不该让运营再去别的按钮上找一次：
+      // 保存完就能看到"这条通道能服务哪些模型"，接着勾选、填价、导入。
+      if (!editing && savedID) {
+        if (hint) hint.textContent = '已新增「' + name + '」，正在识别可用模型…';
+        try {
+          const r = await post('/api/admin/upstreams/probe', { id: savedID });
+          if (r.ok) {
+            window.__probePending = { id: savedID, models: r.models || [] };
+            if (hint) hint.textContent = '已新增「' + name + '」：识别到 ' + r.count +
+              ' 个模型，取消勾选不要的、填好单价后一次导入';
+          } else if (hint) {
+            hint.textContent = '已新增「' + name + '」，但探活失败：' + r.error;
+          }
+        } catch (e) {
+          if (hint) hint.textContent = '已新增「' + name + '」，探活请求失败：' + e.message;
+        }
+      } else if (hint) {
+        hint.textContent = '已保存';
+      }
       loadChannels();
     } catch (e) {
       if (hint) hint.textContent = '保存失败：' + e.message;

@@ -1442,7 +1442,125 @@ function keyScopeLabel(k) {
     if (n) return `代挂自用 · 绑定 ${n} 个账号 · 不扣余额`;
     return k.host_group ? ('代挂自用 · 分组 ' + k.host_group + ' · 不扣余额') : '代挂自用 · 全部本人代挂号 · 不扣余额';
   }
+  // 生效分组（v0.31.88）：非空时它不是装饰标签，而是**计费口径** ——
+  // 换组就是换一整套模型的价，所以必须写进最显眼的那一句。
+  if (k.active_group) return '号池计费 · 分组 ' + groupLabelOf(k.active_group) + ' · 按用量扣余额';
   return '号池计费 · 按用量扣余额';
+}
+
+// groupLabelOf 组 id → 人话（与后端 groupMembersFor 的 label 保持一致）。
+function groupLabelOf(gid) {
+  if (!gid) return '不限制';
+  if (gid === 'work') return '号池官组';
+  return '通道组 ' + gid;
+}
+
+// ratioRangeText 倍率区间 → 一句话（0/0 = 全都没单独配）。
+function ratioRangeText(min, max, global) {
+  if (!min && !max) return '跟随全局 ×' + global;
+  if (Math.abs(min - max) < 1e-9) return '×' + min;
+  return '×' + min + ' ~ ×' + max;
+}
+
+// openKeyGroupModal 切换号池计费 Key 的「生效分组」（v0.31.88）。
+//
+// 这个弹窗要同时回答四件事（少一件用户就会踩坑）：
+//  1. 有哪些组可选（含"不限制"）—— 只列**被授权**的，没授权的不出现在这里；
+//  2. 每个组现在有多少模型、按什么倍率计费 —— 决定"切过去贵不贵"；
+//  3. 切换影响什么（可用模型立即变、组外模型 404、**历史不回算**）；
+//  4. 失败怎么办（空组禁用、选中后给人话原因）。
+async function openKeyGroupModal(k) {
+  let d = null;
+  try { d = await api('/api/keys/' + encodeURIComponent(k.id) + '/group-options'); }
+  catch (e) { toast('读取分组失败：' + e.message, 'err'); return; }
+  if (!d.editable) { toast(d.note || '这把密钥不能切换分组', 'err'); return; }
+
+  const m = openModal('切换计费分组 · ' + (k.name || '未命名'),
+    '换组 = 换可用模型集合，也等于换一套计费倍率（倍率是按模型配的）。'
+    + '已有用量按当时的模型与倍率结算，余额不会被重算。');
+  let picked = d.active_group || '';
+
+  const list = el('div');
+  list.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:4px;';
+  const render = () => {
+    list.textContent = '';
+    for (const o of (d.options || [])) {
+      const row = el('label');
+      row.style.cssText = 'display:flex;gap:10px;align-items:flex-start;cursor:pointer;'
+        + 'border:1px solid ' + (picked === o.id ? 'var(--accent, #4A6CF7)' : 'var(--border)')
+        + ';border-radius:8px;padding:8px 10px;';
+      const rb = el('input');
+      rb.type = 'radio';
+      rb.name = 'wbKeyGroup';
+      rb.value = o.id;
+      rb.checked = (picked === o.id);
+      rb.onchange = () => { picked = o.id; render(); };
+      row.appendChild(rb);
+      const txt = el('div');
+      txt.style.flex = '1';
+      const t1 = el('div');
+      t1.appendChild(el('b', null, o.label));
+      if (o.model) t1.appendChild(el('span', 'muted mono', ' · ' + o.model));
+      if (o.current) {
+        const c = el('span', 'tag ok', ' 当前');
+        t1.appendChild(c);
+      }
+      txt.appendChild(t1);
+      const t2 = el('div', 'muted');
+      t2.style.fontSize = '12px';
+      t2.textContent = o.members + ' 个模型 · 计费 ' + ratioRangeText(o.ratio_min, o.ratio_max, d.global_ratio);
+      txt.appendChild(t2);
+      row.appendChild(txt);
+      // 空组：禁用而不是让它点成功。切到一个没有模型的组 =
+      // 之后每个请求都 404，而界面上看起来"切成功了"。
+      if (!o.members) {
+        rb.disabled = true;
+        row.style.opacity = '.55';
+        const t = el('span', 'tag warn', '空组');
+        t.title = '这组现在没有任何可用模型，切过去请求会全部失败';
+        row.appendChild(t);
+      }
+      list.appendChild(row);
+    }
+  };
+  render();
+  m.body.appendChild(list);
+
+  m.body.appendChild(el('div', 'muted',
+    '切换后立即生效：/v1/models 只会列出该组的模型与组名；用组外模型会直接 404'
+    + '（在选号之前拦下，不消耗账号也不扣费）。'));
+
+  const foot = el('div', 'row');
+  foot.style.cssText = 'gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap;';
+  const btn = el('button', '', '应用并切换');
+  const out = el('div', 'muted');
+  out.style.fontSize = '12px';
+  btn.onclick = async () => {
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '切换中…';
+    try {
+      const r = await post('/api/keys/' + encodeURIComponent(k.id) + '/group', { group: picked });
+      out.style.color = '#2e7d32';
+      out.textContent = '✓ 已切到「' + r.active_label + '」：' + r.models + ' 个模型 · 计费 '
+        + ratioRangeText(r.ratio_min, r.ratio_max, r.global_ratio)
+        + '；' + (r.note || '历史用量与余额未变动');
+      toast('分组已切换', 'ok');
+      if (typeof loadKeys === 'function') loadKeys();
+    } catch (e) {
+      out.style.color = '#c0392b';
+      out.textContent = '✗ ' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  };
+  const cancel = el('button', 'ghost', '关闭');
+  cancel.onclick = () => m.close();
+  foot.appendChild(btn);
+  foot.appendChild(cancel);
+  m.body.appendChild(foot);
+  m.body.appendChild(out);
 }
 
 // bindBoxes 渲染「账号范围」分组框（按代挂分组成组 + 逐账号开关）。
@@ -1983,6 +2101,15 @@ function renderKeyCards() {
       t.title = '这些模型组已被删除或停用；该 Key 的 wb-group-<组> 现在会返回 404。'
         + '请让管理员在该用户卡片上重新授权。';
       chips.appendChild(t);
+    }
+    // 「分组」入口（v0.31.88）：只有号池计费 Key 有分组可切 ——
+    // 代挂 Key 只走本人账号，后端会直接 400（不给它一个点了必然失败的按钮）。
+    if (!host) {
+      const gb = el('button', 'chip', '切换分组');
+      gb.style.padding = '2px 8px';
+      gb.title = '切换这把 Key 的生效分组：换组 = 换可用模型集合，也等于换一套计费倍率';
+      gb.onclick = () => openKeyGroupModal(k);
+      chips.appendChild(gb);
     }
     if (host) chips.appendChild(el('span', 'tag ok', '不扣余额'));
     chips.appendChild(el('span', 'tag ' + (active ? 'ok' : 'warn'), active ? '启用' : '已禁用'));

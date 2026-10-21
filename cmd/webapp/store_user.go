@@ -151,8 +151,21 @@ type APIKey struct {
 	// `work` 的成员就是号池观测目录，`ch<N>` 的成员就是通道 N 的映射。
 	// 所以这里只存"授权关系"，不存成员，避免两处数据各自漂移。
 	GroupScope string
-	LastUsedAt int64
-	CreatedAt  int64
+	// ActiveGroup 该 Key **当前生效**的模型组（v0.31.88，控制台可切换）。
+	//
+	//   ""       不限制：可见 = 号池目录 ∪ 通道模型（老行为，默认值）
+	//   "work"   只用号池官组的模型
+	//   "ch<N>"  只用该通道组的模型
+	//
+	// 与 GroupScope 的分工：GroupScope 是「**被授权**能选哪些组」，ActiveGroup 是
+	// 「**现在**用哪一个」。授权是管理员给的边界，切换是用户自己的选择 ——
+	// 两者混成一个字段，就会出现"用户把管理员给的授权改掉"这类事故。
+	//
+	// 非空时它对**可用模型**是硬约束（不在该组的模型直接 404），
+	// 否则"切换分组"只是换了个标签，计费口径根本没变。
+	ActiveGroup string
+	LastUsedAt  int64
+	CreatedAt   int64
 }
 
 // HostEarning 一笔「代挂账号在池中为号主赚到」的收益流水（对账用）。
@@ -476,6 +489,8 @@ func (s *Store) migrateUsers() error {
 		{"account_uids", "account_uids TEXT NOT NULL DEFAULT ''"},
 		// v0.31.76 模型组授权（逗号分隔组 id；空 = 只有 work 官组）。
 		{"group_scope", "group_scope TEXT NOT NULL DEFAULT ''"},
+		// 当前生效组（v0.31.88）：空 = 不限制（老行为），所以存量 Key 迁移后行为不变。
+		{"active_group", "active_group TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn("api_keys", c.col, c.ddl); err != nil {
 			return fmt.Errorf("migrate api_keys column %s: %w", c.col, err)
@@ -1441,13 +1456,13 @@ func (s *Store) CreateAPIKey(userID int64, name, keyHash, keyEnc, prefix, kind, 
 		Kind: kind, HostGroup: hostGroup, AccountUIDs: accountUIDs, CreatedAt: now}, nil
 }
 
-const keyCols = `id, user_id, name, key_hash, key_enc, key_prefix, status, last_used_at, kind, host_group, account_uids, group_scope, created_at`
+const keyCols = `id, user_id, name, key_hash, key_enc, key_prefix, status, last_used_at, kind, host_group, account_uids, group_scope, active_group, created_at`
 
 func scanAPIKey(row interface{ Scan(dest ...any) error }) (*APIKey, error) {
 	var k APIKey
 	err := row.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.KeyEnc,
 		&k.KeyPrefix, &k.Status, &k.LastUsedAt, &k.Kind, &k.HostGroup, &k.AccountUIDs,
-		&k.GroupScope, &k.CreatedAt)
+		&k.GroupScope, &k.ActiveGroup, &k.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1558,6 +1573,20 @@ func (s *Store) SetAPIKeyGroupsByID(id int64, scope string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetAPIKeyActiveGroup 用户**自己**切换密钥的当前生效模型组（v0.31.88）。
+//
+// 归属条件下推 SQL（id + user_id）：跨用户改别人的 Key 直接 0 行，不泄露存在性。
+// 只改 active_group —— 授权边界（group_scope）只有管理员能动。
+func (s *Store) SetAPIKeyActiveGroup(userID, keyID int64, group string) (bool, error) {
+	res, err := s.db.Exec(`UPDATE api_keys SET active_group = ? WHERE id = ? AND user_id = ?`,
+		group, keyID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // DeleteAPIKey 删除某 key。

@@ -395,6 +395,9 @@ func (a *app) handleListKeys(w http.ResponseWriter, r *http.Request) {
 			// 按钮是否可用，避免点开才发现是老库无密文 / 服务端以 -secret none 启动。
 			"revealable":  a.secret != nil && strings.TrimSpace(k.KeyEnc) != "",
 			"group_scope": k.GroupScope,
+			// active_group（v0.31.88）：当前生效的模型组（"" = 不限制）。
+			// 前端要它才能显示"这把 Key 现在按哪组计费"以及切换后的选项高亮。
+			"active_group": k.ActiveGroup,
 			// stale_groups（v0.31.78）：scope 里**已经不存在**的组。
 			//
 			// 授权指向不存在的组是允许的（组被删/通道停用），但**必须让人看见** ——

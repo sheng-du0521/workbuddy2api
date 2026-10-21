@@ -104,6 +104,30 @@ func (a *app) handleKeyModels(w http.ResponseWriter, r *http.Request) {
 	if a.proxy != nil {
 		resp.Groups = a.proxy.visibleGroups(k)
 	}
+	// 生效分组（v0.31.88）：非空时只列该组 —— 目录与请求约束必须同源。
+	if ms := a.activeGroupModels(k); ms != nil {
+		out2 := make([]string, 0, len(ms)+1)
+		seen2 := map[string]bool{}
+		for _, g := range resp.Groups {
+			if g.ID == k.ActiveGroup && g.Members > 0 && !seen2[g.Model] {
+				seen2[g.Model] = true
+				out2 = append(out2, g.Model)
+			}
+		}
+		for _, m := range ms {
+			if m != "" && !seen2[m] {
+				seen2[m] = true
+				out2 = append(out2, m)
+			}
+		}
+		resp.Models, resp.Count = out2, len(out2)
+		if len(out2) == 0 {
+			resp.Reason = "active_group_empty"
+			resp.Note = "当前生效分组里没有可用模型；可到密钥卡上切换分组"
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	seen := map[string]bool{}
 	out := make([]string, 0, 32+len(resp.Groups))
 	for _, g := range resp.Groups {

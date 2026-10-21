@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.87"
+const version = "0.31.88"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1540,9 +1540,12 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	// 模型组（v0.31.76）：只有**绑定了通道组**的 Key 才会多出 `wb-group-*` 条目 ——
 	// 存量客户端（group_scope 为空）看到的响应逐字节不变，不给它们加噪声。
+	// 两种情况要按 Key 定制清单（v0.31.88 扩到「生效分组」）：
+	//   · 绑了通道组 → 多出 wb-group-* 条目（v0.31.76）；
+	//   · 生效分组非空 → **只列该组**，否则客户端会显示一堆切组后必然 404 的模型。
 	if k, _ := r.Context().Value(ctxAPIKeyKey).(*APIKey); k != nil && a.proxy != nil &&
-		len(splitGroups(k.GroupScope)) > 0 {
-		if p := a.modelsPayloadWithGroups(k); p != nil {
+		(k.ActiveGroup != "" || len(splitGroups(k.GroupScope)) > 0) {
+		if p := a.modelsPayloadFor(k); p != nil {
 			_, _ = w.Write(p)
 			return
 		}
@@ -1560,28 +1563,52 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
 }
 
-// modelsPayloadWithGroups 在缓存清单前插入该 Key 可见的组名条目。
+// modelsPayloadFor 按这把 Key 的可见范围定制 /v1/models。
 //
-// 只在 Key 绑了通道组时调用（见 handleModels）。组名放最前：客户端模型选择器
-// 通常按返回顺序展示，放前面能让"用一个名字通吃"这条路更容易被发现。
+// 两条路径：
+//  1. 生效分组非空 → **只列该组的成员 + 组名**。这是"切换分组"真正生效的地方：
+//     目录不变的话，客户端永远看得到全部模型，用户切了组却还在按老模型发请求。
+//  2. 否则 → 缓存清单 + 该 Key 可见的组名（v0.31.76 的行为，逐字节不变）。
 //
 // 返回 nil 表示"拼不出来"——调用方回落到缓存原文（宁可少两个条目，也不要 500）。
-func (a *app) modelsPayloadWithGroups(k *APIKey) []byte {
+func (a *app) modelsPayloadFor(k *APIKey) []byte {
 	base := modelsPayload()
 	if base == nil {
 		a.refreshModelsCache()
 		base = modelsPayload()
 	}
-	if base == nil {
-		return nil
-	}
 	var doc struct {
 		Object string           `json:"object"`
 		Data   []map[string]any `json:"data"`
 	}
-	if err := json.Unmarshal(base, &doc); err != nil {
-		return nil
+	if base != nil {
+		if err := json.Unmarshal(base, &doc); err != nil {
+			return nil
+		}
 	}
+	doc.Object = "list"
+
+	if ms := a.activeGroupModels(k); ms != nil {
+		label := k.ActiveGroup
+		if _, lb, ok := a.proxy.groupMembersFor(k.ActiveGroup, k); ok {
+			label = lb
+		}
+		out := make([]map[string]any, 0, len(ms)+1)
+		// 组名排第一：客户端模型选择器通常按返回顺序展示，"用一个名字通吃"更容易被发现。
+		out = append(out, map[string]any{
+			"id": groupVirtualModel(k.ActiveGroup), "object": "model", "owned_by": label,
+		})
+		for _, m := range ms {
+			out = append(out, map[string]any{"id": m, "object": "model", "owned_by": label})
+		}
+		doc.Data = out
+		blob, err := json.Marshal(doc)
+		if err != nil {
+			return nil
+		}
+		return blob
+	}
+
 	head := make([]map[string]any, 0, len(doc.Data)+4)
 	for _, g := range a.proxy.visibleGroups(k) {
 		if g.Members == 0 {
@@ -1592,11 +1619,11 @@ func (a *app) modelsPayloadWithGroups(k *APIKey) []byte {
 		})
 	}
 	doc.Data = append(head, doc.Data...)
-	out, err := json.Marshal(doc)
+	blob, err := json.Marshal(doc)
 	if err != nil {
 		return nil
 	}
-	return out
+	return blob
 }
 
 // fetchModelIDs 调用上游取真实模型列表，带 panic 保护（上游异常不应拖垮进程）。
@@ -1671,6 +1698,9 @@ func (a *app) routes() *http.ServeMux {
 	// 该 Key 的可用模型清单（v0.31.74）：测试对话页与一键接入共用这一个来源，
 	// 避免"下拉能选、发出去 404"（口径见 keymodels.go 头注释）。
 	mux.HandleFunc("GET /api/keys/{id}/models", a.userGuard(a.handleKeyModels))
+	// 分组查看与切换（v0.31.88）：用户自己切「当前生效组」，授权边界仍只有管理员能动。
+	mux.HandleFunc("GET /api/keys/{id}/group-options", a.userGuard(a.handleKeyGroupOptions))
+	mux.HandleFunc("POST /api/keys/{id}/group", a.userGuard(a.handleKeyGroupSet))
 	// 一键接入的模型选配（v0.31.82）：运营配"接入时给哪些模型"，两类 Key 分别有默认值。
 	// 与 /api/keys/{id}/models 分开：那个是"实际能用什么"，这个是"接入时推荐填什么"。
 	mux.HandleFunc("GET /api/onboard/options", a.userGuard(a.handleOnboardOptions))
@@ -1751,6 +1781,8 @@ func (a *app) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/upstreams/toggle", a.adminGuard(a.handleAdminUpstreamToggle))
 	mux.HandleFunc("POST /api/admin/upstreams/probe", a.adminGuard(a.handleAdminUpstreamProbe))
 	mux.HandleFunc("POST /api/admin/upstreams/models/save", a.adminGuard(a.handleAdminUpstreamModelSave))
+	// 探活识别到的模型一次入库（v0.31.88）：通道映射 + 系统模型列表，可带单模型倍率。
+	mux.HandleFunc("POST /api/admin/upstreams/models/import", a.adminGuard(a.handleAdminUpstreamImport))
 	mux.HandleFunc("POST /api/admin/upstreams/models/delete", a.adminGuard(a.handleAdminUpstreamModelDelete))
 	mux.HandleFunc("GET /api/referral", a.userGuard(a.handleReferral))
 	// 站内公告（v0.17.8）：用户侧只读启用中的公告，用于弹窗与概览卡片。
