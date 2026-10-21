@@ -1626,7 +1626,9 @@ async function openOnboardModal(k) {
   let picked = targets[0].id;
 
   const m = openModal('一键接入 · ' + (k.name || '未命名'),
-    '把「本站地址 + 这把 Key + 一个模型」写进客户端配置。会先备份原文件，再按 id 合并（不会追加重复条目）。');
+    '把「本站地址 + 这把 Key + 一个模型」写进客户端配置。会先备份原文件，再按 id 合并（不会追加重复条目）。'
+    + '模型默认填「work官组」（' + (k.kind === 'host' ? '自挂官组' : '号池官组') + '），'
+    + '它会替你从' + (k.kind === 'host' ? '你自己的账号' : '平台号池') + '里挑一个能跑的模型，不用先配模型名。');
 
   // 目标选择：用项目里既有的 segmented 控件（不是自造 chip —— 自造就要自己维护
   // 选中态样式，而 .chip 的选中类是 .active 不是 .on，写错时"能点但看不出选了谁"）。
@@ -1679,6 +1681,16 @@ async function openOnboardModal(k) {
     }
     // 默认值以服务端为准：它已经处理过"配置的默认值不在这把 Key 的候选里 → 回落第一项"。
     if (r.default_model) inp.value = r.default_model;
+    // 「work官组」的两类在标题上写清楚：用户不需要知道"组"是什么，
+    // 只需要知道"这一项会替我从哪儿挑模型"。
+    if (r.group_name) {
+      const tag = el('div', 'muted',
+        'work官组 · ' + (r.group_label || '') + '：' + r.group_name
+        + '（填它就自动挑一个能跑的模型）');
+      tag.style.fontSize = '12px';
+      tag.style.marginTop = '4px';
+      row.appendChild(tag);
+    }
     if (r.note) {
       inp.placeholder = r.note;
       const tip = el('div', 'muted', r.note);

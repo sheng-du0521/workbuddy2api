@@ -42,7 +42,7 @@ func TestApplyGroupExpansionRewritesPayload(t *testing.T) {
 	withModelsCache(t, []string{"glm-5.3"})
 
 	payload := map[string]any{"model": "wb-group-work", "messages": []any{}}
-	real, ok := px.applyGroupExpansion(payload, "wb-group-work")
+	real, ok := px.applyGroupExpansion(payload, "wb-group-work", &APIKey{})
 	if !ok {
 		t.Fatal("wb-group-work 应被展开")
 	}
@@ -55,7 +55,7 @@ func TestApplyGroupExpansionRewritesPayload(t *testing.T) {
 
 	// 普通模型名：payload 一个字节都不该动。
 	p2 := map[string]any{"model": "glm-5.3"}
-	if _, ok := px.applyGroupExpansion(p2, "glm-5.3"); ok {
+	if _, ok := px.applyGroupExpansion(p2, "glm-5.3", &APIKey{}); ok {
 		t.Error("普通模型名不该被展开")
 	}
 	if p2["model"] != "glm-5.3" {
@@ -73,7 +73,7 @@ func TestExpandGroupModelOnlyGroupNames(t *testing.T) {
 	withModelsCache(t, []string{"glm-5.3"})
 
 	for _, name := range []string{"glm-5.3", "wb-group-", "wb-groub-work", "claude-sonnet-4-5"} {
-		if _, _, ok := px.expandGroupModel(name); ok {
+		if _, _, ok := px.expandGroupModel(name, &APIKey{}); ok {
 			t.Errorf("%q 不该被当成模型组展开", name)
 		}
 	}
@@ -88,12 +88,12 @@ func TestExpandGroupModelWork(t *testing.T) {
 	defer store.Close()
 	withModelsCache(t, []string{"glm-5.3", "deepseek-v4-flash"})
 
-	real, label, ok := px.expandGroupModel("wb-group-work")
+	real, label, ok := px.expandGroupModel("wb-group-work", &APIKey{})
 	if !ok {
 		t.Fatal("wb-group-work 应被识别为组名")
 	}
-	if label != "work 官组" {
-		t.Errorf("label = %q，期望 work 官组", label)
+	if label != "号池官组" {
+		t.Errorf("label = %q，期望 号池官组", label)
 	}
 	if real != "glm-5.3" && real != "deepseek-v4-flash" {
 		t.Errorf("展开结果 %q 不在号池目录里", real)
@@ -130,7 +130,7 @@ func TestExpandGroupModelChannel(t *testing.T) {
 	}
 
 	gid := "ch" + itoa(int(id))
-	members, label, ok := px.groupMembers(gid)
+	members, label, ok := px.groupMembersFor(gid, &APIKey{})
 	if !ok {
 		t.Fatalf("组 %s 应存在", gid)
 	}
@@ -145,13 +145,19 @@ func TestExpandGroupModelChannel(t *testing.T) {
 	if _, err := store.db.Exec(`UPDATE upstreams SET enabled=0 WHERE id=?`, id); err != nil {
 		t.Fatalf("停用通道: %v", err)
 	}
-	if _, _, ok := px.groupMembers(gid); ok {
+	if _, _, ok := px.groupMembersFor(gid, &APIKey{}); ok {
 		t.Error("通道停用后组应不可见")
 	}
 }
 
-// TestVisibleGroupsHostKeyOnlyWork 代挂自用 Key 只看得见 work，即使绑了通道组。
-func TestVisibleGroupsHostKeyOnlyWork(t *testing.T) {
+// TestVisibleGroupsByKeyKind work官组只有两类，按 Key 类型二选一（v0.31.82）。
+//
+//	池计费 Key → 号池官组（wb-group-work）
+//	代挂自用 Key → 自挂官组（wb-group-host）
+//
+// 通道组（ch<N>）**不再出现在用户可见列表里**：即使 Key 的 group_scope 里还留着
+// 历史授权，也不该再被当成"用户可选的一种组"——产品口径只有两类。
+func TestVisibleGroupsByKeyKind(t *testing.T) {
 	store, px, _ := newTestApp(t, &Account{
 		UID: "g-acct4", Realm: "cn", AccessToken: "at", RefreshToken: "rt",
 		ConsumeGroup: "apply", PoolState: "in",
@@ -172,19 +178,23 @@ func TestVisibleGroupsHostKeyOnlyWork(t *testing.T) {
 		t.Fatalf("SaveUpstreamModel: %v", err)
 	}
 
+	// 代挂 Key：只见自挂官组（即使 group_scope 里还留着通道组授权）。
 	host := &APIKey{Kind: KeyKindHost, GroupScope: "ch" + itoa(int(id))}
 	groups := px.visibleGroups(host)
-	if len(groups) != 1 || groups[0].ID != groupWorkID {
-		t.Fatalf("代挂 Key 应只看见 work，得到 %+v", groups)
+	if len(groups) != 1 || groups[0].ID != groupHostID {
+		t.Fatalf("代挂 Key 应只看见自挂官组，得到 %+v", groups)
+	}
+	if groups[0].Model != "wb-group-host" || groups[0].Label != "自挂官组" {
+		t.Errorf("自挂官组 = %+v，期望 wb-group-host / 自挂官组", groups[0])
 	}
 
-	// 池计费 Key 绑了组 → 两组都在。
+	// 池计费 Key：只见号池官组（历史通道组授权不再暴露）。
 	pool := &APIKey{GroupScope: "ch" + itoa(int(id))}
 	groups = px.visibleGroups(pool)
-	if len(groups) != 2 {
-		t.Fatalf("池计费 Key 应看见 work + 通道组，得到 %+v", groups)
+	if len(groups) != 1 || groups[0].ID != groupWorkID {
+		t.Fatalf("池计费 Key 应只看见号池官组，得到 %+v", groups)
 	}
-	if groups[1].Model != "wb-group-ch"+itoa(int(id)) {
-		t.Errorf("虚拟模型名 = %q，期望 wb-group-ch<id>", groups[1].Model)
+	if groups[0].Model != "wb-group-work" || groups[0].Label != "号池官组" {
+		t.Errorf("号池官组 = %+v，期望 wb-group-work / 号池官组", groups[0])
 	}
 }

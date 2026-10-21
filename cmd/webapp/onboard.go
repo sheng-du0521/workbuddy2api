@@ -411,18 +411,29 @@ func (a *app) handleKeyOnboard(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// 代挂自用 Key 不能把**组名**写进配置（v0.31.81）。
-	//
-	// 组名（wb-group-*）展开出来的是平台号池的模型，而代挂 Key 只在自己的账号里选号 ——
-	// 号主没有那个模型，上游必然 11102/404，表现是"接入成功后一直 404 / 流被中断"。
-	// 在这里就拒绝，比让用户跑完脚本、打开客户端才发现要省一整轮排查。
-	if k.Kind == KeyKindHost && strings.HasPrefix(strings.TrimSpace(model), groupModelPrefix) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "代挂自用 Key 不能接入模型组（" + model + "）：组名对应平台号池的模型，" +
-				"而这把 Key 只走你自己的账号，上游会报「模型不存在」。请填一个你账号实际可用的模型名。",
-			"code": "host_key_cannot_use_group",
-		})
-		return
+	// 「work官组」只有两类，且必须与 Key 类型匹配（v0.31.82）：
+	//   池计费 Key → wb-group-work（号池官组）
+	//   代挂 Key   → wb-group-host（自挂官组）
+	// 串了就在这里拒 —— 组名各自代表"从哪种账号里挑模型"，用错必然挑出跑不了的模型
+	// （v0.31.81 那个线上 404 就是"代挂 Key 用了号池组"）。
+	if strings.HasPrefix(strings.TrimSpace(model), groupModelPrefix) {
+		gid := strings.TrimPrefix(strings.TrimSpace(model), groupModelPrefix)
+		if k.Kind == KeyKindHost && gid == groupWorkID {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "代挂自用 Key 不能用号池官组（" + model + "）：那把 Key 只走你自己的账号，" +
+					"号池里的模型你的账号可能并没有。请用自挂官组 wb-group-host，或填一个具体模型名。",
+				"code": "host_key_cannot_use_pool_group",
+			})
+			return
+		}
+		if k.Kind != KeyKindHost && gid == groupHostID {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "池计费 Key 不能用自挂官组（" + model + "）：自挂官组是从你自己的账号里挑模型，" +
+					"池计费 Key 没有绑定账号。请用号池官组 wb-group-work。",
+				"code": "pool_key_cannot_use_host_group",
+			})
+			return
+		}
 	}
 	plain, derr := a.secret.Decrypt(k.KeyEnc)
 	if derr != nil || plain == "" {

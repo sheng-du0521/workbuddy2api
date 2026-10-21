@@ -1753,17 +1753,18 @@
         <div id="chList">加载中…</div>
       </div>
 
-      <!-- 一键接入选配（v0.31.82）：决定用户点「接入」时能看到哪些模型、默认填哪个。
-           放在本页是因为它和"上游有什么模型"是同一个心智（都能看到号池优先/通道映射）。 -->
+      <!-- work官组（v0.31.82）：一键接入的模型选配，只有两类 —— 号池官组 / 自挂官组。
+           这是全流程唯一的分类方式，不再有"通道组"等第三种说法。 -->
       <div class="card" style="margin-top:14px;">
         <div class="section-head">
-          <h2>一键接入选配</h2>
-          <span class="muted" style="font-size:12px;">只影响「接入」弹窗的候选与默认值，不影响 /v1/models 与实际可用性</span>
+          <h2>work官组</h2>
+          <span class="muted" style="font-size:12px;">一键接入的模型选配 · 只影响「接入」弹窗的候选与默认值</span>
         </div>
         <div class="sub" style="margin:0 0 12px;">
-          不勾任何模型 = <b>不限制</b>（用户看到自己密钥的全量可用模型）。勾了就<b>取交集</b>：
-          只放行这几个，且仍受"这把 Key 自己能跑什么"约束。
-          <br>代挂自用的默认值<b>不能填组名</b>（组名对应号池模型，代挂 Key 会 404）。
+          work官组分两类：<b>号池官组</b>（池计费 Key，从平台号池挑模型）与
+          <b>自挂官组</b>（代挂自用 Key，从号主自己的账号里挑）。
+          <br>两类都<b>开箱即用</b>：不勾任何模型 = 不限制，默认值自动填对应官组的虚拟名，用户不用额外配置。
+          勾了就<b>取交集</b>：只放行这几个，且仍受"这把 Key 自己能跑什么"约束。
         </div>
         <div id="onboardCfg">加载中…</div>
       </div>
@@ -4320,104 +4321,11 @@ function userCard(u) {
   const rec = el('button', 'ghost', '记录');
   rec.title = '余额变动记录：谁在什么时候改了多少、结果如何';
   rec.onclick = () => openBalanceAudits(u);
-  // 「组」（v0.31.77）：给这个用户的 Key 授权第三方通道组。
-  // 放在用户卡上而不是通道页：授权是"给谁"的决定，从用户出发才找得到；
-  // 从通道出发会变成"这条通道给了谁"，那种列表更适合排查，不适合配置。
-  const grp = el('button', 'ghost', '组');
-  grp.title = '该用户各把 Key 能看见哪些模型组（work 官组恒可见，通道组需在此授权）';
-  grp.onclick = () => openKeyGroups(u);
-  foot.append(add, lim, ban, rec, grp);
+  // v0.31.82 起不再有「组」授权入口：work官组只有两类（号池官组 / 自挂官组），
+  // 按 Key 类型自动生效，不需要逐 Key 勾选。通道组的授权界面整体撤下。
+  foot.append(add, lim, ban, rec);
   card.appendChild(foot);
   return card;
-}
-
-// openKeyGroups 某用户的 Key 组授权弹窗（v0.31.77）。
-//
-// 只做一件事：勾选。**不在这里改 Key 状态或删 Key** —— 那是「API 密钥」页的职责，
-// 一个弹窗承担两种破坏性操作，误点的代价太高。
-async function openKeyGroups(u) {
-  let d = null;
-  try { d = await api(`/api/admin/users/${u.id}/keys`); }
-  catch (e) { toast('读取密钥失败：' + e.message, 'err'); return; }
-  const keys = (d && d.keys) || [];
-  const groups = (d && d.groups) || [];
-  const m = openModal('模型组授权 · ' + u.username,
-    'work 官组对所有 Key 恒可见；勾选通道组后，该 Key 才能用 wb-group-ch<N> 这个组名。代挂自用 Key 只能用 work。');
-
-  if (!keys.length) {
-    m.body.appendChild(el('div', 'hintbar', '该用户还没有任何密钥。'));
-    return;
-  }
-  const box = el('div', 'card');
-  box.style.background = 'var(--bg-soft, rgba(0,0,0,.02))';
-  for (const k of keys) {
-    const row = el('div');
-    row.style.cssText = 'padding:8px 0;border-bottom:1px solid rgba(127,127,127,.15);';
-    const head = el('div', 'row');
-    head.style.cssText = 'justify-content:space-between;align-items:center;gap:8px;';
-    const left = el('span');
-    left.appendChild(el('b', null, k.name || '未命名'));
-    left.appendChild(el('span', 'mono muted', ' #' + k.id + ' ' + (k.masked || '')));
-    if (k.kind === 'host') left.appendChild(el('span', 'tag', ' 代挂'));
-    if (k.status !== 'active') left.appendChild(el('span', 'tag warn', ' 已停用'));
-    head.appendChild(left);
-
-    if (k.kind === 'host') {
-      // 代挂 Key：明确说清为什么不能勾（不给一堆禁用复选框，让人以为点了会生效）。
-      const why = el('span', 'muted', '只能用 work 官组');
-      why.style.fontSize = '12px';
-      head.appendChild(why);
-      row.appendChild(head);
-      box.appendChild(row);
-      continue;
-    }
-
-    const sel = new Set(splitScope(k.group_scope));
-    const chRow = el('div', 'row');
-    chRow.style.cssText = 'gap:12px;flex-wrap:wrap;margin-top:6px;';
-    for (const g of groups) {
-      if (g.id === 'work') continue; // work 恒可见，不给勾（勾了等于假装授予过）
-      const lab = el('label', 'muted', ' ' + (g.label || g.id) + (g.members ? '' : '（空组）'));
-      lab.style.cssText = 'display:inline-flex;align-items:center;gap:4px;font-size:12px;';
-      const cb = el('input');
-      cb.type = 'checkbox';
-      cb.checked = sel.has(g.id);
-      cb.disabled = !g.members; // 空组勾了也没用（选它必然失败）
-      cb.onchange = () => { if (cb.checked) sel.add(g.id); else sel.delete(g.id); };
-      lab.prepend(cb);
-      chRow.appendChild(lab);
-    }
-    if (!chRow.children.length) {
-      chRow.appendChild(el('span', 'muted', '还没有启用的通道组（先去「第三方通道」建通道）'));
-    }
-    row.appendChild(head);
-    row.appendChild(chRow);
-
-    const ops = el('div', 'row');
-    ops.style.cssText = 'gap:8px;margin-top:6px;';
-    const save = el('button', '', '保存授权');
-    const hint = el('span', 'muted', '');
-    hint.style.fontSize = '12px';
-    save.onclick = async () => {
-      save.disabled = true;
-      try {
-        const r = await post(`/api/admin/keys/${k.id}/groups`, {
-          group_scope: Array.from(sel).join(','),
-        });
-        hint.textContent = '已保存：' + (r.group_scope || '（仅 work）')
-          + ((r.dropped && r.dropped.length) ? '；已忽略不存在的组：' + r.dropped.join(',') : '');
-        hint.style.color = '#2e7d32';
-      } catch (e) {
-        hint.textContent = '保存失败：' + e.message;
-        hint.style.color = '#c0392b';
-      } finally { save.disabled = false; }
-    };
-    ops.appendChild(save);
-    ops.appendChild(hint);
-    row.appendChild(ops);
-    box.appendChild(row);
-  }
-  m.body.appendChild(box);
 }
 
 // splitScope 逗号分隔的组 scope → 数组（与后端 splitGroups 同语义）。
@@ -8082,10 +7990,12 @@ async function saveAnthropicCfg() {
 //   1. 我配的 key 到底通不通？（探活按钮 → 服务端 GET /models，免费且不耗额度）
 //   2. 这个模型现在会走通道，还是会被号池抢走？（pool_models 命中就标「号池优先」）
 //   3. 改了之后什么时候生效？（停用/加模型会立刻作废模型缓存；计费倍率走快照，保存即生效）
-// loadOnboardCfg 一键接入选配（v0.31.82）。
+// loadOnboardCfg work官组 · 一键接入选配（v0.31.82）。
+//
+// 只有两类：号池官组（池计费 Key）/ 自挂官组（代挂自用 Key）。
+// 全流程只有这一种分类，不再有"通道组"等第三种说法。
 //
 // 只影响「接入」弹窗的候选与默认值 —— 不影响 /v1/models、不影响实际可用性。
-// 所以这里没有"保存即生效"的紧张感，失败也只提示、不阻塞通道页。
 async function loadOnboardCfg() {
   const box = $('onboardCfg');
   if (!box) return;
@@ -8093,93 +8003,114 @@ async function loadOnboardCfg() {
   try { d = await api('/api/admin/onboard-config'); }
   catch (e) { box.textContent = ''; box.appendChild(el('div', 'muted', '读取失败：' + e.message)); return; }
   const all = (d && d.all) || [];
-  const picked = new Set((d && d.models) || []);
-  const raw = String((d && d.raw) || '');
-  // 配过但已下线的名字：必须显式提示，否则"我明明配了却不在列表里"没法自查。
-  const gone = raw.split(',').map((x) => x.trim()).filter((x) => x && !all.includes(x));
-  const configured = !!(d && d.configured);
-
-  box.textContent = '';
-  const head = el('div', 'row');
-  head.style.cssText = 'gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;';
-  const badge = el('span', 'tag ' + (configured ? 'accent' : ''), configured ? '已限制' : '不限制（全量）');
-  head.appendChild(badge);
-  const clear = el('button', 'ghost', '清空（恢复不限制）');
-  clear.style.padding = '2px 8px';
-  clear.onclick = () => { for (const cb of box.querySelectorAll('input[type=checkbox]')) cb.checked = false; };
-  head.appendChild(clear);
-  if (gone.length) {
-    const t = el('span', 'tag warn', '已下线：' + gone.join('、'));
-    t.title = '这些名字还在配置里，但平台当前模型目录里没有，已自动从候选剔除';
-    head.appendChild(t);
-  }
-  box.appendChild(head);
-
   if (!all.length) {
-    box.appendChild(el('div', 'hintbar', '平台还没有可用模型目录（号池为空、也没有通道映射）。'));
+    box.textContent = '';
+    box.appendChild(el('div', 'hintbar',
+      '平台还没有可用模型目录（号池为空、也没有通道映射）。此时两类官组仍可接入：'
+      + '用户填 wb-group-work / wb-group-host 会由平台在能跑的账号里挑，只是暂时没有具体模型可选。'));
     return;
   }
-  // 模型勾选区：两列 + 滚动。50+ 个模型铺满一屏会把下面的默认值顶走。
-  const grid = el('div');
-  grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;'
-    + 'max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px 10px;';
-  for (const m of all) {
-    const lab = el('label', 'muted', ' ' + m);
-    lab.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;';
-    const cb = el('input');
-    cb.type = 'checkbox';
-    cb.value = m;
-    cb.checked = picked.has(m);
-    lab.prepend(cb);
-    grid.appendChild(lab);
+
+  box.textContent = '';
+  // 两个分区共用一套渲染：结构完全一样，差别只在 KV 字段名与文案。
+  const sections = [
+    {
+      title: '号池官组', desc: '池计费 Key：从平台号池里挑模型', group: 'wb-group-work',
+      picked: new Set((d && d.models) || []), raw: String((d && d.raw) || ''),
+      defVal: (d && d.default_pool) || '', defPh: '留空 = wb-group-work',
+    },
+    {
+      title: '自挂官组', desc: '代挂自用 Key：从号主自己的账号里挑', group: 'wb-group-host',
+      picked: new Set((d && d.models_host) || []), raw: String((d && d.raw_host) || ''),
+      defVal: (d && d.default_host) || '', defPh: '留空 = wb-group-host',
+    },
+  ];
+  const inputs = [];
+
+  for (const sec of sections) {
+    const card = el('div');
+    card.style.cssText = 'border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:10px;';
+    const head = el('div', 'row');
+    head.style.cssText = 'align-items:baseline;gap:10px;flex-wrap:wrap;';
+    head.appendChild(el('b', null, sec.title));
+    head.appendChild(el('span', 'muted', sec.desc));
+    const chip = el('span', 'tag accent mono', sec.group);
+    chip.style.cursor = 'pointer';
+    chip.title = '点一下复制这个虚拟模型名（客户端 model 字段填它）';
+    chip.onclick = () => copyText(sec.group);
+    head.appendChild(chip);
+    // 配过但已下线的名字：必须显式提示，否则"我明明配了却不在列表里"没法自查。
+    const gone = sec.raw.split(',').map((x) => x.trim()).filter((x) => x && !all.includes(x));
+    if (gone.length) {
+      const t = el('span', 'tag warn', '已下线：' + gone.join('、'));
+      t.title = '这些名字还在配置里，但平台当前模型目录里没有，已自动从候选剔除';
+      head.appendChild(t);
+    }
+    card.appendChild(head);
+
+    const grid = el('div');
+    grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;'
+      + 'max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:8px;'
+      + 'padding:8px 10px;margin-top:8px;';
+    for (const m of all) {
+      const lab = el('label', 'muted', ' ' + m);
+      lab.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;';
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.value = m;
+      cb.checked = sec.picked.has(m);
+      lab.prepend(cb);
+      grid.appendChild(lab);
+    }
+    card.appendChild(grid);
+
+    const row = el('div', 'row');
+    row.style.cssText = 'gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;';
+    const clear = el('button', 'ghost', '清空（不限制）');
+    clear.style.padding = '2px 8px';
+    clear.onclick = () => { for (const cb of grid.querySelectorAll('input[type=checkbox]')) cb.checked = false; };
+    row.appendChild(clear);
+    row.appendChild(el('span', 'muted', '默认模型：'));
+    const def = el('input');
+    def.value = sec.defVal;
+    def.placeholder = sec.defPh;
+    def.className = 'mono';
+    def.style.width = '200px';
+    row.appendChild(def);
+    card.appendChild(row);
+    inputs.push({ sec, grid, def });
+
+    box.appendChild(card);
   }
-  box.appendChild(grid);
 
-  const row = el('div', 'row');
-  row.style.cssText = 'gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;';
-  const mkInput = (label, val, ph) => {
-    const wrap = el('div', 'row');
-    wrap.style.cssText = 'gap:6px;align-items:center;';
-    wrap.appendChild(el('span', 'muted', label));
-    const i = el('input');
-    i.value = val || '';
-    i.placeholder = ph;
-    i.className = 'mono';
-    i.style.width = '200px';
-    wrap.appendChild(i);
-    return { wrap, input: i };
-  };
-  const poolDef = mkInput('池计费默认', (d && d.default_pool) || '', '留空 = wb-group-work');
-  const hostDef = mkInput('代挂默认', (d && d.default_host) || '', '留空 = 让用户自己选');
-  row.appendChild(poolDef.wrap);
-  row.appendChild(hostDef.wrap);
-
+  const foot = el('div', 'row');
+  foot.style.cssText = 'gap:10px;align-items:center;';
   const save = el('button', '', '保存选配');
   const hint = el('span', 'muted', '');
   hint.style.fontSize = '12px';
   save.onclick = async () => {
-    const models = Array.from(box.querySelectorAll('input[type=checkbox]'))
-      .filter((c) => c.checked).map((c) => c.value);
+    const pick = (g) => Array.from(g.querySelectorAll('input[type=checkbox]'))
+      .filter((c) => c.checked).map((c) => c.value).join(',');
     save.disabled = true;
     try {
       const r = await post('/api/admin/onboard-config', {
-        models: models.join(','),
-        default_pool: poolDef.input.value.trim(),
-        default_host: hostDef.input.value.trim(),
+        models: pick(inputs[0].grid),
+        models_host: pick(inputs[1].grid),
+        default_pool: inputs[0].def.value.trim(),
+        default_host: inputs[1].def.value.trim(),
       });
       hint.style.color = '#2e7d32';
-      hint.textContent = r.configured
-        ? '已保存：接入时只放行 ' + (r.models || []).length + ' 个模型'
-        : '已保存：恢复不限制（用户看到自己密钥的全量可用模型）';
+      hint.textContent = '已保存：号池官组 ' + (r.configured ? (r.models || []).length + ' 个模型' : '不限制')
+        + ' · 自挂官组 ' + (r.configured_host ? (r.models_host || []).length + ' 个模型' : '不限制');
       loadOnboardCfg();
     } catch (e) {
       hint.style.color = '#c0392b';
       hint.textContent = '保存失败：' + e.message;
     } finally { save.disabled = false; }
   };
-  row.appendChild(save);
-  row.appendChild(hint);
-  box.appendChild(row);
+  foot.appendChild(save);
+  foot.appendChild(hint);
+  box.appendChild(foot);
 }
 
 async function loadChannels() {
@@ -8215,14 +8146,6 @@ function channelCard(up, poolModels, affected) {
   head.appendChild(el('span', 'mono muted', up.base_url));
   head.appendChild(el('span', 'muted', 'key ' + (up.key_masked || '—')));
   head.appendChild(el('span', 'muted', '优先级 ' + up.priority));
-  // 组名（v0.31.76）：这个通道在模型组体系里的虚拟模型名。
-  // 客户端的「接入」配置可以直接填它（cc/switch 那种只能填一个模型名的场景），
-  // 点击即复制 —— 运维不用手抄 id。
-  const chip = el('span', 'tag accent', '组 ' + (up.group_model || ('wb-group-ch' + up.id)));
-  chip.style.cursor = 'pointer';
-  chip.title = '点一下复制：把这个组名填进客户端 model 字段，组内自动选一个可用模型';
-  chip.onclick = () => copyText(up.group_model || ('wb-group-ch' + up.id));
-  head.appendChild(chip);
   // 影响面（v0.31.78）：有 Key 授权了这个组时，停用/删除之前必须先看见。
   // 启用状态用黄（预警），停用状态用红（已经在影响）—— 同一件事，两种语气。
   const n = (affected && affected[String(up.id)]) || 0;

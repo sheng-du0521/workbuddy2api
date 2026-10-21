@@ -57,24 +57,38 @@ func TestOnboardHostKeyRejectsGroup(t *testing.T) {
 		return rec.Code, out
 	}
 
-	// ① 代挂 Key + 组名 → 400，且给出可执行的下一步。
+	// ① 代挂 Key + **号池**官组 → 400，且给出可执行的下一步（指向 wb-group-host）。
 	if code, out := call(host.ID, "wb-group-work"); code != http.StatusBadRequest {
-		t.Errorf("代挂 Key 用组名应 400，得到 %d（%v）", code, out)
-	} else if out["code"] != "host_key_cannot_use_group" {
-		t.Errorf("code = %v，期望 host_key_cannot_use_group", out["code"])
+		t.Errorf("代挂 Key 用号池官组应 400，得到 %d（%v）", code, out)
+	} else if out["code"] != "host_key_cannot_use_pool_group" {
+		t.Errorf("code = %v，期望 host_key_cannot_use_pool_group", out["code"])
+	}
+
+	// ①b 代挂 Key + **自挂**官组 → 放行（v0.31.82 起这是它的正当默认值）。
+	// 加密不可用（测试库无 secret）时会走到 409/500，只要不是 400 + 上面那个 code 就算过。
+	if code, out := call(host.ID, "wb-group-host"); code == http.StatusBadRequest &&
+		out["code"] == "host_key_cannot_use_pool_group" {
+		t.Errorf("代挂 Key 用自挂官组被误拦：%d %v", code, out)
+	}
+
+	// ①c 池计费 Key + 自挂官组 → 400（必须与 Key 类型匹配）。
+	if code, out := call(pool.ID, "wb-group-host"); code != http.StatusBadRequest {
+		t.Errorf("池计费 Key 用自挂官组应 400，得到 %d（%v）", code, out)
+	} else if out["code"] != "pool_key_cannot_use_host_group" {
+		t.Errorf("code = %v，期望 pool_key_cannot_use_host_group", out["code"])
 	}
 
 	// ② 代挂 Key + 具体模型名 → 放行（不能因为修 ① 把正常路径也挡了）。
 	// 加密不可用（测试库无 secret）时会是 409/500，这不算本用例的失败：
 	// 只要不是 400 + host_key_cannot_use_group 就说明闸门没有误伤。
 	if code, out := call(host.ID, "glm-5.3"); code == http.StatusBadRequest &&
-		out["code"] == "host_key_cannot_use_group" {
+		(out["code"] == "host_key_cannot_use_pool_group" || out["code"] == "host_key_cannot_use_host_group") {
 		t.Errorf("代挂 Key 用具体模型名被误拦：%d %v", code, out)
 	}
 
 	// ③ 池计费 Key + 组名 → 不该被这条规则拦（它是组名的合法使用者）。
 	if code, out := call(pool.ID, "wb-group-work"); code == http.StatusBadRequest &&
-		out["code"] == "host_key_cannot_use_group" {
+		out["code"] == "host_key_cannot_use_pool_group" {
 		t.Errorf("池计费 Key 被误拦：%d %v", code, out)
 	}
 }

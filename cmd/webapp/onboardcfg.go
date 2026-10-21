@@ -35,18 +35,23 @@ import (
 )
 
 const (
-	kvOnboardModels      = "onboard_models"
-	kvOnboardDefaultPool = "onboard_default_pool"
-	kvOnboardDefaultHost = "onboard_default_host"
+	kvOnboardModels      = "onboard_models"       // 号池官组允许的模型（空 = 不限制）
+	kvOnboardModelsHost  = "onboard_models_host"  // 自挂官组允许的模型（空 = 不限制）
+	kvOnboardDefaultPool = "onboard_default_pool" // 号池官组默认模型（空 = wb-group-work）
+	kvOnboardDefaultHost = "onboard_default_host" // 自挂官组默认模型（空 = wb-group-host）
 )
 
-// onboardOptionsResp 接入弹窗要的三样东西：候选、默认值、为什么受限。
+// onboardOptionsResp 接入弹窗要的东西：候选、默认值、属于哪个官组、为什么受限。
 type onboardOptionsResp struct {
 	Models     []string `json:"models"`
 	Default    string   `json:"default_model"`
 	Kind       string   `json:"kind"`
 	Restricted bool     `json:"restricted"`
 	Note       string   `json:"note,omitempty"`
+	// GroupName / GroupLabel（v0.31.82）：这一类对应的 work官组 虚拟名与中文名，
+	// 前端据此显示「work官组 · 号池官组」而不是自己拼字符串（口径只能有一处）。
+	GroupName  string `json:"group_name"`
+	GroupLabel string `json:"group_label"`
 }
 
 // allModelIDs 平台可见的全部模型名（号池目录 ∪ 通道映射，去重排序）。
@@ -74,12 +79,19 @@ func (a *app) allModelIDs() []string {
 	return out
 }
 
-// onboardAllowList 后台配置的允许模型（空切片 = 不限制）。
+// onboardAllowList 后台为某一类官组配置的允许模型（空切片 = 不限制）。
 //
 // 只保留**当前仍存在**的模型：模型下线后配置里留着名字不该继续出现在候选里
 // （否则用户选一个已经没了的模型，又是 404）。
-func (a *app) onboardAllowList() (allow []string, configured bool) {
-	raw, _ := a.store.GetKV(kvOnboardModels)
+//
+// host 参数区分两类官组（v0.31.82）：号池官组与自挂官组各有自己的放行清单 ——
+// 它们的"能跑什么"本来就不同，共用一份清单等于假装两者等价。
+func (a *app) onboardAllowList(forHost bool) (allow []string, configured bool) {
+	kvKey := kvOnboardModels
+	if forHost {
+		kvKey = kvOnboardModelsHost
+	}
+	raw, _ := a.store.GetKV(kvKey)
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, false
@@ -119,42 +131,60 @@ func (a *app) handleOnboardOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ① 该 Key 自己"能看见什么"（与 /api/keys/{id}/models 同源）。
+	// ① 这一类的候选基础：
+	//    池计费 Key → 平台模型目录（号池官组视角）
+	//    代挂 Key   → **它自己账号能满足的模型**（自挂官组视角）
+	// 这一区分是 v0.31.82 的核心：此前代挂 Key 也拿到整份号池目录，
+	// 于是"选得到、跑不了"，v0.31.81 的 404 就是这么来的。
+	isHost := k.Kind == KeyKindHost
 	base := a.keyModelIDs(k)
+	if isHost && a.proxy != nil {
+		if hm := a.proxy.hostGroupMembers(k); len(hm) > 0 {
+			base = hm
+		}
+	}
 	// ② 与后台选配取交集（选配为空 = 不限制）。
-	allow, configured := a.onboardAllowList()
+	allow, configured := a.onboardAllowList(isHost)
 	models := base
 	note := ""
 	if configured {
 		models = intersectModels(base, allow)
-		note = "候选已按后台「一键接入选配」过滤"
+		note = "候选已按后台「work官组」选配过滤"
 		if len(models) == 0 {
 			note = "后台只放行了 " + strings.Join(allow, "、") +
 				"，但这把密钥一个都用不了 —— 直接手填模型名，或找管理员调整选配"
 		}
 	}
-	// ③ 默认值：按 Key 类型取配置；不在候选里就回落到第一个候选。
+	// ③ 组名永远排第一项：它是"我不用挑，你替我挑"的入口，也是默认值。
+	groupName := groupVirtualModel(groupWorkID)
+	groupLabel := "号池官组"
+	if isHost {
+		groupName = groupVirtualModel(groupHostID)
+		groupLabel = "自挂官组"
+	}
+	models = append([]string{groupName}, models...)
+
+	// ④ 默认值：配置优先；没配就用本类的组名（**开箱即用，不需要管理员先配**）。
 	def := ""
-	if k.Kind == KeyKindHost {
+	if isHost {
 		def, _ = a.store.GetKV(kvOnboardDefaultHost)
+		if strings.TrimSpace(def) == "" {
+			def = groupName // 自挂官组的默认：让平台在自己账号里挑
+		}
 	} else {
 		def, _ = a.store.GetKV(kvOnboardDefaultPool)
 		if strings.TrimSpace(def) == "" {
-			def = groupVirtualModel(groupWorkID) // 池 Key 的既有默认：整个号池
+			def = groupName
 		}
 	}
 	def = pickDefault(def, models)
 	resp := onboardOptionsResp{
 		Models: models, Default: def, Kind: k.Kind, Restricted: configured, Note: note,
+		GroupName: groupName, GroupLabel: groupLabel,
 	}
-	if k.Kind == KeyKindHost {
-		// 代挂 Key 的任何默认值都不能是组名（v0.31.81 的根因）。
-		if strings.HasPrefix(resp.Default, groupModelPrefix) {
-			resp.Default = ""
-		}
-		if resp.Default == "" && len(models) > 0 {
-			resp.Default = models[0]
-		}
+	if isHost && a.proxy != nil && len(a.proxy.hostGroupMembers(k)) == 0 {
+		resp.Note = "这把代挂 Key 没有绑定具体账号（或绑定的账号都不在池），平台无法判断它们能跑哪些模型；" +
+			"可以手填模型名，或在「API 密钥」里给它绑定账号后再试"
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -207,13 +237,21 @@ func pickDefault(def string, models []string) string {
 // 与"选了哪些"分开给：前端不必自己再拼一次目录。
 func (a *app) handleAdminOnboardConfig(w http.ResponseWriter, r *http.Request) {
 	raw, _ := a.store.GetKV(kvOnboardModels)
+	rawHost, _ := a.store.GetKV(kvOnboardModelsHost)
 	defPool, _ := a.store.GetKV(kvOnboardDefaultPool)
 	defHost, _ := a.store.GetKV(kvOnboardDefaultHost)
-	allow, configured := a.onboardAllowList()
+	allow, configured := a.onboardAllowList(false)
+	allowHost, configuredHost := a.onboardAllowList(true)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"models":       allow, // 已配置的（已剔除下线模型）
-		"raw":          raw,   // 原文：让运维看见"配过但已下线"的名字
-		"configured":   configured,
+		// 号池官组
+		"models":     allow, // 已配置的（已剔除下线模型）
+		"raw":        raw,   // 原文：让运维看见"配过但已下线"的名字
+		"configured": configured,
+		// 自挂官组
+		"models_host":     allowHost,
+		"raw_host":        rawHost,
+		"configured_host": configuredHost,
+		// 两类各自的默认值
 		"default_pool": defPool,
 		"default_host": defHost,
 		"all":          a.allModelIDs(),
@@ -229,6 +267,7 @@ func (a *app) handleAdminOnboardConfig(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleAdminSetOnboardConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Models      string `json:"models"`
+		ModelsHost  string `json:"models_host"`
 		DefaultPool string `json:"default_pool"`
 		DefaultHost string `json:"default_host"`
 	}
@@ -236,15 +275,31 @@ func (a *app) handleAdminSetOnboardConfig(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求格式错误"})
 		return
 	}
-	// 代挂默认值不许是组名：那会让每一把代挂 Key 接入后必然 404。
-	if strings.HasPrefix(strings.TrimSpace(req.DefaultHost), groupModelPrefix) {
+	// 两个默认值只认各自类别的组名（v0.31.82）：
+	// 自挂默认填 wb-group-work 仍会 404（组名代表号池模型），所以继续拒；
+	// 但 wb-group-host 是自挂官组的正当默认值。
+	if defHost := strings.TrimSpace(req.DefaultHost); strings.HasPrefix(defHost, groupModelPrefix) &&
+		defHost != groupVirtualModel(groupHostID) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "代挂自用的默认模型不能是模型组（组名对应号池模型，代挂 Key 会 404）",
-			"code":  "host_default_cannot_be_group",
+			"error": "自挂官组的默认模型只能是 wb-group-host（自挂官组）或具体模型名；" +
+				"wb-group-work 是号池官组，代挂 Key 用它必然 404",
+			"code": "host_default_cannot_be_group",
+		})
+		return
+	}
+	if defPool := strings.TrimSpace(req.DefaultPool); strings.HasPrefix(defPool, groupModelPrefix) &&
+		defPool != groupVirtualModel(groupWorkID) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "号池官组的默认模型只能是 wb-group-work（号池官组）或具体模型名",
+			"code":  "pool_default_cannot_be_group",
 		})
 		return
 	}
 	if err := a.store.SetKV(kvOnboardModels, strings.Join(splitGroups(req.Models), ",")); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := a.store.SetKV(kvOnboardModelsHost, strings.Join(splitGroups(req.ModelsHost), ",")); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -256,9 +311,12 @@ func (a *app) handleAdminSetOnboardConfig(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	allow, configured := a.onboardAllowList()
+	allow, configured := a.onboardAllowList(false)
+	allowHost, configuredHost := a.onboardAllowList(true)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "models": allow, "configured": configured,
+		"ok":     true,
+		"models": allow, "configured": configured,
+		"models_host": allowHost, "configured_host": configuredHost,
 		"all": a.allModelIDs(),
 	})
 }

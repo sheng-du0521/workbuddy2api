@@ -1589,21 +1589,31 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	// 展开必须放在归一化之前：归一化会把"不在已知清单里的名字"当作拼写差异处理，
 	// 而 `wb-group-work` 本来就不该出现在上游模型清单里。
 	//
-	// ⚠️ 代挂自用 Key（v0.31.81）**不许用组名**：组名展开出来的是**号池**的模型，
-	// 而代挂 Key 只在自己账号里选号 —— 号主没有那个模型，上游必然 11102/404。
-	// 现象是"一键接入后一直上游中断 + 404"，根因是接入弹窗把 `wb-group-work`
-	// 当成了所有 Key 的默认值（v0.31.76 引入）。这里直接拒，而不是展开成"碰运气"。
+	// v0.31.82 起「work官组」只有两类，且与 Key 类型必须匹配：
+	//   池计费 Key → wb-group-work（号池官组）
+	//   代挂 Key   → wb-group-host（自挂官组）
+	// 用错类型直接 400：组名各自代表"从哪种账号里挑模型"，串了就会挑出跑不了的模型
+	// （v0.31.81 那个线上 404 就是"代挂 Key 用了号池组"）。
 	if strings.HasPrefix(strings.TrimSpace(model), groupModelPrefix) {
-		if k := apiKeyFrom(r); k != nil && k.Kind == KeyKindHost {
-			writeOpenAIErrorHint(w, http.StatusBadRequest,
-				"this key cannot use a model group",
-				"host-billed keys only run on your own accounts, so the pool group would pick a model "+
-					"your accounts do not have (upstream 404). Put a concrete model name instead — "+
-					"GET /v1/models lists the ones this key can see; no upstream account was used")
+		gid := strings.TrimPrefix(strings.TrimSpace(model), groupModelPrefix)
+		k := apiKeyFrom(r)
+		switch {
+		case k == nil:
+			// 无 Key（理论上走不到这里，ServeChat 之前必有鉴权）：交给展开逻辑。
+		case k.Kind == KeyKindHost && gid == groupWorkID:
+			writeOpenAIErrorHint(w, http.StatusBadRequest, "this key cannot use the pool group",
+				"host-billed keys run only on your own accounts, so wb-group-work would pick a pool model "+
+					"your accounts do not have (upstream 404). Use wb-group-host (self-hosted group) or a "+
+					"concrete model name; no upstream account was used")
+			return
+		case k.Kind != KeyKindHost && gid == groupHostID:
+			writeOpenAIErrorHint(w, http.StatusBadRequest, "this key cannot use the self-hosted group",
+				"wb-group-host picks a model from your own accounts, which only host-billed keys have. "+
+					"Use wb-group-work (pool group) or a concrete model name; no upstream account was used")
 			return
 		}
 	}
-	if real, ok := p.applyGroupExpansion(payload, model); ok {
+	if real, ok := p.applyGroupExpansion(payload, model, apiKeyFrom(r)); ok {
 		model = real
 	}
 	// 模型名归一化（v0.31.2）：去空白 / 剥 realm 前缀 / 按已知清单折回规范写法。

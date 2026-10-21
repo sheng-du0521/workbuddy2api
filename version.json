@@ -1,20 +1,20 @@
 {
-  "version": "0.31.81",
+  "version": "0.31.82",
   "min_supported": "0.24.0",
-  "notes": "v0.31.81：修「代挂 Key 一键接入后必然 404」+ 后台可自定义接入选配。\n\n① 线上故障根因：v0.31.76 把接入弹窗的默认模型统一填成了 wb-group-work，而那是**号池**的组名 —— 展开出来是平台号池的某个模型；代挂 Key 只在自己账号里选号，号主没有那个模型，上游必然「模型不存在」（表现为一直 404 / 流被中断）。一句话：组名对代挂 Key 无意义，但界面把它当成了所有人的默认值。\n\n② 三道闸门（缺一不可）：接入弹窗不再给代挂 Key 填组名（默认值改由服务端下发）；生成接入包时代挂 Key + wb-group-* → 400 code=host_key_cannot_use_group；发请求时代挂 Key + wb-group-* → 400 this key cannot use a model group，零出站。第三道专治旧脚本 —— 已生成的脚本不会自动更新，不在这一层拦，以前接入过的用户永远好不了。\n\n③ 后台「一键接入选配」（第三方通道页底部）：可勾选允许接入的模型（不勾 = 不限制）、分别配置池计费与代挂的默认模型。语义是**取交集**不是替换：配了 glm-5.3,kimi-k2.5 之后，一把只能跑 glm-5.3 的代挂 Key 只看到 glm-5.3，不会出现它跑不了的 kimi。**不影响** /v1/models 与测试对话页 —— 那两处是「实际能用什么」，选配管「接入时推荐填什么」。配过但已下线的模型自动剔除并以「已下线：xxx」标出。代挂默认填组名 → 保存即 400 且不写入任何一项。\n\n④ 接口：GET /api/onboard/options?key_id=N（候选+默认值+受限原因）、GET/POST /api/admin/onboard-config。\n\n验证：TestOnboardHostKeyRejectsGroup（代挂+组名 400、代挂+具体模型名不误拦、池 Key+组名不受影响）、TestIntersectModels（部分放行保持顺序 / 一个都不在 base → 空集不硬塞 / 空放行 → 空集）、TestPickDefault（在候选用它 / 不在回落第一项 / 未配置保持空 / 候选空保留配置值）、TestAdminOnboardConfigRejectsHostGroupDefault（拒绝且不留半套配置）；全量 go test + jscheck + uitest + preflight 通过。\n\n边界：第三道闸门只认 wb-group- 前缀，手填真实模型名（即使号主跑不了）不拦，交上游 11102/404 正常拒绝 —— 我们不知道每个号主账号能跑什么；选配为空 ≠ 放行全部（仍受「这把 Key 自己能跑什么」约束）；选配不校验模型是否存在，但回显实际生效清单。",
-  "released_at": 1792552464,
+  "notes": "v0.31.82：统一为「work官组」—— 两类官组，开箱即用。\n\n① 命名统一：把「一键接入选配」这一系列统一叫「work官组」，分类上只有两类 —— 号池官组（wb-group-work，池计费 Key，从平台号池挑）与自挂官组（wb-group-host，代挂自用 Key，从号主自己的账号挑）。名称在全流程一致：用户端弹窗（work官组 · 号池官组：wb-group-work）、后台卡片标题（work官组）、两个分区标题、报错文案、接口字段（group_name/group_label）。\n\n② 通道组（wb-group-ch<N>）不再作为可选分类：它属于运营内部的上游配置，不是用户能选的组。授权入口（用户卡的「组」按钮）、通道卡上的组名 chip、用户可见的组列表都已撤下；**解析逻辑保留** —— 旧脚本里已经填了 wb-group-chN 的照常能用，不会因为升级突然断掉。\n\n③ 默认就能用：两类 Key 点「接入」时模型字段已填好 —— 池计费 → wb-group-work，代挂自用 → wb-group-host（服务端在你自己账号里挑一个能跑的）。不需要管理员先配，也不需要用户理解「组」是什么。\n\n④ 自挂官组是新能力：成员 = 这把代挂 Key 绑定账号能满足的模型（判据用 AvailableUIDsForModel 与该 Key 账号集合求交，与选号同源）。这正好补上 v0.31.81 那个 404 的根 —— 组名不再只代表号池，自挂有自己的组。\n\n⑤ 两类不能串用：代挂 Key + wb-group-work → 400 host_key_cannot_use_pool_group；池计费 Key + wb-group-host → 400 pool_key_cannot_use_host_group；具体模型名不受影响。串用必须拒，否则又会出现「选得到、跑不了」。\n\n⑥ 后台「work官组」页：两个分区各配「允许的模型（不勾=不限制）+ 默认模型（空=各自组名）」。保存校验只认各自类别的组名，号池默认填 host 组或自挂默认填 work 组都会被拒（等于把 404 写进配置）。\n\n验证：TestVisibleGroupsByKeyKind（池 Key 只见号池官组、代挂 Key 只见自挂官组、即使 group_scope 还留着通道组授权也不暴露）、TestOnboardHostKeyRejectsGroup（代挂+号池组 400 / 代挂+自挂组放行 / 池 Key+自挂组 400 / 具体模型名不误拦）、TestExpandGroupModelWork（label=号池官组）、TestAdminOnboardConfigRejectsHostGroupDefault；全量 go test + jscheck + uitest + preflight 通过。\n\n边界：自挂官组依赖「Key 绑定了具体账号」，没绑账号或绑的号都不在池时成员为空，弹窗会明说「平台无法判断它们能跑哪些模型，可以手填」，不给假候选；通道组解析保留 ≠ 支持，新用户不会再看到；wb-group-host 对池计费 Key 直接 400，而不是回空组让人以为坏了。",
+  "released_at": 1792553690,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.81/webapp.exe",
-      "sha256": "c189347efc2b74305ec4f363071a6ce4329b40f0cabc352b16b853d60d29c916",
-      "size": 15996416
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.82/webapp.exe",
+      "sha256": "473126283acecd0904b8a70b431b447de1150b0947d05a2c060b3ec8ba0c7c8a",
+      "size": 15998976
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "odgUDjHmQ9Zi7b0xf1f7r/N6KXMX+5Fol61t+zhGSkUPwQkMDRgRz9eEahhyiNIo0hRmySIud/CLFFLTlVGWAA==",
+  "signature": "T399nLF3QqiWk+0BxXYd2xv2j1CrJPyr2dwayZ4kitWI9I4AFrigGdCsxC66hdOFXn1g5LcJigjVZcsmLHBgBg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
