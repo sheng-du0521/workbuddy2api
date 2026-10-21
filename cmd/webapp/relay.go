@@ -97,6 +97,9 @@ func (p *Proxy) serveRelay(w http.ResponseWriter, r *http.Request, payload map[s
 
 	ratio, ratioSrc := p.ratioForRelay(model)
 	var lastErr string
+	// upstreamStatus 最后一次**上游 HTTP 状态码**（0 = 没拿到响应，网络错误/超时）。
+	// 全失败时它是"该回什么状态、该怎么解释"的唯一依据（v0.31.95）。
+	upstreamStatus := 0
 	tried := 0
 	for _, v := range cands {
 		if tried >= relayMaxAttempts {
@@ -111,6 +114,7 @@ func (p *Proxy) serveRelay(w http.ResponseWriter, r *http.Request, payload map[s
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
 			resp.Body.Close()
+			upstreamStatus = resp.StatusCode
 			lastErr = fmt.Sprintf("%s 返回 %d：%s", v.UpstreamName, resp.StatusCode,
 				truncateStr(strings.TrimSpace(string(body)), 200))
 			// 4xx 也不在这里判"这条通道坏了"：401 是 key 错（要人修配置），
@@ -169,20 +173,57 @@ func (p *Proxy) serveRelay(w http.ResponseWriter, r *http.Request, payload map[s
 		return true, ok
 	}
 
-	// 全部通道都失败：**回 502**（上游不可用 = 可重试语义），并在错误里点明走了通道。
+	// 全部通道都失败：按**最后一次上游状态码**给出可诊断的结论（v0.31.95）。
+	//
+	// 以前一律 502 + "check the channel config"：上游 429 限流、
+	// 400「该模型不支持 chat/completions」全被说成"你配置错了"，
+	// 用户只会去反复核对 base_url / key（2026-10-21 实测：图像模型走对话就是这个形态）。
 	// 不回 404：模型是配置过的（只是通道不可用），说"没有这个模型"会把运维引到
 	// "去查模型名"这个错误方向。
-	log.Printf("WARN: [relay] 所有通道均失败 model=%s（%d 条尝试）：%s", model, tried, lastErr)
+	status, failKind, hint := relayFailureVerdict(upstreamStatus)
+	w.Header().Set("X-Wb-Fail-Kind", failKind)
+	log.Printf("WARN: [relay] 所有通道均失败 model=%s（%d 条尝试，upstream_status=%d → %d %s）：%s",
+		model, tried, upstreamStatus, status, failKind, lastErr)
 	p.noteLive(r, liveEvent{
 		At: time.Now().Unix(), User: liveUserName(u), Model: model, OK: false,
-		Err: "通道不可用：" + lastErr, Status: http.StatusBadGateway,
+		Err: "通道不可用：" + lastErr, Status: status,
 		ElapsedMS: time.Since(start).Milliseconds(),
 	})
-	writeOpenAIErrorHint(w, http.StatusBadGateway,
-		"upstream channel error: "+lastErr,
-		"this model is served by a configured third-party channel and all channels failed; "+
-			"check the channel config (base_url / api_key / model mapping) in the admin console")
+	writeOpenAIErrorHint(w, status, "upstream channel error: "+lastErr, hint)
 	return true, false
+}
+
+// relayFailureVerdict 通道全失败时该回什么状态、给什么解释（纯函数，便于单测）。
+//
+// 输入只有"最后一次拿到的上游 HTTP 状态码"（0 = 没拿到响应）。三类失败必须分开说：
+//
+//	401/403  通道的 key 无效/无权限 —— 确实是配置问题，但错在**通道侧**，不是用户请求
+//	429      限流 —— 可重试，用户什么都不用改（SDK 对 429 会退避重试）
+//	其它 4xx 请求本身跑不通 —— 典型是"图像模型走 chat/completions"或模型名映射不对
+//	5xx / 0  上游不可用 / 连不上
+func relayFailureVerdict(upstreamStatus int) (status int, kind, hint string) {
+	switch {
+	case upstreamStatus == http.StatusUnauthorized || upstreamStatus == http.StatusForbidden:
+		return http.StatusBadGateway, "relay_auth",
+			"the channel rejected our API key (401/403): this is a channel-side configuration " +
+				"problem, not your request. An admin needs to update that channel's key/permissions"
+	case upstreamStatus == http.StatusTooManyRequests:
+		return http.StatusTooManyRequests, "relay_rate_limited",
+			"the upstream rate-limited this channel (429): nothing to fix on your side, retry later; " +
+				"if it keeps happening, lower that channel's priority or add another channel"
+	case upstreamStatus >= 400 && upstreamStatus < 500:
+		return upstreamStatus, "relay_rejected",
+			"the upstream rejected this request (not a gateway failure): typically the model is not " +
+				"served on /chat/completions (e.g. an image model) or its remote name mapping is wrong"
+	case upstreamStatus == 0:
+		return http.StatusBadGateway, "relay_unreachable",
+			"cannot reach the upstream (timeout / network): check the channel base_url and the " +
+				"server's egress"
+	default:
+		return http.StatusBadGateway, "relay_unavailable",
+			"the upstream is temporarily unavailable (5xx): retry later; if it persists check that " +
+				"channel's upstream status"
+	}
 }
 
 // relayRequest 构造并发出一次通道请求（**不写响应**，失败可以换下一条）。

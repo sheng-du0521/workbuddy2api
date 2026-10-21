@@ -1,20 +1,20 @@
 {
-  "version": "0.31.94",
+  "version": "0.31.95",
   "min_supported": "0.24.0",
-  "notes": "v0.31.94：修倍率页「变化记录」的 TypeError（appendChild 收到非节点）。\n\n## 现场\n\n控制台报：\n  Failed to execute 'appendChild' on 'Node': parameter 1 is not of type 'Node'\n  at cfgRow (app.js) ← loadModelRatios (admin.html)\n\n用户看到的是**倍率页只画到一半就停**（后面的表格 / 变化记录区空白），控制台只有这一句，\n连\"哪个面板\"都不说。\n\n## 根因\n\n`cfgRow(title, hint, ctl)` 的第三参是「控件位」，只接受 DOM 节点。\n倍率页「变化记录」把**时间戳字符串**直接传了进去：\n\n    cfgRow(x.model, '倍率：1 → 2', new Date(...).toLocaleString())\n\n`c.appendChild('2026/10/21 18:00:00')` → TypeError。而这段代码在 `async function\nloadModelRatios()` 里，异常不是被捕获后提示，而是**中断整个函数的后续渲染** ——\n所以用户看到的不是\"变化记录坏了\"，而是\"倍率页坏了\"。\n\n顺带：`cfgRow(m.model, m.drift, '')`（口径矛盾列表）也在传空字符串，虽然 `''` 是 falsy\n不会抛错，但会在提示位留一个空盒子 —— 一并改成不传。\n\n## 修复\n\n1. `cmd/webapp/ui/app.js` `cfgRow`：第三参额外接受字符串/数字，渲染成只读 `<span>`。\n   不是纵容，是止损 —— 一处误用不该把整页画到一半就停下；纯文本放在\"控件位\"语义也说得通。\n2. `cmd/webapp/ui/admin.html` 变化记录：传 `el('span','muted', 时间)`（正确类型）；\n   口径矛盾列表改为不传第三参。\n\n## 为什么以前测试没抓到\n\nuitest 没有 `/api/admin/model-ratios` 的桩 → 接口返回 `{}` → `models` 为空 →\n`loadModelRatios` 在\"还没有同步数据\"处**提前 return**，「变化记录」那段永远执行不到。\n而 jsdom 里 async 未捕获异常不会让用例失败。\n\n现在补上非空桩（2 个模型 + 1 条 drift + 2 条 diffs）与断言：\n`#mrDiffs .cfg-row = 2`、`#mrDrift .cfg-row = 1`、两条变化文案、`共 2 个模型`。\n修复前这些断言会红（异常导致一行都渲染不出来）。\n\n## 验证\n\njscheck 0 错；uitest 全绿（新增 ratios 用例 7 条断言）；preflight --expect-manifest 全链绿。",
-  "released_at": 1792578739,
+  "notes": "v0.31.95：通道组请求失败时不再一律甩 502「检查通道配置」。\n\n## 现场（本次实测，用生产两条通道的配置在临时实例里跑）\n\n用户端切到通道组后发一次对话请求：\n\n- `ch1`（codex官组原生，5 个 gpt-* 模型）→ **502**，gateway_hint 说\n  \"all channels failed; check the channel config (base_url / api_key / model mapping)\"\n- `ch2`（image-2.5，3 个 gpt-image-* 模型）→ 同样 502\n\n直接拿通道的 key 打上游才发现真相完全不是\"配置错\"：\n\n| 通道 | 上游真实回答 | 含义 |\n|---|---|---|\n| ch1 `gpt-5.6` | 429 `Upstream rate limit exceeded` | 上游限流 |\n| ch1 `gpt-5.6-sol` | 503 `Service temporarily unavailable` | 上游抖动 |\n| ch2 `gpt-image-2.5*` | 400 `This model is not supported on the Chat Completions endpoint` | 图像模型，对话端点本来就不支持 |\n\n也就是说：组展开、通道分发、鉴权、到达上游 **这条链是通的**；错的是网关把\n\"上游限流 / 模型不支持该端点\"统统说成\"你自己的配置错了\"—— 用户会去反复核对\nbase_url 与 key，方向完全错。\n\n## 改动\n\n`cmd/webapp/relay.go`：新增 `relayFailureVerdict(upstreamStatus)`，全失败时按\n**最后一次上游状态码**决定回什么、说什么（并设置 `X-Wb-Fail-Kind`）：\n\n| 上游状态 | 回给客户端 | fail-kind | 文案要点 |\n|---|---|---|---|\n| 401/403 | 502 | `relay_auth` | 通道 key 无效/无权限，是**通道侧**配置问题 |\n| 429 | **429** | `relay_rate_limited` | 限流，你不用改任何东西，稍后重试 |\n| 其它 4xx | **透传该 4xx** | `relay_rejected` | 上游拒绝（典型：图像模型走 chat、或 remote 名映射不对） |\n| 5xx | 502 | `relay_unavailable` | 上游暂时不可用 |\n| 无响应 | 502 | `relay_unreachable` | 连不上/超时，查 base_url 与出网 |\n\n关键点：429 与 4xx 必须**透传状态码**——SDK 对 429 会退避重试，对 4xx 不重试；\n一律 502 会让客户端做出错误决策。\n\n## 验证\n\n- 新增 `TestRelayFailureVerdict`（8 组状态映射）、`TestRelayAllChannelsFailRateLimited`\n  （429 透传 + fail-kind）、`TestRelayAllChannelsFailModelUnsupported`（400 透传 +\n  文案点明 `/chat/completions`）；原 `TestRelayAllChannelsFail`（500 → 502）保持。\n- 真机复跑（`scripts/channel_group_probe.py`，用生产通道配置的临时实例）：\n  ch1 → `429 relay_rate_limited`、ch2 → `400 relay_rejected`，\n  组名在 `/v1/models` 里正确、切组 200。\n\n## 结论（给运维）\n\n两条通道的**链路都正常**，问题在上游侧：\n- ch1 当前被上游限流（429/503 交替），换时段重试或降低该通道优先级；\n- ch2 是图像模型，**不能用于对话**（`/chat/completions` 不支持），这是上游能力边界，\n  不是配置错；要验它需要走图像端点（本网关目前只转发对话）。",
+  "released_at": 1792580040,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.94/webapp.exe",
-      "sha256": "bb515ec94f1aa3aba257db3a9d580a0303e7b5cb0d637aa1f14395942bf691e0",
-      "size": 16095744
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.95/webapp.exe",
+      "sha256": "b341b364896a8203361f5018e9b82730db9abcee6e78f069de7e91e0c49c6476",
+      "size": 16097280
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "Kl6f7EN0wssS2tArtNIhkZQP21fM5hymngXrMXe0pEKlstdKCnBFmwAoZAaJhTh6PGzgGWcHsAhM19FfYH1mCg==",
+  "signature": "NUy+pdSFCaWmevON35itlfitce14pVQR5NBtZS3eUja8zbgTAVwsGWF/SS+WkHwgVoq1FMfumTaImuwoc2xbAQ==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

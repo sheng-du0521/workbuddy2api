@@ -356,6 +356,87 @@ func TestRelayAllChannelsFail(t *testing.T) {
 	}
 }
 
+// TestRelayFailureVerdict 通道全失败时的状态码与解释（v0.31.95）。
+//
+// 以前一律 502 + "check the channel config"：把**上游限流**和**模型不支持该端点**
+// 都说成"你配置错了"。2026-10-21 真实踩到：图像模型（gpt-image-*）挂在通道组上，
+// 用户用对话接口请求它 → 上游 400 → 用户看到 502「检查通道配置」，
+// 于是去反复核对 base_url / key —— 方向完全错了。
+func TestRelayFailureVerdict(t *testing.T) {
+	cases := []struct {
+		up     int
+		status int
+		kind   string
+		hint   string
+	}{
+		{429, 429, "relay_rate_limited", "rate-limited"},
+		{400, 400, "relay_rejected", "/chat/completions"},
+		{404, 404, "relay_rejected", "remote name mapping"},
+		{401, 502, "relay_auth", "channel-side configuration"},
+		{403, 502, "relay_auth", "channel-side configuration"},
+		{500, 502, "relay_unavailable", "5xx"},
+		{502, 502, "relay_unavailable", "5xx"},
+		{0, 502, "relay_unreachable", "timeout"},
+	}
+	for _, c := range cases {
+		status, kind, hint := relayFailureVerdict(c.up)
+		if status != c.status || kind != c.kind {
+			t.Errorf("upstream=%d → (%d,%s)，期望 (%d,%s)", c.up, status, kind, c.status, c.kind)
+		}
+		if !strings.Contains(hint, c.hint) {
+			t.Errorf("upstream=%d 的 hint 缺 %q：%s", c.up, c.hint, hint)
+		}
+	}
+}
+
+// TestRelayAllChannelsFailRateLimited 上游 429 → 回 429（可重试语义），并带 fail_kind。
+//
+// 回 502 的后果：客户端不会按"限流"退避，用户以为网关坏了。
+func TestRelayAllChannelsFailRateLimited(t *testing.T) {
+	store, _, _, srv := newRelayChatApp(t, false)
+	defer store.Close()
+	defer srv.Close()
+
+	up, _ := fakeRelay(t, 0, 0, 429, false)
+	defer up.Close()
+	seedRelay(t, store, up.URL, "limited-model", 1.0, true)
+	seedPoolModels([]string{"pool-known-model"})
+
+	resp, body := chatOnce(t, srv, `{"model":"limited-model","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("上游 429 应透传 429，得 %d：%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Wb-Fail-Kind"); got != "relay_rate_limited" {
+		t.Fatalf("X-Wb-Fail-Kind = %q，期望 relay_rate_limited", got)
+	}
+	if !strings.Contains(body, "rate-limited") {
+		t.Fatalf("错误里应说明是限流：%s", body)
+	}
+}
+
+// TestRelayAllChannelsFailModelUnsupported 上游 400（模型不支持对话）→ 透传 400。
+func TestRelayAllChannelsFailModelUnsupported(t *testing.T) {
+	store, _, _, srv := newRelayChatApp(t, false)
+	defer store.Close()
+	defer srv.Close()
+
+	up, _ := fakeRelay(t, 0, 0, 400, false)
+	defer up.Close()
+	seedRelay(t, store, up.URL, "image-only-model", 1.0, true)
+	seedPoolModels([]string{"pool-known-model"})
+
+	resp, body := chatOnce(t, srv, `{"model":"image-only-model","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("上游 400 应透传 400（不是 502），得 %d：%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Wb-Fail-Kind"); got != "relay_rejected" {
+		t.Fatalf("X-Wb-Fail-Kind = %q，期望 relay_rejected", got)
+	}
+	if !strings.Contains(body, "/chat/completions") {
+		t.Fatalf("错误里应点明可能不支持该端点：%s", body)
+	}
+}
+
 // R4：停用通道 → 模型立刻从号池清单外消失（relayModelIDs 为空）。
 //
 // 「面板说关了、实际还能看见」是本项目反复踩过的形态（缓存没作废）。
