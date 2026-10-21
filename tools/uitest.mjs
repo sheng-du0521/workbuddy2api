@@ -569,7 +569,23 @@ const FX = {
   // v0.31.74：测试对话页的模型下拉改读「该密钥的可用模型」（与 /v1/models 同源）。
   // 这里给 2 个，断言下拉渲染 2 个 option —— 原来断言的是 datalist#modelOpts。
   '/api/keys/1/models': {
-    models: ['deepseek-v4-flash', 'glm-5.2'], count: 2, kind: 'pool', manual_allowed: true,
+    // v0.31.91：组名条目 + 通道组（回归"生成密钥后选不到通道组"）。
+    models: ['wb-group-work', 'wb-group-ch1', 'deepseek-v4-flash', 'glm-5.2'], count: 4,
+    kind: 'pool', manual_allowed: true,
+    groups: [
+      { id: 'work', model: 'wb-group-work', label: '号池官组', kind: 'work', members: 10 },
+      { id: 'ch1', model: 'wb-group-ch1', label: '通道 · 中转A', kind: 'channel', members: 2 },
+    ],
+  },
+  // 分组切换弹窗（v0.31.88）：pool Key 才 editable，选项里必须有通道组。
+  '/api/keys/1/group-options': {
+    kind: 'pool', active_group: '', editable: true, global_ratio: 1,
+    active_label: '不限制（全部可用模型）',
+    options: [
+      { id: '', model: '', label: '不限制（全部可用模型）', members: 12, ratio_min: 0, ratio_max: 0, current: true },
+      { id: 'work', model: 'wb-group-work', label: '号池官组', members: 10, ratio_min: 0, ratio_max: 0, current: false },
+      { id: 'ch1', model: 'wb-group-ch1', label: '通道 · 中转A', members: 2, ratio_min: 1.5, ratio_max: 1.5, current: false },
+    ],
   },
   // 代挂 Key（id=2）绑的号不在池：清单不可知 → 前端应切成手填（不给假清单）。
   '/api/keys/2/models': {
@@ -1771,7 +1787,24 @@ function run(pageFile, meOverride, plan) {
     // 不再带 nav（避免 clickNav 触发的重新渲染把刚展开的明文冲掉）。
     { click: ['#keyCards .ecard .icon-btn'],
       textIn: [['#keyCards', 'sk-wb-abcdefghijklmnop']] },
-    { nav: 'test', counts: [['testKey', 2], ['testModelSel', 2]] },
+    // v0.31.91：「切换分组」是用户**唯一**能给一把 Key 选通道组的入口。
+    // 只给 pool Key 渲染（代挂 Key 没有分组），且弹窗里必须真的列出通道组 ——
+    // 用户报的「生成密钥后无法选用通道组」，入口或选项缺一个都会复现。
+    { nav: 'keys',
+      run: ["document.querySelectorAll('.modal-mask').forEach(function (m) { m.remove(); })"],
+      has: [['#keyCards button', 1]] },
+    { clickText: [['#keyCards button', '切换分组']],
+      has: [['.modal-mask', 1]],
+      textIn: [['.modal-mask', '不限制（全部可用模型）'], ['.modal-mask', '号池官组'],
+        ['.modal-mask', '通道 · 中转A'], ['.modal-mask', 'wb-group-ch1'],
+        // 通道组的倍率区间要显示出来（决定"切过去贵不贵"）
+        ['.modal-mask', '×1.5']] },
+    { clickText: [['.modal-mask button', '关闭']], absent: ['.modal-mask'] },
+    // v0.31.91：下拉里必须出现通道组名（wb-group-ch1）—— 用户在控制台
+    // 能切到通道组，模型选择器里就得能选到它，否则"切了也白切"。
+    { nav: 'test', counts: [['testKey', 2], ['testModelSel', 4]],
+      textIn: [['#testModelSel', 'wb-group-ch1'], ['#testModelSel', '通道 · 中转A'],
+        ['#testModelSel', 'wb-group-work']] },
     { nav: 'usage', counts: [['bkCards', 3], ['usKpis', 6], ['usChart', 1], ['usModels', 1], ['myDailyTable', 1], ['usFeed', 1]] },
 
     // ================================================================

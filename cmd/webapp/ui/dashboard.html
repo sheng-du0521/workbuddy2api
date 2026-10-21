@@ -1397,7 +1397,12 @@ function startRankPoll() {
 
 let keyAll = [];
 let hostAccountsCache = [];
-let newKeyKind = 'host';      // 'host' = 代挂自用；'pool' = 号池计费
+// 'host' = 代挂自用；'pool' = 号池计费。
+// 初始值不再写死 'host'（v0.31.91）：真正的默认值在 keyBindRestoreOnce 里按
+// "你有没有代挂账号"决定 —— 一个代挂账号都没有的人生成"代挂自用"Key，
+// 得到的是一把跑不了任何模型的密钥（自挂官组成员取决于绑定账号），
+// 而且它没有「切换分组」可点，用户最后会卡在"为什么选不了通道组"。
+let newKeyKind = 'pool';
 let newKeyBind = new Set();   // 新密钥勾选的账号 uid
 let keyKindSegEl = null;
 
@@ -1428,6 +1433,10 @@ function keyBindSave() {
 function keyBindRestoreOnce() {
   if (keyBindRestored) return;
   keyBindRestored = true;
+  // 没有"上次选择"时的默认值（v0.31.91）：有代挂账号才默认代挂自用，
+  // 否则默认号池计费 —— 否则新用户第一次点「生成密钥」拿到的 Key
+  // 既没有可跑模型，也没有「切换分组」入口。
+  newKeyKind = hostAccountsCache.length ? 'host' : 'pool';
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(keyBindLSKey()) || 'null'); } catch (e) { saved = null; }
   if (!saved || typeof saved !== 'object') return;

@@ -150,14 +150,18 @@ func TestExpandGroupModelChannel(t *testing.T) {
 	}
 }
 
-// TestVisibleGroupsByKeyKind work官组只有两类，按 Key 类型二选一（v0.31.82）。
+// TestUserGroupsByKeyKindAndWhitelist 用户可见组的口径（v0.31.91 改写自旧用例）。
 //
-//	池计费 Key → 号池官组（wb-group-work）
-//	代挂自用 Key → 自挂官组（wb-group-host）
+// 旧口径（v0.31.82）是"用户面只有两类官组，通道组一律不出现"。那条口径在
+// v0.31.90 被推翻 —— 用户明确要求能切到通道组，于是切换弹窗改了口径，
+// 而模型清单没改，才出现"能切过去、却选不到这个名字"。
+// 现在的口径（一条）：
 //
-// 通道组（ch<N>）**不再出现在用户可见列表里**：即使 Key 的 group_scope 里还留着
-// 历史授权，也不该再被当成"用户可选的一种组"——产品口径只有两类。
-func TestVisibleGroupsByKeyKind(t *testing.T) {
+//	代挂自用 Key → 自挂官组（host）
+//	池计费 Key   → 号池官组（work）+ 该 Key **可切换**的通道组（ch<N>）
+//
+// 同时验证白名单仍然生效：scope 非空且不含某组 → 那个组不出现。
+func TestUserGroupsByKeyKindAndWhitelist(t *testing.T) {
 	store, px, _ := newTestApp(t, &Account{
 		UID: "g-acct4", Realm: "cn", AccessToken: "at", RefreshToken: "rt",
 		ConsumeGroup: "apply", PoolState: "in",
@@ -178,9 +182,12 @@ func TestVisibleGroupsByKeyKind(t *testing.T) {
 		t.Fatalf("SaveUpstreamModel: %v", err)
 	}
 
-	// 代挂 Key：只见自挂官组（即使 group_scope 里还留着通道组授权）。
-	host := &APIKey{Kind: KeyKindHost, GroupScope: "ch" + itoa(int(id))}
-	groups := px.visibleGroups(host)
+	chID := "ch" + itoa(int(id))
+
+	// ① 代挂 Key：只见自挂官组（即使 group_scope 里还留着通道组授权）——
+	//    代挂 Key 只走自己的账号，给它通道组等于让它选到跑不了的模型。
+	host := &APIKey{Kind: KeyKindHost, GroupScope: chID}
+	groups := px.userGroups(host)
 	if len(groups) != 1 || groups[0].ID != groupHostID {
 		t.Fatalf("代挂 Key 应只看见自挂官组，得到 %+v", groups)
 	}
@@ -188,13 +195,23 @@ func TestVisibleGroupsByKeyKind(t *testing.T) {
 		t.Errorf("自挂官组 = %+v，期望 wb-group-host / 自挂官组", groups[0])
 	}
 
-	// 池计费 Key：只见号池官组（历史通道组授权不再暴露）。
-	pool := &APIKey{GroupScope: "ch" + itoa(int(id))}
-	groups = px.visibleGroups(pool)
-	if len(groups) != 1 || groups[0].ID != groupWorkID {
-		t.Fatalf("池计费 Key 应只看见号池官组，得到 %+v", groups)
+	// ② 池计费 Key + 白名单含该通道：work + 该通道组（默认开放时也一样）。
+	pool := &APIKey{GroupScope: chID}
+	groups = px.userGroups(pool)
+	if len(groups) != 2 || groups[0].ID != groupWorkID || groups[1].ID != chID {
+		t.Fatalf("池计费 Key 应为 work + %s，得到 %+v", chID, groups)
 	}
 	if groups[0].Model != "wb-group-work" || groups[0].Label != "号池官组" {
 		t.Errorf("号池官组 = %+v，期望 wb-group-work / 号池官组", groups[0])
+	}
+	if groups[1].Kind != "channel" || groups[1].Members != 1 {
+		t.Errorf("通道组 = %+v，期望 kind=channel / members=1", groups[1])
+	}
+
+	// ③ 白名单不含它：只剩 work（管理员显式收窄必须立刻生效）。
+	narrow := &APIKey{GroupScope: "work"}
+	groups = px.userGroups(narrow)
+	if len(groups) != 1 || groups[0].ID != groupWorkID {
+		t.Fatalf("白名单只含 work 时应只列 work，得到 %+v", groups)
 	}
 }

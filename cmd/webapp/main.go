@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.91"
+const version = "0.31.92"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1538,13 +1538,15 @@ func (a *app) refreshModelsCache() []string {
 
 func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	// 模型组（v0.31.76）：只有**绑定了通道组**的 Key 才会多出 `wb-group-*` 条目 ——
-	// 存量客户端（group_scope 为空）看到的响应逐字节不变，不给它们加噪声。
-	// 两种情况要按 Key 定制清单（v0.31.88 扩到「生效分组」）：
-	//   · 绑了通道组 → 多出 wb-group-* 条目（v0.31.76）；
-	//   · 生效分组非空 → **只列该组**，否则客户端会显示一堆切组后必然 404 的模型。
+	// 按 Key 定制清单的条件（v0.31.76 起，v0.31.91 改判据，见 keyNeedsGroupCatalog）。
+	//
+	// ⚠️ 这里**不能再**用 `len(splitGroups(k.GroupScope)) > 0`：v0.31.90 把
+	// group_scope 改成「空 = 默认开放」之后，管理员不会再逐 Key 授权，
+	// 于是新建 Key 的 group_scope 恒为空 → 永远走全局缓存原文 →
+	// 客户端模型选择器里连 `wb-group-work` 都没有，更别说通道组。
+	// 那是"生成密钥后无法选用通道组"的第二个落点。
 	if k, _ := r.Context().Value(ctxAPIKeyKey).(*APIKey); k != nil && a.proxy != nil &&
-		(k.ActiveGroup != "" || len(splitGroups(k.GroupScope)) > 0) {
+		a.keyNeedsGroupCatalog(k) {
 		if p := a.modelsPayloadFor(k); p != nil {
 			_, _ = w.Write(p)
 			return
@@ -1561,6 +1563,34 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+}
+
+// keyNeedsGroupCatalog 这把 Key 的 /v1/models 是否需要"按 Key 定制"（多出组名条目）。
+//
+// 判据（v0.31.91）：
+//  1. 生效分组非空 → 必须定制（只列该组，否则客户端会显示一堆切组后必然 404 的模型）；
+//  2. 池计费 Key 且**有通道组可选** → 定制（不然用户在客户端根本选不到通道组）；
+//  3. 代挂自用 Key → 维持存量行为（不按 Key 定制）：它的模型面取决于绑定账号，
+//     拿全局目录冒充会让人选到跑不了的模型；组名由接入脚本直接写入客户端。
+//
+// 为什么"有通道组才定制"而不是"一律定制"：没有通道的部署只有 work 一个组，
+// 此时保持逐字节不变的响应（v0.31.76 的承诺），不给出无意义的额外条目。
+func (a *app) keyNeedsGroupCatalog(k *APIKey) bool {
+	if k == nil || a.proxy == nil {
+		return false
+	}
+	if k.ActiveGroup != "" {
+		return true
+	}
+	if k.Kind == KeyKindHost {
+		return false
+	}
+	for _, g := range a.proxy.userGroups(k) {
+		if g.Kind == "channel" {
+			return true
+		}
+	}
+	return false
 }
 
 // modelsPayloadFor 按这把 Key 的可见范围定制 /v1/models。
@@ -1615,7 +1645,9 @@ func (a *app) modelsPayloadFor(k *APIKey) []byte {
 	}
 
 	head := make([]map[string]any, 0, len(doc.Data)+4)
-	for _, g := range a.proxy.visibleGroups(k) {
+	// v0.31.91：用 userGroups（work + 该 Key 可切换的通道组），不是 visibleGroups。
+	// 否则用户在控制台能切到通道组，客户端的模型列表里却没有这个名字。
+	for _, g := range a.proxy.userGroups(k) {
 		if g.Members == 0 {
 			continue // 空组不列：选它必然失败，不如不给
 		}

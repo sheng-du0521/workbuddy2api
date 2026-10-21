@@ -145,7 +145,13 @@ type APIKey struct {
 	// AccountUIDs 代挂自用 Key 限定的具体账号集合（逗号分隔 uid；空 = 不按账号限定）。
 	// v0.11.0：Key 生成照「API 反代」页，可逐账号勾选参与反代的账号。
 	AccountUIDs string
-	// GroupScope 该 Key 能看见的**模型组**（逗号分隔组 id；空 = 只有内置 work 官组）。
+	// GroupScope 该 Key 能看见的**模型组**（逗号分隔组 id）—— **管理员给的边界**。
+	//
+	//   ""     不限制（v0.31.90 起）：全部 enabled 通道组 + work 都能选
+	//   非空   白名单：只有列出的这些
+	//
+	// ⚠️ 别把它读成"空 = 只有 work"（那是 v0.31.90 之前的旧语义，已推翻）。
+	// 用户面的"可选组"统一由 Proxy.userGroups 计算，判据只有 groupSelectable 一处。
 	//
 	// v0.31.76：组是**派生**概念，不单独存成员表 ——
 	// `work` 的成员就是号池观测目录，`ch<N>` 的成员就是通道 N 的映射。

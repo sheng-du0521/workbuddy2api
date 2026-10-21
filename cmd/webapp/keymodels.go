@@ -98,11 +98,15 @@ func (a *app) handleKeyModels(w http.ResponseWriter, r *http.Request) {
 	if !modelsCacheFresh() {
 		a.refreshModelsCache()
 	}
-	// 模型组（v0.31.76）：控制台**总是**列出 work 官组 ——
-	// 它既是"接入时的默认值"，也是让用户第一次知道"组"这个概念的入口。
-	// （客户端的 /v1/models 只在 Key 绑了通道组时才列组名，避免给存量客户端加噪声。）
+	// 模型组（v0.31.76，v0.31.91 改口径）：控制台列出的是**这把 Key 真正能选的组** ——
+	// 号池官组 + 该 Key 可切换的通道组（代挂 Key 则是自挂官组）。
+	//
+	// 为什么必须用 userGroups 而不是 visibleGroups：v0.31.90 起用户可以在
+	// 「切换分组」里切到通道组，而 visibleGroups 只回 work / host ——
+	// 结果是"切得过去，但下拉里没有 wb-group-ch<N> 这一项可选"，
+	// 用户报的就是「生成密钥后无法选用通道组」。两处口径必须同源。
 	if a.proxy != nil {
-		resp.Groups = a.proxy.visibleGroups(k)
+		resp.Groups = a.proxy.userGroups(k)
 	}
 	// 生效分组（v0.31.88）：非空时只列该组 —— 目录与请求约束必须同源。
 	if ms := a.activeGroupModels(k); ms != nil {

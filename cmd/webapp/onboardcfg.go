@@ -149,6 +149,18 @@ func (a *app) buildOnboardPlan(k *APIKey) workGroupPlan {
 	}
 	isHost := k.Kind == KeyKindHost
 	gid, label, defKV := a.planKey(isHost)
+	// 生效分组（v0.31.91）：用户把 Key 切到某个通道组之后，接入必须写**那个**组名。
+	//
+	// 否则"我在控制台选了通道组、接进客户端却还是号池官组"—— 切组这件事对
+	// 一键接入完全无效，用户看到的现象就是「选了通道组也没用」。
+	// 只在组**确实存在且有成员**时才采用：切组后通道被停用的悬空值不能写进脚本。
+	official := true
+	if !isHost && k.ActiveGroup != "" && a.proxy != nil {
+		if ms, lb, ok := a.proxy.groupMembersFor(k.ActiveGroup, k); ok && len(ms) > 0 {
+			gid, label, official = k.ActiveGroup, lb, false
+			defKV = "" // 后台默认值（onboard_default_pool）只对两类官组有意义
+		}
+	}
 	plan := workGroupPlan{
 		IsHost: isHost, GroupID: gid, GroupLabel: label,
 		GroupName: groupVirtualModel(gid),
@@ -162,7 +174,12 @@ func (a *app) buildOnboardPlan(k *APIKey) workGroupPlan {
 		}
 	}
 	// ② 与后台选配取交集（选配为空 = 不限制）。
+	// 选配是给两类**官组**配的；通道组的候选就是它自己的成员，不套选配
+	// （否则运营为号池勾的名单会莫名其妙地把通道组裁掉一半）。
 	allow, configured := a.onboardAllowList(isHost)
+	if !official {
+		allow, configured = nil, false
+	}
 	plan.Restricted = configured
 	models := base
 	if configured {
@@ -176,9 +193,12 @@ func (a *app) buildOnboardPlan(k *APIKey) workGroupPlan {
 	plan.Members = models
 
 	// ③ 默认值：配置优先；没配就用本组虚拟名。
-	def, _ := a.store.GetKV(defKV)
-	if strings.TrimSpace(def) == "" {
-		def = plan.GroupName
+	// defKV 为空（= 生效分组是通道组）时不读 KV：那条 KV 描述的是号池官组的默认。
+	def := plan.GroupName
+	if defKV != "" {
+		if v, _ := a.store.GetKV(defKV); strings.TrimSpace(v) != "" {
+			def = strings.TrimSpace(v)
+		}
 	}
 	// 候选列表 = 组名 + 成员；组名固定排第一（它是"我不用挑"的入口）。
 	all := append([]string{plan.GroupName}, models...)

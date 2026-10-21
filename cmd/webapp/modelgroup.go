@@ -136,35 +136,71 @@ func (p *Proxy) hostGroupMembers(k *APIKey) []string {
 	return out
 }
 
-// visibleGroups 一把 Key 能看见的「work官组」条目。
-//
-// v0.31.82 起**只有两类**，按 Key 类型二选一：
-//   - 池计费 Key → 号池官组（wb-group-work）
-//   - 代挂自用 Key → 自挂官组（wb-group-host）
-//
-// 通道组（ch<N>）**不再出现在这里**：它属于运营内部的上游配置，不是用户可选的"组"。
-// 解析逻辑仍保留（已经授权过的 Key 照常能用），只是不再对外暴露这个分类 ——
-// 用户面只有"号池官组 / 自挂官组"两种，与产品口径一致。
-func (p *Proxy) visibleGroups(k *APIKey) []modelGroupInfo {
-	out := make([]modelGroupInfo, 0, 2)
-	if k != nil && k.Kind == KeyKindHost {
-		ms, label, ok := p.groupMembersFor(groupHostID, k)
-		if ok {
-			out = append(out, modelGroupInfo{
-				ID: groupHostID, Model: groupVirtualModel(groupHostID),
-				Label: label, Kind: "host", Members: len(ms),
-			})
-		}
-		return out
+// groupKindOf 组 id → 分类标签（前端与日志用）。
+func groupKindOf(gid string) string {
+	switch gid {
+	case groupWorkID:
+		return "work"
+	case groupHostID:
+		return "host"
 	}
-	if ms, label, ok := p.groupMembersFor(groupWorkID, k); ok {
+	return "channel"
+}
+
+// userGroups 用户面「看得见、且选得动」的模型组 —— **唯一口径**（v0.31.91）。
+//
+// # 为什么必须再加一层
+//
+// v0.31.82 把用户面收窄成两类官组（visibleGroups 只回 work / host）；
+// v0.31.90 又因为用户投诉"只有号池组"，给控制台开了「切到通道组」——
+// 但**只有切换弹窗改了口径**（selectableGroupIDs 含 ch<N>），
+// 模型清单（keymodels.go）与 /v1/models（main.go modelsPayloadFor）还在用 visibleGroups。
+//
+// 结果就是用户报的那句「生成密钥后依然无法选用通道组」：
+// 切换弹窗里能切到 ch1，但模型下拉里根本没有 `wb-group-ch1` 这一项 ——
+// 能切、却选不到，两套口径分裂的典型症状。
+//
+// # 口径
+//
+//	代挂自用 Key → 自挂官组（host）
+//	池计费 Key   → 号池官组（work）+ 该 Key **可切换**的通道组（ch<N>）
+//
+// 内部直接复用 selectableGroupIDs，所以"列出来的"与"切得动的"永远是同一批，
+// 不可能再出现"列表里有、点了 403"。
+func (p *Proxy) userGroups(k *APIKey) []modelGroupInfo {
+	if p == nil || k == nil {
+		return nil
+	}
+	if k.Kind == KeyKindHost {
+		ms, label, ok := p.groupMembersFor(groupHostID, k)
+		if !ok {
+			return nil
+		}
+		return []modelGroupInfo{{
+			ID: groupHostID, Model: groupVirtualModel(groupHostID),
+			Label: label, Kind: groupKindOf(groupHostID), Members: len(ms),
+		}}
+	}
+	out := make([]modelGroupInfo, 0, 4)
+	for _, gid := range p.selectableGroupIDs(k) {
+		ms, label, ok := p.groupMembersFor(gid, k)
+		if !ok {
+			continue // 组已删 / 通道已停用：不列（与 groupSelectable 的口径一致）
+		}
 		out = append(out, modelGroupInfo{
-			ID: groupWorkID, Model: groupVirtualModel(groupWorkID),
-			Label: label, Kind: "work", Members: len(ms),
+			ID: gid, Model: groupVirtualModel(gid),
+			Label: label, Kind: groupKindOf(gid), Members: len(ms),
 		})
 	}
 	return out
 }
+
+// 注：v0.31.91 删除了 visibleGroups（"只回官组"的那一版）。
+//
+// 删的理由不是它写得不对，而是**留着就一定会被再次误用**：用户面已经有
+// 「切换分组」（selectableGroupIDs，含通道组）之后，任何只回 work/host 的
+// 用户可见清单都会造成"能切过去、却选不到这个名字"—— 这正是
+// 「生成密钥后依然无法选用通道组」的根因。用户面的组统一走 userGroups。
 
 // groupKindMismatch 判断「组名与 Key 类型不匹配」。
 //

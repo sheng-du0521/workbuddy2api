@@ -1,20 +1,20 @@
 {
-  "version": "0.31.91",
+  "version": "0.31.92",
   "min_supported": "0.24.0",
-  "notes": "v0.31.91：第三方通道「探活」的候选导入弹窗不会再\"闪现消失\"。\n\n反馈：点「探活」，识别到模型的弹窗出现一下就没了。\n\n诚实边界先说清楚：本机用 jsdom + 真浏览器（Edge，1400×900）都复现不出来 —— 单击、双击、探活 0ms 与 800ms 延迟三种时序下，2500ms 采样里弹窗一直稳定存在。所以这次没有\"确证根因\"，而是把三条能产生这个观感的路径一起收紧：\n\n① 弹窗出现时，背后的通道列表还在重建（顺序反了）\n旧：先弹窗、再 loadChannels()。弹窗一出现，背后的卡片列表就被整体清空重建 —— 页面抖一下；运营正在弹窗里勾选时，列表还在变。\n新：先 await loadChannels()，再弹窗。弹窗一出现这一页就静止。弹窗里\"已在映射里\"的判断也改用刚刷新的映射，不再用点击瞬间的旧快照。\n\n② 遮罩\"点一下即关\"没有冷静期（最像\"闪现即消失\"的成因）\n探活要等上游几秒，人会在原地反复点那颗按钮；若请求恰好在两次点击之间返回，弹窗就出现在鼠标正下方，紧跟着那一次点击落在刚出现的遮罩上 —— 等于自己把它点掉。\n新：bindMaskDismiss() 统一给遮罩点击加 350ms 冷静期（openModal 与积分包弹窗共用同一实现）；探活按钮在等待期间显示\"探活中…\"并忽略连点。冷静期对手动关窗无感，但足以吃掉连点/双击的第二下与手势残影。\n\n③ 失败与空结果只写页首一行提示，等于\"什么都没发生\"\n通道卡排在页面下半部分时，那行 #chHint 在视口外，与\"弹窗闪一下没了\"根本分不清。\n新：探活失败改为弹窗显示上游原话 + 「重试探活」；成功但上游返回 0 个模型也弹窗说明。弹窗内容渲染异常改为 toast 显式报错，不再静默成一个空遮罩。\n\n测试：uitest 新增三组回归用例 —— 探活后弹窗存在、隔一个阶段（约 700ms）仍在；勾选/上游名/单价/倍率输入框真的渲染；遮罩在冷静期内点不关、过了冷静期能关（防止被后来的人改成\"永远关不掉\"）。jscheck / 全量 go test / preflight 全链绿。\n\n边界：本次未改探活的服务端逻辑（GET {base_url}/models 与写映射的语义一字未动），也没有改计费链路。",
-  "released_at": 1792573126,
+  "notes": "v0.31.92：修「生成密钥后依然无法选用通道组」—— 用户面的组改成**一个口径**。\n\n## 根因（三处落点，同一个病根：两套口径）\n\n上一批（v0.31.90）给用户开了「切换分组」，但只改了**切换弹窗**那一处\n（selectableGroupIDs 含通道组）。用户可见的「组」还有另外两个出口，\n它们仍在用旧口径（v0.31.82 的 visibleGroups：只回 work / host）：\n\n① `/api/keys/{id}/models` 的 groups → 控制台「测试对话」下拉、\n   「一键接入」弹窗的组标签。于是**能切到 ch1，但下拉里没有 wb-group-ch1 这一项**。\n\n② `/v1/models` 的定制判据还是 `active_group 非空 || group_scope 非空`。\n   v0.31.90 把 group_scope 改成\"空 = 默认开放\"之后，管理员不再逐 Key 授权 →\n   新生成的 Key 两个字段都是空 → **永远走全局缓存原文**，客户端模型选择器里\n   连 wb-group-work 都没有，更别说通道组。这就是\"生成密钥后\"这个前提的由来。\n\n③ `/api/onboard/options`（一键接入）的组名恒为 wb-group-work / wb-group-host，\n   **不看 active_group**。用户切到通道组之后再接入，写进客户端的还是号池官组 ——\n   切组对一键接入完全无效。\n\n另有一个体验陷阱：控制台「生成密钥」的默认类型写死 `host`（代挂自用）。\n一个代挂账号都没有的人点一下生成，拿到的 Key 既没有可跑模型（自挂组成员取决于\n绑定账号），也没有「切换分组」按钮 —— 同样会表现为\"选不了通道组\"。\n\n## 改动\n\n- 新增 `Proxy.userGroups(k)` 作为**用户面唯一口径**：\n  代挂 Key → 自挂官组；池计费 Key → 号池官组 + 该 Key **可切换**的通道组。\n  内部直接复用 `selectableGroupIDs`，所以\"列出来的\"与\"切得动的\"永远同一批，\n  不可能再出现\"列表里有、点了 403\"。\n- **删除 `visibleGroups`**：它没写错，但留着一定会被再次误用 —— 本次故障就是它。\n- `/api/keys/{id}/models` 与 `/v1/models` 都改用 `userGroups`；\n  `/v1/models` 的定制判据换成 `keyNeedsGroupCatalog`（生效分组非空 / 池 Key 且有\n  通道组可选）。**没有通道组的部署保持逐字节不变**（v0.31.76 的承诺仍然守）。\n- 一键接入尊重 `active_group`：切到通道组后，接入包写 wb-group-ch<N>，\n  候选 = 该组成员，且不套用后台给官组配的选配名单（那份名单只对官组有意义）。\n- 控制台默认密钥类型改为\"有代挂账号才默认代挂自用，否则号池计费\"。\n\n## 验证\n\n- 新增 `cmd/webapp/keygroup_userview_test.go` 六条：userGroups 含通道组 /\n  代挂 Key 只有 host / 模型清单里出现 wb-group-ch<N> / 新 Key（两字段全空）的\n  /v1/models 也列出通道组名 / 没有通道组的部署不定制 / 切到通道组后接入包写该组名。\n- 改写 `TestVisibleGroupsByKeyKind` → `TestUserGroupsByKeyKindAndWhitelist`\n  （旧用例锁的正是被推翻的\"通道组不可见\"口径），并保留白名单收窄的断言。\n- uitest 新增：密钥页「切换分组」弹窗必须列出通道组与它的倍率；测试对话下拉必须\n  出现 wb-group-ch1。\n- go test ./...、jscheck、uitest、preflight 全链绿。\n\n## 边界\n\n- 代挂自用 Key 的 /v1/models 仍不按 Key 定制（它的模型面取决于绑定账号，\n  用全局目录冒充会让人选到跑不了的模型），组名由接入脚本直接写入客户端。\n- 通道组的候选不套用「work官组选配」——那份名单是给号池/自挂两类官组配的。",
+  "released_at": 1792574764,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.91/webapp.exe",
-      "sha256": "27d943168521018cd7519d232f8318fccef47674d3ea97119bd1d9720c64c116",
-      "size": 16091136
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.92/webapp.exe",
+      "sha256": "9098382e72b9ce46a673ecb85962d3590c0eff0e21ca013e91fa5b6df5f0b04a",
+      "size": 16093184
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "ovRyDRf90WyHvRWcGb3uVsw0haNcBYZ7W2tqFs2vuUJbLSUJ7v5SazqNGDZ0UmBqgiNF90k/cQyDWv1rTJMZDQ==",
+  "signature": "Ftjg6joE5CG4SxxGUPocaNRpEOiV3jyhwBAI8cpCCcIdvvR5EhOilHuo3D8fdSSWkZND5eC4CF+ls41az7NzDA==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }
