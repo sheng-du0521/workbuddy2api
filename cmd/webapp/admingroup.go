@@ -51,9 +51,21 @@ func (a *app) handleAdminUserKeys(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	// 组清单随接口下发（前端据此渲染勾选项，不自己拼 id）。
+	//
+	// ⚠️ 这里**不能用 visibleGroups**：v0.31.82 起它收窄成"只给 work"，
+	// 用它渲染授权界面就永远只有一个可勾项 —— 管理员会以为"通道组不能授权"。
+	// 授权界面要的是**全部可选组**（work + 所有 enabled 通道组）。
 	var groups []modelGroupInfo
 	if a.proxy != nil {
-		groups = a.proxy.visibleGroups(nil) // nil = 只看 work（组清单本身与 Key 无关）
+		n := 0
+		if ms, _, ok := a.proxy.groupMembersFor(groupWorkID, nil); ok {
+			n = len(ms)
+		}
+		groups = append(groups, modelGroupInfo{
+			ID: groupWorkID, Model: groupVirtualModel(groupWorkID),
+			Label: "号池官组", Kind: "work", Members: n,
+		})
+		groups = append(groups, a.proxy.allChannelGroups()...)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"keys": out, "groups": groups, "count": len(out),

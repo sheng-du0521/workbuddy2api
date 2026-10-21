@@ -1,20 +1,20 @@
 {
-  "version": "0.31.88",
+  "version": "0.31.89",
   "min_supported": "0.24.0",
-  "notes": "v0.31.88：通道接入自动识别模型 + 单模型倍率；号池 Key 可切换计费分组。\n\n① 通道接入：探活结果一键入库。新增 POST /api/admin/upstreams/models/import，探活后通道卡里长出一块候选面板（勾选 + 上游名 + 单价 + 倍率 + 全选/批量填单价），新建通道保存后自动探活并把面板准备好。落库**写两张表**：upstream_models（这条通道能服务哪些模型）与 model_ratios（系统模型列表 = 用户可见目录 + 倍率）——只写一张就会出现\"能用但看不见\"或\"看得见但跑不了\"。幂等语义：已有映射跳过且**不覆盖单价**（人工调过的价不能被一次探活冲掉）；已在 model_ratios 的只补缺、不动官方倍率与实测值；只有显式填了倍率的模型才写 billing_ratio。\n\n② 单模型倍率两处可改：接入时（候选面板每行的输入框）与之后（通道卡模型表新增「计费倍率」列，×1.5 / 跟随全局，点一下改）。默认值 0 = 跟随全局（**不是免费**），界面写\"跟随全局\"而不是留空；通道模型写入时 scope 固定 relay，只作用于该模型经通道的调用，不会连带把号池同名模型一起调价；上限 100 倍、单价 0–100000；只影响之后的请求。\n\n③ 号池计费密钥切换分组。新增 api_keys.active_group（默认空 = 存量 Key 行为不变），与既有两字段分工：kind 决定从哪取号、group_scope 是管理员给的**授权边界**（用户改不了）、active_group 是用户**当前用哪个**。新接口 GET /api/keys/{id}/group-options 与 POST /api/keys/{id}/group；密钥卡加「切换分组」按钮（代挂 Key 没有——后端 400 + 前端不显示按钮）。切换后立刻生效：/v1/models 只列该组模型与组名、测试对话/接入候选同源、组外模型在选号前直接 404（不消耗账号不扣费）。已有用量与余额**一条都不回算**（usage_logs 在结算那一刻就把 model 与倍率写死了），响应显式带 history_unchanged。\n\n④ 校验顺序固定且错误码可区分：代挂 Key 400 host_key_has_no_group、停用 403 key_disabled、未授权 403 group_not_granted（不是 404，避免让人以为组被删了）、组不存在 404 group_not_found、组存在但没模型 409 group_empty（切过去每个请求都会失败，直接拦住）。\n\n⑤ 一处刻意的取舍：group-options 里列的是\"**被授权**的组\"而不是 visibleGroups（后者在 v0.31.82 被收窄成只给 work，用它做切换列表就永远只有一个选项）。没授权的组不出现，所以不存在越权选择。\n\n验证：\n- 单测 12 条：两表都写 / 显式倍率落 relay scope / 重复导入不覆盖单价 / 不冲掉官方倍率与实测值 / 5 行 4 非法只导入 1 行 / 无 id 空清单超 200 条全拒 / 接口 404-400-200 / 列表带出 billing_ratio / 四条拒绝路径 / 切组后可用模型与目录立刻变且组外不可用 / **切换前后余额与流水行数一字不差** / 选项列表（不限制+work，授权后通道组才出现）/ 代挂不可切换。\n- 真机（临时实例 + X-Admin-Key）：建通道 → 导入 2 个模型（一个带倍率）→ 新增 2、入目录 2、写倍率 1 → 再导一次全跳过 → 列表带回 billing_ratio=1.5 且 scope=relay、未给倍率为 0、单价未被覆盖 → 系统模型列表里确有这两个。\n- 全量 go test + jscheck + uitest + preflight 全链通过。\n\n边界：探活只读 /models（不消耗对方额度），导入不做二次校验（探活到 ≠ 现在就可用，上游随时可能下线）；倍率只影响之后的请求；分组切换对\"已经在跑的长连接/流式请求\"不生效；active_group 指向已失效的组时按\"不限制\"处理并在界面提示，不会把所有请求打成 404。",
-  "released_at": 1792569958,
+  "notes": "v0.31.89：恢复「分组授权」入口 + 撤销授权即时失效（v0.31.88 的收尾）。\n\n① 补上一处半开的门：v0.31.88 给用户加了「切换计费分组」，可切范围由管理员授权（group_scope）决定，而 v0.31.82 撤掉的「组」授权入口一直没回来——新用户只有「不限制 / work」两个选项，切换功能等于半开。现在后台用户卡恢复「组」按钮：每把 Key 一块、通道组逐个勾选；work 不出现在勾选项里（恒可用，勾了等于假装授予过）；代挂自用 Key 不给复选框、右侧直写「只能用 work 官组」；空组禁用并标「空组」。副标题明写「授权 ≠ 生效」——授权只是能选，真正生效哪个由用户自己切。\n\n② 修一个会让功能看起来\"不能用\"的接口问题：该接口的组清单原来用 visibleGroups，而它在 v0.31.82 被收窄成只给 work → 管理员永远只看到一个可勾项，会以为通道组不能授权。改为 work + 全部 enabled 通道组（附单测钉住）。\n\n③ 撤销授权必须立刻生效：activeGroupModels 原来只看\"组存不存在\"，不看\"有没有被授权\"。后果很具体——管理员撤销后界面显示「当前分组已失效」，请求却仍按那一组走。现在加授权校验，组不在 group_scope 里立即按「不限制」处理；并与 group-options 的「已失效」提示共用同一个 groupGranted 判据（不再各写一套）。active_group 字段本身不被撤销动作改写——那是用户的选择，撤销的是\"能不能用\"。\n\n④ 两个小修：/v1/models 在缓存未建立时可能返回 \"data\":null（部分 SDK 会直接抛错）→ 统一成 []；group-options 里 work 在 group_scope 含 work 时会重复出现 → 按 id 去重。\n\n验证：新增 TestAdminUserKeysListsAllGroups（组清单必须含 work 与 enabled 通道组 + 成员数）与 TestKeyGroupRevokedImmediatelyInactive（撤销后 active_group 不变但立刻不生效、选项消失、提示「已失效」）；v0.31.88 的 6 条分组用例全部仍通过；全量 go test + jscheck + uitest + preflight 全绿。顺带被 uitest 的 auth-trace 拦下一次误命名（把 rows 元素写成 r.key，被保守正则判成\"前端出现完整 key\"）——改名为 r.k，没有放宽那条检查。\n\n边界：授权只影响\"能选哪些\"，不影响已生效的 active_group（撤销后按不限制处理）；空组仍可被授权但用户切不过去（409），界面已禁用勾选；本次未改计费链路。",
+  "released_at": 1792570700,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.88/webapp.exe",
-      "sha256": "b119c03bfc95a8f1e04e89263489ae19c488ea134a47d1971b2e087f323e18f3",
-      "size": 16076800
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.89/webapp.exe",
+      "sha256": "e8bb0e3c549b03d8dd735379497255a2be568877b8bb6f9cf0f20e6c191d8013",
+      "size": 16084480
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "rAhg5KqUHqWyw0o7HAM4SahmZJ0LCR2eiKfDmsEdCBdhmEb0FLO7dzxuanuP0e7jUfkaYLVfJ5eqGr9D0GwMBA==",
+  "signature": "HkrQ+6cTUAZdW91s/KF1yMFMha7d1Cd6VXYRdpTX/tkSV0pb7W//Y0KHDis63g6rGJg46kH4MtIaqKPq4hl0Ag==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

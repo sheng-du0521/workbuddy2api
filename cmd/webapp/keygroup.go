@@ -127,10 +127,12 @@ func (a *app) handleKeyGroupOptions(w http.ResponseWriter, r *http.Request) {
 	// 用它做切换列表就永远只有一个选项。切换要的是"**被授权**的组"——
 	// 授权了才出现（没授权的用户看不到，也就不存在越权选择）。
 	if a.proxy != nil {
+		seenG := map[string]bool{}
 		for _, gid := range append([]string{groupWorkID}, splitGroups(k.GroupScope)...) {
-			if gid == "" {
+			if gid == "" || seenG[gid] {
 				continue
 			}
+			seenG[gid] = true
 			ms, label, ok := a.proxy.groupMembersFor(gid, k)
 			if !ok {
 				continue // 组已删/停用：不列（当前生效的那一个会走下面的"已失效"分支）
@@ -198,14 +200,9 @@ func (a *app) handleKeyGroupSet(w http.ResponseWriter, r *http.Request) {
 	group := strings.TrimSpace(req.Group)
 	if group != "" && group != groupWorkID {
 		// 授权检查：work 恒可用，通道组必须在 group_scope 里。
-		granted := false
-		for _, gid := range splitGroups(k.GroupScope) {
-			if gid == group {
-				granted = true
-				break
-			}
-		}
-		if !granted {
+		// 用 groupGranted 而不是就地遍历 —— 与 activeGroupModels 的失效判据必须是同一个，
+		// 否则会出现"能切过去、但切完立即算失效"这种自相矛盾。
+		if !groupGranted(k, group) {
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error": "这个分组没有授权给你（需要管理员在后台授权后才会出现）",
 				"code":  "group_not_granted",
@@ -304,6 +301,12 @@ func (p *Proxy) activeGroupModels(k *APIKey) []string {
 	if k == nil || k.ActiveGroup == "" {
 		return nil
 	}
+	// 授权撤销后必须**立刻**失效（v0.31.89）：groupMembersFor 只看"组存不存在"，
+	// 不看"这把 Key 有没有被授权" —— 少了这一句，管理员撤销授权等于没生效：
+	// 界面会显示「已失效」，请求却仍按那一组走。两个口径不一致比缺功能更糟。
+	if k.ActiveGroup != groupWorkID && !groupGranted(k, k.ActiveGroup) {
+		return nil
+	}
 	ms, _, ok := p.groupMembersFor(k.ActiveGroup, k)
 	if !ok {
 		// 组失效（被删/停用）：按不限制处理，与 group-options 的提示保持一致。
@@ -329,6 +332,16 @@ func ratioRangeText(lo, hi, global float64) string {
 func modelInGroup(models []string, model string) bool {
 	for _, m := range models {
 		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
+// groupGranted 该 Key 是否被授权使用某个通道组（work 恒可用，由调用方另行处理）。
+func groupGranted(k *APIKey, gid string) bool {
+	for _, g := range splitGroups(k.GroupScope) {
+		if g == gid {
 			return true
 		}
 	}

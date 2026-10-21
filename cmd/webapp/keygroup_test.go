@@ -298,3 +298,55 @@ func TestKeyGroupOptionsHostNotEditable(t *testing.T) {
 		t.Errorf("应说明为什么不能切：%q", out.Note)
 	}
 }
+
+// TestKeyGroupRevokedImmediatelyInactive 撤销授权后，active_group 必须立刻失效。
+//
+// 这是"管理员撤销"能不能算数的唯一判据：groupMembersFor 只看组存不存在，
+// 不看有没有授权；少了授权校验，界面显示「已失效」而请求仍按该组走。
+func TestKeyGroupRevokedImmediatelyInactive(t *testing.T) {
+	f := newGroupFixture(t)
+	chGroup := "ch" + itoa(int(f.chID))
+	if _, err := f.store.SaveUpstreamModel(&UpstreamModel{
+		UpstreamID: f.chID, Model: "gpt-rev", RemoteModel: "gpt-rev", CreditPer1k: 1, Enabled: true,
+	}); err != nil {
+		t.Fatalf("SaveUpstreamModel: %v", err)
+	}
+	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, chGroup); err != nil {
+		t.Fatalf("授权: %v", err)
+	}
+	if code, out := f.setGroup(t, f.key.ID, chGroup); code != http.StatusOK {
+		t.Fatalf("切到通道组应 200，得到 %d %v", code, out)
+	}
+	k := f.reloadKey(t)
+	if ms := f.px.activeGroupModels(k); ms == nil {
+		t.Fatal("授权有效时该组应生效")
+	}
+
+	// 管理员撤销授权：active_group 仍是 chN，但必须**立刻**不再约束/生效。
+	if err := f.store.SetAPIKeyGroupsByID(f.key.ID, ""); err != nil {
+		t.Fatalf("撤销授权: %v", err)
+	}
+	k = f.reloadKey(t)
+	if k.ActiveGroup != chGroup {
+		t.Fatalf("撤销授权不该改动 active_group（那是用户的选择）：%q", k.ActiveGroup)
+	}
+	if ms := f.px.activeGroupModels(k); ms != nil {
+		t.Errorf("撤销授权后该组必须立刻失效（按不限制处理），得到 %v", ms)
+	}
+	// 界面口径也要一致：选项里不该再有它，且要提示"已失效"。
+	req := httptest.NewRequest(http.MethodGet, "/api/keys/1/group-options", nil)
+	req.SetPathValue("id", itoa(int(f.key.ID)))
+	req = withUser(req, f.user)
+	rec := httptest.NewRecorder()
+	f.a.handleKeyGroupOptions(rec, req)
+	var out keyGroupResp
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	for _, o := range out.Options {
+		if o.ID == chGroup {
+			t.Error("撤销授权后该组不该再出现在可选项里")
+		}
+	}
+	if !strings.Contains(out.ActiveLabel, "已失效") {
+		t.Errorf("当前生效组失效时必须显式提示，得到 %q", out.ActiveLabel)
+	}
+}

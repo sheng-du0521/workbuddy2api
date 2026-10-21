@@ -112,3 +112,63 @@ func TestAdminSetKeyGroups(t *testing.T) {
 		t.Errorf("work 应被忽略：code=%d scope=%v", code, out["group_scope"])
 	}
 }
+
+// TestAdminUserKeysListsAllGroups 授权界面拿到的组清单必须是**全部可选组**。
+//
+// 回归 v0.31.82 的遗留：那里把 visibleGroups 收窄成"只给 work"，
+// 而授权界面用的正是它 —— 结果管理员永远只看到一个可勾项，以为通道组不能授权。
+func TestAdminUserKeysListsAllGroups(t *testing.T) {
+	store, _, a := newTestApp(t)
+	defer store.Close()
+	withModelsCache(t, []string{"glm-5.3"})
+
+	u, err := store.CreateUser("ag-list", "x")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if _, err := store.CreateAPIKey(u.ID, "k", "hash-ag", "", "sk-wb-ag", "", "", ""); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	id, err := store.SaveUpstream(&Upstream{
+		Name: "ag-relay", Kind: upstreamKindOpenAI,
+		BaseURL: "https://ag-relay.example.com/v1", APIKey: "sk-ag",
+		Enabled: true, Priority: 100,
+	})
+	if err != nil {
+		t.Fatalf("SaveUpstream: %v", err)
+	}
+	if _, err := store.SaveUpstreamModel(&UpstreamModel{
+		UpstreamID: id, Model: "gpt-ag", RemoteModel: "gpt-ag", CreditPer1k: 1, Enabled: true,
+	}); err != nil {
+		t.Fatalf("SaveUpstreamModel: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/users/1/keys", nil)
+	req.SetPathValue("id", itoa(int(u.ID)))
+	rec := httptest.NewRecorder()
+	a.handleAdminUserKeys(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d（%s）", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Groups []modelGroupInfo `json:"groups"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析: %v", err)
+	}
+	have := map[string]modelGroupInfo{}
+	for _, g := range out.Groups {
+		have[g.ID] = g
+	}
+	if _, ok := have[groupWorkID]; !ok {
+		t.Errorf("组清单必须包含 work（恒可用），得到 %+v", out.Groups)
+	}
+	ch := "ch" + itoa(int(id))
+	g, ok := have[ch]
+	if !ok {
+		t.Fatalf("组清单必须包含 enabled 的通道组 %s（否则管理员无法授权），得到 %+v", ch, out.Groups)
+	}
+	if g.Members != 1 {
+		t.Errorf("通道组成员数 = %d，期望 1", g.Members)
+	}
+}

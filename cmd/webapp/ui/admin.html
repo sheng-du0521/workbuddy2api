@@ -4321,9 +4321,15 @@ function userCard(u) {
   const rec = el('button', 'ghost', '记录');
   rec.title = '余额变动记录：谁在什么时候改了多少、结果如何';
   rec.onclick = () => openBalanceAudits(u);
-  // v0.31.82 起不再有「组」授权入口：work官组只有两类（号池官组 / 自挂官组），
-  // 按 Key 类型自动生效，不需要逐 Key 勾选。通道组的授权界面整体撤下。
-  foot.append(add, lim, ban, rec);
+  // 「组」授权入口（v0.31.77 首次实现 → v0.31.82 撤下 → v0.31.89 恢复）。
+  //
+  // 为什么恢复：v0.31.88 给用户加了「切换计费分组」，而可切换的范围由这里决定 ——
+  // 没有这个入口，用户永远只有「不限制 / work」两个选项，切换功能等于半开。
+  // 语义要点：这里给的是**能选哪些**（授权边界），真正生效哪个由用户在控制台自己切。
+  const grp = el('button', 'ghost', '组');
+  grp.title = '给该用户的 Key 授权「可选分组」：授权后他才能在控制台切换过去';
+  grp.onclick = () => openKeyGroups(u);
+  foot.append(add, lim, ban, rec, grp);
   card.appendChild(foot);
   return card;
 }
@@ -5444,6 +5450,123 @@ async function loadMultiplierHistory() {
     box.appendChild(el('div', 'hintbar',
       '有调价未能发出公告（见上「⚠ 未发出公告」）：受影响的用户不会收到通知，建议手工在「公告」页补一条。'));
   }
+}
+
+// openKeyGroups 给某用户的 Key 授权「可选模型组」（v0.31.77 / v0.31.89 恢复）。
+//
+// 三个刻意的设计：
+//  1. **work 不出现在勾选项里**：它恒可用，勾了等于假装授予过（数据里也不写它）；
+//  2. **代挂自用 Key 不给复选框**：它只走号主本人账号，右侧直接写"只能用 work 官组"，
+//     给一组禁用框会让人以为点了会生效；
+//  3. **空组禁用并标「空组」**：勾一个必然失败的组没有意义；而且用户切过去会全 404。
+//
+// 最重要的一句写在副标题里：**授权 ≠ 生效**。授权只是"能选"，
+// 用户要在控制台「切换计费分组」里选，否则他看到的还是原来的模型集合。
+async function openKeyGroups(u) {
+  let d = null;
+  try { d = await api('/api/admin/users/' + encodeURIComponent(u.id) + '/keys'); }
+  catch (e) { toast('读取失败：' + e.message, 'err'); return; }
+
+  const keys = (d && d.keys) || [];
+  const groups = ((d && d.groups) || []).filter((g) => g.id !== 'work');
+  const m = openModal('分组授权 · ' + (u.username || u.id),
+    '勾选后该 Key **才能**在控制台切换到这些分组；真正生效哪个由用户自己选（授权 ≠ 生效）。'
+    + 'work 官组恒可用，不需要勾。');
+  if (!keys.length) {
+    m.body.appendChild(el('div', 'hintbar', '该用户还没有密钥。'));
+    return;
+  }
+  if (!groups.length) {
+    m.body.appendChild(el('div', 'hintbar',
+      '平台还没有可授权的通道组（先到「第三方通道」建一条并启用）。'));
+  }
+  const rows = [];
+  for (const k of keys) {
+    const host = k.kind === 'host';
+    const picked = new Set(String(k.group_scope || '').split(',').map((x) => x.trim()).filter(Boolean));
+    const card = el('div');
+    card.style.cssText = 'border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;';
+    const head = el('div', 'row');
+    head.style.cssText = 'gap:8px;align-items:baseline;flex-wrap:wrap;';
+    head.appendChild(el('b', null, k.name || '未命名'));
+    head.appendChild(el('span', 'muted mono', '#' + k.id + ' · ' + (k.masked || '')));
+    head.appendChild(el('span', 'tag ' + (k.status === 'active' ? 'ok' : 'warn'),
+      k.status === 'active' ? '启用' : '已停用'));
+    card.appendChild(head);
+
+    if (host) {
+      const t = el('div', 'muted');
+      t.style.cssText = 'font-size:12px;margin-top:4px;';
+      t.textContent = '代挂自用 Key：只能用 work 官组（只走号主本人账号，不能接入通道组）。';
+      card.appendChild(t);
+      m.body.appendChild(card);
+      continue;
+    }
+
+    const grid = el('div');
+    grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;margin-top:6px;';
+    for (const g of groups) {
+      const lab = el('label', 'muted');
+      lab.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;';
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.value = g.id;
+      cb.checked = picked.has(g.id);
+      // 空组：勾了用户也切不过去（后端 409），所以直接禁掉并说明。
+      if (!g.members) {
+        cb.disabled = true;
+        lab.style.opacity = '.55';
+      }
+      lab.appendChild(cb);
+      lab.appendChild(el('span', null, g.label || g.id));
+      const meta = el('span', 'muted');
+      meta.style.fontSize = '11px';
+      meta.textContent = g.members ? (' ' + g.members + ' 个模型') : '（空组）';
+      lab.appendChild(meta);
+      grid.appendChild(lab);
+    }
+    card.appendChild(grid);
+    rows.push({ k: k, grid });
+    m.body.appendChild(card);
+  }
+
+  const foot = el('div', 'row');
+  foot.style.cssText = 'gap:10px;align-items:center;margin-top:6px;';
+  const save = el('button', '', '保存授权');
+  const out = el('div', 'muted');
+  out.style.fontSize = '12px';
+  save.onclick = async () => {
+    save.disabled = true;
+    const bits = [];
+    const bad = [];
+    for (const r of rows) {
+      const scope = Array.from(r.grid.querySelectorAll('input[type=checkbox]'))
+        .filter((c) => c.checked).map((c) => c.value).join(',');
+      try {
+        const res = await post('/api/admin/keys/' + encodeURIComponent(r.k.id) + '/groups',
+          { group_scope: scope });
+        bits.push((r.k.name || r.k.id) + ' → ' + (res.group_scope || '（无）'));
+        if ((res.dropped || []).length) bits.push('已丢弃 ' + res.dropped.join(','));
+      } catch (e) {
+        bad.push((r.k.name || r.k.id) + '：' + e.message);
+      }
+    }
+    out.style.color = bad.length ? '#c0392b' : '#2e7d32';
+    out.textContent = (bad.length ? '✗ 部分失败：' + bad.join('；') + '\n' : '✓ 已保存：')
+      + bits.join(' · ');
+    save.disabled = false;
+    if (!bad.length) {
+      toast('授权已保存', 'ok');
+      if (typeof loadUsers === 'function') loadUsers();
+    }
+  };
+  const close = el('button', 'ghost', '关闭');
+  close.onclick = () => m.close();
+  foot.appendChild(save);
+  foot.appendChild(close);
+  m.body.appendChild(foot);
+  m.body.appendChild(out);
+  if (!rows.length) save.disabled = true;
 }
 
 // openBalanceAudits 某用户的余额变动记录（v0.27.0）。

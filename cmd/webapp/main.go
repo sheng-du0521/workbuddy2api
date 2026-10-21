@@ -73,7 +73,7 @@ var uiFS embed.FS
 //
 // 之所以要测试而不是靠自觉：这四处都是**间接**消费（通过常量），改代码时不会有人
 // 顺手想起它；只有让测试在"两处版本号不一致"时直接失败，才守得住。
-const version = "0.31.88"
+const version = "0.31.89"
 
 type app struct {
 	// modelRatioMu 模型倍率同步的单飞锁（v0.31.59，审查 F10）。
@@ -1587,6 +1587,11 @@ func (a *app) modelsPayloadFor(k *APIKey) []byte {
 		}
 	}
 	doc.Object = "list"
+	// data 不能是 null：客户端（含官方 SDK）对 `"data":null` 的处理与 `[]` 不同，
+	// 部分实现会直接抛错。缓存未建立时（新实例/号池空）确实可能走到这里。
+	if doc.Data == nil {
+		doc.Data = []map[string]any{}
+	}
 
 	if ms := a.activeGroupModels(k); ms != nil {
 		label := k.ActiveGroup
