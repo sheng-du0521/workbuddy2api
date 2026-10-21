@@ -1,20 +1,20 @@
 {
-  "version": "0.31.78",
+  "version": "0.31.79",
   "min_supported": "0.24.0",
-  "notes": "v0.31.78：需求 7 收尾（空模型 400 + 通道影响面 + 组失效可见）。三件都是静默失效类修补：不算错钱，但会让人找错方向。\n\n① 未指定模型 → 400（此前 503）：body 里没有 model 时会一路走到选号、按空名字选，最后给 503 no available account —— 客户端看到的是「服务挂了」，而真正该做的是把 model 填上。空模型是请求的问题，用 5xx 表达会让 SDK 重试一个永远不会成功的请求。现在在读体之后、选号之前直接 400 + gateway_hint（指向 GET /v1/models 与 wb-group-work），零出站零扣费。\n\n② 通道卡显示「影响 N 把 Key」：停用/删除通道前必须知道有多少把 Key 授权了它的组，否则「我先停一下」停掉的是别人的线上调用。后端 /api/admin/upstreams 新增 affected_keys；前端启用态黄标（预警）、停用态红标（已经在影响）。统计 SQL 用 (',' || group_scope || ',') LIKE '%,ch3,%' 而不是 LIKE '%ch3%' —— 后者会把 ch13/ch30 算进来，让人以为只有 3 把受影响、实际停了 15 把。统计失败不影响通道列表（WARN + 不显示标签）。\n\n③ 控制台「组失效」提示：授权指向的组可能被删/停用（后端允许这种悬空授权，因为组可能重建），此前静默忽略，用户看到组不见了却不知道为什么。现在密钥卡显示「组失效：ch3」，tooltip 说明 wb-group-ch3 会 404、请让管理员重新授权；GET /api/keys 新增 stale_groups。\n\n验证：TestCountKeysByGroupExact（ch3 / ch13 / ch30 交叉，前缀相似不能算成同一组：ch3 应命中 2 把而不是 3 把）；全量 go test + jscheck + uitest + preflight 通过。\n\n边界：影响面是打开页面那一刻的快照；空模型检查只看 model 字段（wb-group-* 也算指定了模型，展开失败才 404）；「组失效」不自动清 scope —— 组重建后授权自动恢复生效。",
-  "released_at": 1792532888,
+  "notes": "v0.31.79：503 可定位 + 拒绝拼串模型名。\n\n① 查证结论：生产近 3 小时**没有 503**。6 小时 463 条流水里 461 ok + 2 interrupted，按 hard_credit / session_dead / 11140 / 11102 搜也是 0 条；号池 5 个在池号、46 个未入池。唯一异常是一条 404：客户端把 /v1/models 的整个清单用空格拼成一个字符串塞进 model（54 个名字、1KB），打了 2 个号各被 11102 拒、触发 rotateguard 才停。\n\n② 拒绝拼串模型名 → 400 零出站。判据用「词数 >= 3 或长度 > 128」，且**必须放在归一化之后**。第一版判据是「空格 >= 2」且放在归一化前，当场把带首尾空格的 [global:]GLM-5.3 误判成拼串回 400 —— 归一化用例立刻红。教训：漏判一条垃圾请求远好于误伤一个真实用户，所以判据改成 strings.Fields 的**词数**（连续/首尾空白都不算），检查点后移到归一化之后。\n\n③ 503 可定位：响应头新增 X-Wb-Fail-Kind（值来自 upstream.Classify 的分类名，同源不另起词），日志新增一行 kind + status + model + 上游原文（此前这条出口只写 message，日志里查不到）。报障时把这两个发来，就能判断是「号池真没号 / 积分耗尽 / 会话失效 / 上游 5xx」哪一类。\n\n验证：TestModelNameLooksLikeList（glm-5.3、claude-sonnet-4-5-20250929、wb-group-work、默认模型、glm 5.3、带首尾空格的 [global:]GLM-5.3、连续空白、128 字符边界都不判成清单；\"auto fast-model balanced-model deep-model\"、129 字符、54 个名字 join 判成清单）+ TestModelNameNormalization 回归；全量 go test + jscheck + uitest + preflight 通过。\n\n边界：拼串判据只在进入上游之前生效，不影响已归一化的名字；真实 503 仍原样返回（不改分类映射 —— 503 = 可重试的容量/上游问题，与 4xx 的分界由 upstream.Classify 决定），这次只让它可查；X-Wb-Fail-Kind 只在最终失败时出现。",
+  "released_at": 1792549935,
   "url": "https://github.com/sheng-du0521/workbuddy2api/releases",
   "assets": [
     {
       "os": "windows",
       "arch": "amd64",
-      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.78/webapp.exe",
-      "sha256": "60120b08e81d5ab31ba084d81a6faf0a584e429c8589b9c5e20ccad0d715bed3",
-      "size": 15968768
+      "url": "https://github.com/sheng-du0521/workbuddy2api/releases/download/v0.31.79/webapp.exe",
+      "sha256": "39450e5d58d7dfbde850f5b8818c8d6333c526aafd6a9b4374952f3e3048cd5d",
+      "size": 15972864
     }
   ],
   "sig_alg": "ed25519",
   "key_id": "b899cc8d",
-  "signature": "JacOz/hvgXfstruNqd1lkHkKvgskY9e2PUQ1xBQGt4ruQhjBI4qyYm6rsjnpFW+HL2/TMvc95zkebtMbQgt+Dw==",
+  "signature": "/HWHqEqbAJ8+BJpYfJrkLYjJleK2ALFazwH40RNN/exDK8PO7ulbmDxOr0u7AmdkaXqJCaSNHRI4QcrKNbh6Cg==",
   "_assets_hint": "填写格式：[{\"os\":\"windows\",\"arch\":\"amd64\",\"url\":\"https://…/webapp.exe\",\"sha256\":\"<64位十六进制>\",\"size\":<字节>}]。sha256 必填。产物随 release 标签发布（本条目对应 tag v0.31.25）；换版本时同步换 url 与 sha256。"
 }

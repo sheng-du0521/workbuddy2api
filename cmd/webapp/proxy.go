@@ -1607,6 +1607,23 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 		model = norm
 		payload["model"] = norm
 	}
+	// 模型名形态校验（v0.31.79）：线上真实出现过把**整个模型清单**用空格拼成一个
+	// model 发过来的请求（54 个名字、1KB 长）。它会被当成"某个不存在的模型"打进上游，
+	// 被 11102 拒、触发 rotateguard、浪费账号配额，最后回给客户端 404/503 ——
+	// 每个环节都"看起来正常"，只有那条 1KB 的 WARN 能看出真相。
+	//
+	// ⚠️ **必须放在归一化之后**：归一化会去掉首尾空白，而 `" [global:]GLM-5.3 "`
+	// 这种输入（复制粘贴常见）首尾各一个空格 —— 在归一化前判会把它当"拼串"回 400，
+	// 等于把正常用户挡在门外（归一化用例当场就红了）。漏判一条垃圾请求 < 误伤一个真实用户。
+	if modelNameLooksLikeList(model) {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model is not a single model id",
+			"the model field looks like a list of names (too many words or too long); "+
+				"GET /v1/models returns {\"data\":[{\"id\":\"...\"}]} — take ONE id and send it as a plain string, "+
+				"do not join the list; no upstream account was used")
+		log.Printf("WARN: [proxy] 拒绝拼串模型名（%d 字符，%d 个词）：%s",
+			len(model), len(strings.Fields(model)), truncateStr(model, 160))
+		return
+	}
 	// 归一化之后仍不在已知清单里 → 记一条 WARN（同名一次）。
 	// 这正是"客户端模型名配置错"的直接症状：每次调用都会拿到上游 400/11102，
 	// 而我们回 404 —— 没有这条日志时，运维要在台账、上游原文与客户端配置之间来回对账。
@@ -2127,6 +2144,15 @@ func (p *Proxy) ServeChat(w http.ResponseWriter, r *http.Request) {
 	if hint == "" && finalKind == upstream.ErrNone {
 		hint = upstream.NoHealthyAccountHint()
 	}
+	// 503 的取证（v0.31.79）：此前这条出口**只写 message**，于是"到底是哪一类失败"
+	// 只能在 /api/admin/live 的内存事件里看，日志里查不到 —— 用户报 503 时我们只能靠猜。
+	// 现在两件事一起做：
+	//   1. 日志里打最终 kind + 状态码 + 模型（lastErr 已含上游原文，截断防止刷屏）；
+	//   2. 响应头 X-Wb-Fail-Kind 带出分类，用户报障时能直接告诉我们属于哪一类。
+	// kind 名来自 upstream.ErrKind.String()，与 Classify 同源，不另起一套词。
+	w.Header().Set("X-Wb-Fail-Kind", finalKind.String())
+	log.Printf("WARN: [proxy] 请求最终失败 kind=%s status=%d model=%q err=%s",
+		finalKind.String(), finalStatus, model, truncateStr(lastErr, 300))
 	writeOpenAIErrorHint(w, finalStatus, "upstream unavailable: "+lastErr, hint)
 }
 
@@ -2163,6 +2189,22 @@ func isClientFaultKind(k upstream.ErrKind) bool {
 // 映射原则：
 //
 //	· 400 —— 请求本身的问题（参数/内容/长度/图片）。改请求才有用，重试无意义。
+//
+// modelNameLooksLikeList 判断 model 字段是不是"把整个模型清单拼成了一个字符串"。
+//
+// 判据用**词数**而不是空格数：`strings.Fields` 会忽略连续空白与首尾空白，
+// 所以 `" glm-5.3 "`（复制粘贴常见）算 1 个词、不会被误伤。
+// 真实模型 id 不含空格（最长的 `claude-sonnet-4-5-20250929` 也就 28 字符），
+// 出现 3 个以上词基本只能是清单 join。
+//
+// 调用点必须在**归一化之后**（归一化会去首尾空白），见 ServeChat 里的注释。
+func modelNameLooksLikeList(m string) bool {
+	return len(m) > 128 || len(strings.Fields(m)) >= 3
+}
+
+// upstreamFailureStatus 失败归因 → 回给客户端的状态码。
+//
+//	· 400 —— 请求本身的问题（参数/内容/渠道策略/prompt 过长），换号也没用。
 //	· 404 —— 模型不存在或无权限（ErrModelBlocked）。
 //	· 429 —— 上游限流（ErrSoftRate），并透传 Retry-After。
 //	· 503 —— 无可服务账号 / 账号级故障 / 上游 5xx —— 这是我方容量问题，可重试。
